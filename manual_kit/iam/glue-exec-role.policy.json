@@ -1,0 +1,48 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3DataAndScripts",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": ["arn:aws:s3:::<<BUCKET>>/*"]
+    },
+    {
+      "Sid": "S3List",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::<<BUCKET>>"]
+    },
+    {
+      "Sid": "DsqlConnect",
+      "Effect": "Allow",
+      "Action": ["dsql:DbConnectAdmin", "dsql:DbConnect"],
+      "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
+    },
+    {
+      "Sid": "DmsDescribeForCdcDdlWatcher",
+      "Effect": "Allow",
+      "Action": ["dms:DescribeTableStatistics", "dms:DescribeReplicationTasks"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "SourceSecret",
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+      "Resource": ["<<SOURCE_SECRET_ARN>>"]
+    },
+    {
+      "Sid": "CloudWatchLogs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": ["arn:aws:logs:<<REGION>>:*:/aws-glue/*"]
+    },
+    {
+      "Sid": "CloudWatchMetricsForCdc",
+      "Effect": "Allow",
+      "Action": ["cloudwatch:PutMetricData"],
+      "Resource": ["*"],
+      "Condition": {"StringEquals": {"cloudwatch:namespace": "GlueCDC/NonPK"}}
+    }
+  ]
+}
