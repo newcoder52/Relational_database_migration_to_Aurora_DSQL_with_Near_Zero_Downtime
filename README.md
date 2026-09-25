@@ -83,7 +83,6 @@ manual_kit/                 Operator deployment kit (deploy + run the pipeline b
   CDC_EDGE_CASE_RESULTS.md  CDC edge-case + data-type limitations (with fixes)
 docs/
   NO_PK_CDC_UPDATE_TRACKING.md   Design note: no-PK CDC update tracking
-  architecture.png               Architecture diagram
 ```
 
 > The complete, authoritative deploy/operate reference is **[`manual_kit/RUNBOOK.md`](manual_kit/RUNBOOK.md)**.
