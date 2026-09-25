@@ -15,8 +15,6 @@ Source DB ──DMS (full load + CDC)──▶ S3 (CSV) ──AWS Glue──▶ 
                                           CDC job  continuous apply (long-running)
 ```
 
-![Architecture](docs/architecture.png)
-
 ---
 
 ## Table of contents
