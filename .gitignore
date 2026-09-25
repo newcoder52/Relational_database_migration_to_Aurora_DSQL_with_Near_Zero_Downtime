@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Archives
+*.zip
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Local env / secrets
+.env
+*.pem
