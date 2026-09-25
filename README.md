@@ -81,9 +81,10 @@ USAGE_GUIDE.md              End-to-end operational usage
 ENGINEERING_RECORD.md       Architecture, every bug found + fix, DDL support matrix
 CDC_EDGE_CASE_RESULTS.md    CDC edge-case + data-type limitations (with fixes)
 docs/
-  NO_PK_CDC_UPDATE_TRACKING.md   Design note: no-PK CDC update tracking
-docx/                       Word-format copies of the guides (Usage, Performance,
-                            Considerations & Limitations)
+  NO_PK_CDC_UPDATE_TRACKING.md      Design note: no-PK CDC update tracking
+  CONSIDERATIONS_AND_LIMITATIONS.docx   Word-format copies of the guides
+  PERFORMANCE_GUIDE.docx
+  USAGE_GUIDE.docx
 ```
 
 > The complete, authoritative deploy/operate reference is **[`RUNBOOK.md`](RUNBOOK.md)**.
