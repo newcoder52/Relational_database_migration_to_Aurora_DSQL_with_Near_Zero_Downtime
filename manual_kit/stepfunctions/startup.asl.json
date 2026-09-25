@@ -1,0 +1,282 @@
+{
+  "Comment": "Per-task startup: ONE state machine per DMS task (TASK_ARN hardcoded). Manages its own Glue jobs from S3 templates. Serialized CDC (default S3 layout).",
+  "StartAt": "StartDmsTask",
+  "States": {
+    "StartDmsTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
+      "Parameters": {
+        "ReplicationTaskArn": "<<TASK_ARN>>",
+        "StartReplicationTaskType": "start-replication"
+      },
+      "ResultPath": "$.startResult",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 2, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "InitPollCount", "ResultPath": "$.startError"}],
+      "Next": "InitPollCount"
+    },
+    "InitPollCount": {"Type": "Pass", "Parameters": {"pollCount": 0}, "ResultPath": "$.poll", "Next": "WaitForDms"},
+    "WaitForDms": {"Type": "Wait", "Seconds": 30, "Next": "DescribeDmsTask"},
+    "DescribeDmsTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+      "Parameters": {"Filters": [{"Name": "replication-task-arn", "Values": ["<<TASK_ARN>>"]}]},
+      "ResultPath": "$.describeResult",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "DmsFailed", "ResultPath": "$.error"}],
+      "Next": "IsDmsDone"
+    },
+    "IsDmsDone": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored", "IsPresent": true},
+            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored", "NumericGreaterThan": 0}
+          ],
+          "Next": "DmsFailed"
+        },
+        {
+          "And": [
+            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent", "IsPresent": true},
+            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent", "NumericEquals": 100},
+            {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "stopped"},
+            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "IsPresent": true},
+            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"}
+          ],
+          "Next": "ResolveTask"
+        },
+        {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "failed", "Next": "DmsFailed"},
+        {
+          "And": [
+            {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "stopped"},
+            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "IsPresent": true},
+            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "StringMatches": "*STOPPED_AFTER_FULL_LOAD*"}
+          ],
+          "Next": "DmsFailed"
+        }
+      ],
+      "Default": "IncrementPollCount"
+    },
+    "IncrementPollCount": {
+      "Type": "Pass",
+      "Parameters": {"pollCount.$": "States.MathAdd($.poll.pollCount, 1)"},
+      "ResultPath": "$.poll",
+      "Next": "PollBudgetLeft"
+    },
+    "PollBudgetLeft": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.poll.pollCount", "NumericLessThan": 2880, "Next": "WaitForDms"}],
+      "Default": "DmsTimedOut"
+    },
+    "ResolveTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>", "Payload": {"taskArn": "<<TASK_ARN>>", "configPrefix": "<<CONFIG_PREFIX>>"}},
+      "ResultSelector": {"dmsS3Base.$": "$.Payload.dmsS3Base", "s3Bucket.$": "$.Payload.s3Bucket", "cdcRoot.$": "$.Payload.cdcRoot"},
+      "ResultPath": "$.resolved",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "DriverDiscoveryFullload"
+    },
+    "DriverDiscoveryFullload": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>", "Payload": {"bucket": "<<BUCKET>>", "drivers_prefix": "driver-fullload"}},
+      "ResultSelector": {"extraPyFiles.$": "$.Payload.extraPyFiles"},
+      "ResultPath": "$.driverFullload",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "DriverDiscoveryValidation"
+    },
+    "DriverDiscoveryValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>", "Payload": {"bucket": "<<BUCKET>>", "drivers_prefix": "driver-validation"}},
+      "ResultSelector": {"extraPyFiles.$": "$.Payload.extraPyFiles"},
+      "ResultPath": "$.driverValidation",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "DriverDiscoveryCdc"
+    },
+    "DriverDiscoveryCdc": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {"FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>", "Payload": {"bucket": "<<BUCKET>>", "drivers_prefix": "driver-cdc"}},
+      "ResultSelector": {"extraPyFiles.$": "$.Payload.extraPyFiles"},
+      "ResultPath": "$.driverCdc",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "CreateGlueJobs"
+    },
+    "CreateGlueJobs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "create",
+          "bucket": "<<BUCKET>>",
+          "glue_templates_prefix": "glue-templates",
+          "scripts_prefix": "scripts",
+          "project": "<<PROJECT>>",
+          "taskSuffix": "<<TASK_SUFFIX>>",
+          "configPrefix": "<<CONFIG_PREFIX>>",
+          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
+          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
+          "glue_role_arn": "<<GLUE_EXEC_ROLE_ARN>>",
+          "region": "<<REGION>>",
+          "dsql_endpoint": "<<DSQL_ENDPOINT>>",
+          "dsql_user": "<<DSQL_USER>>",
+          "dsql_database": "<<DSQL_DATABASE>>",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "timestampColumnName.$": "$.resolved.timestampColumnName",
+          "control_schema": "cdc_control",
+          "dms_task_arn": "<<TASK_ARN>>"
+        }
+      },
+      "ResultSelector": {"jobs.$": "$.Payload.jobs"},
+      "ResultPath": "$.glue",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "RunDiscovery"
+    },
+    "RunDiscovery": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.glue.jobs.discovery",
+        "Arguments": {"--config_prefix": "<<CONFIG_PREFIX>>"}
+      },
+      "ResultPath": "$.discoveryResult",
+      "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "PlanSplit"
+    },
+    "PlanSplit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<PLAN_SPLIT_LAMBDA_ARN>>",
+        "Payload": {
+          "config_prefix": "<<CONFIG_PREFIX>>",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "big_table_row_threshold": 6000000,
+          "file_fanout_threshold": 8,
+          "max_files_in_parallel": 30,
+          "max_groups": 10,
+          "conn_budget": 900,
+          "min_writers_per_loader": 100,
+          "max_writers_per_loader": 150,
+          "map_max_concurrency": 6
+        }
+      },
+      "ResultSelector": {"groups.$": "$.Payload.groups", "group_count.$": "$.Payload.group_count"},
+      "ResultPath": "$.plan",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "GroupFanOut"
+    },
+    "GroupFanOut": {
+      "Type": "Map",
+      "ItemsPath": "$.plan.groups",
+      "MaxConcurrency": 6,
+      "Parameters": {
+        "group_index.$": "$$.Map.Item.Value.group_index",
+        "config_prefix.$": "$$.Map.Item.Value.config_prefix",
+        "kind.$": "$$.Map.Item.Value.kind",
+        "load_args.$": "$$.Map.Item.Value.load_args",
+        "extraPyFilesFullload.$": "$.driverFullload.extraPyFiles",
+        "extraPyFilesValidation.$": "$.driverValidation.extraPyFiles",
+        "loadJob.$": "$.glue.jobs.load",
+        "loadBigJob.$": "$.glue.jobs['load-big']",
+        "validateJob.$": "$.glue.jobs.validate"
+      },
+      "ResultPath": "$.mapResult",
+      "Iterator": {
+        "StartAt": "PickLoaderBySize",
+        "States": {
+          "PickLoaderBySize": {
+            "Type": "Choice",
+            "Choices": [{"Variable": "$.kind", "StringEquals": "big", "Next": "GroupLoadBig"}],
+            "Default": "GroupLoad"
+          },
+          "GroupLoad": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName.$": "$.loadJob",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--extra-py-files.$": "$.extraPyFilesFullload",
+                "--max_files_in_parallel.$": "$.load_args['--max_files_in_parallel']",
+                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']"
+              }
+            },
+            "ResultPath": "$.loadResult",
+            "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupFailed", "ResultPath": "$.error"}],
+            "Next": "GroupValidate"
+          },
+          "GroupLoadBig": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName.$": "$.loadBigJob",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--extra-py-files.$": "$.extraPyFilesFullload",
+                "--max_files_in_parallel.$": "$.load_args['--max_files_in_parallel']",
+                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']"
+              }
+            },
+            "ResultPath": "$.loadResult",
+            "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupFailed", "ResultPath": "$.error"}],
+            "Next": "GroupValidate"
+          },
+          "GroupValidate": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName.$": "$.validateJob",
+              "Arguments": {"--config_prefix.$": "$.config_prefix", "--extra-py-files.$": "$.extraPyFilesValidation"}
+            },
+            "ResultPath": "$.validateResult",
+            "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
+            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupValidateFailed", "ResultPath": "$.error"}],
+            "End": true
+          },
+          "GroupFailed": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "failed"}, "End": true},
+          "GroupValidateFailed": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "validate_failed"}, "End": true}
+        }
+      },
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "ResumeDmsToCdc"
+    },
+    "ResumeDmsToCdc": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
+      "Parameters": {"ReplicationTaskArn": "<<TASK_ARN>>", "StartReplicationTaskType": "resume-processing"},
+      "ResultPath": "$.resumeResult",
+      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "StartCdcJob"
+    },
+    "StartCdcJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun",
+      "Parameters": {
+        "JobName.$": "$.glue.jobs.cdc",
+        "Arguments": {"--config_prefix": "<<CONFIG_PREFIX>>", "--dms_task_arn": "<<TASK_ARN>>", "--extra-py-files.$": "$.driverCdc.extraPyFiles", "--cdc_root.$": "$.resolved.cdcRoot", "--timestamp_column.$": "$.resolved.timestampColumnName"}
+      },
+      "ResultPath": "$.cdcStart",
+      "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Next": "TaskSucceeded"
+    },
+    "TaskSucceeded": {"Type": "Succeed"},
+    "DmsFailed": {"Type": "Fail", "Error": "DmsTaskFailed", "Cause": "DMS task failed / stopped without cached changes / errored tables at completion."},
+    "DmsTimedOut": {"Type": "Fail", "Error": "DmsPollBudgetExceeded", "Cause": "DMS did not reach STOPPED_AFTER_CACHED_EVENTS within the poll budget."},
+    "PipelineFailed": {"Type": "Fail", "Error": "PipelineFailed", "Cause": "A Glue/Lambda step failed. See execution history."}
+  }
+}
