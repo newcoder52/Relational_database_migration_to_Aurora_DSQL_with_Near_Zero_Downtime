@@ -1,0 +1,10 @@
+{
+  "role": "cdc",
+  "script": "glue_cdc_continuous.py",
+  "command_name": "pythonshell",
+  "glue_version": "4.0",
+  "max_capacity": 1,
+  "timeout_minutes": 10080,
+  "max_concurrent_runs": 1,
+  "default_arguments": {}
+}
