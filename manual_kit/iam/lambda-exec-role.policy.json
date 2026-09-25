@@ -1,0 +1,44 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": ["arn:aws:logs:<<REGION>>:<<ACCOUNT_ID>>:*"]
+    },
+    {
+      "Sid": "S3",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::<<BUCKET>>", "arn:aws:s3:::<<BUCKET>>/*"]
+    },
+    {
+      "Sid": "DmsDescribe",
+      "Effect": "Allow",
+      "Action": ["dms:DescribeReplicationTasks", "dms:DescribeEndpoints",
+                 "dms:DescribeTableStatistics"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "DsqlConnectForDrainAndDropTags",
+      "Effect": "Allow",
+      "Action": ["dsql:DbConnectAdmin", "dsql:DbConnect"],
+      "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
+    },
+    {
+      "Sid": "GlueManageJobsAtRuntime",
+      "Effect": "Allow",
+      "Action": ["glue:CreateJob", "glue:UpdateJob", "glue:DeleteJob", "glue:GetJob",
+                 "glue:GetJobRuns", "glue:BatchStopJobRun"],
+      "Resource": ["*"]
+    },
+    {
+      "Sid": "PassGlueRoleToCreatedJobs",
+      "Effect": "Allow",
+      "Action": ["iam:PassRole"],
+      "Resource": ["arn:aws:iam::<<ACCOUNT_ID>>:role/<<GLUE_EXEC_ROLE_NAME>>"],
+      "Condition": { "StringEquals": { "iam:PassedToService": "glue.amazonaws.com" } }
+    }
+  ]
+}
