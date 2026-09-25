@@ -15,6 +15,8 @@ Source DB ──DMS (full load + CDC)──▶ S3 (CSV) ──AWS Glue──▶ 
                                           CDC job  continuous apply (long-running)
 ```
 
+![Full-load + CDC migration architecture](docs/architecture.png)
+
 ---
 
 ## Table of contents
@@ -85,6 +87,8 @@ docs/
   CONSIDERATIONS_AND_LIMITATIONS.docx   Word-format copies of the guides
   PERFORMANCE_GUIDE.docx
   USAGE_GUIDE.docx
+  architecture.png                  Architecture diagram (full load + CDC)
+  FullLoad_CDC_oracle-DSQL.drawio   Editable draw.io source for the diagram
 ```
 
 > The complete, authoritative deploy/operate reference is **[`RUNBOOK.md`](RUNBOOK.md)**.

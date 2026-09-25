@@ -1,0 +1,172 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Page-1" id="fullload-cdc-oracle-dsql">
+    <mxGraphModel dx="1341" dy="879" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1000" pageHeight="900" math="0" shadow="0" adaptiveColors="auto">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=15;fontStyle=1;fontColor=#232F3E;" value="Full-load + CDC migration to Amazon Aurora DSQL (near-zero downtime)" vertex="1">
+          <mxGeometry height="26" width="920" x="40" y="12" as="geometry" />
+        </mxCell>
+
+        <mxCell id="dp" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#5A6B86;dashed=1;fontSize=11;fontStyle=1;fontColor=#5A6B86;verticalAlign=top;align=center;spacingTop=4;" value="Data plane" vertex="1">
+          <mxGeometry height="700" width="160" x="40" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="src" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#5A6B86;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;aspect=fixed;shape=mxgraph.flowchart.database;" value="Source DB (Oracle)" vertex="1">
+          <mxGeometry height="66" width="60" x="90" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="dms" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#527FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.database_migration_service;" value="AWS DMS&#xa;(full-load-and-cdc)" vertex="1">
+          <mxGeometry height="58" width="58" x="91" y="248" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#7AA116;strokeColor=none;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;aspect=fixed;pointerEvents=1;shape=mxgraph.aws4.bucket;" value="Amazon S3&#xa;(LOAD*.csv + &lt;ts&gt;.csv)" vertex="1">
+          <mxGeometry height="58" width="56" x="92" y="430" as="geometry" />
+        </mxCell>
+        <mxCell id="dsql" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#C925D1;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=10;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.aurora;" value="Aurora DSQL&#xa;(+ cdc_control tables)" vertex="1">
+          <mxGeometry height="58" width="58" x="91" y="640" as="geometry" />
+        </mxCell>
+        <mxCell id="e_src_dms" edge="1" parent="1" source="src" style="strokeColor=#5A6B86;strokeWidth=2;endArrow=block;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="dms">
+          <mxGeometry relative="1" as="geometry"><Array as="points" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e_dms_s3" edge="1" parent="1" source="dms" style="strokeColor=#7AA116;strokeWidth=2;endArrow=block;fontSize=9;fontColor=#4A6410;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="s3" value="full load &#8594; LOAD*.csv&#xa;CDC &#8594; &lt;ts&gt;.csv (Op)">
+          <mxGeometry relative="1" as="geometry"><Array as="points" /></mxGeometry>
+        </mxCell>
+        <mxCell id="e_s3_dsql" edge="1" parent="1" source="s3" style="strokeColor=#C925D1;strokeWidth=2;endArrow=block;fontSize=9;fontColor=#8A1B90;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="dsql" value="loaded / applied into">
+          <mxGeometry relative="1" as="geometry"><Array as="points" /></mxGeometry>
+        </mxCell>
+
+        <mxCell id="sfn" parent="1" style="sketch=0;outlineConnect=0;gradientColor=none;html=1;whiteSpace=wrap;fontSize=11;fontStyle=1;shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_aws_step_functions_workflow;strokeColor=#CD2264;fillColor=none;verticalAlign=top;align=center;spacingTop=4;fontColor=#CD2264;dashed=0;" value="" vertex="1">
+          <mxGeometry height="640" width="280" x="240" y="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn_title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontStyle=1;fontColor=#CD2264;" value="AWS Step Functions &#8212; startup&#xa;(one per DMS task, states only)" vertex="1">
+          <mxGeometry height="30" width="230" x="265" y="66" as="geometry" />
+        </mxCell>
+        <mxCell id="s1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="1. Start DMS task" vertex="1">
+          <mxGeometry height="30" width="230" x="265" y="104" as="geometry" />
+        </mxCell>
+        <mxCell id="s2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF3CD;strokeColor=#B8860B;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="2. Poll &#8594; STOPPED_AFTER_CACHED_EVENTS (Choice)" vertex="1">
+          <mxGeometry height="40" width="230" x="265" y="144" as="geometry" />
+        </mxCell>
+        <mxCell id="s3s" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="3. resolve-task (Lambda)" vertex="1">
+          <mxGeometry height="28" width="230" x="265" y="194" as="geometry" />
+        </mxCell>
+        <mxCell id="s4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="4. driver-discovery &#215;3 (Lambda)" vertex="1">
+          <mxGeometry height="28" width="230" x="265" y="232" as="geometry" />
+        </mxCell>
+        <mxCell id="s5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="5. create-glue-jobs (Lambda)" vertex="1">
+          <mxGeometry height="28" width="230" x="265" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="s6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="6. Run Job 1 discovery (startJobRun.sync)" vertex="1">
+          <mxGeometry height="34" width="230" x="265" y="308" as="geometry" />
+        </mxCell>
+        <mxCell id="s7" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="7. plan-split (Lambda)" vertex="1">
+          <mxGeometry height="28" width="230" x="265" y="352" as="geometry" />
+        </mxCell>
+        <mxCell id="s8" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FCE9F1;strokeColor=#CD2264;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="8. Map (per group): load &#8594; validate (startJobRun.sync)" vertex="1">
+          <mxGeometry height="42" width="230" x="265" y="390" as="geometry" />
+        </mxCell>
+        <mxCell id="s9" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F0FF;strokeColor=#527FFF;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="9. Resume DMS &#8594; CDC (resume-processing)" vertex="1">
+          <mxGeometry height="34" width="230" x="265" y="442" as="geometry" />
+        </mxCell>
+        <mxCell id="s10" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#E6F0FF;strokeColor=#527FFF;fontSize=10;fontColor=#232F3E;verticalAlign=middle;" value="10. Start CDC job (continuous, startJobRun.async)" vertex="1">
+          <mxGeometry height="34" width="230" x="265" y="486" as="geometry" />
+        </mxCell>
+        <mxCell id="s11" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#DDF3DD;strokeColor=#3F8624;fontSize=10;fontStyle=1;fontColor=#232F3E;verticalAlign=middle;" value="11. Succeed (full load done; CDC live)" vertex="1">
+          <mxGeometry height="30" width="230" x="265" y="530" as="geometry" />
+        </mxCell>
+
+        <mxCell id="q1" edge="1" parent="1" source="s1" target="s2" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q2" edge="1" parent="1" source="s2" target="s3s" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q3" edge="1" parent="1" source="s3s" target="s4" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q4" edge="1" parent="1" source="s4" target="s5" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q5" edge="1" parent="1" source="s5" target="s6" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q6" edge="1" parent="1" source="s6" target="s7" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q7" edge="1" parent="1" source="s7" target="s8" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q8" edge="1" parent="1" source="s8" target="s9" style="endArrow=block;strokeColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q9" edge="1" parent="1" source="s9" target="s10" style="endArrow=block;strokeColor=#527FFF;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="q10" edge="1" parent="1" source="s10" target="s11" style="endArrow=block;strokeColor=#3F8624;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="e_sfn_dms" edge="1" parent="1" source="s1" target="dms" style="dashed=1;strokeColor=#CD2264;endArrow=open;fontSize=9;fontColor=#CD2264;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="start / resume / poll">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="210" y="119" /><mxPoint x="210" y="277" /></Array></mxGeometry>
+        </mxCell>
+
+        <mxCell id="cband" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#879196;dashed=1;fontSize=11;fontStyle=1;fontColor=#687078;verticalAlign=top;align=center;spacingTop=4;" value="Control &amp; compute (invoked by the state machine; run outside it)" vertex="1">
+          <mxGeometry height="620" width="420" x="545" y="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cband_l" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontStyle=1;fontColor=#ED7100;" value="AWS Lambda" vertex="1">
+          <mxGeometry height="16" width="180" x="570" y="90" as="geometry" />
+        </mxCell>
+        <mxCell id="l_resolve" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="resolve-task" vertex="1">
+          <mxGeometry height="38" width="38" x="575" y="116" as="geometry" />
+        </mxCell>
+        <mxCell id="l_driver" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="driver-discovery" vertex="1">
+          <mxGeometry height="38" width="38" x="695" y="116" as="geometry" />
+        </mxCell>
+        <mxCell id="l_create" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="create-glue-jobs" vertex="1">
+          <mxGeometry height="38" width="38" x="815" y="116" as="geometry" />
+        </mxCell>
+        <mxCell id="l_plan" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="plan-split" vertex="1">
+          <mxGeometry height="38" width="38" x="575" y="188" as="geometry" />
+        </mxCell>
+        <mxCell id="l_drain" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="drain-check" vertex="1">
+          <mxGeometry height="38" width="38" x="695" y="188" as="geometry" />
+        </mxCell>
+        <mxCell id="l_stopcdc" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="stop-cdc-run" vertex="1">
+          <mxGeometry height="38" width="38" x="815" y="188" as="geometry" />
+        </mxCell>
+        <mxCell id="l_drop" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#ED7100;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.lambda;" value="drop-tags" vertex="1">
+          <mxGeometry height="38" width="38" x="575" y="248" as="geometry" />
+        </mxCell>
+
+        <mxCell id="cband_g" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=10;fontStyle=1;fontColor=#8C4FFF;" value="AWS Glue jobs" vertex="1">
+          <mxGeometry height="16" width="180" x="570" y="310" as="geometry" />
+        </mxCell>
+        <mxCell id="g_disc" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.glue;" value="Job 1: discovery" vertex="1">
+          <mxGeometry height="38" width="38" x="600" y="338" as="geometry" />
+        </mxCell>
+        <mxCell id="g_disc_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=8;fontColor=#5A6B86;" value="target schema + PK/type metadata &#8594; mapping + master index" vertex="1">
+          <mxGeometry height="34" width="270" x="650" y="338" as="geometry" />
+        </mxCell>
+        <mxCell id="g_load" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.glue;" value="Job 2: load / load-big" vertex="1">
+          <mxGeometry height="38" width="38" x="600" y="404" as="geometry" />
+        </mxCell>
+        <mxCell id="g_load_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=8;fontColor=#5A6B86;" value="per-file parallel (250MB &#215;30); DSQL txn limits; UUID + timestamptz" vertex="1">
+          <mxGeometry height="34" width="270" x="650" y="404" as="geometry" />
+        </mxCell>
+        <mxCell id="g_val" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.glue;" value="Job 3: validate" vertex="1">
+          <mxGeometry height="38" width="38" x="600" y="470" as="geometry" />
+        </mxCell>
+        <mxCell id="g_val_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=8;fontColor=#5A6B86;" value="per-range count compare (+ optional checksum) &#8594; report" vertex="1">
+          <mxGeometry height="34" width="270" x="650" y="470" as="geometry" />
+        </mxCell>
+        <mxCell id="g_cdc" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=9;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.glue;" value="CDC: continuous" vertex="1">
+          <mxGeometry height="38" width="38" x="600" y="536" as="geometry" />
+        </mxCell>
+        <mxCell id="g_cdc_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=8;fontColor=#5A6B86;" value="long-running Python-shell; applies I/U/D; crash-proof resume via cdc_control; no-loss / no-dup" vertex="1">
+          <mxGeometry height="40" width="285" x="650" y="534" as="geometry" />
+        </mxCell>
+
+        <mxCell id="g_load_val" edge="1" parent="1" source="g_load" target="g_val" style="endArrow=block;strokeColor=#8C4FFF;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=0;entryY=0.5;" value=""><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="590" y="423" /><mxPoint x="590" y="489" /></Array></mxGeometry></mxCell>
+
+        <mxCell id="inv_l1" edge="1" parent="1" source="s3s" target="l_resolve" style="dashed=1;strokeColor=#ED7100;endArrow=open;fontSize=8;fontColor=#B85C00;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="invoke"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="525" y="208" /><mxPoint x="525" y="135" /></Array></mxGeometry></mxCell>
+        <mxCell id="inv_l2" edge="1" parent="1" source="s4" target="l_driver" style="dashed=1;strokeColor=#ED7100;endArrow=open;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="535" y="246" /><mxPoint x="535" y="170" /><mxPoint x="714" y="170" /></Array></mxGeometry></mxCell>
+        <mxCell id="inv_l3" edge="1" parent="1" source="s5" target="l_create" style="dashed=1;strokeColor=#ED7100;endArrow=open;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="855" y="284" /><mxPoint x="855" y="160" /></Array></mxGeometry></mxCell>
+        <mxCell id="inv_l4" edge="1" parent="1" source="s7" target="l_plan" style="dashed=1;strokeColor=#ED7100;endArrow=open;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="555" y="366" /><mxPoint x="555" y="207" /></Array></mxGeometry></mxCell>
+        <mxCell id="inv_g6" edge="1" parent="1" source="s6" target="g_disc" style="dashed=1;strokeColor=#8C4FFF;endArrow=open;fontSize=8;fontColor=#5B2FA6;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="startJobRun"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="565" y="325" /><mxPoint x="565" y="357" /></Array></mxGeometry></mxCell>
+        <mxCell id="inv_g8" edge="1" parent="1" source="s8" target="g_load" style="dashed=1;strokeColor=#8C4FFF;endArrow=open;fontSize=8;fontColor=#5B2FA6;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="startJobRun"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="620" y="411" /></Array></mxGeometry></mxCell>
+        <mxCell id="inv_g10" edge="1" parent="1" source="s10" target="g_cdc" style="dashed=1;strokeColor=#8C4FFF;endArrow=open;fontSize=8;fontColor=#5B2FA6;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="startJobRun"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="545" y="503" /><mxPoint x="545" y="555" /></Array></mxGeometry></mxCell>
+
+        <mxCell id="e_g_s3" edge="1" parent="1" source="g_disc" target="s3" style="dashed=1;strokeColor=#7AA116;endArrow=open;fontSize=8;fontColor=#4A6410;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value=""><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="530" y="357" /><mxPoint x="530" y="470" /><mxPoint x="120" y="470" /></Array></mxGeometry></mxCell>
+        <mxCell id="e_cdc_s3" edge="1" parent="1" source="g_cdc" target="s3" style="dashed=1;strokeColor=#7AA116;endArrow=open;fontSize=8;fontColor=#4A6410;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="poll CDC files"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="560" y="555" /><mxPoint x="560" y="700" /><mxPoint x="120" y="700" /></Array></mxGeometry></mxCell>
+        <mxCell id="e_cdc_dsql" edge="1" parent="1" source="g_cdc" target="dsql" style="dashed=1;strokeColor=#C925D1;endArrow=open;fontSize=8;fontColor=#8A1B90;edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" value="apply I/U/D + checkpoint"><mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="619" y="600" /><mxPoint x="120" y="600" /></Array></mxGeometry></mxCell>
+
+        <mxCell id="cutover" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FFF7E6;strokeColor=#B8860B;dashed=1;fontSize=9;fontColor=#7A5B00;align=left;verticalAlign=top;spacingLeft=6;spacingTop=4;" value="Cutover state machine (separate, run when ready): drain-check &#8594; stop-cdc-run &#8594; drop-tags (_cdc_file) &#8594; delete Glue jobs. Then stop DMS &amp; repoint app to Aurora DSQL." vertex="1">
+          <mxGeometry height="52" width="420" x="545" y="690" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=9;fontColor=#5A6B86;" value="Solid = data plane (Source &#8594; DMS &#8594; S3 &#8594; Glue writes/applies to Aurora DSQL).  Dashed = control plane: Step Functions holds only states; its Task states invoke Lambda and, via startJobRun, Glue &#8212; both run outside the state machine. Blue states (9&#8211;10) add the CDC phase; the continuous CDC job applies ongoing changes until cutover." vertex="1">
+          <mxGeometry height="46" width="920" x="40" y="800" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
