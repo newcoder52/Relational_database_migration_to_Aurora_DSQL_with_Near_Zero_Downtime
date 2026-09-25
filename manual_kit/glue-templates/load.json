@@ -1,0 +1,13 @@
+{
+  "role": "load",
+  "script": "job2_load.py",
+  "command_name": "glueetl",
+  "glue_version": "4.0",
+  "worker_type": "G.4X",
+  "number_of_workers": 10,
+  "timeout_minutes": 480,
+  "max_concurrent_runs": 10,
+  "default_arguments": {
+    "--TempDir": "s3://<<BUCKET>>/glue-temp/"
+  }
+}
