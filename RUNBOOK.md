@@ -50,7 +50,6 @@ So the full config prefix for a task is always `s3://<<BUCKET>>/config/_task/<<T
 | `<<DSQL_ENDPOINT>>` | DSQL endpoint host | `abcd.dsql.us-east-1.on.aws` |
 | `<<DSQL_CLUSTER_ID>>` | DSQL cluster id (first label of endpoint) | `abcd` |
 | `<<DSQL_USER>>` / `<<DSQL_DATABASE>>` | DSQL user / db | `admin` / `postgres` |
-| `<<SOURCE_SECRET_ARN>>` | source DB secret ARN | `arn:aws:secretsmanager:...` |
 | `<<GLUE_EXEC_ROLE_ARN>>` | Glue exec role ARN (from Step 1) | `arn:aws:iam::...:role/dms-dsql-glue-exec-role` |
 | `<<*_LAMBDA_ARN>>` | the 7 Lambda ARNs (from Step 2) | `arn:aws:lambda:...:function:dms-dsql-resolve-task` |
 
