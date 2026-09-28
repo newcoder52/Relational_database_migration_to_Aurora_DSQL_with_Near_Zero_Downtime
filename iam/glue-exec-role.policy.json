@@ -26,12 +26,6 @@
       "Resource": ["*"]
     },
     {
-      "Sid": "SourceSecret",
-      "Effect": "Allow",
-      "Action": ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
-      "Resource": ["<<SOURCE_SECRET_ARN>>"]
-    },
-    {
       "Sid": "CloudWatchLogs",
       "Effect": "Allow",
       "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
