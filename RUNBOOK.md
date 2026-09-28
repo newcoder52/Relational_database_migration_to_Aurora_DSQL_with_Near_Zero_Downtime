@@ -98,17 +98,33 @@ aws s3 cp glue-templates/ s3://$BUCKET/glue-templates/ --recursive --exclude "*"
 #    in-script shim promotes them ahead of Glue's bundled, too-old boto3). So the driver folders
 #    are split by job type and driver-discovery is called once per folder by the startup SM.
 #
-#    (a) DSQL driver: pg8000 + its deps (scramp, asn1crypto, python-dateutil, six)
-pip download pg8000 -d _drv/            # pulls pg8000 + scramp + asn1crypto (+ dateutil, six)
-#    (b) MODERN boto3/botocore for the CDC pythonshell job only (dsql-aware)
-pip download "boto3>=1.34.0" "botocore>=1.34.0" -d _boto3/
+#    IMPORTANT — driver-discovery bundles EVERY .whl it finds in a folder onto --extra-py-files
+#    and fails ONLY if pg8000 is missing. So a stray/wrong wheel is NOT ignored — it gets loaded.
+#    In particular, a boto3/botocore wheel in a Spark folder WILL break the Spark jobs.
+#
+#    PLATFORM PIN (required): Glue 4.0 runs on Linux x86_64 / CPython 3.10. Download the LINUX
+#    wheels, not your Mac/Windows wheels, or they may fail to load in Glue. The pin below forces
+#    manylinux + py3.10 binary wheels.
+PLAT="--platform manylinux2014_x86_64 --python-version 310 --only-binary=:all:"
 
-# driver-fullload/ and driver-validation/  = DSQL drivers ONLY (Spark jobs)
+#    (a) DSQL driver stack -> _drv/  (pg8000 + scramp + asn1crypto + python_dateutil + six)
+pip download pg8000 $PLAT -d _drv/
+#    (b) MODERN boto3/botocore for the CDC pythonshell job only -> _boto3/
+#        (boto3 + botocore + jmespath + s3transfer + urllib3, +dateutil/six already in _drv)
+pip download "boto3>=1.34.0" "botocore>=1.34.0" $PLAT -d _boto3/
+
+# driver-fullload/ and driver-validation/  = DSQL drivers ONLY (the 5 pg8000-stack wheels).
+# MUST NOT contain boto3/botocore — that breaks the Spark jobs (DataNotFoundError: endpoints).
 aws s3 cp _drv/ s3://$BUCKET/driver-fullload/   --recursive --exclude "*" --include "*.whl"
 aws s3 cp _drv/ s3://$BUCKET/driver-validation/ --recursive --exclude "*" --include "*.whl"
 # driver-cdc/  = DSQL drivers + modern boto3/botocore (pythonshell CDC job)
 aws s3 cp _drv/   s3://$BUCKET/driver-cdc/ --recursive --exclude "*" --include "*.whl"
 aws s3 cp _boto3/ s3://$BUCKET/driver-cdc/ --recursive --exclude "*" --include "*.whl"
+
+# VERIFY (before running the pipeline):
+#   aws s3 ls s3://$BUCKET/driver-fullload/    -> 5 wheels, ZERO boto3/botocore
+#   aws s3 ls s3://$BUCKET/driver-validation/  -> 5 wheels, ZERO boto3/botocore
+#   aws s3 ls s3://$BUCKET/driver-cdc/         -> pg8000 stack + boto3/botocore present
 
 # 4) per-task table manifest  ->  s3://$BUCKET/config/_task/<TASK_SUFFIX>/table_manifest.csv
 aws s3 cp table_manifest.csv s3://$BUCKET/config/_task/abc/table_manifest.csv   # abc = this task's suffix
