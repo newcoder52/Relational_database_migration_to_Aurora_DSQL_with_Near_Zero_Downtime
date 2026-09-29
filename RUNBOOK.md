@@ -243,6 +243,11 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
    ```bash
    aws s3 cp fn.zip s3://$BUCKET/lambda-code/fn.zip
    ```
+   > **What is `lambda-code/`?** It's just an arbitrary **staging folder (prefix)** for the zip —
+   > **not** one of the pipeline's fixed folders, and **not** read at runtime. You don't need to
+   > create it first (`aws s3 cp` makes it), and you can name it anything (`deploy/`, `lambda-zip/`,
+   > …) as long as the same key is used in the `--code S3Key=...` below. Safe to delete after the
+   > functions are created.
 3. **Create the 7 functions from the S3 object** (note `--code` instead of `--zip-file`):
    ```bash
    for spec in \
