@@ -250,13 +250,15 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
    - **Upload straight to S3 from your PC** (skip building in CloudShell entirely): on your PC, in
      the repo's `lambdas/` folder, run `pip install pg8000 -t .` then zip it, and upload:
      ```bash
-     aws s3 cp fn.zip s3://$BUCKET/lambda-code/fn.zip
+     # aws s3 cp  <SOURCE: local file on your PC>  <DESTINATION: S3 path>
+     aws s3 cp ~/Downloads/dms-s3-glue-dsql-migration/lambdas/fn.zip s3://$BUCKET/lambda-code/fn.zip
      ```
      Then open CloudShell and jump straight to **step 3** below (create the functions from S3) —
      the zip is already in the bucket, so step 2 is done.
 2. **Upload the zip to S3** (CloudShell has no persistent local storage you can point Lambda at,
    so stage it in your bucket):
    ```bash
+   # aws s3 cp  <SOURCE: the fn.zip you just built>  <DESTINATION: S3 path>
    aws s3 cp fn.zip s3://$BUCKET/lambda-code/fn.zip
    ```
    > **What is `lambda-code/`?** It's just an arbitrary **staging folder (prefix)** for the zip —
