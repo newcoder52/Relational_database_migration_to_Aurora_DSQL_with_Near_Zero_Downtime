@@ -496,9 +496,43 @@ aws s3 cp table_manifest.csv "${CONFIG_PREFIX}table_manifest.csv"
 example `<<BUCKET>>`, `<<TASK_ARN>>`. You fill in those blanks with your own values, save the
 filled-in copies, and hand them to AWS. That's all Step 4 is.
 
-There are **two kinds of blanks**, and you fill them in two different ways:
-- **Most blanks** (bucket, region, account, task ARN, …) → filled **automatically** by the command in 4a.
-- **A few ARN blanks** (the 7 Lambda ARNs + the Glue role ARN) → you **paste in by hand** in 4b, because their exact value is unique to your account.
+> **Coming in cold — did Steps 1–3 in the console, not with this guide's variables?**
+> Step 4 doesn't touch AWS to *read* anything — it just does find-and-replace on the template
+> files using shell variables. So those variables have to exist in your current terminal. If you
+> already ran the **"Fill in your values ONCE"** block above, they're set — **skip this box.**
+> If you opened a fresh terminal (or never ran that block because you built things by hand), set
+> just the ones Step 4 uses. **Only set a variable if it isn't already set** — re-setting one you
+> already have is harmless but unnecessary:
+>
+> ```bash
+> # identity / naming — must MATCH the names you actually created by hand
+> export PROJECT="dms-dsql"        # the prefix in your role/function names ($PROJECT-glue-exec-role, etc.)
+> export REGION="us-east-1"
+> export ACCOUNT_ID="123456789012"
+> export BUCKET="my-migration-bucket"
+> # Aurora DSQL target (the CDC states embed these)
+> export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"
+> export DSQL_USER="admin"
+> export DSQL_DATABASE="postgres"
+> # this task
+> export TASK_SUFFIX="abc"
+> export TASK_ARN="arn:aws:dms:us-east-1:123456789012:task:XXXX"
+> export AWS_PAGER=""
+> # derived — these BUILD the ARNs/paths from the above, so set them after the others
+> export CONFIG_PREFIX="s3://$BUCKET/config/_task/$TASK_SUFFIX/"
+> export GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
+> ```
+>
+> **The names must match what you built by hand.** Step 4 *derives* the Lambda and Glue-role ARNs
+> from `$PROJECT`/`$REGION`/`$ACCOUNT_ID` (e.g. `arn:…:function:$PROJECT-resolve-task`). If the
+> functions/role you created in the console are named differently, the safest fix is to set
+> `$PROJECT` (and the others) to match those names — or, if they can't follow the `$PROJECT-<name>`
+> pattern at all, edit the generated ARNs directly in the two `*.asl.json` files after 4a. The
+> `grep '<<'` check in 4b is your safety net — it catches any blank a missing variable left behind.
+
+**Good news: every blank is filled automatically.** The 7 Lambda ARNs and the Glue role ARN are all
+derivable from `$PROJECT`/`$REGION`/`$ACCOUNT_ID`, so the command in **4a** fills in *everything* —
+there's no hand-editing. **4b** is just a quick check that no blank was left behind.
 
 ---
 
@@ -523,6 +557,9 @@ for f in startup cutover; do
       -e "s|<<REGION>>|$REGION|g" \
       -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
       -e "s|<<GLUE_EXEC_ROLE_ARN>>|$GLUE_ROLE_ARN|g" \
+      -e "s|<<DSQL_ENDPOINT>>|$DSQL_ENDPOINT|g" \
+      -e "s|<<DSQL_USER>>|$DSQL_USER|g" \
+      -e "s|<<DSQL_DATABASE>>|$DSQL_DATABASE|g" \
       -e "s|<<RESOLVE_TASK_LAMBDA_ARN>>|$LAMBDA_BASE-resolve-task|g" \
       -e "s|<<DRIVER_DISCOVERY_LAMBDA_ARN>>|$LAMBDA_BASE-driver-discovery|g" \
       -e "s|<<PLAN_SPLIT_LAMBDA_ARN>>|$LAMBDA_BASE-plan-split|g" \
@@ -559,7 +596,8 @@ grep '<<' startup.$TASK_SUFFIX.asl.json cutover.$TASK_SUFFIX.asl.json
 ```
 
 This should print **nothing**. If it prints a line, a variable was unset when you ran 4a —
-re-check your `export` values (`echo "$PROJECT $REGION $ACCOUNT_ID"`) and run 4a again.
+re-check your `export` values (`echo "$PROJECT $REGION $ACCOUNT_ID $DSQL_ENDPOINT $DSQL_USER $DSQL_DATABASE"`)
+and run 4a again. (A blank `<<DSQL_...>>` almost always means one of the DSQL variables wasn't set.)
 
 ---
 ### 4c — Register the two state machines
