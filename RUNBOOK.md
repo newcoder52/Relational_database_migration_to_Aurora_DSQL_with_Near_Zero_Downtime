@@ -278,10 +278,20 @@ aws s3 cp table_manifest.csv "${CONFIG_PREFIX}table_manifest.csv"
 **Goal:** create the two Step Functions state machines that run this task — **startup**
 (full load → validate → start CDC) and **cutover** (drain → finalize).
 
-**Do this:**
+The template files in `stepfunctions/` (`startup.asl.json`, `cutover.asl.json`) ship with
+`<<PLACEHOLDER>>` tokens where your account-specific values need to go. This step **fills those
+placeholders in** with the variables you set earlier, writes out ready-to-use copies, and
+registers them as state machines.
+
+### 4a — Fill in the templates
+
+The command below runs `sed` (a find-and-replace tool) over each template. Each
+`-e "s|<<PLACEHOLDER>>|value|g"` rule means *"replace every `<<PLACEHOLDER>>` with this value"*
+(the `|` is just the separator, and `g` = replace all occurrences). It loops over both templates
+and writes a filled-in copy per task (e.g. `startup.abc.asl.json`), leaving the originals untouched
+so you can reuse them for the next task.
 
 ```bash
-# 1) Substitute placeholders into copies of the templates
 for f in startup cutover; do
   sed -e "s|<<TASK_ARN>>|$TASK_ARN|g" \
       -e "s|<<TASK_SUFFIX>>|$TASK_SUFFIX|g" \
@@ -290,14 +300,58 @@ for f in startup cutover; do
       -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
       "stepfunctions/$f.asl.json" > "$f.$TASK_SUFFIX.asl.json"
 done
-# Also paste your 7 Lambda ARNs where the templates reference <<*_LAMBDA_ARN>>.
+```
 
-# 2) Create both state machines
+**What each placeholder becomes** (using the example values from the "Fill in your values" block):
+
+| Placeholder in the template | Replaced with your variable | Example result |
+|---|---|---|
+| `<<TASK_ARN>>` | `$TASK_ARN` | `arn:aws:dms:us-east-1:123456789012:task:XXXX` |
+| `<<TASK_SUFFIX>>` | `$TASK_SUFFIX` | `abc` |
+| `<<CONFIG_PREFIX>>` | `$CONFIG_PREFIX` | `s3://my-migration-bucket/config/_task/abc/` |
+| `<<BUCKET>>` | `$BUCKET` | `my-migration-bucket` |
+| `<<PROJECT>>` | `$PROJECT` | `dms-dsql` |
+| `<<REGION>>` | `$REGION` | `us-east-1` |
+| `<<ACCOUNT_ID>>` | `$ACCOUNT_ID` | `123456789012` |
+
+So a template line like:
+```json
+"Resource": "<<TASK_ARN>>",
+```
+becomes, in the generated `startup.abc.asl.json`:
+```json
+"Resource": "arn:aws:dms:us-east-1:123456789012:task:XXXX",
+```
+
+> **One manual edit — the Lambda ARNs.** The templates also reference the 7 Lambdas as
+> `<<RESOLVE_TASK_LAMBDA_ARN>>`, `<<DRIVER_DISCOVERY_LAMBDA_ARN>>`, `<<PLAN_SPLIT_LAMBDA_ARN>>`,
+> `<<CREATE_GLUE_JOBS_LAMBDA_ARN>>`, `<<STOP_CDC_RUN_LAMBDA_ARN>>`, `<<DRAIN_CHECK_LAMBDA_ARN>>`,
+> `<<DROP_TAGS_LAMBDA_ARN>>`. These aren't in the `sed` loop above because they vary per function.
+> Get each one and paste it into the generated `.asl.json` files (find/replace in your editor).
+> To list them:
+> ```bash
+> aws lambda list-functions \
+>   --query "Functions[?starts_with(FunctionName,'$PROJECT-')].[FunctionName,FunctionArn]" --output table
+> ```
+> Each ARN looks like: `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-resolve-task`.
+> Tip: confirm no placeholders remain before creating the machine —
+> `grep '<<' startup.$TASK_SUFFIX.asl.json` should print **nothing**.
+
+### 4b — Register the two state machines
+
+`--name` is what the machine is called in the console; `--definition file://…` is the filled-in
+file you just generated; `--role-arn` is the Step Functions execution role from Step 1
+(`$SFN_ROLE_ARN`, which resolves to `arn:aws:iam::123456789012:role/dms-dsql-sfn-exec-role`).
+
+```bash
 aws stepfunctions create-state-machine --name "$PROJECT-startup-$TASK_SUFFIX" \
   --definition file://startup.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN"
 aws stepfunctions create-state-machine --name "$PROJECT-cutover-$TASK_SUFFIX" \
   --definition file://cutover.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN"
 ```
+
+With the example values, the first command creates a state machine named
+`dms-dsql-startup-abc` from `startup.abc.asl.json`.
 
 **Verify:** `aws stepfunctions list-state-machines --query "stateMachines[?contains(name,'$TASK_SUFFIX')].name"`
 shows both.
