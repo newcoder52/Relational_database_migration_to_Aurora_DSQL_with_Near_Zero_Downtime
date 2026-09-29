@@ -196,6 +196,8 @@ done
 
 ### Option B — AWS Console (manual, click-through)
 
+---
+
 Do this once **per function** in the table above (7 times), changing only the **name** and
 **handler** each time:
 
@@ -213,6 +215,59 @@ Do this once **per function** in the table above (7 times), changing only the **
    the handler from the table (e.g. `resolve_task.handler`).
 9. **Configuration → General configuration → Edit → Timeout:** set to **2 min** (120 s).
 10. **Save.** Repeat for the remaining functions.
+
+### Option C — AWS CloudShell (build in the browser, deploy from S3)
+
+Use this if you're working entirely in the browser (no local machine) — AWS **CloudShell**
+already has `aws`, `python`, `pip`, `zip`, and `git` installed. The trick for CloudShell is that
+function code over ~50 MB (or when you'd rather not keep it in the shell) is deployed **from an S3
+object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
+
+1. **Open CloudShell** (icon in the AWS Console top bar), then get the code and build the zip:
+   ```bash
+   # set the same variables you used elsewhere
+   export BUCKET="my-migration-bucket"; export PROJECT="dms-dsql"
+   export LAMBDA_ROLE_ARN="arn:aws:iam::123456789012:role/dms-dsql-lambda-exec-role"
+
+   # get the lambda code (clone the repo, or upload lambdas/ via CloudShell "Actions -> Upload file")
+   git clone https://github.com/newcoder52/Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime.git
+   cd Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime/lambdas
+
+   # (the two DSQL functions need pg8000 — bundle it in so all functions share one zip)
+   pip install pg8000 -t .
+   zip -r ../fn.zip .
+   cd ..
+   ```
+2. **Upload the zip to S3** (CloudShell has no persistent local storage you can point Lambda at,
+   so stage it in your bucket):
+   ```bash
+   aws s3 cp fn.zip s3://$BUCKET/lambda-code/fn.zip
+   ```
+3. **Create the 7 functions from the S3 object** (note `--code` instead of `--zip-file`):
+   ```bash
+   for spec in \
+     "resolve-task:resolve_task.handler" \
+     "driver-discovery:driver_discovery.handler" \
+     "plan-split:plan_split.handler" \
+     "create-glue-jobs:create_glue_jobs.handler" \
+     "stop-cdc-run:stop_cdc_run.handler" \
+     "drain-check:drain_check.handler" \
+     "drop-tags:drop_tags.handler" ; do
+       NAME="${spec%%:*}"; HANDLER="${spec##*:}"
+       aws lambda create-function --function-name "$PROJECT-$NAME" \
+         --runtime python3.12 --handler "$HANDLER" --timeout 120 \
+         --role "$LAMBDA_ROLE_ARN" \
+         --code S3Bucket=$BUCKET,S3Key=lambda-code/fn.zip
+   done
+   ```
+   > To **update** a function's code later after re-uploading the zip:
+   > `aws lambda update-function-code --function-name "$PROJECT-<name>" --s3-bucket $BUCKET --s3-key lambda-code/fn.zip`
+
+Because `pg8000` is bundled into `fn.zip` here, the two DSQL functions (`drain-check`, `drop-tags`)
+are already covered — no separate layer needed. The `lambda-code/` prefix is just a staging spot;
+it's not read at runtime (only at create/update time), so you can delete it afterward if you like.
+
+---
 
 ### The two DSQL functions need the `pg8000` library
 
