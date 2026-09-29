@@ -68,7 +68,7 @@ session; re-run this block if you open a new terminal.)
 export BUCKET="my-migration-bucket"          # your ONE source-of-truth S3 bucket (no s3://, no slash)
 export ACCOUNT_ID="123456789012"             # your 12-digit AWS account id
 export REGION="us-east-1"                     # your AWS region
-export PROJECT="dms-dsql"                     # short prefix for role/job names
+export PROJECT="dms-dsql"                     # short prefix for role/job names — pick anything; USE THE SAME VALUE EVERYWHERE
 export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"   # your Aurora DSQL endpoint host
 export DSQL_CLUSTER_ID="abcd"                 # first label of the endpoint (before ".dsql")
 export DSQL_USER="admin"
@@ -483,6 +483,11 @@ becomes, in the generated `startup.abc.asl.json`:
 > `<<CREATE_GLUE_JOBS_LAMBDA_ARN>>`, `<<STOP_CDC_RUN_LAMBDA_ARN>>`, `<<DRAIN_CHECK_LAMBDA_ARN>>`,
 > `<<DROP_TAGS_LAMBDA_ARN>>`. These aren't in the `sed` loop above because they vary per function.
 > Get each one and paste it into the generated `.asl.json` files (find/replace in your editor).
+> **Use the ARNs of the functions YOU created** — they carry whatever `$PROJECT` you chose
+> (e.g. if `PROJECT=acme-mig`, the ARN is `…:function:acme-mig-resolve-task`). Do NOT paste the
+> example `dms-dsql-…` ARNs unless that's actually your project name. The state machine invokes
+> Lambdas by these ARNs (not by `$PROJECT`), so the name inside each ARN must exactly match the
+> function name from Step 2, or you'll get `Lambda function not found` at runtime.
 > To list them:
 > ```bash
 > aws lambda list-functions \
