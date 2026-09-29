@@ -529,6 +529,30 @@ filled-in copies, and hand them to AWS. That's all Step 4 is.
 > `$PROJECT` (and the others) to match those names — or, if they can't follow the `$PROJECT-<name>`
 > pattern at all, edit the generated ARNs directly in the two `*.asl.json` files after 4a. The
 > `grep '<<'` check in 4b is your safety net — it catches any blank a missing variable left behind.
+>
+> **Pre-flight name check (cold-start only).** Before you run 4a, confirm the things you built by
+> hand actually match your `$PROJECT`. This lists the 7 Lambdas and the Glue role Step 4 expects —
+> eyeball that the names come back (not empty):
+>
+> ```bash
+> # 1) The 7 Lambda functions should all exist as $PROJECT-<name>
+> for n in resolve-task driver-discovery plan-split create-glue-jobs stop-cdc-run drain-check drop-tags; do
+>   printf "%-42s " "$PROJECT-$n"
+>   aws lambda get-function --function-name "$PROJECT-$n" \
+>     --query "Configuration.FunctionName" --output text --no-cli-pager 2>/dev/null \
+>     || echo "❌ NOT FOUND"
+> done
+>
+> # 2) The Glue execution role should exist as $PROJECT-glue-exec-role
+> aws iam get-role --role-name "$PROJECT-glue-exec-role" \
+>   --query "Role.Arn" --output text --no-cli-pager 2>/dev/null || echo "❌ Glue role NOT FOUND"
+> ```
+>
+> Every Lambda line should echo its own name, and the role line should print an ARN. Any
+> **`❌ NOT FOUND`** means that name doesn't match `$PROJECT-<name>` — either your `$PROJECT` is set
+> to something other than what you named the resource, or the resource is named off-pattern. Fix
+> that (set `$PROJECT` to match, or rename the resource) **before** 4a, so the derived ARNs point at
+> things that actually exist.
 
 **Good news: every blank is filled automatically.** The 7 Lambda ARNs and the Glue role ARN are all
 derivable from `$PROJECT`/`$REGION`/`$ACCOUNT_ID`, so the command in **4a** fills in *everything* —
