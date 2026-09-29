@@ -223,6 +223,51 @@ already has `aws`, `python`, `pip`, `zip`, and `git` installed. The trick for Cl
 function code over ~50 MB (or when you'd rather not keep it in the shell) is deployed **from an S3
 object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
 
+> **⭐ Already built `fn.zip` on your PC (with `pg8000` inside) and uploaded it to S3? Start here.**
+> You do NOT need to clone, `pip install`, or zip anything — the code is already in S3. Just open
+> CloudShell and run this one block. It assumes your zip is at
+> `s3://<your-bucket>/lambda-code/fn.zip` — change `ZIP_KEY` if you used a different path.
+>
+> ```bash
+> # 1) Set your values (a fresh CloudShell has none of these)
+> export BUCKET="my-migration-bucket"                 # the bucket where fn.zip already lives
+> export PROJECT="dms-dsql"                            # YOUR project prefix (same one used in Steps 1-2)
+> export ACCOUNT_ID="123456789012"
+> export LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-lambda-exec-role"
+> export ZIP_KEY="lambda-code/fn.zip"                  # the S3 key where YOUR fn.zip lives
+>
+> # 2) Confirm the zip is actually there
+> aws s3 ls "s3://$BUCKET/$ZIP_KEY"
+>
+> # 3) Create all 7 functions FROM the S3 zip (no local files needed)
+> for spec in \
+>   "resolve-task:resolve_task.handler" \
+>   "driver-discovery:driver_discovery.handler" \
+>   "plan-split:plan_split.handler" \
+>   "create-glue-jobs:create_glue_jobs.handler" \
+>   "stop-cdc-run:stop_cdc_run.handler" \
+>   "drain-check:drain_check.handler" \
+>   "drop-tags:drop_tags.handler" ; do
+>     NAME="${spec%%:*}"; HANDLER="${spec##*:}"
+>     aws lambda create-function --function-name "$PROJECT-$NAME" \
+>       --runtime python3.12 --handler "$HANDLER" --timeout 120 \
+>       --role "$LAMBDA_ROLE_ARN" \
+>       --code S3Bucket="$BUCKET",S3Key="$ZIP_KEY"
+> done
+>
+> # 4) Verify all 7 exist
+> aws lambda list-functions \
+>   --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName" --output table
+> ```
+> That's the whole thing for your case. Because `pg8000` is already inside your `fn.zip`, the two
+> DSQL functions (`drain-check`, `drop-tags`) are covered — no layer needed. Skip the numbered
+> steps below (they're for building the zip from scratch). Next stop: **Step 3 — stage files to S3**
+> (if not done) and **Step 4 — create the state machines**.
+
+---
+
+If instead you're starting from nothing in CloudShell, follow the numbered steps:
+
 1. **Open CloudShell** (icon in the AWS Console top bar), then get the code and build the zip:
    ```bash
    # set the same variables you used elsewhere
