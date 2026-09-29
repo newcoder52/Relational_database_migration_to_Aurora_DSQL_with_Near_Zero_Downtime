@@ -563,6 +563,14 @@ Each ARN looks like `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-res
 **2) The Glue role ARN.** Replace `<<GLUE_EXEC_ROLE_ARN>>` with:
 `arn:aws:iam::<ACCOUNT_ID>:role/<PROJECT>-glue-exec-role` (the Glue role from Step 1).
 
+*Where does Glue come in?* You staged the Glue **scripts** to S3 in Step 3, but the Glue **jobs**
+don't exist yet. When the startup machine runs, its `create-glue-jobs` step builds the 5 Glue jobs
+(discovery, load, load-big, validate, cdc) on the fly from those scripts — and every Glue job has to
+be told which IAM role to run under. That's this role. So `<<GLUE_EXEC_ROLE_ARN>>` is the role the
+state machine hands to each Glue job it creates; the Glue jobs then use it to read/write your S3
+bucket and connect to Aurora DSQL. (The jobs are deleted again at cutover — they only exist while a
+task is running.)
+
 > **Important — use YOUR names, not the examples.** If you chose a `$PROJECT` other than the example
 > `dms-dsql` (say `acme-mig`), your ARNs contain `acme-mig-…`. Paste *those*. The migration invokes
 > Lambdas by these exact ARNs, so if the name inside an ARN doesn't match the function you actually
