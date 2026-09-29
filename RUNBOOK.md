@@ -497,6 +497,19 @@ becomes, in the generated `startup.abc.asl.json`:
 > Tip: confirm no placeholders remain before creating the machine —
 > `grep '<<' startup.$TASK_SUFFIX.asl.json` should print **nothing**.
 
+> **Using a custom `$PROJECT`? Three things in the state machine must carry it** (all resource
+> names built from your project prefix):
+> 1. **`<<PROJECT>>` token** — used to build the Glue job names (`<PROJECT>-<TASK_SUFFIX>-…`).
+>    ✅ Handled automatically by the `sed` loop above (it substitutes `<<PROJECT>>` → `$PROJECT`).
+> 2. **The 7 Lambda ARNs** — each ends in `…:function:<PROJECT>-<name>`. ⚠️ Manual — paste YOUR
+>    functions' ARNs (Step 2), not the example `dms-dsql-…`.
+> 3. **`<<GLUE_EXEC_ROLE_ARN>>`** — the Glue role the created jobs run as, named
+>    `<PROJECT>-glue-exec-role` (Step 1). ⚠️ Manual — paste `arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role`.
+>
+> As long as the **same `$PROJECT` value** was used in Step 1 (roles), Step 2 (functions), and
+> here, these line up. A mismatch shows up at runtime as `Lambda function not found` or an
+> IAM/role error — not at create time.
+
 ### 4b — Register the two state machines
 
 `--name` is what the machine is called in the console; `--definition file://…` is the filled-in
