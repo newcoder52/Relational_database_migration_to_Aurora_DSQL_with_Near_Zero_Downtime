@@ -268,6 +268,12 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
    > functions are created.
 3. **Create the 7 functions from the S3 object** (note `--code` instead of `--zip-file`):
    ```bash
+   # If you came straight here (uploaded the zip to S3 from your PC) and this is a FRESH
+   # CloudShell, set these three variables first — the loop below uses them:
+   export BUCKET="my-migration-bucket"
+   export PROJECT="dms-dsql"
+   export LAMBDA_ROLE_ARN="arn:aws:iam::123456789012:role/dms-dsql-lambda-exec-role"
+
    for spec in \
      "resolve-task:resolve_task.handler" \
      "driver-discovery:driver_discovery.handler" \
@@ -283,6 +289,8 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
          --code S3Bucket=$BUCKET,S3Key=lambda-code/fn.zip
    done
    ```
+   > Make sure the `S3Key` here (`lambda-code/fn.zip`) matches the path you uploaded the zip to
+   > (Step 2, or your PC upload). If you used a different prefix/name, change it in both places.
    > To **update** a function's code later after re-uploading the zip:
    > `aws lambda update-function-code --function-name "$PROJECT-<name>" --s3-bucket $BUCKET --s3-key lambda-code/fn.zip`
 
