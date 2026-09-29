@@ -155,7 +155,24 @@ aws iam put-role-policy --role-name $PROJECT-sfn-exec-role \
 
 **Goal:** deploy the small orchestration Lambdas the state machine calls.
 
-**Do this:**
+All 7 use the **same zip** (all the `.py` files from `lambdas/`) and the **same execution role**
+(`$LAMBDA_ROLE_ARN` from Step 1); they differ only by **handler** (which `.py` file's `handler`
+function runs) and by **name**. Here's the full set:
+
+| Function name | Handler | What it does |
+|---|---|---|
+| `$PROJECT-resolve-task` | `resolve_task.handler` | reads the DMS S3 target endpoint settings |
+| `$PROJECT-driver-discovery` | `driver_discovery.handler` | lists the driver wheels in each `driver-*` folder |
+| `$PROJECT-plan-split` | `plan_split.handler` | splits the table list into balanced load groups |
+| `$PROJECT-create-glue-jobs` | `create_glue_jobs.handler` | creates the task's Glue jobs from the templates |
+| `$PROJECT-stop-cdc-run` | `stop_cdc_run.handler` | stops the CDC Glue run at cutover |
+| `$PROJECT-drain-check` | `drain_check.handler` | **(talks to DSQL)** waits until the last CDC file is applied |
+| `$PROJECT-drop-tags` | `drop_tags.handler` | **(talks to DSQL)** drops the `_cdc_file` column at cutover |
+
+Do it **either** with the CLI loop (fast) **or** in the Console (click-through). Both produce the
+same 7 functions.
+
+### Option A — CLI (fast, recommended)
 
 ```bash
 # Zip all lambda code (all .py at the zip root)
@@ -177,9 +194,61 @@ for spec in \
 done
 ```
 
-> **Two of them talk to DSQL** — `drain-check` and `drop-tags` need the `pg8000` library.
-> Either attach a **pg8000 Lambda layer** to those two, or bundle `pg8000` into `fn.zip`
-> before zipping. Without it, those two functions fail at cutover (Step 6).
+### Option B — AWS Console (manual, click-through)
+
+Do this once **per function** in the table above (7 times), changing only the **name** and
+**handler** each time:
+
+1. Go to **AWS Console → Lambda → Create function**.
+2. Choose **Author from scratch**.
+3. **Function name:** the name from the table (e.g. `dms-dsql-resolve-task`).
+4. **Runtime:** **Python 3.12**.
+5. **Architecture:** `x86_64` (default).
+6. Expand **Change default execution role → Use an existing role**, and pick your
+   **`<PROJECT>-lambda-exec-role`** (created in Step 1). *(Not "Create a new role" — you want the
+   role that already has the S3/DMS/DSQL/Glue permissions.)*
+7. Click **Create function**.
+8. On the function page: **Code** tab → **Upload from → .zip file** → upload the `fn.zip` you
+   built above (or drag the `lambdas/` files in). **Runtime settings → Edit → Handler:** set it to
+   the handler from the table (e.g. `resolve_task.handler`).
+9. **Configuration → General configuration → Edit → Timeout:** set to **2 min** (120 s).
+10. **Save.** Repeat for the remaining functions.
+
+### The two DSQL functions need the `pg8000` library
+
+`drain-check` and `drop-tags` connect to Aurora DSQL, so they need the `pg8000` Python package.
+The other 5 functions do **not**. If you skip this, those two fail at **cutover (Step 6)** with
+`No module named 'pg8000'`. Two ways to provide it:
+
+**Option 1 — bundle pg8000 into the zip (simplest):** install it alongside the code before zipping,
+so it's inside `fn.zip` for all functions.
+```bash
+cd lambdas
+pip install pg8000 -t .        # installs pg8000 (+scramp, asn1crypto) into this folder
+zip -r ../fn.zip .             # now the zip contains the lambda code AND pg8000
+cd ..
+```
+
+**Option 2 — a Lambda layer (cleaner; keeps function zips small):** build a `pg8000` layer once and
+attach it to just the two DSQL functions.
+```bash
+# Build the layer zip (Lambda expects libs under python/)
+mkdir -p layer/python
+pip install pg8000 -t layer/python/
+cd layer && zip -r ../pg8000-layer.zip python && cd ..
+
+# Publish the layer
+LAYER_ARN=$(aws lambda publish-layer-version --layer-name pg8000 \
+  --zip-file fileb://pg8000-layer.zip \
+  --compatible-runtimes python3.12 \
+  --query LayerVersionArn --output text)
+
+# Attach it to the two DSQL functions
+aws lambda update-function-configuration --function-name "$PROJECT-drain-check" --layers "$LAYER_ARN"
+aws lambda update-function-configuration --function-name "$PROJECT-drop-tags"  --layers "$LAYER_ARN"
+```
+> In the Console, the layer equivalent is: function page → scroll to **Layers → Add a layer →
+> Custom layers →** pick `pg8000` → the version → **Add**. Do it for `drain-check` and `drop-tags`.
 
 **Verify:** `aws lambda list-functions --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName"`
 lists all 7.
