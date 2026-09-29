@@ -494,14 +494,18 @@ There are **two kinds of blanks**, and you fill them in two different ways:
 
 ---
 
-### 4a — Auto-fill most of the blanks
+### 4a — Fill in the blanks (all of them, automatically)
 
-Run this. It reads each template, swaps every `<<...>>` blank it can for the value you set back in
-the "Fill in your values" block, and saves a filled-in copy named after your task (e.g.
-`startup.abc.asl.json`). Your original templates are left untouched, so you can reuse them for the
-next task.
+Run this one command. It reads each template and fills in **every** `<<...>>` blank —
+including the 7 Lambda ARNs and the Glue role ARN, which are all built from your
+`$PROJECT` / `$REGION` / `$ACCOUNT_ID` values. It saves a filled-in copy named after your
+task (e.g. `startup.abc.asl.json`) and leaves the original templates untouched for the next task.
 
 ```bash
+# ARNs are all derivable from your variables, so we build them once here:
+LAMBDA_BASE="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT"
+GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
+
 for f in startup cutover; do
   sed -e "s|<<TASK_ARN>>|$TASK_ARN|g" \
       -e "s|<<TASK_SUFFIX>>|$TASK_SUFFIX|g" \
@@ -510,81 +514,46 @@ for f in startup cutover; do
       -e "s|<<PROJECT>>|$PROJECT|g" \
       -e "s|<<REGION>>|$REGION|g" \
       -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
+      -e "s|<<GLUE_EXEC_ROLE_ARN>>|$GLUE_ROLE_ARN|g" \
+      -e "s|<<RESOLVE_TASK_LAMBDA_ARN>>|$LAMBDA_BASE-resolve-task|g" \
+      -e "s|<<DRIVER_DISCOVERY_LAMBDA_ARN>>|$LAMBDA_BASE-driver-discovery|g" \
+      -e "s|<<PLAN_SPLIT_LAMBDA_ARN>>|$LAMBDA_BASE-plan-split|g" \
+      -e "s|<<CREATE_GLUE_JOBS_LAMBDA_ARN>>|$LAMBDA_BASE-create-glue-jobs|g" \
+      -e "s|<<STOP_CDC_RUN_LAMBDA_ARN>>|$LAMBDA_BASE-stop-cdc-run|g" \
+      -e "s|<<DRAIN_CHECK_LAMBDA_ARN>>|$LAMBDA_BASE-drain-check|g" \
+      -e "s|<<DROP_TAGS_LAMBDA_ARN>>|$LAMBDA_BASE-drop-tags|g" \
       "stepfunctions/$f.asl.json" > "$f.$TASK_SUFFIX.asl.json"
 done
 ```
 
-*(That command uses `sed`, a standard find-and-replace tool. Each `-e "s|<<X>>|value|g"` = "replace
-every `<<X>>` with `value`". You don't need to understand `sed` to use it — just run it.)*
-
-Here's what gets filled in, using the example values from earlier:
-
-| Blank in the template | Filled with | Example result |
-|---|---|---|
-| `<<TASK_ARN>>` | your DMS task ARN | `arn:aws:dms:us-east-1:123456789012:task:XXXX` |
-| `<<TASK_SUFFIX>>` | your task tag | `abc` |
-| `<<CONFIG_PREFIX>>` | your config S3 path | `s3://my-migration-bucket/config/_task/abc/` |
-| `<<BUCKET>>` | your bucket | `my-migration-bucket` |
-| `<<PROJECT>>` | your project prefix | `dms-dsql` |
-| `<<REGION>>` | your region | `us-east-1` |
-| `<<ACCOUNT_ID>>` | your account id | `123456789012` |
-
-So a line that started as `"Resource": "<<TASK_ARN>>"` becomes
-`"Resource": "arn:aws:dms:us-east-1:123456789012:task:XXXX"` in your generated file.
+> **How the ARNs are built** (so you can sanity-check them):
+> - **Lambda ARNs:** `arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT-<name>` — e.g.
+>   `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-resolve-task`. This works because
+>   you created the functions as `$PROJECT-<name>` in Step 2 (same `$PROJECT`), so the names line up.
+> - **Glue role ARN:** `arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role` — the role you
+>   created in Step 1. The state machine hands this to each Glue job it creates at runtime so the
+>   jobs can read/write S3 and connect to Aurora DSQL. (Those jobs are auto-created on run and
+>   deleted at cutover — you never create them yourself.)
+>
+> **This all depends on using the SAME `$PROJECT` in Steps 1, 2, and here.** If they differ, an
+> ARN will point at a name that doesn't exist and you'll get `Lambda function not found` (or a
+> role error) at runtime.
 
 ---
 
-### 4b — Paste in the ARN blanks by hand
+### 4b — Confirm nothing is left blank
 
-A few blanks aren't in the command above because their values are unique per function/role and can't
-be built from a simple variable. **Open the two generated files** (`startup.$TASK_SUFFIX.asl.json`,
-`cutover.$TASK_SUFFIX.asl.json`) in an editor and replace these:
+The command in 4a fills in everything, but always double-check the generated files have no
+leftover `<<...>>` placeholders before you register them:
 
-**1) The 7 Lambda ARNs.** List your functions and their ARNs:
-```bash
-aws lambda list-functions \
-  --query "Functions[?starts_with(FunctionName,'$PROJECT-')].[FunctionName,FunctionArn]" \
-  --output table --no-cli-pager
-```
-Then find/replace each blank with the matching ARN:
-
-| Blank in the template | Paste this function's ARN |
-|---|---|
-| `<<RESOLVE_TASK_LAMBDA_ARN>>` | `$PROJECT-resolve-task` |
-| `<<DRIVER_DISCOVERY_LAMBDA_ARN>>` | `$PROJECT-driver-discovery` |
-| `<<PLAN_SPLIT_LAMBDA_ARN>>` | `$PROJECT-plan-split` |
-| `<<CREATE_GLUE_JOBS_LAMBDA_ARN>>` | `$PROJECT-create-glue-jobs` |
-| `<<STOP_CDC_RUN_LAMBDA_ARN>>` | `$PROJECT-stop-cdc-run` |
-| `<<DRAIN_CHECK_LAMBDA_ARN>>` | `$PROJECT-drain-check` |
-| `<<DROP_TAGS_LAMBDA_ARN>>` | `$PROJECT-drop-tags` |
-
-Each ARN looks like `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-resolve-task`.
-
-**2) The Glue role ARN.** Replace `<<GLUE_EXEC_ROLE_ARN>>` with:
-`arn:aws:iam::<ACCOUNT_ID>:role/<PROJECT>-glue-exec-role` (the Glue role from Step 1).
-
-*Where does Glue come in?* You staged the Glue **scripts** to S3 in Step 3, but the Glue **jobs**
-don't exist yet. When the startup machine runs, its `create-glue-jobs` step builds the 5 Glue jobs
-(discovery, load, load-big, validate, cdc) on the fly from those scripts — and every Glue job has to
-be told which IAM role to run under. That's this role. So `<<GLUE_EXEC_ROLE_ARN>>` is the role the
-state machine hands to each Glue job it creates; the Glue jobs then use it to read/write your S3
-bucket and connect to Aurora DSQL. (The jobs are deleted again at cutover — they only exist while a
-task is running.)
-
-> **Important — use YOUR names, not the examples.** If you chose a `$PROJECT` other than the example
-> `dms-dsql` (say `acme-mig`), your ARNs contain `acme-mig-…`. Paste *those*. The migration invokes
-> Lambdas by these exact ARNs, so if the name inside an ARN doesn't match the function you actually
-> created in Step 2, you'll get **`Lambda function not found`** when it runs. Same `$PROJECT`
-> everywhere (Steps 1, 2, and here) = everything lines up.
-
-**Final check — make sure no blanks are left:**
 ```bash
 grep '<<' startup.$TASK_SUFFIX.asl.json cutover.$TASK_SUFFIX.asl.json
 ```
-This should print **nothing**. If it prints a line, that blank still needs a value.
+
+This should print **nothing**. If it prints a line, a variable was unset when you ran 4a —
+re-check your `export` values (`echo "$PROJECT $REGION $ACCOUNT_ID"`) and run 4a again.
 
 ---
-
 ### 4c — Register the two state machines
 
 Now hand the filled-in files to AWS. `--name` is what you'll see in the console, `--definition`
