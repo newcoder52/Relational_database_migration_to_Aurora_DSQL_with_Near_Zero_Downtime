@@ -73,6 +73,7 @@ export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"   # your Aurora DSQL endpoint 
 export DSQL_CLUSTER_ID="abcd"                 # first label of the endpoint (before ".dsql")
 export DSQL_USER="admin"
 export DSQL_DATABASE="postgres"
+export AWS_PAGER=""                            # stops the AWS CLI pager from making commands appear to "hang"
 
 # ---- per migration task (change when you start a new task) ----
 export TASK_SUFFIX="abc"                      # short unique tag for THIS task (names its folder + jobs)
@@ -190,7 +191,7 @@ for spec in \
     NAME="${spec%%:*}"; HANDLER="${spec##*:}"
     aws lambda create-function --function-name "$PROJECT-$NAME" \
       --runtime python3.12 --handler "$HANDLER" --timeout 120 \
-      --role "$LAMBDA_ROLE_ARN" --zip-file fileb://fn.zip
+      --role "$LAMBDA_ROLE_ARN" --zip-file fileb://fn.zip --no-cli-pager
 done
 ```
 
@@ -235,6 +236,7 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
 > export ACCOUNT_ID="123456789012"
 > export LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-lambda-exec-role"
 > export ZIP_KEY="lambda-code/fn.zip"                  # the S3 key where YOUR fn.zip lives
+> export AWS_PAGER=""                                  # stops the CLI pager from making each command "hang"
 >
 > # 2) Confirm the zip is actually there
 > aws s3 ls "s3://$BUCKET/$ZIP_KEY"
@@ -252,7 +254,7 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
 >     aws lambda create-function --function-name "$PROJECT-$NAME" \
 >       --runtime python3.12 --handler "$HANDLER" --timeout 120 \
 >       --role "$LAMBDA_ROLE_ARN" \
->       --code S3Bucket="$BUCKET",S3Key="$ZIP_KEY"
+>       --code S3Bucket="$BUCKET",S3Key="$ZIP_KEY" --no-cli-pager
 > done
 >
 > # 4) Verify all 7 exist
@@ -318,6 +320,7 @@ If instead you're starting from nothing in CloudShell, follow the numbered steps
    export BUCKET="my-migration-bucket"
    export PROJECT="dms-dsql"
    export LAMBDA_ROLE_ARN="arn:aws:iam::123456789012:role/dms-dsql-lambda-exec-role"
+   export AWS_PAGER=""     # stops the CLI pager from making each create-function "hang"
 
    for spec in \
      "resolve-task:resolve_task.handler" \
@@ -331,7 +334,7 @@ If instead you're starting from nothing in CloudShell, follow the numbered steps
        aws lambda create-function --function-name "$PROJECT-$NAME" \
          --runtime python3.12 --handler "$HANDLER" --timeout 120 \
          --role "$LAMBDA_ROLE_ARN" \
-         --code S3Bucket=$BUCKET,S3Key=lambda-code/fn.zip
+         --code S3Bucket=$BUCKET,S3Key=lambda-code/fn.zip --no-cli-pager
    done
    ```
    > Make sure the `S3Key` here (`lambda-code/fn.zip`) matches the path you uploaded the zip to
@@ -650,6 +653,7 @@ One task failing or cutting over never affects another.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Each `aws` command seems to **hang** until you press **Ctrl-C**, then the next one runs (e.g. only 1 Lambda created per loop) | the AWS CLI **pager** is paging the JSON output and waiting for you to quit it | run `export AWS_PAGER=""` (and/or add `--no-cli-pager`) before the loop, then re-run it — each command returns on its own. Any functions you already Ctrl-C'd were still created; the re-run reports them as already-exists and fills in the rest |
 | Spark job fails `DataNotFoundError: endpoints` | a `boto3`/`botocore` wheel leaked into `driver-fullload/` or `driver-validation/` | remove it — those folders hold the 5 pg8000 wheels ONLY (re-check Step 3b verify) |
 | CDC job fails `UnknownServiceError: dsql` | `driver-cdc/` is missing modern boto3/botocore | upload the boto3 set to `driver-cdc/` (Step 3b) |
 | A driver job fails "no pg8000" | driver folder empty or wrong-platform wheels | re-run the platform-pinned `pip download` (Step 3b) and re-upload |
