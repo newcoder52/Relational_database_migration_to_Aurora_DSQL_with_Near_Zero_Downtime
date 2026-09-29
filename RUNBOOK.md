@@ -476,108 +476,114 @@ aws s3 cp table_manifest.csv "${CONFIG_PREFIX}table_manifest.csv"
 
 ---
 
-## Step 4 — Create the state machines for this task (per task, ~10 min)
+## Step 4 — Create the two state machines for this task (per task, ~10 min)
 
-**Goal:** create the two Step Functions state machines that run this task — **startup**
-(full load → validate → start CDC) and **cutover** (drain → finalize).
+**Goal:** set up the "conductor" that runs this migration for you. You create **two** of them:
 
-The template files in `stepfunctions/` (`startup.asl.json`, `cutover.asl.json`) ship with
-`<<PLACEHOLDER>>` tokens where your account-specific values need to go. This step **fills those
-placeholders in** with the variables you set earlier, writes out ready-to-use copies, and
-registers them as state machines.
+- **startup** — runs the whole migration: full load → validate → switch DMS to CDC → start the continuous CDC job.
+- **cutover** — run later, when you're ready to switch over: drains the last changes and finalizes.
 
-### 4a — Fill in the templates
+**Why templates?** The `stepfunctions/` folder has two ready-made definition files
+(`startup.asl.json`, `cutover.asl.json`). They contain blanks written as `<<SOMETHING>>` — for
+example `<<BUCKET>>`, `<<TASK_ARN>>`. You fill in those blanks with your own values, save the
+filled-in copies, and hand them to AWS. That's all Step 4 is.
 
-The command below runs `sed` (a find-and-replace tool) over each template. Each
-`-e "s|<<PLACEHOLDER>>|value|g"` rule means *"replace every `<<PLACEHOLDER>>` with this value"*
-(the `|` is just the separator, and `g` = replace all occurrences). It loops over both templates
-and writes a filled-in copy per task (e.g. `startup.abc.asl.json`), leaving the originals untouched
-so you can reuse them for the next task.
+There are **two kinds of blanks**, and you fill them in two different ways:
+- **Most blanks** (bucket, region, account, task ARN, …) → filled **automatically** by the command in 4a.
+- **A few ARN blanks** (the 7 Lambda ARNs + the Glue role ARN) → you **paste in by hand** in 4b, because their exact value is unique to your account.
+
+---
+
+### 4a — Auto-fill most of the blanks
+
+Run this. It reads each template, swaps every `<<...>>` blank it can for the value you set back in
+the "Fill in your values" block, and saves a filled-in copy named after your task (e.g.
+`startup.abc.asl.json`). Your original templates are left untouched, so you can reuse them for the
+next task.
 
 ```bash
 for f in startup cutover; do
-  sed -e "s|<<TASK_ARN>>|$TASK_ARN|g" \
-      -e "s|<<TASK_SUFFIX>>|$TASK_SUFFIX|g" \
-      -e "s|<<CONFIG_PREFIX>>|$CONFIG_PREFIX|g" \
-      -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<PROJECT>>|$PROJECT|g" \
-      -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
-      "stepfunctions/$f.asl.json" > "$f.$TASK_SUFFIX.asl.json"
+  sed -e "s|<<TASK_ARN>>|$TASK_ARN|g"       -e "s|<<TASK_SUFFIX>>|$TASK_SUFFIX|g"       -e "s|<<CONFIG_PREFIX>>|$CONFIG_PREFIX|g"       -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<PROJECT>>|$PROJECT|g"       -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g"       "stepfunctions/$f.asl.json" > "$f.$TASK_SUFFIX.asl.json"
 done
 ```
 
-**What each placeholder becomes** (using the example values from the "Fill in your values" block):
+*(That command uses `sed`, a standard find-and-replace tool. Each `-e "s|<<X>>|value|g"` = "replace
+every `<<X>>` with `value`". You don't need to understand `sed` to use it — just run it.)*
 
-| Placeholder in the template | Replaced with your variable | Example result |
+Here's what gets filled in, using the example values from earlier:
+
+| Blank in the template | Filled with | Example result |
 |---|---|---|
-| `<<TASK_ARN>>` | `$TASK_ARN` | `arn:aws:dms:us-east-1:123456789012:task:XXXX` |
-| `<<TASK_SUFFIX>>` | `$TASK_SUFFIX` | `abc` |
-| `<<CONFIG_PREFIX>>` | `$CONFIG_PREFIX` | `s3://my-migration-bucket/config/_task/abc/` |
-| `<<BUCKET>>` | `$BUCKET` | `my-migration-bucket` |
-| `<<PROJECT>>` | `$PROJECT` | `dms-dsql` |
-| `<<REGION>>` | `$REGION` | `us-east-1` |
-| `<<ACCOUNT_ID>>` | `$ACCOUNT_ID` | `123456789012` |
+| `<<TASK_ARN>>` | your DMS task ARN | `arn:aws:dms:us-east-1:123456789012:task:XXXX` |
+| `<<TASK_SUFFIX>>` | your task tag | `abc` |
+| `<<CONFIG_PREFIX>>` | your config S3 path | `s3://my-migration-bucket/config/_task/abc/` |
+| `<<BUCKET>>` | your bucket | `my-migration-bucket` |
+| `<<PROJECT>>` | your project prefix | `dms-dsql` |
+| `<<REGION>>` | your region | `us-east-1` |
+| `<<ACCOUNT_ID>>` | your account id | `123456789012` |
 
-So a template line like:
-```json
-"Resource": "<<TASK_ARN>>",
-```
-becomes, in the generated `startup.abc.asl.json`:
-```json
-"Resource": "arn:aws:dms:us-east-1:123456789012:task:XXXX",
-```
-
-> **One manual edit — the Lambda ARNs.** The templates also reference the 7 Lambdas as
-> `<<RESOLVE_TASK_LAMBDA_ARN>>`, `<<DRIVER_DISCOVERY_LAMBDA_ARN>>`, `<<PLAN_SPLIT_LAMBDA_ARN>>`,
-> `<<CREATE_GLUE_JOBS_LAMBDA_ARN>>`, `<<STOP_CDC_RUN_LAMBDA_ARN>>`, `<<DRAIN_CHECK_LAMBDA_ARN>>`,
-> `<<DROP_TAGS_LAMBDA_ARN>>`. These aren't in the `sed` loop above because they vary per function.
-> Get each one and paste it into the generated `.asl.json` files (find/replace in your editor).
-> **Use the ARNs of the functions YOU created** — they carry whatever `$PROJECT` you chose
-> (e.g. if `PROJECT=acme-mig`, the ARN is `…:function:acme-mig-resolve-task`). Do NOT paste the
-> example `dms-dsql-…` ARNs unless that's actually your project name. The state machine invokes
-> Lambdas by these ARNs (not by `$PROJECT`), so the name inside each ARN must exactly match the
-> function name from Step 2, or you'll get `Lambda function not found` at runtime.
-> To list them:
-> ```bash
-> aws lambda list-functions \
->   --query "Functions[?starts_with(FunctionName,'$PROJECT-')].[FunctionName,FunctionArn]" --output table
-> ```
-> Each ARN looks like: `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-resolve-task`.
-> Tip: confirm no placeholders remain before creating the machine —
-> `grep '<<' startup.$TASK_SUFFIX.asl.json` should print **nothing**.
-
-> **Using a custom `$PROJECT`? Three things in the state machine must carry it** (all resource
-> names built from your project prefix):
-> 1. **`<<PROJECT>>` token** — used to build the Glue job names (`<PROJECT>-<TASK_SUFFIX>-…`).
->    ✅ Handled automatically by the `sed` loop above (it substitutes `<<PROJECT>>` → `$PROJECT`).
-> 2. **The 7 Lambda ARNs** — each ends in `…:function:<PROJECT>-<name>`. ⚠️ Manual — paste YOUR
->    functions' ARNs (Step 2), not the example `dms-dsql-…`.
-> 3. **`<<GLUE_EXEC_ROLE_ARN>>`** — the Glue role the created jobs run as, named
->    `<PROJECT>-glue-exec-role` (Step 1). ⚠️ Manual — paste `arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role`.
->
-> As long as the **same `$PROJECT` value** was used in Step 1 (roles), Step 2 (functions), and
-> here, these line up. A mismatch shows up at runtime as `Lambda function not found` or an
-> IAM/role error — not at create time.
-
-### 4b — Register the two state machines
-
-`--name` is what the machine is called in the console; `--definition file://…` is the filled-in
-file you just generated; `--role-arn` is the Step Functions execution role from Step 1
-(`$SFN_ROLE_ARN`, which resolves to `arn:aws:iam::123456789012:role/dms-dsql-sfn-exec-role`).
-
-```bash
-aws stepfunctions create-state-machine --name "$PROJECT-startup-$TASK_SUFFIX" \
-  --definition file://startup.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN"
-aws stepfunctions create-state-machine --name "$PROJECT-cutover-$TASK_SUFFIX" \
-  --definition file://cutover.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN"
-```
-
-With the example values, the first command creates a state machine named
-`dms-dsql-startup-abc` from `startup.abc.asl.json`.
-
-**Verify:** `aws stepfunctions list-state-machines --query "stateMachines[?contains(name,'$TASK_SUFFIX')].name"`
-shows both.
+So a line that started as `"Resource": "<<TASK_ARN>>"` becomes
+`"Resource": "arn:aws:dms:us-east-1:123456789012:task:XXXX"` in your generated file.
 
 ---
+
+### 4b — Paste in the ARN blanks by hand
+
+A few blanks aren't in the command above because their values are unique per function/role and can't
+be built from a simple variable. **Open the two generated files** (`startup.$TASK_SUFFIX.asl.json`,
+`cutover.$TASK_SUFFIX.asl.json`) in an editor and replace these:
+
+**1) The 7 Lambda ARNs.** List your functions and their ARNs:
+```bash
+aws lambda list-functions   --query "Functions[?starts_with(FunctionName,'$PROJECT-')].[FunctionName,FunctionArn]"   --output table --no-cli-pager
+```
+Then find/replace each blank with the matching ARN:
+
+| Blank in the template | Paste this function's ARN |
+|---|---|
+| `<<RESOLVE_TASK_LAMBDA_ARN>>` | `$PROJECT-resolve-task` |
+| `<<DRIVER_DISCOVERY_LAMBDA_ARN>>` | `$PROJECT-driver-discovery` |
+| `<<PLAN_SPLIT_LAMBDA_ARN>>` | `$PROJECT-plan-split` |
+| `<<CREATE_GLUE_JOBS_LAMBDA_ARN>>` | `$PROJECT-create-glue-jobs` |
+| `<<STOP_CDC_RUN_LAMBDA_ARN>>` | `$PROJECT-stop-cdc-run` |
+| `<<DRAIN_CHECK_LAMBDA_ARN>>` | `$PROJECT-drain-check` |
+| `<<DROP_TAGS_LAMBDA_ARN>>` | `$PROJECT-drop-tags` |
+
+Each ARN looks like `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-resolve-task`.
+
+**2) The Glue role ARN.** Replace `<<GLUE_EXEC_ROLE_ARN>>` with:
+`arn:aws:iam::<ACCOUNT_ID>:role/<PROJECT>-glue-exec-role` (the Glue role from Step 1).
+
+> **Important — use YOUR names, not the examples.** If you chose a `$PROJECT` other than the example
+> `dms-dsql` (say `acme-mig`), your ARNs contain `acme-mig-…`. Paste *those*. The migration invokes
+> Lambdas by these exact ARNs, so if the name inside an ARN doesn't match the function you actually
+> created in Step 2, you'll get **`Lambda function not found`** when it runs. Same `$PROJECT`
+> everywhere (Steps 1, 2, and here) = everything lines up.
+
+**Final check — make sure no blanks are left:**
+```bash
+grep '<<' startup.$TASK_SUFFIX.asl.json cutover.$TASK_SUFFIX.asl.json
+```
+This should print **nothing**. If it prints a line, that blank still needs a value.
+
+---
+
+### 4c — Register the two state machines
+
+Now hand the filled-in files to AWS. `--name` is what you'll see in the console, `--definition`
+points at your generated file, and `--role-arn` is the Step Functions role from Step 1.
+
+```bash
+aws stepfunctions create-state-machine --name "$PROJECT-startup-$TASK_SUFFIX"   --definition file://startup.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
+aws stepfunctions create-state-machine --name "$PROJECT-cutover-$TASK_SUFFIX"   --definition file://cutover.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
+```
+
+With the example values, the first command creates a machine named `dms-dsql-startup-abc`.
+
+**Verify** both exist:
+```bash
+aws stepfunctions list-state-machines   --query "stateMachines[?contains(name,'$TASK_SUFFIX')].name" --output table --no-cli-pager
+```
 
 ## Step 5 — Run the migration (per task)
 
