@@ -567,8 +567,21 @@ including the 7 Lambda ARNs and the Glue role ARN, which are all built from your
 `$PROJECT` / `$REGION` / `$ACCOUNT_ID` values. It saves a filled-in copy named after your
 task (e.g. `startup.abc.asl.json`) and leaves the original templates untouched for the next task.
 
+> **Running in AWS CloudShell?** This loop works as-is (CloudShell has bash, GNU `sed`, and the AWS
+> CLI with your credentials already loaded). Two things to know: **(1)** CloudShell's `$HOME`
+> persists, but **exported shell variables do not survive a reconnect** — if your session timed out
+> (~20 min idle), re-run the **"Fill in your values ONCE"** block (or the cold-start box above)
+> before this loop. The guard below will stop you with a clear message if anything's unset.
+> **(2)** Anywhere this guide uses in-place `sed -i ''` (the macOS form), on CloudShell drop the `''`
+> and use `sed -i` — CloudShell is Linux (GNU sed). The 4a loop doesn't use `-i`, so it's unaffected.
+
 ```bash
 # ARNs are all derivable from your variables, so we build them once here:
+# fail fast: stop with a clear message if any required variable is unset or empty
+: "${PROJECT:?set PROJECT}" "${REGION:?set REGION}" "${ACCOUNT_ID:?set ACCOUNT_ID}" "${BUCKET:?set BUCKET}" \
+  "${DSQL_ENDPOINT:?set DSQL_ENDPOINT}" "${DSQL_USER:?set DSQL_USER}" "${DSQL_DATABASE:?set DSQL_DATABASE}" \
+  "${TASK_ARN:?set TASK_ARN}" "${TASK_SUFFIX:?set TASK_SUFFIX}" "${CONFIG_PREFIX:?set CONFIG_PREFIX}"
+
 LAMBDA_BASE="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT"
 GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
 
