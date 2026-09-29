@@ -238,6 +238,22 @@ object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
    zip -r ../fn.zip .
    cd ..
    ```
+
+   **Already have the repo downloaded on your PC?** You don't need to `git clone` again — get your
+   local copy into CloudShell one of two ways:
+
+   - **Upload the folder into CloudShell**, then build the zip there: in CloudShell click
+     **Actions → Upload file** and upload your local `fn.zip` (if you already zipped it on the PC),
+     or a zip of the `lambdas/` folder; then unzip/`cd` into it and run the `pip install pg8000 -t .`
+     + `zip -r ../fn.zip .` steps above. *(CloudShell's Upload file takes a single file, so zip the
+     folder on your PC first.)*
+   - **Upload straight to S3 from your PC** (skip building in CloudShell entirely): on your PC, in
+     the repo's `lambdas/` folder, run `pip install pg8000 -t .` then zip it, and upload:
+     ```bash
+     aws s3 cp fn.zip s3://$BUCKET/lambda-code/fn.zip
+     ```
+     Then open CloudShell and jump straight to **step 3** below (create the functions from S3) —
+     the zip is already in the bucket, so step 2 is done.
 2. **Upload the zip to S3** (CloudShell has no persistent local storage you can point Lambda at,
    so stage it in your bucket):
    ```bash
