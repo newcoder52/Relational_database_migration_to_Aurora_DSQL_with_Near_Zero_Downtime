@@ -33,6 +33,14 @@ The moving parts:
 - **Steps 5–6 (per migration task):** point a state machine at a DMS task and run it. Repeat
   for each DMS task you migrate.
 
+**A few terms you'll see** (so nothing below is a surprise):
+- **full load** = the one-time bulk copy of all existing rows. **CDC** (change data capture) = the
+  ongoing stream of inserts/updates/deletes that happen *after* the full load, kept flowing until cutover.
+- **`STOPPED_AFTER_CACHED_EVENTS`** = the DMS status meaning "full load done, changes captured and paused" — the pipeline waits for this before loading into DSQL.
+- **cutover** = the final switch: CDC has caught up, so you point your app at Aurora DSQL and stop the old flow.
+- **idle** (in the CDC control tables) = that table is fully caught up, nothing pending.
+- **state machine** = an AWS Step Functions workflow — the "conductor" that runs the steps for you.
+
 ---
 
 ## Before you start — prerequisites checklist
@@ -583,10 +591,10 @@ switch DMS to CDC → start the continuous CDC job.
 
 ```bash
 STARTUP_ARN=$(aws stepfunctions list-state-machines \
-  --query "stateMachines[?name=='$PROJECT-startup-$TASK_SUFFIX'].stateMachineArn" --output text)
+  --query "stateMachines[?name=='$PROJECT-startup-$TASK_SUFFIX'].stateMachineArn" --output text --no-cli-pager)
 
 aws stepfunctions start-execution --state-machine-arn "$STARTUP_ARN" \
-  --name run-$(date +%Y%m%d-%H%M%S)
+  --name run-$(date +%Y%m%d-%H%M%S) --no-cli-pager
 ```
 
 **What happens (in order), so you can follow along in the Step Functions console:**
@@ -615,10 +623,10 @@ switch the application to Aurora DSQL.
 
 ```bash
 CUTOVER_ARN=$(aws stepfunctions list-state-machines \
-  --query "stateMachines[?name=='$PROJECT-cutover-$TASK_SUFFIX'].stateMachineArn" --output text)
+  --query "stateMachines[?name=='$PROJECT-cutover-$TASK_SUFFIX'].stateMachineArn" --output text --no-cli-pager)
 
 aws stepfunctions start-execution --state-machine-arn "$CUTOVER_ARN" \
-  --name cutover-$(date +%Y%m%d-%H%M%S)
+  --name cutover-$(date +%Y%m%d-%H%M%S) --no-cli-pager
 ```
 
 It stops CDC, drain-checks that the last CDC file was applied, removes the pipeline's internal
