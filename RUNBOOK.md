@@ -503,7 +503,14 @@ next task.
 
 ```bash
 for f in startup cutover; do
-  sed -e "s|<<TASK_ARN>>|$TASK_ARN|g"       -e "s|<<TASK_SUFFIX>>|$TASK_SUFFIX|g"       -e "s|<<CONFIG_PREFIX>>|$CONFIG_PREFIX|g"       -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<PROJECT>>|$PROJECT|g"       -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g"       "stepfunctions/$f.asl.json" > "$f.$TASK_SUFFIX.asl.json"
+  sed -e "s|<<TASK_ARN>>|$TASK_ARN|g" \
+      -e "s|<<TASK_SUFFIX>>|$TASK_SUFFIX|g" \
+      -e "s|<<CONFIG_PREFIX>>|$CONFIG_PREFIX|g" \
+      -e "s|<<BUCKET>>|$BUCKET|g" \
+      -e "s|<<PROJECT>>|$PROJECT|g" \
+      -e "s|<<REGION>>|$REGION|g" \
+      -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
+      "stepfunctions/$f.asl.json" > "$f.$TASK_SUFFIX.asl.json"
 done
 ```
 
@@ -535,7 +542,9 @@ be built from a simple variable. **Open the two generated files** (`startup.$TAS
 
 **1) The 7 Lambda ARNs.** List your functions and their ARNs:
 ```bash
-aws lambda list-functions   --query "Functions[?starts_with(FunctionName,'$PROJECT-')].[FunctionName,FunctionArn]"   --output table --no-cli-pager
+aws lambda list-functions \
+  --query "Functions[?starts_with(FunctionName,'$PROJECT-')].[FunctionName,FunctionArn]" \
+  --output table --no-cli-pager
 ```
 Then find/replace each blank with the matching ARN:
 
@@ -574,15 +583,18 @@ Now hand the filled-in files to AWS. `--name` is what you'll see in the console,
 points at your generated file, and `--role-arn` is the Step Functions role from Step 1.
 
 ```bash
-aws stepfunctions create-state-machine --name "$PROJECT-startup-$TASK_SUFFIX"   --definition file://startup.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
-aws stepfunctions create-state-machine --name "$PROJECT-cutover-$TASK_SUFFIX"   --definition file://cutover.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
+aws stepfunctions create-state-machine --name "$PROJECT-startup-$TASK_SUFFIX" \
+  --definition file://startup.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
+aws stepfunctions create-state-machine --name "$PROJECT-cutover-$TASK_SUFFIX" \
+  --definition file://cutover.$TASK_SUFFIX.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
 ```
 
 With the example values, the first command creates a machine named `dms-dsql-startup-abc`.
 
 **Verify** both exist:
 ```bash
-aws stepfunctions list-state-machines   --query "stateMachines[?contains(name,'$TASK_SUFFIX')].name" --output table --no-cli-pager
+aws stepfunctions list-state-machines \
+  --query "stateMachines[?contains(name,'$TASK_SUFFIX')].name" --output table --no-cli-pager
 ```
 
 ## Step 5 — Run the migration (per task)
