@@ -59,6 +59,26 @@ def _job_name(project, task_suffix, role):
     return f"{project}-{task_suffix}-{role}"[:255]
 
 
+# Wheels a Spark (glueetl) job needs to get a DSQL-aware boto3. Glue 4.0 bundles a boto3 that
+# predates Aurora DSQL (-> "UnknownServiceError: Unknown service: 'dsql'"). The fix is to
+# pip-install a modern boto3 via --additional-python-modules. It must NOT go on
+# --extra-py-files: boto3 wheels there break botocore's data-dir lookup under Spark
+# ("DataNotFoundError: endpoints"). We reuse the wheels already staged in driver-cdc/
+# (passed in as cdcExtraPyFiles) so nothing is fetched from PyPI. jmespath / urllib3 /
+# python-dateutil are left to Glue's bundled versions (they satisfy botocore); s3transfer
+# is included because boto3 pins a matching s3transfer version.
+_SPARK_BOTO3_PREFIXES = ("boto3-", "botocore-", "s3transfer-")
+
+
+def _spark_boto3_modules(wheel_csv):
+    picks = []
+    for w in (wheel_csv or "").split(","):
+        w = w.strip()
+        if w and w.rsplit("/", 1)[-1].lower().startswith(_SPARK_BOTO3_PREFIXES):
+            picks.append(w)
+    return ",".join(sorted(picks))
+
+
 def handler(event, context):
     mode = event.get("mode", "create")
     bucket = event["bucket"]
@@ -154,6 +174,17 @@ def handler(event, context):
             if _cdc_extra:
                 args["--extra-py-files"] = _cdc_extra
         args.update(tmpl.get("default_arguments", {}) or {})
+
+        # Spark jobs: deliver a DSQL-aware boto3 via --additional-python-modules (S3 wheels,
+        # no PyPI). A template may set its own value to override this.
+        if command_name != "pythonshell" and "--additional-python-modules" not in args:
+            _mods = _spark_boto3_modules(event.get("cdcExtraPyFiles", ""))
+            if not _mods:
+                raise Exception(
+                    f"No boto3/botocore/s3transfer wheels found in cdcExtraPyFiles for Spark job "
+                    f"{name}. Stage them in s3://{bucket}/driver-cdc/ (Glue 4.0's bundled boto3 "
+                    f"has no 'dsql' client), or set --additional-python-modules in {role}.json.")
+            args["--additional-python-modules"] = _mods
 
         # Defensive placeholder substitution: a template's default_arguments may still
         # contain <<BUCKET>>/<<REGION>>/<<ACCOUNT_ID>> (e.g. --TempDir "s3://<<BUCKET>>/glue-temp/")
