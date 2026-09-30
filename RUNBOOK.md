@@ -50,6 +50,12 @@ it never creates target tables.
 
 - [ ] **AWS CLI installed and configured** (`aws sts get-caller-identity` returns your account).
 - [ ] **An Aurora DSQL cluster** exists, and you know its endpoint (e.g. `abcd.dsql.us-east-1.on.aws`).
+- [ ] **A network path from Glue to DSQL**, if your account is locked down (Glue's default network
+      can't reach your DSQL cluster). You need a **private subnet** and a **security group** that can
+      reach DSQL (through a DSQL VPC endpoint with private DNS on, or a NAT gateway), and the subnet's
+      route table needs an **S3 gateway endpoint**. You'll put their IDs in `SUBNET_ID` and
+      `SECURITY_GROUP_ID` below, and Step 1b turns them into a Glue network connection. If Glue can
+      already reach DSQL, skip this.
 - [ ] **Target tables already created in DSQL** — every table you plan to migrate must exist in
       the target schema, with a single-column primary key where possible (best for CDC + validation).
 - [ ] **A DMS task** of type **`full-load-and-cdc`** with:
@@ -82,6 +88,11 @@ export DSQL_CLUSTER_ID="abcd"                 # first label of the endpoint (bef
 export DSQL_USER="admin"
 export DSQL_DATABASE="postgres"
 export AWS_PAGER=""                            # stops the AWS CLI pager from making commands appear to "hang"
+
+# ---- network: only if Glue must run inside your VPC to reach DSQL (see prerequisites) ----
+export SUBNET_ID="subnet-0abc1234"            # private subnet with a route to DSQL + an S3 gateway endpoint
+export SECURITY_GROUP_ID="sg-0abc1234"        # must allow all TCP from itself; outbound 443 and 5432
+export GLUE_CONNECTION="$PROJECT-vpc"         # Glue network connection Step 1b creates. Set to "" if you do NOT use a VPC
 
 # ---- per migration task (change when you start a new task) ----
 export TASK_SUFFIX="abc"                      # short unique tag for THIS task (names its folder + jobs)
@@ -134,6 +145,9 @@ aws iam create-role --role-name $PROJECT-glue-exec-role \
   --assume-role-policy-document file://iam/glue-exec-role.trust.json
 aws iam put-role-policy --role-name $PROJECT-glue-exec-role \
   --policy-name glue --policy-document file://iam/glue-exec-role.policy.json
+# Only if you use a VPC (GLUE_CONNECTION is set): lets Glue create network interfaces in your subnet
+aws iam put-role-policy --role-name $PROJECT-glue-exec-role \
+  --policy-name glue-vpc --policy-document file://iam/glue-exec-role.vpc-addon.policy.json
 
 # Lambda execution role
 aws iam create-role --role-name $PROJECT-lambda-exec-role \
@@ -148,15 +162,76 @@ aws iam put-role-policy --role-name $PROJECT-sfn-exec-role \
   --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.json
 ```
 
-> The policy files use `<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`, `<<DSQL_CLUSTER_ID>>`
+> The policy files use `<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`, `<<DSQL_CLUSTER_ID>>` and
+> `<<GLUE_EXEC_ROLE_NAME>>`
 > placeholders. Substitute your values first — quick one-liner:
 > ```bash
 > sed -i '' -e "s/<<REGION>>/$REGION/g" -e "s/<<ACCOUNT_ID>>/$ACCOUNT_ID/g" \
->           -e "s/<<BUCKET>>/$BUCKET/g" -e "s/<<DSQL_CLUSTER_ID>>/$DSQL_CLUSTER_ID/g" iam/*.json
+>           -e "s/<<BUCKET>>/$BUCKET/g" -e "s/<<DSQL_CLUSTER_ID>>/$DSQL_CLUSTER_ID/g" \
+>           -e "s/<<GLUE_EXEC_ROLE_NAME>>/$PROJECT-glue-exec-role/g" iam/*.json
+> grep "<<" iam/*.json    # must print nothing, or a policy will point at a literal <<...>> name
 > ```
 > (On Linux, use `sed -i` without the `''`.)
 
 **Verify:** `aws iam get-role --role-name $PROJECT-glue-exec-role` returns the role.
+
+---
+
+## Step 1b — Create the Glue network connection (one-time, only if you use a VPC)
+
+**Skip this step if `GLUE_CONNECTION` is `""`.**
+
+**Goal:** let the Glue jobs run inside your VPC so they can reach DSQL. Glue jobs don't take a
+subnet or security group directly; they join a VPC through a **Glue network connection**. The
+pipeline attaches this connection to every job it creates.
+
+> Don't add the connection to the jobs in the Glue console. The pipeline rewrites each job's
+> definition on every run, so a manual change is lost.
+
+**Do this:**
+
+```bash
+# Glue requires the security group to allow all TCP from itself (Spark workers talk to each other)
+aws ec2 authorize-security-group-ingress --group-id $SECURITY_GROUP_ID --protocol tcp --port 0-65535 \
+  --source-group $SECURITY_GROUP_ID --region $REGION --no-cli-pager 2>/dev/null || echo "rule already exists"
+
+AZ=$(aws ec2 describe-subnets --subnet-ids $SUBNET_ID --region $REGION --no-cli-pager \
+  --query "Subnets[0].AvailabilityZone" --output text)
+
+aws glue create-connection --region $REGION --no-cli-pager --connection-input "{
+  \"Name\": \"$GLUE_CONNECTION\",
+  \"ConnectionType\": \"NETWORK\",
+  \"ConnectionProperties\": {},
+  \"PhysicalConnectionRequirements\": {
+    \"SubnetId\": \"$SUBNET_ID\",
+    \"SecurityGroupIdList\": [\"$SECURITY_GROUP_ID\"],
+    \"AvailabilityZone\": \"$AZ\"
+  }
+}"
+```
+
+**Verify:**
+```bash
+aws glue get-connection --name $GLUE_CONNECTION --region $REGION --no-cli-pager \
+  --query "Connection.PhysicalConnectionRequirements"
+```
+
+**The subnet also needs:**
+- an **S3 gateway endpoint** in its route table (the jobs load their scripts, wheels and CSVs from S3)
+- a route to DSQL: a DSQL VPC endpoint with **private DNS on**, or NAT. If you use an endpoint, its
+  security group must allow inbound 5432 from `$SECURITY_GROUP_ID`
+- for the CDC job: the DMS and CloudWatch APIs, through VPC endpoints or NAT
+
+> **The two cutover Lambdas connect to DSQL too.** `drain-check` and `drop-tags` need the same
+> network path. After Step 2, put them in the VPC:
+> ```bash
+> aws iam attach-role-policy --role-name $PROJECT-lambda-exec-role \
+>   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+> for n in drain-check drop-tags; do
+>   aws lambda update-function-configuration --function-name $PROJECT-$n --region $REGION --no-cli-pager \
+>     --vpc-config SubnetIds=$SUBNET_ID,SecurityGroupIds=$SECURITY_GROUP_ID --query FunctionName
+> done
+> ```
 
 ---
 
@@ -514,6 +589,8 @@ filled-in copies, and hand them to AWS. That's all Step 4 is.
 > export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"
 > export DSQL_USER="admin"
 > export DSQL_DATABASE="postgres"
+> # network: the Glue connection from Step 1b, or "" if you do not use a VPC
+> export GLUE_CONNECTION="dms-dsql-vpc"
 > # this task
 > export TASK_SUFFIX="abc"
 > export TASK_ARN="arn:aws:dms:us-east-1:123456789012:task:XXXX"
@@ -580,7 +657,8 @@ task (e.g. `startup.abc.asl.json`) and leaves the original templates untouched f
 # fail fast: stop with a clear message if any required variable is unset or empty
 : "${PROJECT:?set PROJECT}" "${REGION:?set REGION}" "${ACCOUNT_ID:?set ACCOUNT_ID}" "${BUCKET:?set BUCKET}" \
   "${DSQL_ENDPOINT:?set DSQL_ENDPOINT}" "${DSQL_USER:?set DSQL_USER}" "${DSQL_DATABASE:?set DSQL_DATABASE}" \
-  "${TASK_ARN:?set TASK_ARN}" "${TASK_SUFFIX:?set TASK_SUFFIX}" "${CONFIG_PREFIX:?set CONFIG_PREFIX}"
+  "${TASK_ARN:?set TASK_ARN}" "${TASK_SUFFIX:?set TASK_SUFFIX}" "${CONFIG_PREFIX:?set CONFIG_PREFIX}" \
+  "${GLUE_CONNECTION?set GLUE_CONNECTION (empty means no VPC)}"
 
 LAMBDA_BASE="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT"
 GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
@@ -597,6 +675,7 @@ for f in startup cutover; do
       -e "s|<<DSQL_ENDPOINT>>|$DSQL_ENDPOINT|g" \
       -e "s|<<DSQL_USER>>|$DSQL_USER|g" \
       -e "s|<<DSQL_DATABASE>>|$DSQL_DATABASE|g" \
+      -e "s|<<GLUE_CONNECTION>>|$GLUE_CONNECTION|g" \
       -e "s|<<RESOLVE_TASK_LAMBDA_ARN>>|$LAMBDA_BASE-resolve-task|g" \
       -e "s|<<DRIVER_DISCOVERY_LAMBDA_ARN>>|$LAMBDA_BASE-driver-discovery|g" \
       -e "s|<<PLAN_SPLIT_LAMBDA_ARN>>|$LAMBDA_BASE-plan-split|g" \
@@ -733,7 +812,9 @@ One task failing or cutting over never affects another.
 |---|---|---|
 | Each `aws` command seems to **hang** until you press **Ctrl-C**, then the next one runs (e.g. only 1 Lambda created per loop) | the AWS CLI **pager** is paging the JSON output and waiting for you to quit it | run `export AWS_PAGER=""` (and/or add `--no-cli-pager`) before the loop, then re-run it — each command returns on its own. Any functions you already Ctrl-C'd were still created; the re-run reports them as already-exists and fills in the rest |
 | Spark job fails `DataNotFoundError: endpoints` | a `boto3`/`botocore` wheel leaked into `driver-fullload/` or `driver-validation/` | remove it — those folders hold the 5 pg8000 wheels ONLY (re-check Step 3b verify) |
-| CDC job fails `UnknownServiceError: dsql` | `driver-cdc/` is missing modern boto3/botocore | upload the boto3 set to `driver-cdc/` (Step 3b) |
+| Any Glue job fails `UnknownServiceError: Unknown service: 'dsql'` | Glue 4.0's bundled boto3 predates DSQL, and `driver-cdc/` is missing the modern boto3 set (the Spark jobs also get boto3 from there) | upload the boto3 set to `driver-cdc/` (Step 3b) and redeploy the Lambdas |
+| Glue job fails `InterfaceError: Can't create a connection to host ...dsql... port 5432` | the job isn't running inside your VPC (no Glue connection attached) | create the connection (Step 1b), set `GLUE_CONNECTION`, then regenerate and update the state machines (Step 4). Check: `aws glue get-job --job-name <job> --query Job.Connections` |
+| `CreateGlueJobs` fails `not authorized to perform: iam:PassRole` | `<<GLUE_EXEC_ROLE_NAME>>` wasn't replaced in the Lambda policy | re-run the Step 1 fill-in command and `put-role-policy` for the Lambda role |
 | A driver job fails "no pg8000" | driver folder empty or wrong-platform wheels | re-run the platform-pinned `pip download` (Step 3b) and re-upload |
 | Load "SUCCEEDED" but 0 rows loaded | stale `_load_status.json` marks tables done | delete `${CONFIG_PREFIX}_load_status.json` and re-run |
 | CDC runs but applies 0 rows | CDC looking in the wrong S3 folder | confirm the DMS S3 target matches where the CDC job reads (auto-derived; see USAGE_GUIDE) |
@@ -760,6 +841,8 @@ support matrix, see **[`ENGINEERING_RECORD.md`](ENGINEERING_RECORD.md)**.
 | `<<DSQL_ENDPOINT>>` / `<<DSQL_CLUSTER_ID>>` | DSQL endpoint host / its first label | `abcd.dsql.us-east-1.on.aws` / `abcd` |
 | `<<DSQL_USER>>` / `<<DSQL_DATABASE>>` | DSQL user / db | `admin` / `postgres` |
 | `<<GLUE_EXEC_ROLE_ARN>>` | Glue exec role ARN (Step 1) | `arn:aws:iam::…:role/dms-dsql-glue-exec-role` |
+| `<<GLUE_CONNECTION>>` | Glue network connection the jobs run in (empty = no VPC) | `dms-dsql-vpc` |
+| `<<GLUE_EXEC_ROLE_NAME>>` | Glue role name, in the Lambda policy's `iam:PassRole` | `dms-dsql-glue-exec-role` |
 | `<<*_LAMBDA_ARN>>` | the 7 Lambda ARNs (Step 2) | `arn:aws:lambda:…:function:dms-dsql-resolve-task` |
 | `<<TASK_ARN>>` | the DMS task this SM drives | `arn:aws:dms:…:task:ABC` |
 | `<<TASK_SUFFIX>>` | short per-task tag (names folder + jobs) | `abc` |
