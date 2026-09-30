@@ -79,6 +79,23 @@ def _spark_boto3_modules(wheel_csv):
     return ",".join(sorted(picks))
 
 
+def _connections_for(tmpl, event):
+    """Glue connection name(s) to attach so the job runs INSIDE your VPC (needed when DSQL,
+    S3 or anything else is only reachable from the VPC). Resolution order:
+      1. the template's "connections" (list or comma-separated string), if the key exists
+      2. the event's "glue_connections"
+      3. the Lambda env var GLUE_CONNECTIONS (comma-separated) -- lets you enable it on a
+         live deployment without editing the state machine.
+    Empty -> no connection (job runs on Glue's default network, the previous behaviour).
+    Unfilled <<...>> placeholders are ignored."""
+    raw = tmpl.get("connections") if "connections" in tmpl else None
+    if raw is None:
+        raw = event.get("glue_connections") or os.environ.get("GLUE_CONNECTIONS", "")
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    return [c.strip() for c in (raw or []) if isinstance(c, str) and c.strip() and "<<" not in c]
+
+
 def handler(event, context):
     mode = event.get("mode", "create")
     bucket = event["bucket"]
@@ -237,6 +254,10 @@ def handler(event, context):
             job_kwargs["GlueVersion"] = tmpl.get("glue_version", "4.0")
             job_kwargs["WorkerType"] = tmpl.get("worker_type", "G.4X")
             job_kwargs["NumberOfWorkers"] = int(tmpl.get("number_of_workers", 10))
+
+        _conns = _connections_for(tmpl, event)
+        if _conns:
+            job_kwargs["Connections"] = {"Connections": _conns}
 
         try:
             glue.create_job(**job_kwargs)
