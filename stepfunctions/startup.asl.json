@@ -72,7 +72,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {"FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>", "Payload": {"taskArn": "<<TASK_ARN>>", "configPrefix": "<<CONFIG_PREFIX>>"}},
-      "ResultSelector": {"dmsS3Base.$": "$.Payload.dmsS3Base", "s3Bucket.$": "$.Payload.s3Bucket", "cdcRoot.$": "$.Payload.cdcRoot"},
+      "ResultSelector": {"dmsS3Base.$": "$.Payload.dmsS3Base", "s3Bucket.$": "$.Payload.s3Bucket", "cdcRoot.$": "$.Payload.cdcRoot", "timestampColumnName.$": "$.Payload.timestampColumnName"},
       "ResultPath": "$.resolved",
       "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
