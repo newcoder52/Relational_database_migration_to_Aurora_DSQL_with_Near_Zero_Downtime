@@ -131,7 +131,8 @@
           "cdc_root.$": "$.resolved.cdcRoot",
           "timestampColumnName.$": "$.resolved.timestampColumnName",
           "control_schema": "cdc_control",
-          "dms_task_arn": "<<TASK_ARN>>"
+          "dms_task_arn": "<<TASK_ARN>>",
+          "glue_connections": "<<GLUE_CONNECTION>>"
         }
       },
       "ResultSelector": {"jobs.$": "$.Payload.jobs"},
