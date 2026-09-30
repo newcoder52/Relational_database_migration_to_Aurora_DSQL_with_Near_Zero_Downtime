@@ -155,6 +155,35 @@ def handler(event, context):
                 args["--extra-py-files"] = _cdc_extra
         args.update(tmpl.get("default_arguments", {}) or {})
 
+        # Defensive placeholder substitution: a template's default_arguments may still
+        # contain <<BUCKET>>/<<REGION>>/<<ACCOUNT_ID>> (e.g. --TempDir "s3://<<BUCKET>>/glue-temp/")
+        # if the template was staged to S3 without the Step-3 sed pass. create_glue_jobs
+        # merges default_arguments verbatim, so an un-substituted placeholder would reach
+        # Glue literally (invalid TempDir -> load job fails). Substitute the known tokens
+        # here so a created job can never carry a raw <<...>> placeholder.
+        _subs = {
+            "<<BUCKET>>": bucket,
+            "<<REGION>>": region,
+            "<<ACCOUNT_ID>>": (event.get("account_id") or ""),
+            "<<PROJECT>>": project,
+            "<<TASK_SUFFIX>>": task_suffix,
+        }
+        for _k, _v in list(args.items()):
+            if isinstance(_v, str) and "<<" in _v:
+                for _ph, _rep in _subs.items():
+                    if _rep:
+                        _v = _v.replace(_ph, _rep)
+                args[_k] = _v
+        # Guard: fail fast if any placeholder survived (better a clear error than a
+        # silently-broken Glue job that fails minutes later on an invalid path).
+        _leftover = {_k: _v for _k, _v in args.items()
+                     if isinstance(_v, str) and "<<" in _v and ">>" in _v}
+        if _leftover:
+            raise Exception(
+                f"Unresolved <<...>> placeholder(s) in Glue args for job {name}: "
+                f"{_leftover}. Re-stage the {role}.json template with real values "
+                f"(the Step-3 sed pass), or check the create-glue-jobs event payload.")
+
         command = {"Name": command_name, "PythonVersion": "3",
                    "ScriptLocation": script_location}
         job_kwargs = {
