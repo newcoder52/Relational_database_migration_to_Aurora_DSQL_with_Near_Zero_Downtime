@@ -172,7 +172,8 @@ INDEX_S3_KEY = None   # optional explicit key override; else derived from CONFIG
 # its full load completes). Set False only if you deliberately run CDC without the gate
 # (e.g. full load handled entirely out-of-band and you accept the risk).
 REQUIRE_FULL_LOAD_DONE = True
-LOAD_STATUS_KEY = None   # optional explicit key; else CONFIG_PREFIX + "_load_status.json"
+LOAD_STATUS_KEY = None   # optional explicit key; else merge CONFIG_PREFIX + "_load_status.json"
+                         # and every CONFIG_PREFIX + "_orchestrator/group-*/_load_status.json"
 
 # Per-table CDC file layout. Each table's CDC CSVs live under:
 #     s3://{BUCKET}/{CDC_ROOT}/{dms_schema}/{dms_table}/*.csv
@@ -1552,41 +1553,83 @@ def load_table_config(entry):
     return json.loads(obj['Body'].read().decode('utf-8'))
 
 
+def _read_load_status_doc(bucket, key):
+    """Read ONE _load_status.json -> (last_modified, {label: status}). Raises on any error."""
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    doc = json.loads(obj['Body'].read().decode('utf-8'))
+    tables = doc.get('tables', {}) if isinstance(doc, dict) else {}
+    return obj.get('LastModified'), {k: (v or {}).get('status') for k, v in tables.items()}
+
+
+def _load_status_err_code(e):
+    return (e.response.get("Error", {}).get("Code") if hasattr(e, "response") else "") or ""
+
+
 def load_full_load_status():
-    """Read _load_status.json (written by the full-load job) -> {label: status_string}.
-    Returns {} if the file is absent/unreadable (treated as 'no table done yet' when the
-    gate is on). Shape matches Job 2: {"tables": {"<schema.table>": {"status": "done", ...}}}.
-    Re-read each poll cycle so a table becomes CDC-eligible as soon as its load finishes."""
+    """Read the full-load status -> {label: status_string}. Re-read each poll cycle so a table
+    becomes CDC-eligible as soon as its load finishes. Shape of each file matches Job 2:
+    {"tables": {"<schema.table>": {"status": "done", ...}}}.
+
+    WHERE THE STATUS LIVES: the startup state machine runs the loader once PER GROUP, each
+    with --config_prefix = <CONFIG_PREFIX>_orchestrator/group-<k>/, so Job 2 writes one
+    status file per group. This (single, task-level) CDC job therefore merges:
+      - <CONFIG_PREFIX>_load_status.json                    (single-run / legacy layout)
+      - <CONFIG_PREFIX>_orchestrator/group-*/_load_status.json   (orchestrated layout)
+    Files are merged oldest-first by LastModified, so the newest file wins for a table that
+    appears in more than one (e.g. a stale group left over from an earlier plan).
+    LOAD_STATUS_KEY, if set, reads exactly that one key instead.
+
+    Fail-closed: a missing/unreadable/unparseable file contributes nothing, so its tables
+    stay 'not done' and CDC keeps waiting. Misconfigs (access denied, bad JSON) are LOUD so a
+    stuck pipeline isn't mistaken for a slow full load."""
     if LOAD_STATUS_KEY:
-        bucket, key = BUCKET, LOAD_STATUS_KEY
+        candidates = [(BUCKET, LOAD_STATUS_KEY)]
     else:
-        bucket, key = split_s3(CONFIG_PREFIX.rstrip('/') + '/_load_status.json')
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=key)
-    except Exception as e:
-        # Distinguish "file legitimately not written yet" (expected before the first full
-        # load completes -> quiet) from "present but we can't read it / access denied /
-        # wrong key" (a MISCONFIG that would otherwise masquerade as 'waiting_full_load'
-        # forever). Fail-closed either way (gate stays shut), but make a misconfig LOUD so
-        # a stuck pipeline isn't mistaken for a slow full load.
-        err_code = (e.response.get("Error", {}).get("Code") if hasattr(e, "response") else "") or ""
-        if err_code in ("NoSuchKey", "404", "NoSuchBucket"):
-            print(f"  ℹ️ _load_status.json not present yet at s3://{bucket}/{key} "
-                  f"— treating all tables as 'full load not done' (expected pre-load).")
-        else:
-            print(f"  ⚠️ CANNOT READ _load_status.json at s3://{bucket}/{key}: {e}. "
-                  f"CDC gate stays CLOSED (fail-closed). Check LOAD_STATUS_KEY / IAM "
-                  f"s3:GetObject — this is a MISCONFIG, not a slow full load.")
+        bucket, base = split_s3(CONFIG_PREFIX.rstrip('/') + '/')
+        candidates = [(bucket, base + '_load_status.json')]
+        try:
+            pag = s3.get_paginator('list_objects_v2')
+            for page in pag.paginate(Bucket=bucket, Prefix=base + '_orchestrator/', Delimiter='/'):
+                for cp in page.get('CommonPrefixes', []) or []:
+                    p = cp.get('Prefix', '')
+                    if p[len(base) + len('_orchestrator/'):].startswith('group-'):
+                        candidates.append((bucket, p + '_load_status.json'))
+        except Exception as e:
+            print(f"  ⚠️ CANNOT LIST s3://{bucket}/{base}_orchestrator/ to find the per-group "
+                  f"_load_status.json files: {e}. CDC gate stays CLOSED (fail-closed). Check "
+                  f"IAM s3:ListBucket on the bucket — this is a MISCONFIG, not a slow full load.")
+            return {}
+
+    found = []
+    for bucket, key in candidates:
+        try:
+            found.append(_read_load_status_doc(bucket, key))
+        except Exception as e:
+            code = _load_status_err_code(e)
+            if code in ("NoSuchKey", "404", "NoSuchBucket"):
+                continue   # that group hasn't written status yet (expected mid-load)
+            if code:
+                print(f"  ⚠️ CANNOT READ _load_status.json at s3://{bucket}/{key}: {e}. "
+                      f"Its tables stay 'not done' (fail-closed). Check LOAD_STATUS_KEY / IAM "
+                      f"s3:GetObject — this is a MISCONFIG, not a slow full load.")
+            else:
+                print(f"  ⚠️ _load_status.json at s3://{bucket}/{key} is present but UNPARSEABLE: "
+                      f"{e}. Its tables stay 'not done'. Fix the file (must be JSON "
+                      f'{{"tables": {{"<schema.table>": {{"status": "done"}}}}}}).')
+
+    if not found:
+        where = (f"s3://{candidates[0][0]}/{candidates[0][1]}" if LOAD_STATUS_KEY else
+                 f"{CONFIG_PREFIX} (top level or _orchestrator/group-*/)")
+        print(f"  ℹ️ no _load_status.json found yet under {where} — treating all tables as "
+              f"'full load not done' (expected pre-load).")
         return {}
-    try:
-        doc = json.loads(obj['Body'].read().decode('utf-8'))
-        tables = doc.get('tables', {}) if isinstance(doc, dict) else {}
-        return {k: (v or {}).get('status') for k, v in tables.items()}
-    except Exception as e:
-        print(f"  ⚠️ _load_status.json at s3://{bucket}/{key} is present but UNPARSEABLE: "
-              f"{e}. CDC gate stays CLOSED. Fix the file (must be JSON "
-              f'{{"tables": {{"<schema.table>": {{"status": "done"}}}}}}).')
-        return {}
+
+    _epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    found.sort(key=lambda f: f[0] or _epoch)
+    merged = {}
+    for _, statuses in found:
+        merged.update(statuses)
+    return merged
 
 
 def load_dsql_schema(cur, dsql_schema, dsql_table):

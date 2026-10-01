@@ -156,8 +156,10 @@ Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──�
 Two clean-slate pitfalls caused **false results** during testing and MUST be respected:
 1. **Stale `_load_status.json`**: the loader skips tables marked `done` in this file. A "clean"
    re-run that only drops the target but leaves `_load_status.json` will load **0 rows**.
-   Clean slate MUST purge `config/_task/<suffix>/_load_status.json` (and
-   `_validation_report.json`).
+   Clean slate MUST purge the per-group status under `config/_task/<suffix>/_orchestrator/`
+   (`group-*/_load_status.json`, `group-*/_file_status/`, `group-*/_validation_report.json`).
+   The loader and validator run once per table group with that group's own config prefix, so
+   their status files live there, not at the task's top-level prefix.
 2. **`processed/` files**: the CDC job moves applied files to `processed/` and skips them. A
    mid-test target reset leaves already-processed files in `processed/`, so their rows are NOT
    re-applied to the fresh target. Only a **single clean pass with no mid-run resets** yields a

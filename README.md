@@ -191,8 +191,7 @@ artifacts (see `USAGE_GUIDE.md` §8):
 
 ```bash
 aws s3 rm s3://<bucket>/<schema>/<table>/ --recursive          # per table (incl. processed/ + failed/)
-aws s3 rm s3://<bucket>/config/_task/<SUF>/_load_status.json
-aws s3 rm s3://<bucket>/config/_task/<SUF>/_validation_report.json
+aws s3 rm s3://<bucket>/config/_task/<SUF>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
 # DSQL: drop+recreate target tables, and clear the cdc_control rows for the table
 ```
 

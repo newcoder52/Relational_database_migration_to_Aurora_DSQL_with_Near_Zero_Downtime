@@ -245,15 +245,48 @@
             "ResultPath": "$.validateResult",
             "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
             "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupValidateFailed", "ResultPath": "$.error"}],
-            "End": true
+            "Next": "GroupOk"
           },
+          "GroupOk": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "ok"}, "End": true},
           "GroupFailed": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "failed"}, "End": true},
           "GroupValidateFailed": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "validate_failed"}, "End": true}
         }
       },
       "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
-      "Next": "ResumeDmsToCdc"
+      "Next": "CollectGroupResults"
     },
+    "CollectGroupResults": {
+      "Type": "Pass",
+      "Comment": "Every group ends with {group, status}: ok | failed (load) | validate_failed.",
+      "Parameters": {"statuses.$": "$.mapResult[*].status"},
+      "ResultPath": "$.groupCheck",
+      "Next": "EvaluateGroupResults"
+    },
+    "EvaluateGroupResults": {
+      "Type": "Pass",
+      "Parameters": {
+        "statuses.$": "$.groupCheck.statuses",
+        "anyLoadFailed.$": "States.ArrayContains($.groupCheck.statuses, 'failed')",
+        "anyValidateFailed.$": "States.ArrayContains($.groupCheck.statuses, 'validate_failed')"
+      },
+      "ResultPath": "$.groupCheck",
+      "Next": "AllGroupsSucceeded"
+    },
+    "AllGroupsSucceeded": {
+      "Type": "Choice",
+      "Comment": "Do NOT resume DMS or start CDC if any group's load or validation failed.",
+      "Choices": [
+        {
+          "Or": [
+            {"Variable": "$.groupCheck.anyLoadFailed", "BooleanEquals": true},
+            {"Variable": "$.groupCheck.anyValidateFailed", "BooleanEquals": true}
+          ],
+          "Next": "GroupsFailed"
+        }
+      ],
+      "Default": "ResumeDmsToCdc"
+    },
+    "GroupsFailed": {"Type": "Fail", "Error": "GroupLoadOrValidateFailed", "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run."},
     "ResumeDmsToCdc": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",

@@ -756,7 +756,11 @@ aws stepfunctions start-execution --state-machine-arn "$STARTUP_ARN" \
 2. Resolve the DMS endpoint's S3 settings automatically.
 3. Discover driver files (×3 folders) and create this task's Glue jobs from the templates.
 4. Run **Job 1** (discovery) → **Job 2** (load) → **Job 3** (validate), per table group.
-5. Resume DMS into ongoing CDC and start the **continuous CDC job**.
+   **If any group's load or validation fails, the run stops here (`GroupsFailed`) and DMS stays
+   paused**, so CDC never starts on top of an incomplete load.
+5. Resume DMS into ongoing CDC and start the **continuous CDC job**. It applies changes to each
+   table only once that table's load is marked `done` in its group's status file
+   (`${CONFIG_PREFIX}_orchestrator/group-<n>/_load_status.json`).
 
 **Verify:** the execution reaches a **Succeed** state; full load is now in DSQL, validated, and
 CDC is live and applying ongoing changes. (See `USAGE_GUIDE.md` → Monitoring for the
@@ -816,7 +820,9 @@ One task failing or cutting over never affects another.
 | Glue job fails `InterfaceError: Can't create a connection to host ...dsql... port 5432` | the job isn't running inside your VPC (no Glue connection attached) | create the connection (Step 1b), set `GLUE_CONNECTION`, then regenerate and update the state machines (Step 4). Check: `aws glue get-job --job-name <job> --query Job.Connections` |
 | `CreateGlueJobs` fails `not authorized to perform: iam:PassRole` | `<<GLUE_EXEC_ROLE_NAME>>` wasn't replaced in the Lambda policy | re-run the Step 1 fill-in command and `put-role-policy` for the Lambda role |
 | A driver job fails "no pg8000" | driver folder empty or wrong-platform wheels | re-run the platform-pinned `pip download` (Step 3b) and re-upload |
-| Load "SUCCEEDED" but 0 rows loaded | stale `_load_status.json` marks tables done | delete `${CONFIG_PREFIX}_load_status.json` and re-run |
+| Load "SUCCEEDED" but 0 rows loaded | a stale per-group `_load_status.json` marks tables done | `aws s3 rm ${CONFIG_PREFIX}_orchestrator/ --recursive` (the group plan is rebuilt on the next run), then re-run |
+| Startup run ends in `GroupsFailed` (`GroupLoadOrValidateFailed`) | a table group's load or validation failed, so the run stopped before resuming DMS | open the `GroupFanOut` step in the execution to see which group failed, read that Glue job run's log, fix it, and start a new execution (finished files and tables are skipped) |
+| CDC job keeps logging `full load not done ... waiting` | the CDC job can't see the per-group status files | make sure `s3://$BUCKET/scripts/glue_cdc_continuous.py` is the current version (it reads `_orchestrator/group-*/_load_status.json`), then check `aws s3 ls ${CONFIG_PREFIX}_orchestrator/ --recursive \| grep _load_status` |
 | CDC runs but applies 0 rows | CDC looking in the wrong S3 folder | confirm the DMS S3 target matches where the CDC job reads (auto-derived; see USAGE_GUIDE) |
 | A table shows `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source | drop the column on the DSQL target, clear the table's `cdc_status` row, restart CDC |
 | `drain-check` / `drop-tags` Lambda errors | missing `pg8000` on those two Lambdas | attach a pg8000 layer or bundle it into the zip (Step 2) |

@@ -179,7 +179,7 @@ FROM cdc_control.cdc_file_status WHERE table_name = 'target_schema.table' ORDER 
 SELECT * FROM cdc_control.cdc_apply_exceptions WHERE table_name = 'target_schema.table';
 ```
 
-**Full-load validation report:** `s3://<bucket>/config/_task/<SUF>/_validation_report.json`
+**Full-load validation report:** `s3://<bucket>/config/_task/<SUF>/_orchestrator/group-<n>/_validation_report.json` (one per table group)
 (`match` / `mismatch` / `skipped` per table; `skipped` = no single-column rangeable integer PK,
 which is by-design — the count is still checked by Job2's `_load_status.json`).
 
@@ -208,14 +208,14 @@ Then stop the DMS task and repoint the application to DSQL.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Load run "SUCCEEDED" but **0 rows** | stale `_load_status.json` marks tables `done` → skipped | delete `s3://<bucket>/config/_task/<SUF>/_load_status.json` and re-run load |
+| Load run "SUCCEEDED" but **0 rows** | a stale per-group `_load_status.json` marks tables `done` → skipped | delete `s3://<bucket>/config/_task/<SUF>/_orchestrator/` (recursive) and re-run |
 | CDC job fails `UnknownServiceError: dsql` | CDC job didn't get modern boto3 | ensure `driver-cdc/` has boto3/botocore wheels and the job's `--extra-py-files` is the **cdc** list (not fullload) |
 | CDC job runs but applies 0 rows | `cdc_root` points at the wrong folder | confirm `resolve_task` `cdcRoot` matches where DMS writes; pass `--cdc_root` from `resolve_task` (use `.` for no bucketFolder) |
 | Full-load columns shifted/corrupted | stale `processed/` or CDC files read as full-load | the guards prevent this; ensure a clean S3 (purge `processed/`,`failed/`, old CDC) before a fresh full load |
 | Table `blocked` after a DROP COLUMN | missing-column guard | drop the column on target + clear `cdc_status` (CDC job stopped), restart |
 | Table `blocked`: "missing column(s) [X]" after a rename | should not happen post-fix; if using `--single_swap_is_rename false` | add `metadata.rename_hints` or re-enable the default |
 | Target value wrong after a type change | header-diff blind to type change | `ALTER` target column type manually + re-apply affected rows (known limitation) |
-| Re-run after a mid-test target reset misses rows | files already in `processed/` are skipped | for a true clean run, purge the whole per-table S3 prefix (incl `processed/`) + control tables + `_load_status.json` |
+| Re-run after a mid-test target reset misses rows | files already in `processed/` are skipped | for a true clean run, purge the whole per-table S3 prefix (incl `processed/`) + control tables + `config/_task/<SUF>/_orchestrator/` |
 
 ---
 
@@ -226,8 +226,7 @@ Purge **all** of these, or you will get stale-state artifacts (see Engineering R
 # 1) S3 per-table prefixes INCLUDING processed/ and failed/
 aws s3 rm s3://<bucket>/<schema>/<table>/ --recursive     # per table
 # 2) config status files
-aws s3 rm s3://<bucket>/config/_task/<SUF>/_load_status.json
-aws s3 rm s3://<bucket>/config/_task/<SUF>/_validation_report.json
+aws s3 rm s3://<bucket>/config/_task/<SUF>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
 # 3) DSQL: drop+recreate target tables, and clear control rows
 DELETE FROM cdc_control.cdc_status        WHERE table_name='<schema.table>';
 DELETE FROM cdc_control.cdc_file_status   WHERE table_name='<schema.table>';
