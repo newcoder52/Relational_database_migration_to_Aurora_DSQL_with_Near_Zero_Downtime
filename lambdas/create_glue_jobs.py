@@ -272,6 +272,21 @@ def handler(event, context):
                or "already exists" in str(_ce).lower() \
                or "already submitted" in str(_ce).lower():
                 upd = {k: v for k, v in job_kwargs.items() if k != "Name"}
+                # UpdateJob REPLACES the whole job definition: any field we omit is wiped.
+                # If no connection is configured for this run, keep the one already on the job
+                # (e.g. a VPC connection added in the Glue console) instead of silently
+                # stripping it -- otherwise the job falls back to Glue's default network and
+                # can no longer reach a VPC-only DSQL endpoint.
+                if "Connections" not in upd:
+                    try:
+                        _existing = (glue.get_job(JobName=name).get("Job", {})
+                                     .get("Connections") or {})
+                        if _existing.get("Connections"):
+                            upd["Connections"] = {"Connections": _existing["Connections"]}
+                            print(f"(info) {name}: keeping existing connection(s) "
+                                  f"{_existing['Connections']}")
+                    except Exception as _ge:
+                        print(f"(warn) {name}: could not read existing connections: {_ge}")
                 glue.update_job(JobName=name, JobUpdate=upd)
                 updated.append(name)
             else:
