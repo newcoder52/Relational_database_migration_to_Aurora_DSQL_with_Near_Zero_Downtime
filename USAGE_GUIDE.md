@@ -11,8 +11,9 @@ the Engineering Record before relying on schema-change replication.**
 
 ## 0. Mental model (read once)
 
-- **One DMS task = one Step Functions state machine = one config prefix**
-  `s3://<bucket>/config/_task/<TASK_SUFFIX>/`.
+- **Two shared state machines (startup, cutover) serve every DMS task**, started with
+  `{"taskArn": "..."}`. Shared settings live in `s3://<bucket>/config/pipeline.json`; each task's
+  config prefix is `s3://<bucket>/config/_task/<task name>/` (the DMS task's name).
 - DMS writes CSVs to `s3://<bucket>/<schema>/<table>/` (full load = `LOAD*.csv`, CDC =
   `<timestamp>.csv` with a leading `Op` column). Glue loads them into DSQL.
 - Flow per task: **full load → (Glue) discover → load → validate → resume DMS to CDC →
@@ -28,7 +29,12 @@ the Engineering Record before relying on schema-change replication.**
    `s3://<bucket>/scripts/`, glue-templates staged, and the **three driver folders** populated:
    - `driver-fullload/`, `driver-validation/` — DSQL driver wheels only (pg8000, scramp,
      asn1crypto, python-dateutil, six).
-   - `driver-cdc/` — the same DSQL drivers **plus** modern `boto3`/`botocore` wheels.
+   - `driver-cdc/` — the same DSQL drivers **plus** modern `boto3`/`botocore` wheels, downloaded
+     **for Python 3.9** (RUNBOOK Step 3b). The startup workflow checks them and prepares
+     install-safe copies in `driver-cdc-prepared/` before DMS starts, so the Python shell CDC job
+     installs them without internet.
+   - `config/pipeline.json` written (RUNBOOK Step 3c) and the two shared state machines created
+     (RUNBOOK Step 4).
 2. **DMS S3 target endpoint** configured with (these are validated automatically):
    - `AddColumnName = true` (CSVs have header rows),
    - `DatePartitionEnabled = false`,
@@ -51,7 +57,7 @@ the Engineering Record before relying on schema-change replication.**
 4. **Target tables exist in DSQL** (created from your clean DDLs) in the lowercased target
    schema, with a single-column PK where possible (multi-column PK tables can't CDC-apply
    cleanly; range-validation needs an integer PK).
-5. **Manifest** staged: `s3://<bucket>/config/_task/<TASK_SUFFIX>/table_manifest.csv`
+5. **Manifest** staged: `s3://<bucket>/config/_task/<task name>/table_manifest.csv`
    ```
    dms_schema,dms_table
    target_schema,table_a
@@ -62,19 +68,23 @@ the Engineering Record before relying on schema-change replication.**
 
 ## 2. Run the pipeline (the normal path — via the state machine)
 
-The **startup state machine** does everything automatically. Substitute placeholders per
-`RUNBOOK.md` Step 3, then:
+The shared **startup state machine** does everything automatically. Start it with the DMS
+task's ARN (RUNBOOK Step 5):
 
 ```bash
 aws stepfunctions start-execution \
-  --state-machine-arn <startup-sm-arn-for-this-task> \
-  --name run-$(date +%Y%m%d-%H%M%S)
+  --state-machine-arn <arn-of-$PROJECT-startup> \
+  --name <task-name>-$(date +%Y%m%d%H%M) \
+  --input '{"taskArn":"arn:aws:dms:<region>:<account>:task:<id>"}'
 ```
 
 It performs, in order:
-1. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS`.
-2. **ResolveTask** → derives `cdcRoot`, `timestampColumnName`, S3 settings from the endpoint
-   (fails fast if `DatePartitionEnabled=true` or `CdcPath` set).
+1. **ResolveTask** → reads `config/pipeline.json`; derives the task's folder and job names from its
+   name; derives `cdcRoot`, `timestampColumnName`, S3 settings from the endpoint; checks the DMS task
+   before starting it (fails at `ResolveFailed` if `StopTaskCachedChangesApplied` isn't true,
+   `AddColumnName` isn't true, the endpoint writes to another bucket, the task is already past its
+   full load, `DatePartitionEnabled=true` or `CdcPath` set).
+2. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS`.
 3. **DriverDiscovery** ×3 (fullload / validation / cdc folders).
 4. **CreateGlueJobs** → creates this task's 5 Glue jobs (discovery/load/load-big/validate/cdc).
 5. **RunDiscovery** (Job1) → writes `_manifest_index.json` + per-table column mappings.
@@ -90,7 +100,7 @@ After this, full load is in DSQL, validated, and CDC is live.
 
 Useful when iterating. Set once:
 ```bash
-REGION=us-east-1; PROJECT=<project>; SUF=<task_suffix>
+REGION=us-east-1; PROJECT=<project>; SUF=<task name>   # the DMS task's name
 CFG=s3://<bucket>/config/_task/$SUF/
 ARN=<dms-task-arn>
 ```
@@ -128,9 +138,12 @@ ARN=<dms-task-arn>
      --start-replication-task-type resume-processing
    aws glue start-job-run --job-name $PROJECT-$SUF-cdc --arguments "{
      \"--config_prefix\":\"$CFG\",\"--dms_task_arn\":\"$ARN\",
-     \"--extra-py-files\":\"<cdc-list>\",\"--cdc_root\":\"<cdcRoot>\",
-     \"--timestamp_column\":\"<timestampColumnName>\"}"
+     \"--cdc_root\":\"<cdcRoot>\",\"--timestamp_column\":\"<timestampColumnName>\"}"
    ```
+   No `--extra-py-files` here: `create-glue-jobs` saved the right driver setup on the job (Python
+   shell: the `driver-cdc/` list; Spark: `driver-fullload/` plus boto3 via
+   `--additional-python-modules`). Passing the `driver-cdc/` list to a Spark CDC job breaks it.
+   Always pass `--config_prefix` as a run argument: cutover finds the CDC run by it.
 
 > The CDC job is a **continuous poller** — it stays RUNNING and applies new files each cycle.
 > Stop it with `aws glue batch-stop-job-run` when cutting over or pausing.
@@ -146,7 +159,7 @@ next data row after the DDL. Sequence any change as **DML → DDL → DML**.
 |---|---|---|
 | `ADD COLUMN` (single or many) | Auto-added to target | none |
 | `RENAME COLUMN` (single, multiple, or combined with ADD) | Auto-renamed on target (positional detection) | none |
-| `DROP COLUMN` | **Table BLOCKS** | remediate: `ALTER TABLE <target> DROP COLUMN <col>`, then `DELETE FROM cdc_control.cdc_status WHERE table_name='<schema.table>'` (with the CDC job stopped), restart CDC |
+| `DROP COLUMN` | **Table BLOCKS** | remediate: `ALTER TABLE <target> DROP COLUMN <col>`, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'` (CDC resumes the blocked file at its saved offset; never delete the row) |
 | `CHANGE DATA TYPE` | **Silent — value may be truncated/coerced to the old target type; no error** | avoid, or manually `ALTER` the target column type + re-apply affected rows |
 
 - To force a rename deterministically (instead of relying on positional detection), add to the
@@ -157,6 +170,32 @@ next data row after the DDL. Sequence any change as **DML → DDL → DML**.
 See `ENGINEERING_RECORD.md` §4 for the full tested matrix and root causes.
 
 ---
+
+## 4b. How NULLs and text values are stored
+
+DMS marks a real NULL in its CSV files with the S3 endpoint's `CsvNullValue` (DMS default: the text
+`NULL`). The load, validation and CDC jobs use exactly that marker, read from the endpoint at
+startup:
+
+| Value in the DMS file | Stored in DSQL |
+|---|---|
+| the marker (`NULL` by default), or an empty field | NULL |
+| `NA`, `N/A`, `NONE`, `(NULL)`, `\N`, `null`, ` NULL ` and any other text | exactly as written, spaces included |
+| a number, date, uuid or boolean | trimmed and converted; whitespace-only becomes NULL |
+
+So with the default marker, a source text value that is literally `NULL` can't be told apart from a
+real NULL and is stored as NULL. If that matters, set `CsvNullValue` on the endpoint to something
+that never appears in your data before the full load.
+
+> **Upgrading from an earlier version:** earlier versions stored `NA`, `N/A`, `NONE`, `(NULL)`,
+> `\N` and `null` as NULL in every column, and the full load trimmed spaces from text. Rows loaded
+> or changed before the upgrade keep those values. To find affected rows, run this on the source
+> for each text column (any count above 0 means those rows hold NULL in DSQL):
+> ```sql
+> SELECT COUNT(*) FROM <schema>.<table>
+> WHERE UPPER(TRIM(<column>)) IN ('NA','N/A','NONE','(NULL)','\N') OR <column> = 'null';
+> ```
+> Reload an affected table (Section 8), or correct its rows from the source.
 
 ## 5. Monitoring
 
@@ -179,9 +218,34 @@ FROM cdc_control.cdc_file_status WHERE table_name = 'target_schema.table' ORDER 
 SELECT * FROM cdc_control.cdc_apply_exceptions WHERE table_name = 'target_schema.table';
 ```
 
-**Full-load validation report:** `s3://<bucket>/config/_task/<SUF>/_orchestrator/group-<n>/_validation_report.json` (one per table group)
+**Full-load validation report:** `s3://<bucket>/config/_task/<task name>/_orchestrator/group-<n>/_validation_report.json` (one per table group)
 (`match` / `mismatch` / `skipped` per table; `skipped` = no single-column rangeable integer PK,
 which is by-design — the count is still checked by Job2's `_load_status.json`).
+
+**Processed files and the per-table manifest:** after a CDC file is fully applied, the CDC job
+**copies** it to `<schema>/<table>/processed/` (with retries, verified by size). The original is
+**never deleted**: files are skipped by the high-water mark (`cdc_status.last_done_file`), not by
+where they sit, so a failed or throttled S3 copy can't lose a file — it is retried next cycle.
+Each table also has `<schema>/<table>/processed/_manifest.json` with counts only:
+
+```json
+{"table": "target_schema.table", "updated_at": "...", "status": "idle",
+ "cdc_files_in_folder": 120, "pending_apply": 0, "applied_in_folder": 120,
+ "copied_to_processed": 120, "pending_copy": 0, "processed_folder_files": 120,
+ "applied_total_ledger": 120, "copy_errors_this_cycle": 0, "all_done": true}
+```
+
+`all_done: true` = nothing left to apply and nothing left to copy. `pending_copy` above 0 that
+doesn't go down means copies keep failing (see `last_copy_error`). Busy tables update it every
+cycle, idle tables at most every 5 minutes.
+
+```bash
+aws s3 cp s3://<bucket>/<schema>/<table>/processed/_manifest.json -
+```
+
+**Unblocking a table:** fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'`. CDC resumes the blocked file at its saved offset on the next poll, without skipping or repeating rows.
+**Never `DELETE` the table's `cdc_status` row:** applied files stay in the table folder, so a
+missing row would replay all of them from the start.
 
 **Glue job logs:** CloudWatch `/aws-glue/python-jobs/output` and `/aws-glue/python-jobs/error`
 (CDC pythonshell), `/aws-glue/jobs/output` (Spark load/validate). Look for `🔄 SCHEMA CHANGE`,
@@ -208,25 +272,35 @@ Then stop the DMS task and repoint the application to DSQL.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Load run "SUCCEEDED" but **0 rows** | a stale per-group `_load_status.json` marks tables `done` → skipped | delete `s3://<bucket>/config/_task/<SUF>/_orchestrator/` (recursive) and re-run |
+| Load run "SUCCEEDED" but **0 rows** | a stale per-group `_load_status.json` marks tables `done` → skipped | delete `s3://<bucket>/config/_task/<task name>/_orchestrator/` (recursive) and re-run |
 | CDC job fails `UnknownServiceError: dsql` | CDC job didn't get modern boto3 | ensure `driver-cdc/` has boto3/botocore wheels and the job's `--extra-py-files` is the **cdc** list (not fullload) |
+| CDC log: `another CDC run is applying this table` (cycle summary lists the table as applied by another run) | two different CDC jobs or runs are applying the same table | each change is still applied once; find the extra job (old per-task workflow, hand-made copy, a second DMS task with the same table) and stop it |
+| Startup stops at `ResolveFailed`: `Another startup run is already running` | a startup for this task is still running | wait for it or stop it, then start again |
+| CDC startup log: `NOT applied by this job (multi-column primary key)` | the table's primary key has more than one column | expected: run the separate multi-column-key CDC job for it; cutover waits until that job has caught up |
+| Startup stops at `DriversFailed` | a `driver-cdc/` wheel can't work on Python 3.9, or one is missing | the error names the wheel; fix `driver-cdc/` (RUNBOOK Step 3b) and start again (DMS was not started) |
+| CDC job fails installing a `.whl` (`CalledProcessError`, `pypi.org` timeouts), often after ~20 min | the run was given the raw `driver-cdc/` list (older per-task workflow, or a hand-made start with `--extra-py-files`) | start it without `--extra-py-files` so it uses the prepared list saved on the job |
+| Startup ends at `CdcRunFailed`, `CdcRunEnded` or `CdcStartNotConfirmed` | the CDC run failed, stopped, or never reached its poll loop | full load is done and DMS is capturing changes: read the CDC log, fix, restart the CDC job with `--config_prefix` |
+| Startup stops at `ResolveFailed` | a DMS task setting, `pipeline.json`, or folder-owner check failed before DMS started | read the execution's error message; RUNBOOK → Troubleshooting lists each case |
 | CDC job runs but applies 0 rows | `cdc_root` points at the wrong folder | confirm `resolve_task` `cdcRoot` matches where DMS writes; pass `--cdc_root` from `resolve_task` (use `.` for no bucketFolder) |
 | Full-load columns shifted/corrupted | stale `processed/` or CDC files read as full-load | the guards prevent this; ensure a clean S3 (purge `processed/`,`failed/`, old CDC) before a fresh full load |
-| Table `blocked` after a DROP COLUMN | missing-column guard | drop the column on target + clear `cdc_status` (CDC job stopped), restart |
+| Table `blocked` after a DROP COLUMN, or a rejected row (e.g. NULL into a NOT NULL column) | missing-column guard / DSQL rejected the row | fix the cause (drop the column on target / allow NULL or fix the source row), then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'` — never delete the row |
 | Table `blocked`: "missing column(s) [X]" after a rename | should not happen post-fix; if using `--single_swap_is_rename false` | add `metadata.rename_hints` or re-enable the default |
 | Target value wrong after a type change | header-diff blind to type change | `ALTER` target column type manually + re-apply affected rows (known limitation) |
-| Re-run after a mid-test target reset misses rows | files already in `processed/` are skipped | for a true clean run, purge the whole per-table S3 prefix (incl `processed/`) + control tables + `config/_task/<SUF>/_orchestrator/` |
+| Re-run after a mid-test target reset misses rows | files already applied are skipped by the high-water mark (`cdc_status.last_done_file`) | for a true clean run, purge the whole per-table S3 prefix (incl `processed/`) + control tables + `config/_task/<task name>/_orchestrator/` |
 
 ---
 
 ## 8. Clean-slate checklist (for a fresh full reload)
 
-Purge **all** of these, or you will get stale-state artifacts (see Engineering Record §3):
+Stop the task's CDC run first. Then purge **all** of these together, or you will get
+stale-state artifacts (see Engineering Record §3). In particular, never delete a table's
+`cdc_control` rows without also purging its S3 prefix: applied CDC files stay in the table
+folder, so CDC would apply every one of them again on top of the fresh load.
 ```bash
 # 1) S3 per-table prefixes INCLUDING processed/ and failed/
 aws s3 rm s3://<bucket>/<schema>/<table>/ --recursive     # per table
 # 2) config status files
-aws s3 rm s3://<bucket>/config/_task/<SUF>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
+aws s3 rm s3://<bucket>/config/_task/<task name>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
 # 3) DSQL: drop+recreate target tables, and clear control rows
 DELETE FROM cdc_control.cdc_status        WHERE table_name='<schema.table>';
 DELETE FROM cdc_control.cdc_file_status   WHERE table_name='<schema.table>';

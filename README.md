@@ -50,8 +50,10 @@ at the final cutover, once CDC has drained and the target matches the source.
 
 ## How it works
 
-- **One DMS task = one Step Functions state machine = one config prefix**
-  (`s3://<bucket>/config/_task/<TASK_SUFFIX>/`). Tasks run and cut over independently.
+- **Two shared Step Functions state machines (startup, cutover) serve every DMS task.** You start
+  them with just the task's ARN; shared settings come from `s3://<bucket>/config/pipeline.json`, and
+  the DMS task's **name** becomes its config folder (`s3://<bucket>/config/_task/<task name>/`) and
+  its Glue job names. Tasks run and cut over independently.
 - DMS writes CSVs to `s3://<bucket>/<schema>/<table>/` — full load as `LOAD*.csv`, CDC as
   `<timestamp>.csv` with a leading `Op` column.
 - The startup state machine runs: **start DMS → discover → load → validate → resume to CDC →
@@ -114,27 +116,32 @@ Detailed commands are in **[`RUNBOOK.md`](RUNBOOK.md)** (Steps 0–4). In brief:
 0. **Stage to one S3 bucket** (fixed folder layout): the 4 scripts → `scripts/`, the 5 job
    templates → `glue-templates/`, and driver wheels into **three** per-job folders —
    `driver-fullload/`, `driver-validation/` (DSQL drivers only) and `driver-cdc/` (DSQL
-   drivers **plus** modern boto3/botocore for the Python-shell CDC job). Stage each task's
-   `table_manifest.csv` under `config/_task/<suffix>/`.
+   drivers **plus** modern boto3/botocore for the Python-shell CDC job, downloaded for Python 3.9;
+   the startup workflow checks and prepares them automatically so they install without internet), and the
+   settings file `config/pipeline.json` (template: `config/pipeline.example.json`).
 1. **Create the IAM roles** (Glue, Lambda, Step Functions) from `iam/`.
 2. **Create the 7 Lambdas** from `lambdas/`.
-3. **Create the per-task startup state machine** from `stepfunctions/startup.asl.json`.
-4. **Create the per-task cutover state machine** from `stepfunctions/cutover.asl.json`.
+3. **Create the shared startup and cutover state machines** from `stepfunctions/` (fill in the
+   bucket and Lambda ARNs once).
+4. **Per task:** upload its `table_manifest.csv` to `config/_task/<task name>/`.
 
 ## Run a migration
 
-Start the task's startup state machine:
+Start the shared startup state machine with the DMS task's ARN:
 
 ```bash
 aws stepfunctions start-execution \
-  --state-machine-arn <startup-sm-arn-for-this-task> \
-  --name run-$(date +%Y%m%d-%H%M%S)
+  --state-machine-arn <arn-of-$PROJECT-startup> \
+  --name <task-name>-$(date +%Y%m%d%H%M) \
+  --input '{"taskArn":"arn:aws:dms:<region>:<account>:task:<id>"}'
 ```
 
 It performs, in order:
 
-1. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS`.
-2. **ResolveTask** → derives `cdcRoot`, `timestampColumnName`, S3 settings from the endpoint.
+1. **ResolveTask** → reads `config/pipeline.json`, derives the task's folder and job names from
+   its name, derives `cdcRoot`, `timestampColumnName` and S3 settings from the endpoint, and checks
+   the DMS task before starting it (fails in seconds at `ResolveFailed` if a setting is wrong).
+2. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS`.
 3. **DriverDiscovery** ×3 (fullload / validation / cdc folders).
 4. **CreateGlueJobs** → creates this task's Glue jobs (discovery/load/load-big/validate/cdc).
 5. **RunDiscovery** (Job 1) → writes `_manifest_index.json` + per-table column mappings.
@@ -161,7 +168,7 @@ FROM cdc_control.cdc_file_status WHERE table_name = 'target_schema.table' ORDER 
 SELECT * FROM cdc_control.cdc_skipped_ops WHERE table_name = 'target_schema.table';
 ```
 
-**Validation report:** `s3://<bucket>/config/_task/<SUF>/_validation_report.json`
+**Validation report:** `s3://<bucket>/config/_task/<task name>/_validation_report.json`
 (`match` / `mismatch` / `skipped` per table). **Glue logs:** CloudWatch
 `/aws-glue/python-jobs/*` (CDC) and `/aws-glue/jobs/output` (Spark load/validate).
 
@@ -174,15 +181,15 @@ next data row). Full matrix is in `ENGINEERING_RECORD.md` §4.
 |---|---|---|
 | `ADD COLUMN` (one or many) | Auto-added to target | none |
 | `RENAME COLUMN` (single/multiple/with add) | Auto-renamed (positional detection) | none |
-| `DROP COLUMN` | **Table blocks** (guard can't tell a drop from an omitted column) | drop on target + clear `cdc_status`, restart CDC |
+| `DROP COLUMN` | **Table blocks** (guard can't tell a drop from an omitted column) | drop on target, then set `cdc_status.status='active'` (never delete the row) |
 | `CHANGE DATA TYPE` | **Silent** — not detected by name-based header diff | `ALTER` target type + re-apply affected rows |
 
 ## Cutover
 
-When CDC has caught up (all tables `idle`, source ≈ target), run the **cutover state machine**.
-It drain-checks each table until quiesced, stops the CDC job, and drops the `_cdc_file`
-tracking column. Then stop the DMS task and repoint the application to Aurora DSQL. Other
-tasks are unaffected.
+When CDC has caught up (all tables `idle`, source ≈ target), start the shared **cutover state
+machine** with the same input, `{"taskArn": "..."}`. It stops the DMS task, drain-checks each table
+until quiesced, stops this task's CDC run, drops the `_cdc_file` tracking column and deletes the
+task's Glue jobs. Then repoint the application to Aurora DSQL. Other tasks are unaffected.
 
 ## Clean-slate reload
 
@@ -191,7 +198,7 @@ artifacts (see `USAGE_GUIDE.md` §8):
 
 ```bash
 aws s3 rm s3://<bucket>/<schema>/<table>/ --recursive          # per table (incl. processed/ + failed/)
-aws s3 rm s3://<bucket>/config/_task/<SUF>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
+aws s3 rm s3://<bucket>/config/_task/<task name>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
 # DSQL: drop+recreate target tables, and clear the cdc_control rows for the table
 ```
 
@@ -199,6 +206,11 @@ aws s3 rm s3://<bucket>/config/_task/<SUF>/_orchestrator/ --recursive   # per-gr
 
 See `ENGINEERING_RECORD.md` and `CDC_EDGE_CASE_RESULTS.md` for detail.
 
+- **NULL marker:** only the DMS endpoint's `CsvNullValue` (default `NULL`) or an empty field is stored as
+  NULL; every other text value, including `NA` and `NONE`, is stored as written (USAGE_GUIDE §4b).
+- **Multi-column primary keys:** the CDC job leaves these tables to a separate CDC job (it lists them
+  at startup). Cutover waits until that job has marked their latest change files `done` in
+  `cdc_control.cdc_file_status`.
 - **DROP COLUMN** during CDC blocks the affected table (resumable after operator remediation).
 - **In-place CHANGE DATA TYPE** is not detected by the header-diff schema reconciliation.
 - Content-checksum validation covers single-column integer/UUID PK tables; composite /

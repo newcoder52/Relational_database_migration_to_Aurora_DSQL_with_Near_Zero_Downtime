@@ -1,0 +1,12 @@
+{
+  "description": "Settings shared by every DMS task. Copy to s3://<bucket>/config/pipeline.json and replace every <...> (RUNBOOK Step 3c).",
+  "project": "dms-dsql",
+  "region": "<region, e.g. us-east-1>",
+  "dsql_endpoint": "<cluster-id>.dsql.<region>.on.aws",
+  "dsql_user": "admin",
+  "dsql_database": "postgres",
+  "glue_role_arn": "arn:aws:iam::<account-id>:role/dms-dsql-glue-exec-role",
+  "glue_connection": "<exact Glue connection name, or empty string for no VPC>",
+  "cdc_engine": "pythonshell",
+  "control_schema": "cdc_control"
+}

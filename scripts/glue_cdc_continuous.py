@@ -57,8 +57,8 @@ PRESERVED FROM v3 (kept intentionally, adapted to be per-table)
   - hex(32) -> canonical uuid conversion (v3 hex_to_uuid), hardened with v15's anchored
     exactly-32 rule so "32-hex + trailing junk" is NOT silently truncated.
   - Header-based CSV column detection (DMS AddColumnName=true).
-  - The 30s poll loop and the S3 processed/ + failed/ file moves (kept as a human-visible
-    artifact; DSQL cdc_status is the authoritative resume position).
+  - The 30s poll loop and the S3 processed/ copies of applied files (kept as a human-visible
+    artifact; originals stay in place; DSQL cdc_status is the authoritative resume position).
 
 DMS S3 ENDPOINT SETTINGS REQUIRED
 ---------------------------------
@@ -133,6 +133,7 @@ import io
 import re
 import uuid
 import threading
+import random
 import boto3
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -208,7 +209,7 @@ SINGLE_SWAP_IS_RENAME = True
 # ---- WAKE: how the loop learns a new CDC file arrived --------------------------------
 # The loop re-lists S3 every POLL_INTERVAL seconds and runs a list+sort+high-water apply
 # cycle. Per-table serial DMS-timestamp order is owned by files.sort(); already-applied
-# files are skipped via last_done_file / processed-move (idempotent no-op), and the
+# files are skipped via last_done_file (the high-water mark; originals stay in place), and the
 # MIN_FILE_AGE_SECONDS guard avoids reading a file DMS is still finalizing.
 
 # CONTINUOUS OPERATION: CDC is an unbounded stream — DMS keeps writing new files
@@ -435,7 +436,14 @@ CONNECT_MAX_RETRIES = 4
 # also re-derives nothing at import (load_
 # manifest / load_full_load_status derive their keys from CONFIG_PREFIX at call time), so
 # overriding the CONFIG_PREFIX global is sufficient.
+# How DMS marks a real NULL in its CSV files: the S3 target endpoint's CsvNullValue (DMS
+# default "NULL"), passed by create-glue-jobs as --csv_null_value ("__EMPTY__" = the endpoint
+# sets it to the empty string). Only that exact text, or an empty field, is stored as NULL.
+CSV_NULL_VALUE = "NULL"
+
+
 def _apply_cdc_arg_overrides():
+    global CSV_NULL_VALUE
     global CONFIG_PREFIX, INDEX_S3_KEY, LOAD_STATUS_KEY, BUCKET, CDC_ROOT
     global DSQL_ENDPOINT, DSQL_DATABASE, DSQL_USER, REGION
     global DMS_TASK_ARN, CONTROL_SCHEMA
@@ -445,7 +453,7 @@ def _apply_cdc_arg_overrides():
                 "dsql_endpoint", "dsql_database", "dsql_user", "region",
                 "dms_task_arn", "control_schema",
                 "max_parallel_tables", "require_full_load_done", "poll_interval",
-                "timestamp_column", "single_swap_is_rename"]
+                "timestamp_column", "single_swap_is_rename", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -475,6 +483,10 @@ def _apply_cdc_arg_overrides():
         _rebuild_ignore_columns()
         print(f"  ↪ DMS_TIMESTAMP_COLUMN overridden -> {DMS_TIMESTAMP_COLUMN} "
               f"(IGNORE_COLUMNS={sorted(IGNORE_COLUMNS)})")
+    if "csv_null_value" in ov and ov["csv_null_value"] is not None:
+        _nv = str(ov["csv_null_value"])
+        CSV_NULL_VALUE = "" if _nv == "__EMPTY__" else _nv
+        print(f"  ↪ CSV_NULL_VALUE (DMS null marker) -> {CSV_NULL_VALUE!r}")
     if _s("single_swap_is_rename"):
         SINGLE_SWAP_IS_RENAME = _s("single_swap_is_rename").strip().lower() in ("true", "1", "yes")
         print(f"  ↪ SINGLE_SWAP_IS_RENAME overridden -> {SINGLE_SWAP_IS_RENAME}")
@@ -509,7 +521,14 @@ _apply_cdc_arg_overrides()
 # =============================================================================
 # GLOBALS
 # =============================================================================
-s3 = boto3.client('s3', region_name=REGION)
+# S3 calls retry throttling/5xx with boto3's adaptive mode (client-side rate limiting), plus the
+# explicit retry loop in _s3_retry for copies, lists and manifest writes.
+try:
+    from botocore.config import Config as _S3Config
+    s3 = boto3.client('s3', region_name=REGION,
+                      config=_S3Config(retries={"max_attempts": 10, "mode": "adaptive"}))
+except Exception:
+    s3 = boto3.client('s3', region_name=REGION)
 dms = boto3.client('dms', region_name=REGION)
 try:
     cloudwatch = boto3.client('cloudwatch', region_name=REGION)
@@ -568,8 +587,11 @@ UUID_RAW_HEX_RE = r'^[0-9a-fA-F]{32}$'
 _UUID_CANONICAL = re.compile(UUID_CANONICAL_RE)
 _UUID_RAW_HEX = re.compile(UUID_RAW_HEX_RE)
 
-NULL_SENTINELS = {"NULL", "N/A", "NA", "NONE", "(NULL)", "\\N"}
-_SENTINEL_UPPER = {s.upper() for s in NULL_SENTINELS}
+# Categories that are re-parsed or cast (anything else is text and is stored exactly as DMS
+# wrote it). A whitespace-only value in one of these is NULL: it can't be cast.
+_TYPED_CATEGORIES = frozenset({
+    'uuid', 'boolean', 'timestamptz', 'date', 'bigint', 'integer', 'smallint', 'numeric',
+    'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
 
 # Boolean serializations across engines (v15 mapping).
 _BOOL_TRUE = {"true", "t", "y", "yes", "1"}
@@ -610,21 +632,19 @@ def hex_to_canonical_uuid(v):
 
 
 def _coerce_null(v):
-    """Map DMS/CSV null sentinels and empty/whitespace-only string to None.
-    IMPORTANT: the trim is used ONLY to DETECT a null/sentinel — the RETURNED value keeps the
-    ORIGINAL, untrimmed string so that significant leading/trailing whitespace in VARCHAR data
-    is preserved (previously this returned the stripped value, silently trimming padded text).
-    Typed categories (numeric/int/uuid/timestamp/boolean) re-parse in convert_value and are
-    unaffected by surrounding spaces (the DSQL ::cast and the timestamp/uuid normalizers
-    tolerate them)."""
+    """None for a real NULL, else the value exactly as DMS wrote it.
+
+    A real NULL is an empty field or the endpoint's null marker (CSV_NULL_VALUE, DMS default
+    "NULL"), compared exactly: no trimming, case-sensitive. Every other value is data and is
+    kept as written, including 'NA', 'N/A', 'NONE', '(NULL)', '\\N', 'null' and ' NULL '.
+    (Earlier versions turned all of those into NULL in every column, silently losing real text
+    values.) Whitespace is never trimmed here; convert_value strips it for typed columns only."""
     if v is None:
         return None
-    s = v.strip() if isinstance(v, str) else str(v)
-    if s == "" or s.upper() in _SENTINEL_UPPER:
+    s = v if isinstance(v, str) else str(v)
+    if s == "" or (CSV_NULL_VALUE and s == CSV_NULL_VALUE):
         return None
-    # not a null/sentinel -> return the ORIGINAL value (whitespace intact) for str inputs;
-    # for non-str, return the str() form (no meaningful surrounding whitespace to preserve).
-    return v if isinstance(v, str) else s
+    return s
 
 
 # Oracle/DMS timestamp input formats, translated from v15's Java (Spark) patterns to
@@ -744,6 +764,8 @@ def convert_value(raw, category):
     # they operate on a stripped copy. VARCHAR/text (the final pass-through) keeps the ORIGINAL
     # value so significant leading/trailing spaces are preserved.
     vs = v.strip() if isinstance(v, str) else v
+    if category in _TYPED_CATEGORIES and vs == "":
+        return None   # whitespace-only in a typed column can't be cast -> NULL
     if category == 'uuid':
         return hex_to_canonical_uuid(vs)
     if category == 'boolean':
@@ -1036,6 +1058,26 @@ def utc_now_iso():
 # The checkpoint is written in the SAME TRANSACTION as the chunk's data -> atomic.
 # Keyed by table_name -> cross-run resume survives; NEVER dropped.
 def ensure_control_tables():
+    """Create the control schema + tables if missing. Every statement is IF NOT EXISTS, so the
+    whole step is safe to repeat. Many CDC jobs starting at the same moment run these DDLs
+    concurrently, and DSQL can abort a concurrent DDL (OC000/OC001, or a duplicate-key error
+    on its catalog); those are retried with backoff instead of failing the run at startup."""
+    for _attempt in range(1, 11):
+        try:
+            _ensure_control_tables_once()
+            return
+        except Exception as e:
+            retriable = (is_occ_conflict(e) or is_schema_conflict(e) or is_unique_violation(e)
+                         or is_transient_server_error(e) or is_broken_pipe_error(e))
+            if not retriable or _attempt == 10:
+                raise
+            _bo = min(30.0, 0.5 * (2 ** (_attempt - 1))) * (0.5 + random.random())
+            print(f"  ↻ control tables: attempt {_attempt}/10 hit a concurrent change ({e}); "
+                  f"retry in {_bo:.1f}s", flush=True)
+            time.sleep(_bo)
+
+
+def _ensure_control_tables_once():
     conn = connect_dsql_with_retry(autocommit=True, what="ensure_control_tables")
     cur = conn.cursor()
     try:
@@ -1093,7 +1135,7 @@ def ensure_control_tables():
         #     true, every row in the file is durably in the target.
         #   • status 'started'->'done' (Option A, LIFECYCLE): 'started' written before the
         #     chunk loop; 'done' written in the immediately-following high-water txn that
-        #     advances cdc_status.last_done_file + moves the file to processed/.
+        #     advances cdc_status.last_done_file; the file is then copied to processed/.
         # The narrow crash window (final chunk committed, high-water not yet advanced) is now
         # OBSERVABLE + self-describing: all_rows_committed=true AND status='started' means
         # "data safe, high-water lagging; resume re-marks it" (idempotent, no loss). Composite
@@ -1312,7 +1354,7 @@ def mark_file_committed_cur(cur, table_name, cdc_file, rows_applied, chunks_comm
 def mark_file_done_cur(cur, table_name, cdc_file):
     """LIFECYCLE marker 'done' (Option A): set status='done' + done_time in the same short
     txn that advances cdc_status.last_done_file (high-water) after the file is fully applied
-    and about to be moved to processed/. Cursor-based; the caller (_commit_status via
+    and about to be copied to processed/. Cursor-based; the caller (_commit_status via
     run_control_op) owns the commit + retry set. Pure UPDATE; harmless no-op if the row is
     somehow absent (resume re-creates it via mark_file_started_cur)."""
     cur.execute(
@@ -1663,6 +1705,13 @@ def derive_table_prefixes(entry):
     }
 
 
+class MultiColumnKeyTable(Exception):
+    """Raised by build_table_context for a table whose primary key has more than one column.
+    This CDC job does not apply those tables: its keyed path targets one key column, and its
+    keyless path would skip every UPDATE. They are left to a separate CDC job built for
+    multi-column keys. main() lists them at startup and never touches them."""
+
+
 def build_table_context(entry):
     """Assemble everything a table's CDC worker needs from Job 1 config."""
     config = load_table_config(entry)
@@ -1674,6 +1723,14 @@ def build_table_context(entry):
                       for c in config.get('target_columns', [])]
     pk_meta = meta.get('primary_key', {}) or {}
     pk_cols = pk_meta.get('columns') or []
+    # MULTI-COLUMN PRIMARY KEY -> not this job's table. Checked before anything else (a
+    # declared logical key does not override it): applying such a table here would key it on
+    # one column or treat it as keyless and skip its UPDATEs. Nothing is written for it, so
+    # its cdc_control rows stay free for the job that does apply it.
+    if len(pk_cols) > 1:
+        raise MultiColumnKeyTable(
+            f"{dsql_schema}.{dsql_table} has a multi-column primary key "
+            f"({', '.join(str(c) for c in pk_cols)})")
     pk_col = pk_cols[0] if len(pk_cols) == 1 else None
 
     # ── APPLY KEY (Tier-1 targeting key) ─────────────────────────────────────────────
@@ -1701,11 +1758,11 @@ def build_table_context(entry):
         key_source = "logical_key"
     else:
         key_source = "none"
-    # Tier hint from configuration alone (op-stream observation in collapse_net_ops can
-    # still DOWNGRADE a keyless table to Tier 3 the moment it sees an UPDATE):
-    #   Tier 1 = has an apply key (PK or logical) -> correct synchronous I/U/D.
-    #   keyless -> provisional; classified at apply time (Tier 2 insert/delete-only, or
-    #   Tier 3 fail-closed if an UPDATE is observed).
+    # Tier hint from configuration alone:
+    #   Tier 1 = has an apply key (single-column PK or logical key) -> I/U/D applied by key.
+    #   keyless (no PK, no logical key) -> Tier 2: INSERT/DELETE applied, UPDATE skipped and
+    #   logged in cdc_skipped_ops (the table is not blocked).
+    #   Multi-column PK tables never reach here (MultiColumnKeyTable above).
     tier_hint = 1 if apply_key is not None else None
     # varchar length guards from column_mapping (name -> max_length).
     varchar_max = {}
@@ -1992,11 +2049,202 @@ def read_cdc_file(key):
     return header, rows[1:]
 
 
-def move_file(key, dest_prefix):
-    filename = key.split('/')[-1]
-    new_key = dest_prefix + filename
-    s3.copy_object(Bucket=BUCKET, Key=new_key, CopySource={'Bucket': BUCKET, 'Key': key})
-    s3.delete_object(Bucket=BUCKET, Key=key)
+# =============================================================================
+# PROCESSED/ COPIES (never move) + S3 RETRIES + PER-TABLE MANIFEST
+# =============================================================================
+# After a file is fully applied, it is COPIED to <table>/processed/. The original is NEVER
+# deleted, so a failed or throttled S3 call can't lose a file: the worst case is a missing copy,
+# which the next cycle retries (refresh_processed). Re-applying is impossible because files are
+# skipped by the high-water mark (cdc_status.last_done_file), not by where they sit.
+#
+# Each table also gets <table>/processed/_manifest.json with COUNTS only (no file names), e.g.
+#   {"table": "s.t", "status": "idle", "cdc_files_in_folder": 120, "pending_apply": 0,
+#    "applied_in_folder": 120, "copied_to_processed": 120, "pending_copy": 0,
+#    "processed_folder_files": 120, "applied_total_ledger": 120, "all_done": true, ...}
+# all_done = nothing left to apply AND nothing left to copy.
+#
+# NOTE: never DELETE a table's cdc_status row to unblock it (set status='active' instead).
+# With the originals kept in place, a missing row would replay the table's files from the start.
+import random as _cdc_rnd
+
+S3_COPY_MAX_ATTEMPTS = 6            # per S3 call, on top of boto3's own adaptive retries
+S3_COPY_BASE_BACKOFF_SECONDS = 0.5  # exponential with jitter: 0.5, 1, 2, 4, 8 s (x 0.5-1.5)
+MANIFEST_NAME = "_manifest.json"
+MANIFEST_IDLE_REFRESH_SECONDS = 300 # an idle table refreshes its manifest at most every 5 min
+COPY_CATCHUP_MAX_PER_CYCLE = 200    # missing copies re-tried per table per cycle
+_S3_PERMANENT = {"NoSuchKey", "404", "NotFound", "NoSuchBucket", "AccessDenied", "403",
+                 "InvalidObjectState", "InvalidRequest"}
+_manifest_state = {}                # label -> {"sig": <counts>, "at": monotonic}
+_manifest_lock = threading.Lock()
+
+
+def _s3_code(e):
+    try:
+        return str((getattr(e, "response", None) or {}).get("Error", {}).get("Code", "") or "")
+    except Exception:
+        return ""
+
+
+def _s3_retry(fn, what):
+    """Run an S3 call with retries + jittered exponential backoff. Permanent errors (missing
+    object, access denied) are raised at once; anything else (throttling, 5xx, timeouts,
+    connection resets) is retried up to S3_COPY_MAX_ATTEMPTS times."""
+    last = None
+    for attempt in range(1, S3_COPY_MAX_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if _s3_code(e) in _S3_PERMANENT or attempt == S3_COPY_MAX_ATTEMPTS:
+                raise
+            delay = S3_COPY_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)) * (0.5 + _cdc_rnd.random())
+            print(f"    ↻ S3 {what}: attempt {attempt}/{S3_COPY_MAX_ATTEMPTS} failed "
+                  f"({_s3_code(e) or type(e).__name__}); retry in {delay:.1f}s", flush=True)
+            time.sleep(delay)
+    raise last
+
+
+def _s3_head_or_none(key):
+    """head_object with retries; None if the object does not exist."""
+    try:
+        return _s3_retry(lambda: s3.head_object(Bucket=BUCKET, Key=key), f"head {key}")
+    except Exception as e:
+        if _s3_code(e) in ("404", "NoSuchKey", "NotFound"):
+            return None
+        raise
+
+
+def copy_to_processed(key, dest_prefix):
+    """Copy an applied CDC file to dest_prefix (processed/). NEVER deletes the original.
+    Idempotent: an existing copy of the same size is left alone. The copy is verified by
+    size before it counts. Returns "copied" or "already"; raises after retries are exhausted
+    (the caller treats that as non-fatal; refresh_processed retries next cycle)."""
+    new_key = dest_prefix + key.rsplit("/", 1)[-1]
+    src = _s3_head_or_none(key)
+    if src is None:
+        raise RuntimeError(f"source {key} not found; cannot copy to {dest_prefix}")
+    size = src.get("ContentLength")
+    dst = _s3_head_or_none(new_key)
+    if dst is not None and dst.get("ContentLength") == size:
+        return "already"
+    _s3_retry(lambda: s3.copy_object(Bucket=BUCKET, Key=new_key,
+                                     CopySource={"Bucket": BUCKET, "Key": key}),
+              f"copy {key.rsplit('/', 1)[-1]}")
+    dst = _s3_head_or_none(new_key)
+    if dst is None or dst.get("ContentLength") != size:
+        raise RuntimeError(f"copy of {key} to {new_key} could not be verified "
+                           f"(source {size} bytes, copy "
+                           f"{None if dst is None else dst.get('ContentLength')} bytes)")
+    return "copied"
+
+
+def _list_cdc_names(prefix):
+    """Names of the .csv files directly under prefix (no subfolders), excluding full-load
+    LOAD*.csv files. Unlike list_cdc_files, includes files still being written."""
+    names, token = set(), None
+    while True:
+        kw = {"Bucket": BUCKET, "Prefix": prefix, "Delimiter": "/"}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = _s3_retry(lambda: s3.list_objects_v2(**kw), f"list {prefix}")
+        for o in resp.get("Contents", []) or []:
+            name = o["Key"][len(prefix):]
+            if name.endswith(".csv") and "/" not in name and not name.upper().startswith("LOAD"):
+                names.add(name)
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return names
+
+
+def _manifest_due(label, force):
+    if force:
+        return True
+    with _manifest_lock:
+        st = _manifest_state.get(label)
+    return st is None or (time.monotonic() - st["at"]) >= MANIFEST_IDLE_REFRESH_SECONDS
+
+
+def _ledger_done_count(conn, label):
+    """Files this table has marked 'done' in cdc_file_status (None if it can't be read)."""
+    try:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        cur = conn.cursor()
+        cur.execute(f"SELECT count(*) FROM {CONTROL_SCHEMA}.cdc_file_status "
+                    f"WHERE table_name = %s AND status = %s", (label, "done"))
+        n = cur.fetchone()[0]
+        cur.close()
+        conn.commit()
+        return int(n)
+    except Exception:
+        return None
+
+
+def refresh_processed(ctx, last_done, status, ledger_done=None, force=False):
+    """Retry any missing processed/ copies and write the table's _manifest.json. Runs after
+    every busy cycle and at most every MANIFEST_IDLE_REFRESH_SECONDS when idle. NEVER raises:
+    a problem here must not affect applying changes."""
+    label = ctx.get("label", "?")
+    try:
+        if not _manifest_due(label, force):
+            return None
+        base = ctx["prefixes"]["cdc"]
+        proc = ctx["prefixes"]["processed"]
+        in_folder = _list_cdc_names(base)
+        applied = sorted(n for n in in_folder if last_done and (base + n) <= last_done)
+        copied = _list_cdc_names(proc)
+        missing = [n for n in applied if n not in copied]
+        copy_errors = 0
+        last_err = None
+        for n in missing[:COPY_CATCHUP_MAX_PER_CYCLE]:
+            try:
+                copy_to_processed(base + n, proc)
+                copied.add(n)
+            except Exception as e:
+                copy_errors += 1
+                last_err = str(e)[:300]
+        pending_copy = sum(1 for n in applied if n not in copied)
+        pending_apply = len(in_folder) - len(applied)
+        counts = {
+            "status": status,
+            "cdc_files_in_folder": len(in_folder),
+            "pending_apply": pending_apply,
+            "applied_in_folder": len(applied),
+            "copied_to_processed": len(applied) - pending_copy,
+            "pending_copy": pending_copy,
+            "processed_folder_files": len(copied),
+            "applied_total_ledger": ledger_done,
+            "copy_errors_this_cycle": copy_errors,
+            "all_done": pending_apply == 0 and pending_copy == 0,
+        }
+        with _manifest_lock:
+            prev = _manifest_state.get(label)
+        if prev is not None and prev["sig"] == counts and not force:
+            with _manifest_lock:
+                _manifest_state[label] = {"sig": counts, "at": time.monotonic()}
+            return counts
+        doc = {"table": label, "updated_at": utc_now_iso()}
+        doc.update(counts)
+        if last_err:
+            doc["last_copy_error"] = last_err
+        body = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+        _s3_retry(lambda: s3.put_object(Bucket=BUCKET, Key=proc + MANIFEST_NAME, Body=body,
+                                        ContentType="application/json"),
+                  f"write {proc}{MANIFEST_NAME}")
+        with _manifest_lock:
+            _manifest_state[label] = {"sig": counts, "at": time.monotonic()}
+        if copy_errors or pending_copy:
+            print(f"    ⚠️ {label}: {pending_copy} applied file(s) not yet copied to processed/ "
+                  f"(originals kept; retried next cycle){': ' + last_err if last_err else ''}",
+                  flush=True)
+        return counts
+    except Exception as e:
+        print(f"    ⚠️ {label}: processed/ manifest refresh failed (non-fatal): {e}", flush=True)
+        return None
 
 
 # =============================================================================
@@ -2011,6 +2259,55 @@ class _SchemaChangedMidFile(Exception):
     chunk txn was open, so the file's frozen column list is stale. apply_file unwinds; the
     table is NOT blocked. process_table logs it and returns normally so the NEXT poll cycle
     re-runs apply_file from the committed offset, re-reconciling the schema at the top."""
+
+
+class _PositionMoved(Exception):
+    """Internal signal (NOT a block, NOT an error): this table's checkpoint in cdc_status is no
+    longer where this run left it, so ANOTHER CDC run is applying the same table (a second
+    Glue job for the same tables, an old per-task workflow next to the shared one, a hand-made
+    copy of the job), or an operator set the table to 'blocked'. Nothing from the step that
+    detected it was committed. process_table leaves the table for this cycle; the next cycle
+    re-reads the checkpoint and carries on from wherever it now is."""
+
+
+def _pos(in_progress_file, last_offset, last_done_file):
+    """Normalized checkpoint position: (in_progress_file, last_offset, last_done_file).
+    last_offset only means something while a file is in progress."""
+    ipf = in_progress_file or None
+    return (ipf, int(last_offset or 0) if ipf else 0, last_done_file or None)
+
+
+def _fmt_pos(p):
+    f = (p[0] or "-").rsplit("/", 1)[-1]
+    d = (p[2] or "-").rsplit("/", 1)[-1]
+    return f"in-progress={f}@{p[1]} last-done={d}"
+
+
+def check_position_cur(cur, table_name, expected, target):
+    """POSITION FENCE, run FIRST inside every transaction that moves a table's checkpoint (each
+    data chunk, the file-done step, the idle step). Returns:
+      "ok"      the checkpoint is still `expected`: this run makes the next step;
+      "already" it is exactly `target`: this step is already committed (this run's own
+                earlier attempt, e.g. a connection that dropped after COMMIT, or another run
+                that made the identical step) -> do NOT apply it again;
+    and raises _PositionMoved otherwise, or if the table was set to 'blocked'.
+    Why this is enough: every such transaction also UPDATEs the same cdc_status row, so when
+    two runs race, DSQL aborts the later committer (OC000); its retry re-reads the checkpoint
+    here and sees it moved. Each step therefore commits at most once and in order, however
+    many runs apply the table, and an older chunk can never be re-applied over newer data."""
+    cur.execute(
+        f'SELECT in_progress_file, last_offset, last_done_file, status '
+        f'FROM {CONTROL_SCHEMA}.cdc_status WHERE table_name = %s', (table_name,))
+    row = cur.fetchone()
+    got = _pos(row[0], row[1], row[2]) if row else _pos(None, 0, None)
+    if row is not None and str(row[3] or "").lower() == "blocked":
+        raise _PositionMoved(f"{table_name} was set to 'blocked' while this run was applying it")
+    if got == tuple(expected):
+        return "ok"
+    if target is not None and got == tuple(target):
+        return "already"
+    raise _PositionMoved(f"{table_name}: checkpoint is now {_fmt_pos(got)}, but this run "
+                         f"left it at {_fmt_pos(expected)}")
 
 
 def dsql_type_to_category(data_type):
@@ -2185,7 +2482,7 @@ def min_dms_ts(rows, header):
     return best
 
 
-def apply_file(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None):
+def apply_file(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None, pos_box=None):
     """Apply ONE CDC file to DSQL, SERIALLY, in chunks. Each chunk commits its data AND
     the cdc_status checkpoint (in_progress_file, last_offset, watermark_ts) in ONE
     transaction. Resumes from start_offset. Zero-loss: any genuinely bad row raises
@@ -2240,7 +2537,7 @@ def apply_file(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None):
             f"{_schema_missing} that exist in the DSQL target. DMS CDC with "
             f"AddColumnName=true should send every column on each change; a missing "
             f"column would silently NULL a real value on UPDATE. Fix the DMS mapping / "
-            f"header, then clear cdc_status to resume.")
+            f"header, then " + "set cdc_status.status='active' for this table to resume (UPDATE, never DELETE the row).")
 
     # Resolve a type_category for every insert column + the PK: prefer the Job 1 config,
     # else derive from the LIVE DSQL type (so ADD/RENAME columns get the right ::cast).
@@ -2520,6 +2817,15 @@ def apply_file(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None):
             try:
                 # Use the statements already built by the backstop for the first attempt;
                 # rebuild only after a re-pack (txn-timeout step-down) changed chunk_ops.
+                # POSITION FENCE (see check_position_cur): first statement of the chunk txn.
+                if pos_box is not None:
+                    _tgt = (cdc_key, new_offset, pos_box["pos"][2])
+                    if check_position_cur(cur, label, pos_box["pos"], _tgt) == "already":
+                        conn.rollback()
+                        pos_box["pos"] = _tgt
+                        print(f"    ↷ {label}: rows {idx}-{new_offset} of {cdc_key.split('/')[-1]} "
+                              f"are already committed; not applying them again", flush=True)
+                        break
                 if _built_stmts is None:
                     _built_stmts = build_chunk_sql(chunk_ops, new_offset)
                 for stmt, _ in _built_stmts:
@@ -2560,12 +2866,15 @@ def apply_file(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None):
                         watermark_ts=file_watermark,
                     )
                 conn.commit()
+                if pos_box is not None:
+                    pos_box["pos"] = (cdc_key, new_offset, pos_box["pos"][2])
                 break
-            except TableBlocked:
+            except (TableBlocked, _PositionMoved):
                 try:
                     conn.rollback()
                 except Exception:
                     pass
+                cur.close()
                 raise
             except Exception as e:
                 try:
@@ -2754,7 +3063,7 @@ def collapse_net_ops_nonpk(rows, header, ctx, insert_cols, col_category):
     return netops, skipped, stats
 
 
-def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None):
+def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None, pos_box=None):
     """TIER-2 keyless apply for ONE CDC file. INSERT + DELETE only (full-row content match);
     UPDATEs are skipped + logged (cdc_skipped_ops) and never block. Signature + return shape
     MATCH apply_file — (total_applied, file_watermark, chunks_committed) — so process_table's
@@ -2808,7 +3117,7 @@ def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=No
             f"CDC file {cdc_key.split('/')[-1]} for {label} (keyless) is missing column(s) "
             f"{_schema_missing} present in the DSQL target. Every column must be sent on each "
             f"change; a missing column would corrupt the full-row content match. Fix the DMS "
-            f"mapping/header, then clear cdc_status to resume.")
+            f"mapping/header, then " + "set cdc_status.status='active' for this table to resume (UPDATE, never DELETE the row).")
 
     def _cat(col_name):
         c = type_categories.get(col_name)
@@ -2921,6 +3230,17 @@ def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=No
         occ_attempt = server_attempt = pipe_attempt = 0
         while True:
             try:
+                _applied_so_far = total_committed + len(chunk_sql)
+                # POSITION FENCE (see check_position_cur): first statement of the chunk txn.
+                if pos_box is not None:
+                    _tgt = (cdc_key, _applied_so_far, pos_box["pos"][2])
+                    if check_position_cur(cur, label, pos_box["pos"], _tgt) == "already":
+                        conn.rollback()
+                        pos_box["pos"] = _tgt
+                        print(f"    ↷ {label}: keyless chunk {ci + 1}/{n_chunks} of "
+                              f"{cdc_key.split('/')[-1]} is already committed; not applying it "
+                              f"again", flush=True)
+                        break
                 if is_first:
                     cur.execute(purge_sql)   # file-scoped reload — ONCE, in the first chunk
                 for _s in chunk_sql:
@@ -2934,7 +3254,6 @@ def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=No
                             json.dumps(sk["values"], default=str))
                 # SAME-TXN CHECKPOINT: running row count applied so far (observability; resume
                 # for keyless is whole-file restart, so offset is informational, not seeked).
-                _applied_so_far = total_committed + len(chunk_sql)
                 update_cdc_status(
                     cur, label, status="active", in_progress_file=cdc_key,
                     last_offset=_applied_so_far, watermark_ts=file_watermark,
@@ -2948,12 +3267,15 @@ def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=No
                         cur, label, cdc_key, rows_applied=n_rows,
                         chunks_committed=n_chunks, watermark_ts=file_watermark)
                 conn.commit()
+                if pos_box is not None:
+                    pos_box["pos"] = (cdc_key, _applied_so_far, pos_box["pos"][2])
                 break
-            except TableBlocked:
+            except (TableBlocked, _PositionMoved):
                 try:
                     conn.rollback()
                 except Exception:
                     pass
+                cur.close()
                 raise
             except Exception as e:
                 try:
@@ -3063,6 +3385,8 @@ def run_control_op(conn_holder, label, fn, what):
                 conn.rollback()
             except Exception:
                 pass
+            if isinstance(e, _PositionMoved):
+                raise   # another run moved the checkpoint: not retriable, the caller yields
             if is_occ_conflict(e) and occ < OCC_MAX_RETRIES:
                 occ += 1
                 time.sleep(occ_backoff_seconds(occ))
@@ -3170,7 +3494,7 @@ def process_table(ctx, load_status_map=None):
               f"attempts (isolated, retry next poll): {_last_err}")
         return {"table": label, "status": "error", "files": 0, "rows": 0, "error": str(_last_err)}
 
-    def _commit_status(_done_file=None, **fields):
+    def _commit_status(_done_file=None, _expect=None, _target=None, **fields):
         """Write a cdc_status marker on THE TABLE'S OWN connection as its own short txn
         (outside a chunk apply), with the full control-op retry set (OCC/OC001, transient
         server-unavailable, txn-timeout, broken-pipe reconnect).
@@ -3183,15 +3507,24 @@ def process_table(ctx, load_status_map=None):
         final data chunk (Option B), so a crash between the two leaves an observable, correct
         state (committed=true, status='started')."""
         def _do(c):
+            # POSITION FENCE: only move the checkpoint if it is still where this run left it.
+            if _expect is not None and check_position_cur(c, label, _expect, _target) == "already":
+                conn_holder[0].rollback()
+                return
             upsert_cdc_status(c, label, **fields)
             if _done_file is not None:
                 mark_file_done_cur(c, label, _done_file)
             conn_holder[0].commit()
         run_control_op(conn_holder, label, _do, "commit_status")
+        if _target is not None:
+            pos_box["pos"] = _target
 
     applied_rows = 0
     files_done = 0
     chunks_done = 0   # telemetry: total committed chunks (commits) across this table's files
+    # For the processed/ copies + manifest refresh in `finally` (status None = skip it).
+    _mf = {"last_done": None, "status": None, "busy": False}
+    pos_box = {"pos": None}   # this run's view of the table's checkpoint (position fence)
     try:
         # Read resume position on the SAME connection (no separate handshake). This is the
         # FIRST statement on a session that was idle between poll cycles -> per the DSQL
@@ -3204,12 +3537,20 @@ def process_table(ctx, load_status_map=None):
             conn_holder[0].commit()   # end the read txn cleanly
         run_control_op(conn_holder, label, _read_state, "read_resume_state")
         state = _state_box["state"]
+        # Where this run found the checkpoint; every step below must start from here.
+        pos_box["pos"] = _pos(state["in_progress_file"], state["last_offset"],
+                              state["last_done_file"])
+        _mf["last_done"] = state["last_done_file"]
+        _mf["status"] = state["status"] or "idle"
 
         if state["status"] == "blocked":
-            print(f"  ⛔ {label} is BLOCKED (prior bad row) — skipping. Clear cdc_status to resume.")
+            print(f"  ⛔ {label} is BLOCKED (prior bad row) — skipping. To resume: UPDATE "
+                  f"{CONTROL_SCHEMA}.cdc_status SET status='active' WHERE table_name='{label}' "
+                  f"(never DELETE the row).")
             return {"table": label, "status": "blocked", "files": 0, "rows": 0}
 
         files = list_cdc_files(ctx)
+        _mf["status"] = "active"
         last_done = state["last_done_file"]
         in_progress = state["in_progress_file"]
         resume_offset = state["last_offset"] if in_progress else 0
@@ -3218,7 +3559,9 @@ def process_table(ctx, load_status_map=None):
         # by DMS timestamp filename and complete strictly in order (serial), so this is safe.
         pending = [key for key in files if not (last_done and key <= last_done)]
         if not pending:
+            _mf["status"] = "idle"
             return {"table": label, "status": "idle", "files": 0, "rows": 0}
+        _mf["busy"] = True
 
         # Guarantee the cdc_status row EXISTS before any chunk runs, so the per-chunk
         # checkpoint (update_cdc_status) is a pure UPDATE on the hot path — no SELECT,
@@ -3238,13 +3581,13 @@ def process_table(ctx, load_status_map=None):
         # keyed apply_file (Tier 1, correct I/U/D). A keyless table uses apply_file_nonpk (Tier
         # 2: insert/delete only, updates skipped+logged, no chunking). Both share the same
         # (total_applied, file_watermark, chunks_committed) return shape, so everything below
-        # (ledger markers, checkpoint, done/blocked handling, file moves) is identical.
+        # (ledger markers, checkpoint, done/blocked handling, processed/ copies) is identical.
         _apply_fn = apply_file if ctx["apply_key"] is not None else apply_file_nonpk
         for key in pending:
             start = resume_offset if (in_progress and key == in_progress) else 0
             try:
                 n, file_wm, n_chunks = _apply_fn(ctx, key, start, conn_holder,
-                                                 prior_watermark=prior_wm)
+                                                 prior_watermark=prior_wm, pos_box=pos_box)
                 applied_rows += n
                 chunks_done += n_chunks
                 if file_wm is not None:
@@ -3255,6 +3598,7 @@ def process_table(ctx, load_status_map=None):
                 # committed offset. Return cleanly with what we applied so far — the next
                 # poll cycle re-runs apply_file from that offset and re-reconciles schema.
                 print(f"    🔄 {label}: {sc} (non-blocking; resuming next cycle)")
+                _mf["status"] = "schema_changed"
                 return {"table": label, "status": "schema_changed",
                         "files": files_done, "rows": applied_rows, "chunks": chunks_done}
             except TableBlocked as tb:
@@ -3272,28 +3616,48 @@ def process_table(ctx, load_status_map=None):
                 # list_cdc_files and the remaining rows would be silently skipped -> loss.
                 # The file therefore stays in place; failed/ is reserved for a file an
                 # operator explicitly abandons out of band.
+                _mf["status"] = "blocked"
                 record_exception(label, key, start, "(apply)", str(tb))
                 print(f"    ⛔ {label} BLOCKED at {key.split('/')[-1]} @offset {start}: {tb}")
-                print(f"       RESUMABLE: fix the cause, then clear cdc_status.status "
-                      f"('{label}') to resume from offset {start} (file left in place).")
+                print(f"       RESUMABLE: fix the cause, then UPDATE {CONTROL_SCHEMA}.cdc_status SET "
+                      f"status='active' WHERE table_name='{label}' to resume from offset {start} "
+                      f"(file left in place; never DELETE the row).")
                 return {"table": label, "status": "blocked", "files": files_done,
                         "rows": applied_rows, "chunks": chunks_done, "error": str(tb)}
             # File fully applied -> advance the high-water + clear in-progress on THE
-            # TABLE'S OWN connection (no new handshake), then move the S3 file to
-            # processed/ (human artifact; DSQL is the source of truth). The same txn stamps
-            # the cdc_file_status ledger row 'done' (Option-A lifecycle marker), fused to the
-            # high-water advance.
+            # TABLE'S OWN connection (no new handshake), then COPY the S3 file to
+            # processed/ (human artifact; DSQL is the source of truth). The original is kept;
+            # the high-water mark, not the file's location, stops it being applied again. The
+            # same txn stamps the cdc_file_status ledger row 'done' (Option-A lifecycle
+            # marker), fused to the high-water advance.
             _commit_status(status="active", last_done_file=key,
-                           in_progress_file=None, last_offset=0, _done_file=key)
+                           in_progress_file=None, last_offset=0, _done_file=key,
+                           _expect=pos_box["pos"], _target=(None, 0, key))
+            _mf["last_done"] = key
             try:
-                move_file(key, ctx["prefixes"]["processed"])
+                copy_to_processed(key, ctx["prefixes"]["processed"])
             except Exception as e:
-                print(f"    ⚠️ move to processed/ failed (non-fatal, DSQL is source of truth): {e}")
+                print(f"    ⚠️ copy to processed/ failed after retries (non-fatal: original kept, "
+                      f"retried next cycle; DSQL is source of truth): {e}")
             files_done += 1
             resume_offset = 0
             in_progress = None
         # All pending files done -> mark idle (same session).
-        _commit_status(status="idle", in_progress_file=None, last_offset=0)
+        _commit_status(status="idle", in_progress_file=None, last_offset=0,
+                       _expect=pos_box["pos"], _target=None)
+        _mf["status"] = "idle"
+    except _PositionMoved as pm:
+        # Another CDC run is applying this table (or an operator just blocked it). Nothing
+        # from the step that noticed was committed. Leave the table to the other run for this
+        # cycle; the next cycle re-reads the checkpoint. Two runs on one table stay correct,
+        # but it is wasted work and usually a mistake, so say so loudly.
+        print(f"    ⚠️ {label}: left for this cycle: {pm}. If this repeats, ANOTHER CDC run "
+              f"is applying this table (a second Glue job, an old per-task workflow, or a "
+              f"hand-made copy); stop all but one. Each change is still applied once.",
+              flush=True)
+        _mf["status"] = None   # the run that owns the table writes its manifest
+        return {"table": label, "status": "yielded", "files": files_done,
+                "rows": applied_rows, "chunks": chunks_done, "error": str(pm)}
     except Exception as e:
         # TABLE-LEVEL SAFETY NET — process_table must NEVER raise, so one table's
         # exhausted/unclassified DSQL error (e.g. a control-op that retried through OCC /
@@ -3303,9 +3667,21 @@ def process_table(ctx, load_status_map=None):
         # needs an operator) — 'error' is transient/self-healing. Best-effort log only;
         # the checkpoint already reflects the last committed offset, so resume is exact.
         print(f"    ⚠️ {label}: cycle error (isolated, will retry next poll): {e}")
+        if _mf["status"] is not None:
+            _mf["status"] = "error"
         return {"table": label, "status": "error", "files": files_done,
                 "rows": applied_rows, "chunks": chunks_done, "error": str(e)}
     finally:
+        # processed/ copies + manifest: busy cycles always, idle tables at most every 5 min.
+        # Never raises (refresh_processed and _ledger_done_count catch everything).
+        try:
+            if _mf["status"] is not None and _manifest_due(label, _mf["busy"]):
+                _ld = (_ledger_done_count(conn_holder[0], label)
+                       if conn_holder[0] is not None else None)
+                refresh_processed(ctx, _mf["last_done"], _mf["status"], ledger_done=_ld,
+                                  force=_mf["busy"])
+        except Exception as _me:
+            print(f"    ⚠️ {label}: processed/ refresh skipped (non-fatal): {_me}")
         try:
             conn_holder[0].close()
         except Exception:
@@ -3322,12 +3698,56 @@ def wait_for_wake():
     """Sleep POLL_INTERVAL, then return so the caller runs the next list+apply cycle.
 
     The loop re-lists S3 each cycle; per-table serial DMS-timestamp order is owned by
-    files.sort(), and already-applied files are skipped via last_done_file / processed-move
-    (idempotent no-op), so an extra cycle with nothing new is cheap.
+    files.sort(), and already-applied files are skipped via last_done_file (the high-water
+    mark), so an extra cycle with nothing new is cheap.
 
     Returns True on a normal wake (always True today; reserved for future stop signals)."""
     time.sleep(POLL_INTERVAL)
     return True
+
+
+def _run_arg(name):
+    """Value of --<name> from this run's arguments, or None."""
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--" + name and _i + 1 < len(sys.argv):
+            return sys.argv[_i + 1]
+        if _a.startswith("--" + name + "="):
+            return _a.split("=", 1)[1]
+    return None
+
+
+def _start_token():
+    """Name of the start marker: the startup workflow passes its execution name as
+    --startup_execution; a run started any other way falls back to Glue's --JOB_RUN_ID."""
+    return _run_arg("startup_execution") or _run_arg("JOB_RUN_ID")
+
+
+def write_started_marker():
+    """Tell the startup workflow this run really started: written once, when the run reaches
+    its poll loop (drivers installed, DSQL reachable, control tables and manifest loaded).
+    Key: <CONFIG_PREFIX>_cdc_started/<start token>.json (+ _latest.json). The workflow waits for
+    it before reporting success. Never raises: a failed write only means the workflow reports
+    CdcStartNotConfirmed while this run keeps applying changes."""
+    try:
+        if not str(CONFIG_PREFIX).startswith("s3://"):
+            print(f"  (start marker skipped: CONFIG_PREFIX {CONFIG_PREFIX!r} is not an s3:// path)", flush=True)
+            return
+        _bkt, _, _key = CONFIG_PREFIX[len("s3://"):].partition("/")
+        _rid = _start_token()
+        _doc = json.dumps({"start_token": _rid, "job_run_id": _run_arg("JOB_RUN_ID"),
+                           "started_at": utc_now_iso(),
+                           "config_prefix": CONFIG_PREFIX, "dms_task_arn": DMS_TASK_ARN,
+                           "control_schema": CONTROL_SCHEMA}, indent=1).encode("utf-8")
+        _keys = [_key + "_cdc_started/_latest.json"]
+        if _rid:
+            _keys.insert(0, _key + f"_cdc_started/{_rid}.json")
+        for _k in _keys:
+            _s3_retry(lambda _k=_k: s3.put_object(Bucket=_bkt, Key=_k, Body=_doc,
+                                                  ContentType="application/json"),
+                      f"write {_k}")
+        print(f"  [startup] start marker written: s3://{_bkt}/{_keys[0]}", flush=True)
+    except Exception as _e:
+        print(f"  ⚠️ start marker not written (non-fatal; CDC keeps running): {_e}", flush=True)
 
 
 # =============================================================================
@@ -3353,15 +3773,27 @@ def main():
     entries = load_manifest()
     print(f"  [startup] manifest loaded: {len(entries)} entries; building contexts…", flush=True)
     contexts = []
+    multi_key = []
     for _i, e in enumerate(entries):
         try:
             print(f"    [startup] context {_i+1}/{len(entries)}: {e.get('dsql_schema')}.{e.get('dsql_table')}", flush=True)
             contexts.append(build_table_context(e))
+        except MultiColumnKeyTable as mk:
+            multi_key.append(str(mk))
         except Exception as ex:
             print(f"  ⚠️ skipping {e.get('dsql_table')} — config load failed: {ex}", flush=True)
     print(f"  Tables discovered: {len(contexts)}", flush=True)
-    if not contexts:
+    if multi_key:
+        print(f"  ⏭  {len(multi_key)} table(s) NOT applied by this job (multi-column primary key; "
+              f"run the separate multi-column-key CDC job for them). Cutover waits until their "
+              f"change files are marked done in {CONTROL_SCHEMA}.cdc_file_status:", flush=True)
+        for _m in multi_key:
+            print(f"       - {_m}", flush=True)
+    if not contexts and not multi_key:
         raise Exception("No usable tables from the manifest.")
+    if not contexts:
+        print("  ℹ️ every table in this task has a multi-column primary key: this job has "
+              "nothing to apply and stays idle (cutover stops it).", flush=True)
 
     # STARTUP KEY-CONSISTENCY DIAGNOSTIC. The full-load gate matches a table by its EXACT
     # label (dsql_schema.dsql_table) against the keys in _load_status.json. v4 builds that
@@ -3398,6 +3830,7 @@ def main():
     watcher.start()
     print(f"  DDL watcher started for {len(dms_tables)} table(s)", flush=True)
     print("  [startup] entering poll loop.", flush=True)
+    write_started_marker()
 
     last_activity = time.time()
     poll = 0
@@ -3467,6 +3900,10 @@ def main():
             errored = [r["table"] for r in results if r.get("status") == "error"]
             if errored:
                 print(f"  ⚠️ transient-error tables (auto-retry next poll): {errored}")
+            yielded = [r["table"] for r in results if r.get("status") == "yielded"]
+            if yielded:
+                print(f"  ⚠️ tables another CDC run is also applying (left to it this cycle; "
+                      f"stop the extra run): {yielded}")
 
             if any_work:
                 last_activity = time.time()

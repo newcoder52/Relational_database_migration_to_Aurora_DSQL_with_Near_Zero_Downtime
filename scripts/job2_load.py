@@ -435,7 +435,11 @@ def plan_ranges_text(min_str, max_str, total_rows, target_rows_per_partition,
 # (getResolvedOptions raises on a required arg that's missing, so we only request args
 # actually present in sys.argv.)
 # =============================================================================
+CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
+
+
 def _apply_v6_arg_overrides():
+    global CSV_NULL_VALUE
     global V6_WRITE_MODE, LARGE_TABLE_BYTES_THRESHOLD, TARGET_ROWS_PER_PARTITION
     global MAX_WRITE_CONCURRENCY, V6_PARALLEL_ENABLED, PER_TABLE_WRITE_CONCURRENCY
     global V6_CHUNK_FANOUT_ENABLED, INTRA_TABLE_WRITERS, FORCE_V5_TABLES
@@ -450,7 +454,7 @@ def _apply_v6_arg_overrides():
                 "dsql_endpoint", "dsql_user", "dsql_database", "region",  # kit: connection overlay
                 "chunk_fanout_enabled", "intra_table_writers", "force_v5_tables",
                 "auto_reblank_on_resume", "per_table_write_concurrency",
-                "verbose_chunks", "verbose_chunk_every"]
+                "verbose_chunks", "verbose_chunk_every", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -521,6 +525,10 @@ def _apply_v6_arg_overrides():
         if _rg:
             REGION = _rg
             print(f"  ↪ REGION overridden -> {REGION}")
+    if "csv_null_value" in ov and ov["csv_null_value"] is not None:
+        _nv = str(ov["csv_null_value"])
+        CSV_NULL_VALUE = "" if _nv == "__EMPTY__" else _nv
+        print(f"  ↪ CSV_NULL_VALUE (DMS null marker) -> {CSV_NULL_VALUE!r}")
     if "v6_parallel_enabled" in ov:
         V6_PARALLEL_ENABLED = str(ov["v6_parallel_enabled"]).strip().lower() in ("true", "1", "yes")
     if "chunk_fanout_enabled" in ov:
@@ -1216,8 +1224,28 @@ def server_backoff_seconds(attempt):
                  SERVER_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
     return random.uniform(0, capped)
 
-# Tokens DMS / Oracle may emit to represent NULL — coerced to real NULL.
-NULL_SENTINELS = {"NULL", "N/A", "NA", "NONE", "(NULL)", r"\N"}
+# How DMS marks a real NULL in its CSV files: the S3 target endpoint's CsvNullValue (DMS
+# default "NULL"), passed by create-glue-jobs as --csv_null_value ("__EMPTY__" = the endpoint
+# sets it to the empty string). Only that exact text, or an empty field, is stored as NULL.
+# Every other value is data: 'NA', 'N/A', 'NONE', '(NULL)', '\\N', 'null' are kept as written.
+# MUST stay identical in job2_load, job3_validate and glue_cdc_continuous (_coerce_null).
+_TYPED_CATEGORIES = frozenset({
+    'uuid', 'boolean', 'timestamptz', 'date', 'bigint', 'integer', 'smallint', 'numeric',
+    'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
+
+
+def null_marker_expr(c, category):
+    """Spark expression for column c: NULL for a real NULL (Spark null, empty field, or the
+    exact DMS null marker), else the value. Text columns keep the value exactly (whitespace
+    too); typed columns are trimmed, and whitespace-only becomes NULL (it can't be cast)."""
+    raw = col(c)
+    is_null = raw.isNull() | (raw == lit(""))
+    if CSV_NULL_VALUE:
+        is_null = is_null | (raw == lit(CSV_NULL_VALUE))
+    if category in _TYPED_CATEGORIES:
+        t = trim(raw)
+        return when(is_null | (t == lit("")), lit(None)).otherwise(t)
+    return when(is_null, lit(None)).otherwise(raw)
 
 # Candidate timestamp/date input formats emitted by Oracle/DMS.
 TIMESTAMP_INPUT_FORMATS = [
@@ -1238,7 +1266,6 @@ TIMESTAMP_INPUT_FORMATS = [
 ]
 DATE_INPUT_FORMATS = TIMESTAMP_INPUT_FORMATS
 
-sentinel_upper = [s.upper() for s in NULL_SENTINELS]
 
 # Canonical + raw uuid shapes for the uuid guard.
 UUID_CANONICAL_RE = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -2346,15 +2373,11 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     df = df.select(select_cols)
 
     # ---- Type conversions ----
-    # (a) empty string AND NULL sentinels -> real NULL
+    # (a) real NULLs -> NULL (empty field or the DMS null marker); every other value kept.
+    #     Text is no longer trimmed (the CSV read already preserves whitespace, and the CDC job
+    #     keeps it), so a value is stored the same whether it arrived in the full load or CDC.
     for c in df.columns:
-        trimmed = trim(col(c))
-        df = df.withColumn(
-            c,
-            when(trimmed == "", lit(None))
-            .when(upper(trimmed).isin(sentinel_upper), lit(None))
-            .otherwise(trimmed)
-        )
+        df = df.withColumn(c, null_marker_expr(c, type_categories.get(c)))
 
     # (b) UUID: RAW hex -> UUID format
     uuid_cols = sorted([n for n in df.columns if type_categories.get(n) == 'uuid'])
@@ -4180,11 +4203,13 @@ def run_one_table(item):
                            f"done(0); CDC will apply any rows that arrive later.")
                 print(f"[PARALLEL] END   {label} thread={_th} epoch={time.time():.3f} "
                       f"dur={time.time()-_t_start:.1f}s EMPTY(done,0)", flush=True)
-                return (label, {"rows": 0, "ranges": 0, "empty_at_full_load": True}, None, log)
+                return (label, {"table": label, "rows": 0, "ranges": 0, "empty_at_full_load": True},
+                        None, log)
             log.append(f"  ↪ {label}: was empty at discovery but S3 files now present — "
                        f"loading normally.")
         # auto-dispatch (whole-table path or range-parallel) per table.
         result = load_table_auto(worker_s3, entry)
+        result.setdefault("table", label)   # the load functions set it; the summary needs it
         rngtxt = f", {result['ranges']} ranges" if result.get('ranges') else ""
         log.append(f"  ✓ DONE {label}: {result['rows']:,} rows{rngtxt}")
         print(f"[PARALLEL] END   {label} thread={_th} epoch={time.time():.3f} "

@@ -126,14 +126,18 @@ GLUE_API_TIMEOUT = 5
 # status / report S3 paths at call time from CONFIG_PREFIX (see load_manifest /
 # load_full_load_status / the report writer), so overriding the CONFIG_PREFIX global here is
 # sufficient — there are no import-time derived path constants to recompute (unlike v16).
+CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
+
+
 def _apply_job3_arg_overrides():
+    global CSV_NULL_VALUE
     global CONFIG_PREFIX, INDEX_S3_KEY, DSQL_ENDPOINT, DSQL_USER, DSQL_DATABASE, REGION
     global CHECKSUM_MODE, MAX_PARALLEL_TABLES, VALIDATE_ROWS_PER_RANGE, MAX_QUERY_CONCURRENCY
     global REQUIRE_FULL_LOAD_DONE
     optional = ["config_prefix", "index_s3_key", "dsql_endpoint", "dsql_user",
                 "dsql_database", "region",
                 "checksum_mode", "max_parallel_tables", "validate_rows_per_range",
-                "max_query_concurrency", "require_full_load_done"]
+                "max_query_concurrency", "require_full_load_done", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -175,6 +179,10 @@ def _apply_job3_arg_overrides():
             MAX_QUERY_CONCURRENCY = max(1, int(ov["max_query_concurrency"]))
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid max_query_concurrency={ov['max_query_concurrency']!r}")
+    if "csv_null_value" in ov and ov["csv_null_value"] is not None:
+        _nv = str(ov["csv_null_value"])
+        CSV_NULL_VALUE = "" if _nv == "__EMPTY__" else _nv
+        print(f"  ↪ CSV_NULL_VALUE (DMS null marker) -> {CSV_NULL_VALUE!r}")
     if "require_full_load_done" in ov:
         REQUIRE_FULL_LOAD_DONE = str(ov["require_full_load_done"]).strip().lower() in ("true", "1", "yes")
 
@@ -208,8 +216,28 @@ CSV_READ_OPTIONS = {
     "pathGlobFilter": "LOAD*.csv",
 }
 
-NULL_SENTINELS = {"NULL", "N/A", "NA", "NONE", "(NULL)", "\\N"}
-_SENTINEL_UPPER = [s.upper() for s in NULL_SENTINELS]
+# How DMS marks a real NULL in its CSV files: the S3 target endpoint's CsvNullValue (DMS
+# default "NULL"), passed by create-glue-jobs as --csv_null_value ("__EMPTY__" = the endpoint
+# sets it to the empty string). Only that exact text, or an empty field, is stored as NULL.
+# Every other value is data: 'NA', 'N/A', 'NONE', '(NULL)', '\\N', 'null' are kept as written.
+# MUST stay identical in job2_load, job3_validate and glue_cdc_continuous (_coerce_null).
+_TYPED_CATEGORIES = frozenset({
+    'uuid', 'boolean', 'timestamptz', 'date', 'bigint', 'integer', 'smallint', 'numeric',
+    'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
+
+
+def null_marker_expr(c, category):
+    """Spark expression for column c: NULL for a real NULL (Spark null, empty field, or the
+    exact DMS null marker), else the value. Text columns keep the value exactly (whitespace
+    too); typed columns are trimmed, and whitespace-only becomes NULL (it can't be cast)."""
+    raw = col(c)
+    is_null = raw.isNull() | (raw == lit(""))
+    if CSV_NULL_VALUE:
+        is_null = is_null | (raw == lit(CSV_NULL_VALUE))
+    if category in _TYPED_CATEGORIES:
+        t = trim(raw)
+        return when(is_null | (t == lit("")), lit(None)).otherwise(t)
+    return when(is_null, lit(None)).otherwise(raw)
 
 UUID_CANONICAL_RE = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 UUID_RAW_HEX_RE = r'^[0-9a-fA-F]{32}$'
@@ -384,13 +412,10 @@ def read_dms_csv(dms_s3_path, dms_has_headers):
 
 def apply_transform(df, target_columns, type_categories):
     """Apply the loader's per-column normalization so the source rows match what the target
-    stores: null-sentinel coercion, uuid canonicalization, boolean mapping, ts/date ISO."""
-    # (a) null sentinels + empty -> NULL
+    stores: real NULLs (null_marker_expr), uuid canonicalization, boolean mapping, ts/date ISO."""
+    # (a) real NULLs -> NULL; every other value kept (same rule as the loader and CDC)
     for c in df.columns:
-        trimmed = trim(col(c))
-        df = df.withColumn(c, when(trimmed == "", lit(None))
-                           .when(upper(trimmed).isin(_SENTINEL_UPPER), lit(None))
-                           .otherwise(trimmed))
+        df = df.withColumn(c, null_marker_expr(c, type_categories.get(c)))
     # (b) uuid: exactly-32-hex -> canonical (anchored, anti-truncation); canonical -> lower
     for c in [n for n in df.columns if type_categories.get(n) == 'uuid']:
         raw = col(c)

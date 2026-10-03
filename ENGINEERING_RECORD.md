@@ -160,9 +160,10 @@ Two clean-slate pitfalls caused **false results** during testing and MUST be res
    (`group-*/_load_status.json`, `group-*/_file_status/`, `group-*/_validation_report.json`).
    The loader and validator run once per table group with that group's own config prefix, so
    their status files live there, not at the task's top-level prefix.
-2. **`processed/` files**: the CDC job moves applied files to `processed/` and skips them. A
-   mid-test target reset leaves already-processed files in `processed/`, so their rows are NOT
-   re-applied to the fresh target. Only a **single clean pass with no mid-run resets** yields a
+2. **Applied CDC files**: the CDC job skips applied files by its high-water mark
+   (`cdc_status.last_done_file`) and copies them to `processed/` (originals are kept since
+   2026-10-02). A mid-test target reset therefore does NOT re-apply them to the fresh target
+   unless the table's `cdc_status` row and S3 prefix are purged too. Only a **single clean pass with no mid-run resets** yields a
    trustworthy result.
 
 ---
@@ -186,7 +187,7 @@ case as **DML → DDL → DML** (a trailing DML is required — see T12).
 ### ⚠️ Limitations (where it breaks — mark these)
 | Case | DDL config | Behavior | Root cause |
 |------|-----------|----------|------------|
-| **T8** | `DROP COLUMN` | **BLOCKS the table**; needs operator remediation (drop the column on the DSQL target + clear `cdc_status`), then converges | The missing-column guard can't distinguish a genuine DROP from a column omitted from a change row (which would silently NULL data), so it blocks. |
+| **T8** | `DROP COLUMN` | **BLOCKS the table**; needs operator remediation (drop the column on the DSQL target, then set `cdc_status.status='active'`), then converges | The missing-column guard can't distinguish a genuine DROP from a column omitted from a change row (which would silently NULL data), so it blocks. |
 | **T10** | `CHANGE COLUMN DATA TYPE` | **SILENT DATA CORRUPTION** — no error, no block, row "converges" but the value is wrong (e.g. source `123.4567` → target `123`) | `handle_schema_changes` is purely **name-based**. A type change keeps the same column name → invisible → target keeps its original type → the value is coerced/truncated on apply. Most dangerous failure mode. |
 | **T12** | DDL with **no trailing DML** | Not surfaced until the next DML row for that table | Inherent to DMS `AddColumnName=true`: a schema change only appears on the next data row. Not a script bug — a hard requirement that **every DDL be followed by DML** to propagate. |
 
@@ -222,3 +223,162 @@ changes (same name = no diff → silent corruption), and **conservatively blocks
 - CDC: converged with I/U/D + cached changes; ADD/RENAME (single, multiple, combined)
   propagate correctly hands-off.
 - DDL limitations mapped (Section 4).
+
+---
+
+## 6. 2026-10 field run (locked-down VPC, firewall, no internet) and the shared workflows
+
+A customer run in a VPC with a VPC-only DSQL endpoint and no internet access exposed the issues
+below. Each is fixed in the repo.
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 1 | CDC `... .whl installation failed` after ~20 min, `pypi.org` timeouts, no control tables | Glue Python shell pip-installs `--extra-py-files` one wheel at a time before the script starts; a wheel whose dependency isn't installed yet (boto3 → botocore, python-dateutil → six) makes pip ask PyPI, which the firewall blocks. Spark jobs are not affected (wheels go straight on the Python path) | `prepare_cdc_wheels.py` (now in `lambdas/`, run automatically by the startup workflow; see 2026-10-02 below): validates the `driver-cdc/` set for Python 3.9 (pure-Python, one version per package, Requires-Python, dependency ranges), then removes Requires-Dist and updates RECORD. Proven with `pip install --no-index` per wheel in the worst order, and in a real Glue run |
+| 2 | `boto3-1.43.x` / `scramp-1.4.17` fail to install in the CDC job | wheels downloaded for Python 3.10; Glue Python shell only runs 3.6/3.9 (boto3/botocore 1.43+ and scramp 1.4.7+ need 3.10; on 3.9 botocore needs urllib3 <1.27) | RUNBOOK Step 3b downloads `driver-cdc/` for Python 3.9 with version caps |
+| 3 | CDC waited forever (`full load not done`) | an old CDC script read only the top-level `_load_status.json` | fixed earlier (merges `_orchestrator/group-*/`); RUNBOOK troubleshooting points to it |
+| 4 | Load job `KeyError: 'table'` after a table was empty at load time | that result had no `table` field | added |
+| 5 | Jobs created outside the VPC when a workflow's connection value was left unfilled | `<<GLUE_CONNECTION>>` (or `""`) was treated as "no connection" | `create_glue_jobs` falls back to the Lambda's `GLUE_CONNECTIONS` setting; the shared workflows take it from `pipeline.json` |
+| 6 | Startup waited ~24 h then failed when DMS was already past its full load | the completion gate only matches `STOPPED_AFTER_CACHED_EVENTS` | the shared startup checks the task before starting DMS and fails in seconds |
+| 7 | — | `create_glue_jobs` cut names at 255 characters, so `-load` and `-load-big` could collide | raises instead |
+| 8 | Optional CDC engine | some environments prefer the CDC job to load drivers exactly like the full-load jobs | `cdc_engine: "spark"` (`glue-templates/cdc-spark.json`, Glue 4.0, 2 × G.1X); `StartCdcJob` no longer passes a wheel list (the job's own setup is used), which a Spark job requires. Proven end to end in a real Glue run (I/U/D applied) |
+
+### Shared startup/cutover state machines
+
+One startup and one cutover state machine now serve every DMS task, started with
+`{"taskArn": "..."}`:
+
+- `config/pipeline.json` holds the values that are the same for every task (project, region,
+  DSQL target, Glue role, Glue connection, CDC engine, control schema).
+- The DMS task's **name** is the task suffix: config folder `config/_task/<name>/`, Glue jobs
+  `<project>-<name>-<role>`. DMS names are letters/digits/hyphens (valid for S3, Glue and Step
+  Functions run names) and unique per region.
+- `resolve_task` (new `mode` = `startup` | `cutover`) runs **before** DMS is started: reads the
+  settings, derives the per-task values, and checks `full-load-and-cdc`,
+  `StopTaskCachedChangesApplied=true`, `AddColumnName=true`, target bucket = pipeline bucket, and
+  that the task isn't already past its full load. Failures stop at `ResolveFailed` with the reason.
+- Safeguards: `config/_task/<name>/_task.json` records the owning task ARN (a reused name of a
+  deleted task is refused, since its old status files would let CDC skip tables the new task never
+  loaded); `config/_task_index/<task id>.json` records the suffix by ARN (a renamed task keeps its
+  folder and jobs, so cutover still finds them).
+- Backward compatible: without `mode`, `resolve_task` returns exactly the old output, and the old
+  per-task state machines run unchanged against the new Lambdas.
+- Verified with a state-machine simulator driving the real `resolve_task`, `create_glue_jobs` and
+  `stop_cdc_run` code: both engines, two concurrent tasks, cutover of one leaving the other
+  running, a failed load group, every `ResolveFailed` case, and every JSONPath reference in both
+  definitions resolved. **Not yet run on real AWS.**
+
+Lesson: test the pipeline in a VPC **without** internet access. With internet, pip silently
+fills dependency gaps and items 1 and 2 stay hidden.
+
+
+### 2026-10-02 — processed/ copies, S3 retries, per-table manifest, cutover LOAD-file fix
+
+- **Symptom:** one table's `processed/` folder dropped from 1,000+ files to ~60 while the
+  table's CDC was blocked on a rejected NULL row.
+- **Change:** applied files are now **copied** to `processed/`, never moved: no CDC file is ever
+  deleted by the pipeline. Each copy is verified by size and retried (boto3 adaptive retries +
+  6 jittered attempts); a copy that still fails is non-fatal (original kept) and is retried every
+  cycle. `processed/_manifest.json` per table reports counts only (in folder, pending apply,
+  applied, copied, pending copy, ledger total, `all_done`).
+- **Consequence:** unblock a table with `UPDATE cdc_control.cdc_status SET status='active'`, never
+  by deleting its row (that would replay every file still in the folder).
+- **Cutover fix:** `drain_check` picked the alphabetically last file as "latest", which with no
+  DMS BucketFolder was always a full-load `LOAD*.csv` (never in the CDC ledger), so cutover could
+  never finish (`CdcDrainTimedOut`). It now skips `LOAD*` files, like the CDC job.
+- **Verified:** the copy/retry/manifest code against a simulated S3 (throttling, failed and short
+  copies, pagination; 17 checks), and the real `process_table` with simulated S3 + DSQL through
+  apply, re-run, a throttled copy, a NULL-row block and an unblock (11 checks: no file deleted,
+  no file applied twice).
+
+### 2026-10-02 — CDC drivers prepared automatically; CDC start confirmed
+
+- **Problem:** every new deployment needed the `driver-cdc/` wheels prepared by hand
+  (`prepare_cdc_wheels.py`) before the Python-shell CDC job could install them behind a firewall.
+  A wrong wheel only surfaced after the full load, as a CDC install failure ~20 min in, and the
+  startup run still reported `Succeeded` because it didn't wait for the CDC run.
+- **Change:** `driver_discovery` (with `prepare_for: pythonshell`, set by the shared startup from
+  `cdc_engine`) validates the set for Python 3.9 with the same code as the tool, plus checks that
+  still apply to already-stripped wheels (all 10 packages, urllib3 1.26.x, matching
+  boto3/botocore). It then writes stripped, verified copies to
+  `driver-cdc-prepared/<fingerprint>/` (`MANIFEST.txt`, then `_READY.json` last) and returns that
+  list; later tasks reuse it. The driver steps now run **before DMS starts** (`DriversFailed`).
+  After `StartCdcJob` the workflow waits for `config/_task/<task>/_cdc_started/<execution
+  name>.json`, which the CDC script writes on reaching its poll loop (`CdcRunFailed`,
+  `CdcRunEnded`, `CdcStartNotConfirmed`).
+- **Deploy impact:** the driver-discovery Lambda needs 1 GB / 300 s; the Step Functions role gets
+  `s3:ListBucket` on `config/_task/*`. No manual wheel step remains.
+- **Verified (simulation):** the Lambda against the real PyPI wheel sets (23 checks: the prepared
+  wheels are byte-identical to the tool's output that installed offline in Glue; scramp 1.4.17,
+  urllib3 2.x, missing six, two scramps, boto3/botocore mismatch and a `.zip` all stopped with a
+  clear message and nothing written; reuse; rebuild after a deleted file; Spark and old per-task
+  calls unchanged). Workflow simulation: 40 checks, including every new failure path. CDC
+  script: 38 checks, including the start marker.
+
+### 2026-10-03 — Overlapping runs: one change applied once, whatever starts the jobs
+
+- **Two CDC runs on one table** (a second Glue job for the same tables, an old per-task workflow
+  next to the shared one, a hand-made copy, two DMS tasks sharing a table). Before: nothing
+  stopped them. A chunk whose commit DSQL rejected (OC000) was retried as-is, so both runs applied
+  every change (simulation: each change applied twice) and the checkpoint jumped back and forth.
+  The final rows came out right in every interleaving simulated, but the work was doubled and
+  intermediate states were stale. **Now:** every step that moves a table's checkpoint (each
+  data chunk, the file-done step, the idle step) first checks, inside the same transaction, that
+  `cdc_status` is still where this run left it (`check_position_cur`). Because both runs update the
+  same `cdc_status` row, DSQL aborts the later committer; its retry sees the moved checkpoint and
+  the run leaves the table for that cycle (`yielded`, with a warning naming the likely causes). A
+  retry after a connection dropped *after* COMMIT now recognizes its own committed step instead of
+  applying it again. A table set to `blocked` mid-run stops at the next step.
+  Verified: the real `process_table`/`apply_file`/`apply_file_nonpk` against a simulated DSQL with
+  optimistic concurrency, a second run interleaved before every commit of the first (keyed: every
+  change committed exactly once and in order, 16 interleavings; keyless: final contents identical
+  to a single run, 10 interleavings), plus the dropped-connection-after-commit and block-mid-run
+  cases (12 checks, both script copies). The same test fails 7 of 12 checks on the previous script.
+- **Two startup (or cutover) runs for one task:** resolve-task now refuses the later of two
+  RUNNING executions of the same state machine for the same `taskArn` (tie-break so exactly one
+  stops). Needs `states:ListExecutions`/`DescribeExecution`; without them it only warns.
+- **Many CDC jobs starting at once:** `ensure_control_tables` retries concurrent-DDL conflicts
+  (OC000/OC001/catalog 23505) up to 10 times; real errors are not retried.
+- **Many tasks preparing CDC drivers at once:** the preparation is deterministic (same
+  fingerprint, byte-identical wheels), so two simultaneous preparations write identical files.
+- **Not guarded:** a load job started by hand while the workflow runs the same group (keyless
+  tables can get duplicates; validation reports them).
+- **Found, not changed:** for a keyless table the apply runs all of a file's DELETEs before its
+  INSERTs, so a row inserted and deleted within the same file survives. Keyless tables only.
+- **Docs:** RUNBOOK Step 1's fill-in command now replaces `<<PROJECT>>` (used by the Step
+  Functions and Lambda policies).
+
+### 2026-10-03 — Multi-column primary keys left to a separate CDC job
+
+- **Before:** a table whose primary key has more than one column had no single apply key, so the
+  CDC job treated it as keyless: every UPDATE was skipped (logged in `cdc_skipped_ops`), DELETEs
+  matched on every column (and did nothing if DMS sent only the key columns), and a `_cdc_file`
+  column was added to the target. The old comment promising a fail-closed "Tier 3" for this
+  case had no code behind it.
+- **Now:** `build_table_context` raises `MultiColumnKeyTable` for those tables (even if a logical
+  key is declared); `main()` lists them at startup and never processes them, so their
+  `cdc_control` rows stay free for the separate multi-column-key CDC job. A task whose tables all
+  have multi-column keys starts, writes its start marker and stays idle. The drain check is
+  unchanged and still waits for them, so cutover can't finish before that job has caught up.
+- **Verified:** the real `build_table_context` and `main()` with a mix of single-key, keyless and
+  multi-column-key tables (10 checks); the copy-fix (38) and two-run (12) suites still pass.
+
+### 2026-10-03 — Only the DMS null marker is NULL; text is stored as written
+
+- **Before:** the load, validation and CDC jobs turned `NULL`, `N/A`, `NA`, `NONE`, `(NULL)` and `\N`
+  (any case, spaces ignored) into NULL in every column, so real text values such as a product
+  code `NA` were silently lost, or rejected by a NOT NULL column (which blocks the table in CDC).
+  The full load also trimmed spaces from all text, while CDC kept them.
+- **Now:** a value is NULL only if it is empty or exactly equals the endpoint's `CsvNullValue`
+  (DMS default `NULL`, per the DMS S3Settings reference). resolve-task reads it from the
+  endpoint (shared mode), the startup workflow passes it to create-glue-jobs, which sets
+  `--csv_null_value` on the load, load-big, validate and CDC jobs (`__EMPTY__` when the marker is
+  the empty string, because Glue can't pass an empty argument). Without it (older workflows) the
+  scripts use `NULL`. Text is kept exactly, spaces included, in all three jobs; typed columns are
+  trimmed and whitespace-only becomes NULL. A typed column holding `NA` now fails its cast
+  instead of silently becoming NULL.
+- **Verified:** the real `convert_value` (both CDC copies) and the real Spark `null_marker_expr`
+  (load and validation) on the same text and numeric values with three markers (`NULL`, empty,
+  custom): all three jobs agree (12 checks); workflow plumbing including an empty marker and the
+  legacy path (46 workflow checks); all other suites unchanged.
+- **Not changed:** data already loaded by earlier versions (USAGE_GUIDE §4b explains how to find
+  and fix it).

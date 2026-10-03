@@ -39,6 +39,18 @@
       "Action": ["iam:PassRole"],
       "Resource": ["arn:aws:iam::<<ACCOUNT_ID>>:role/<<GLUE_EXEC_ROLE_NAME>>"],
       "Condition": { "StringEquals": { "iam:PassedToService": "glue.amazonaws.com" } }
+    },
+    {
+      "Sid": "RefuseSecondRunForSameTaskList",
+      "Effect": "Allow",
+      "Action": ["states:ListExecutions"],
+      "Resource": ["arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-*"]
+    },
+    {
+      "Sid": "RefuseSecondRunForSameTaskDescribe",
+      "Effect": "Allow",
+      "Action": ["states:DescribeExecution"],
+      "Resource": ["arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-*:*"]
     }
   ]
 }

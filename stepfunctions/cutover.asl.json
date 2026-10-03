@@ -1,95 +1,313 @@
 {
-  "Comment": "Per-task cutover: ONE per task (TASK_ARN hardcoded). Stop CDC -> drain -> stop this task's CDC run -> drop _cdc_file -> delete this task's Glue jobs.",
-  "StartAt": "CutoverResolveTask",
+  "Comment": "Shared cutover: ONE state machine for every DMS task. Start with {\"taskArn\": \"...\"}. Stop DMS -> drain CDC -> stop this task's CDC run -> drop _cdc_file -> delete this task's Glue jobs. The task's folder and job names are found by its ARN, so renaming the DMS task does not break cutover.",
+  "StartAt": "CheckInput",
   "States": {
+    "CheckInput": {
+      "Type": "Choice",
+      "Comment": "Start input must be {\"taskArn\": \"...\"}; everything else comes from config/pipeline.json and the DMS task.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.taskArn",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.taskArn",
+              "IsString": true
+            }
+          ],
+          "Next": "CutoverResolveTask"
+        }
+      ],
+      "Default": "MissingTaskArn"
+    },
+    "MissingTaskArn": {
+      "Type": "Fail",
+      "Error": "MissingTaskArn",
+      "Cause": "Start this workflow with input {\"taskArn\": \"arn:aws:dms:<region>:<account>:task:<id>\"}. Optional: \"taskSuffix\" (override the folder/job name), \"adoptExistingFolder\": true (startup only)."
+    },
     "CutoverResolveTask": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "Derive cdc_root from the task's S3 target BucketFolder (matches startup) so drain-check scans the folder where DMS actually wrote CDC files.",
-      "Parameters": {"FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>", "Payload": {"taskArn": "<<TASK_ARN>>", "configPrefix": "<<CONFIG_PREFIX>>"}},
-      "ResultSelector": {"cdcRoot.$": "$.Payload.cdcRoot"},
+      "Comment": "Settings + this task's folder, CDC job name and cdc_root (resolve_task shared mode, read-only).",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "cutover",
+          "bucket": "<<BUCKET>>",
+          "settingsKey": "config/pipeline.json",
+          "input.$": "$",
+          "execution.$": "$$.Execution.Id",
+          "stateMachine.$": "$$.StateMachine.Id"
+        }
+      },
+      "ResultSelector": {
+        "taskArnList.$": "$.Payload.taskArnList",
+        "taskName.$": "$.Payload.taskName",
+        "taskSuffix.$": "$.Payload.taskSuffix",
+        "configPrefix.$": "$.Payload.configPrefix",
+        "project.$": "$.Payload.project",
+        "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+        "dsqlUser.$": "$.Payload.dsqlUser",
+        "dsqlDatabase.$": "$.Payload.dsqlDatabase",
+        "controlSchema.$": "$.Payload.controlSchema",
+        "cdcJobName.$": "$.Payload.cdcJobName",
+        "cdcRoot.$": "$.Payload.cdcRoot",
+        "warnings.$": "$.Payload.warnings"
+      },
       "ResultPath": "$.resolved",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ResolveFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "StopCdcDmsTask"
+    },
+    "ResolveFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the resolve-task error (bad settings, DMS task check, folder owner check).",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
     },
     "StopCdcDmsTask": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:stopReplicationTask",
-      "Parameters": {"ReplicationTaskArn": "<<TASK_ARN>>"},
+      "Parameters": {
+        "ReplicationTaskArn.$": "$.taskArn"
+      },
       "ResultPath": "$.stopResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "InitDmsStopCount"
     },
-    "InitDmsStopCount": {"Type": "Pass", "Parameters": {"c": 0}, "ResultPath": "$.dmsStop", "Next": "WaitDmsStop"},
-    "WaitDmsStop": {"Type": "Wait", "Seconds": 15, "Next": "DescribeCdcDmsTask"},
+    "InitDmsStopCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "c": 0
+      },
+      "ResultPath": "$.dmsStop",
+      "Next": "WaitDmsStop"
+    },
+    "WaitDmsStop": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "DescribeCdcDmsTask"
+    },
     "DescribeCdcDmsTask": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
-      "Parameters": {"Filters": [{"Name": "replication-task-arn", "Values": ["<<TASK_ARN>>"]}]},
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "replication-task-arn",
+            "Values.$": "$.resolved.taskArnList"
+          }
+        ]
+      },
       "ResultPath": "$.describeResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "IsCdcTaskStopped"
     },
     "IsCdcTaskStopped": {
       "Type": "Choice",
       "Choices": [
-        {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "stopped", "Next": "InitDrainCount"},
-        {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "failed", "Next": "CutoverFailed"}
+        {
+          "Variable": "$.describeResult.ReplicationTasks[0].Status",
+          "StringEquals": "stopped",
+          "Next": "InitDrainCount"
+        },
+        {
+          "Variable": "$.describeResult.ReplicationTasks[0].Status",
+          "StringEquals": "failed",
+          "Next": "CutoverFailed"
+        }
       ],
       "Default": "IncrDmsStopCount"
     },
-    "IncrDmsStopCount": {"Type": "Pass", "Parameters": {"c.$": "States.MathAdd($.dmsStop.c, 1)"}, "ResultPath": "$.dmsStop", "Next": "DmsStopBudgetLeft"},
+    "IncrDmsStopCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "c.$": "States.MathAdd($.dmsStop.c, 1)"
+      },
+      "ResultPath": "$.dmsStop",
+      "Next": "DmsStopBudgetLeft"
+    },
     "DmsStopBudgetLeft": {
       "Type": "Choice",
-      "Choices": [{"Variable": "$.dmsStop.c", "NumericLessThan": 240, "Next": "WaitDmsStop"}],
+      "Choices": [
+        {
+          "Variable": "$.dmsStop.c",
+          "NumericLessThan": 240,
+          "Next": "WaitDmsStop"
+        }
+      ],
       "Default": "CutoverFailed"
     },
-    "InitDrainCount": {"Type": "Pass", "Parameters": {"c": 0}, "ResultPath": "$.drain", "Next": "DrainCheck"},
+    "InitDrainCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "c": 0
+      },
+      "ResultPath": "$.drain",
+      "Next": "DrainCheck"
+    },
     "DrainCheck": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "<<DRAIN_CHECK_LAMBDA_ARN>>",
         "Payload": {
-          "config_prefix": "<<CONFIG_PREFIX>>",
+          "config_prefix.$": "$.resolved.configPrefix",
           "cdc_root.$": "$.resolved.cdcRoot",
-          "dsql_endpoint": "<<DSQL_ENDPOINT>>",
-          "dsql_user": "<<DSQL_USER>>",
-          "dsql_database": "<<DSQL_DATABASE>>",
-          "control_schema": "cdc_control"
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema"
         }
       },
-      "ResultSelector": {"caughtUp.$": "$.Payload.caughtUp"},
+      "ResultSelector": {
+        "caughtUp.$": "$.Payload.caughtUp"
+      },
       "ResultPath": "$.drainResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "CdcCaughtUp"
     },
     "CdcCaughtUp": {
       "Type": "Choice",
-      "Choices": [{"Variable": "$.drainResult.caughtUp", "BooleanEquals": true, "Next": "StopCdcRun"}],
+      "Choices": [
+        {
+          "Variable": "$.drainResult.caughtUp",
+          "BooleanEquals": true,
+          "Next": "StopCdcRun"
+        }
+      ],
       "Default": "IncrDrainCount"
     },
-    "IncrDrainCount": {"Type": "Pass", "Parameters": {"c.$": "States.MathAdd($.drain.c, 1)"}, "ResultPath": "$.drain", "Next": "DrainBudgetLeft"},
+    "IncrDrainCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "c.$": "States.MathAdd($.drain.c, 1)"
+      },
+      "ResultPath": "$.drain",
+      "Next": "DrainBudgetLeft"
+    },
     "DrainBudgetLeft": {
       "Type": "Choice",
-      "Choices": [{"Variable": "$.drain.c", "NumericLessThan": 4320, "Next": "WaitDrain"}],
+      "Choices": [
+        {
+          "Variable": "$.drain.c",
+          "NumericLessThan": 4320,
+          "Next": "WaitDrain"
+        }
+      ],
       "Default": "CdcDrainTimedOut"
     },
-    "WaitDrain": {"Type": "Wait", "Seconds": 10, "Next": "DrainCheck"},
+    "WaitDrain": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "DrainCheck"
+    },
     "StopCdcRun": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "<<STOP_CDC_RUN_LAMBDA_ARN>>",
-        "Payload": {"cdcJobName": "<<PROJECT>>-<<TASK_SUFFIX>>-cdc", "configPrefix": "<<CONFIG_PREFIX>>"}
+        "Payload": {
+          "cdcJobName.$": "$.resolved.cdcJobName",
+          "configPrefix.$": "$.resolved.configPrefix"
+        }
       },
       "ResultPath": "$.stopRun",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "DropTags"
     },
     "DropTags": {
@@ -98,16 +316,33 @@
       "Parameters": {
         "FunctionName": "<<DROP_TAGS_LAMBDA_ARN>>",
         "Payload": {
-          "config_prefix": "<<CONFIG_PREFIX>>",
-          "dsql_endpoint": "<<DSQL_ENDPOINT>>",
-          "dsql_user": "<<DSQL_USER>>",
-          "dsql_database": "<<DSQL_DATABASE>>",
+          "config_prefix.$": "$.resolved.configPrefix",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
           "drop_cdc_file_tag": true
         }
       },
       "ResultPath": "$.dropResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "DeleteGlueJobs"
     },
     "DeleteGlueJobs": {
@@ -115,15 +350,47 @@
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
-        "Payload": {"mode": "delete", "bucket": "<<BUCKET>>", "project": "<<PROJECT>>", "taskSuffix": "<<TASK_SUFFIX>>"}
+        "Payload": {
+          "mode": "delete",
+          "bucket": "<<BUCKET>>",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix"
+        }
       },
       "ResultPath": "$.deleteJobs",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "CutoverSucceeded", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverSucceeded",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "CutoverSucceeded"
     },
-    "CutoverSucceeded": {"Type": "Succeed"},
-    "CutoverFailed": {"Type": "Fail", "Error": "CutoverFailed", "Cause": "A cutover step failed. See execution history."},
-    "CdcDrainTimedOut": {"Type": "Fail", "Error": "CdcDrainBudgetExceeded", "Cause": "CDC did not catch up to the latest S3 CSV within the drain budget. Investigate, then re-run cutover."}
+    "CutoverSucceeded": {
+      "Type": "Succeed"
+    },
+    "CutoverFailed": {
+      "Type": "Fail",
+      "Error": "CutoverFailed",
+      "Cause": "A cutover step failed. See execution history."
+    },
+    "CdcDrainTimedOut": {
+      "Type": "Fail",
+      "Error": "CdcDrainBudgetExceeded",
+      "Cause": "CDC did not catch up to the latest S3 CSV within the drain budget. Investigate, then re-run cutover."
+    }
   }
 }

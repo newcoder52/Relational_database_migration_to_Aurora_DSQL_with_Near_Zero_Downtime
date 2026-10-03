@@ -36,8 +36,25 @@ Input event: {
   "cdcExtraPyFiles",   # optional: driver-cdc wheel list (incl. boto3) for the cdc role's stored default
   "glue_role_arn", "region",
   "dsql_endpoint", "dsql_user", "dsql_database",
-  "cdc_root", "control_schema", "dms_task_arn"   # dms_task_arn used by the cdc role only
+  "cdc_root", "control_schema", "dms_task_arn",  # dms_task_arn used by the cdc role only
+  "csv_null_value",    # optional: the DMS endpoint's CsvNullValue (how DMS writes a real NULL);
+                       # set on load/load-big/validate/cdc as --csv_null_value ("" -> "__EMPTY__").
+                       # Absent (older workflows): the scripts use the DMS default "NULL".
+  "cdc_engine"         # optional: "pythonshell" (default, glue-templates/cdc.json) or "spark"
+                       # (the shared startup workflow passes pipeline.json's cdc_engine)
+                       # (glue-templates/cdc-spark.json). Also settable with the Lambda env var
+                       # CDC_ENGINE. Same job name and same script either way.
 }
+
+CDC engines:
+  pythonshell  Python 3.9, 1 DPU. Glue pip-installs --extra-py-files (driver-cdc/ list), so the
+               wheels must have no Requires-Dist behind a firewall (cdc_firewall_fix/plan_a_python_shell/prepare_cdc_wheels.py).
+  spark        Glue 4.0 Spark (Python 3.10), 2 x G.1X. Identical driver delivery to the full-load
+               jobs: --extra-py-files = driver-fullload/ (added to sys.path, no pip) and boto3 via
+               --additional-python-modules from driver-cdc/. Costs ~2x pythonshell per hour. The
+               script does not use Spark; it just runs on the Spark driver.
+  Switching engine on an existing job: Glue cannot change a job's type in place, so the job is
+  deleted and re-created with the same name (refused while a run is active).
 Returns: { "jobs": { "load": "<name>", "load-big": "...", "validate": "...", "cdc": "..." },
            "created": [...], "updated": [...], "deleted": [...] }
 """
@@ -49,6 +66,23 @@ import boto3
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 _ROLES = ["discovery", "load", "load-big", "validate", "cdc"]
+_CDC_ENGINES = {"pythonshell": "cdc", "spark": "cdc-spark"}   # engine -> template file stem
+_ACTIVE_RUN_STATES = {"STARTING", "RUNNING", "STOPPING", "WAITING"}
+
+
+def _cdc_engine(event):
+    eng = (event.get("cdc_engine") or os.environ.get("CDC_ENGINE") or "pythonshell")
+    eng = str(eng).strip().lower()
+    if eng in ("glueetl", "pyspark"):
+        eng = "spark"
+    if eng not in _CDC_ENGINES:
+        raise Exception(f"cdc_engine must be 'pythonshell' or 'spark' (got {eng!r})")
+    return eng
+
+
+def _active_runs(glue, name):
+    runs = glue.get_job_runs(JobName=name, MaxResults=50).get("JobRuns", [])
+    return [r["Id"] for r in runs if r.get("JobRunState") in _ACTIVE_RUN_STATES]
 
 
 def _read_json(s3, bucket, key):
@@ -56,7 +90,13 @@ def _read_json(s3, bucket, key):
 
 
 def _job_name(project, task_suffix, role):
-    return f"{project}-{task_suffix}-{role}"[:255]
+    # Never truncate: cutting at 255 could give two roles (e.g. -load and -load-big) the same
+    # name. resolve_task already refuses suffixes that are too long; this is the backstop.
+    name = f"{project}-{task_suffix}-{role}"
+    if len(name) > 255:
+        raise Exception(f"Glue job name {name[:60]}... is {len(name)} characters (max 255). "
+                        f"Use a shorter project or task name.")
+    return name
 
 
 # Wheels a Spark (glueetl) job needs to get a DSQL-aware boto3. Glue 4.0 bundles a boto3 that
@@ -87,13 +127,18 @@ def _connections_for(tmpl, event):
       3. the Lambda env var GLUE_CONNECTIONS (comma-separated) -- lets you enable it on a
          live deployment without editing the state machine.
     Empty -> no connection (job runs on Glue's default network, the previous behaviour).
-    Unfilled <<...>> placeholders are ignored."""
-    raw = tmpl.get("connections") if "connections" in tmpl else None
-    if raw is None:
-        raw = event.get("glue_connections") or os.environ.get("GLUE_CONNECTIONS", "")
-    if isinstance(raw, str):
-        raw = raw.split(",")
-    return [c.strip() for c in (raw or []) if isinstance(c, str) and c.strip() and "<<" not in c]
+    Unfilled <<...>> placeholders are ignored, so step 3 still applies."""
+    def _clean(raw):
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        return [c.strip() for c in (raw or []) if isinstance(c, str) and c.strip()
+                and "<<" not in c]
+
+    if tmpl.get("connections") is not None:
+        return _clean(tmpl.get("connections"))
+    # An unfilled "<<GLUE_CONNECTION>>" from a workflow (or an empty value) falls through to
+    # the Lambda's GLUE_CONNECTIONS setting instead of silently creating jobs with no VPC.
+    return _clean(event.get("glue_connections")) or _clean(os.environ.get("GLUE_CONNECTIONS", ""))
 
 
 def handler(event, context):
@@ -135,12 +180,17 @@ def handler(event, context):
     dms_task_arn = event.get("dms_task_arn", "")
 
     s3 = boto3.client("s3", region_name=REGION)
-    created, updated = [], []
+    created, updated, replaced = [], [], []
+    cdc_engine = _cdc_engine(event)
 
     for role in _ROLES:
-        tmpl = _read_json(s3, bucket, f"{templates_prefix}/{role}.json")
+        tmpl_stem = _CDC_ENGINES[cdc_engine] if role == "cdc" else role
+        tmpl = _read_json(s3, bucket, f"{templates_prefix}/{tmpl_stem}.json")
         name = names[role]
         command_name = tmpl.get("command_name", "glueetl")
+        if role == "cdc" and (command_name == "pythonshell") != (cdc_engine == "pythonshell"):
+            raise Exception(f"{tmpl_stem}.json has command_name={command_name!r}, which does not "
+                            f"match cdc_engine={cdc_engine!r}")
         script_key = tmpl["script"]
         script_location = f"s3://{bucket}/{scripts_prefix}/{script_key}"
 
@@ -164,6 +214,10 @@ def handler(event, context):
         }
         if extra_py_files:
             args["--extra-py-files"] = extra_py_files
+        if role != "discovery" and event.get("csv_null_value") is not None:
+            # Glue can't pass an empty argument value, so an empty marker travels as __EMPTY__.
+            _nv = str(event["csv_null_value"])
+            args["--csv_null_value"] = _nv if _nv != "" else "__EMPTY__"
         if role == "cdc":
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema
@@ -176,7 +230,9 @@ def handler(event, context):
                 args["--dms_task_arn"] = dms_task_arn
             # Python Shell jobs do NOT auto-inject --JOB_NAME the way Spark (glueetl) jobs do,
             # but the script calls getResolvedOptions(sys.argv, ['JOB_NAME']) -> must pass it.
-            args["--JOB_NAME"] = name
+            # Spark jobs: Glue sets --JOB_NAME itself and its docs say never to set it.
+            if command_name == "pythonshell":
+                args["--JOB_NAME"] = name
             # CDC (pythonshell) needs a dsql-aware boto3 delivered as S3 WHEELS on
             # --extra-py-files (the in-script shim promotes them ahead of Glue's bundled,
             # too-old boto3). The glueetl jobs must NOT get boto3 wheels (they break botocore's
@@ -187,9 +243,16 @@ def handler(event, context):
             # Use it for the cdc role's stored default; the startup SM also passes the same
             # list as --extra-py-files at run time (authoritative). Falls back to the shared
             # extraPyFiles if cdcExtraPyFiles was not provided.
-            _cdc_extra = event.get("cdcExtraPyFiles", "") or extra_py_files
-            if _cdc_extra:
-                args["--extra-py-files"] = _cdc_extra
+            # Spark CDC engine: keep the driver-fullload list (pg8000 stack only) on
+            # --extra-py-files exactly like the other Spark jobs; boto3 arrives through
+            # --additional-python-modules below.
+            if command_name == "pythonshell":
+                _cdc_extra = event.get("cdcExtraPyFiles", "") or extra_py_files
+                if _cdc_extra:
+                    args["--extra-py-files"] = _cdc_extra
+            elif not extra_py_files:
+                raise Exception(f"Spark CDC job {name} needs the driver-fullload wheel list "
+                                f"(extraPyFiles) for pg8000; it was empty.")
         args.update(tmpl.get("default_arguments", {}) or {})
 
         # Spark jobs: deliver a DSQL-aware boto3 via --additional-python-modules (S3 wheels,
@@ -272,24 +335,44 @@ def handler(event, context):
                or "already exists" in str(_ce).lower() \
                or "already submitted" in str(_ce).lower():
                 upd = {k: v for k, v in job_kwargs.items() if k != "Name"}
+                try:
+                    _existing_job = glue.get_job(JobName=name).get("Job", {})
+                except Exception as _ge:
+                    _existing_job = {}
+                    print(f"(warn) {name}: could not read existing job: {_ge}")
                 # UpdateJob REPLACES the whole job definition: any field we omit is wiped.
                 # If no connection is configured for this run, keep the one already on the job
                 # (e.g. a VPC connection added in the Glue console) instead of silently
                 # stripping it -- otherwise the job falls back to Glue's default network and
                 # can no longer reach a VPC-only DSQL endpoint.
                 if "Connections" not in upd:
-                    try:
-                        _existing = (glue.get_job(JobName=name).get("Job", {})
-                                     .get("Connections") or {})
-                        if _existing.get("Connections"):
-                            upd["Connections"] = {"Connections": _existing["Connections"]}
-                            print(f"(info) {name}: keeping existing connection(s) "
-                                  f"{_existing['Connections']}")
-                    except Exception as _ge:
-                        print(f"(warn) {name}: could not read existing connections: {_ge}")
-                glue.update_job(JobName=name, JobUpdate=upd)
-                updated.append(name)
+                    _existing = _existing_job.get("Connections") or {}
+                    if _existing.get("Connections"):
+                        upd["Connections"] = {"Connections": _existing["Connections"]}
+                        job_kwargs["Connections"] = upd["Connections"]
+                        print(f"(info) {name}: keeping existing connection(s) "
+                              f"{_existing['Connections']}")
+                _old_type = (_existing_job.get("Command") or {}).get("Name")
+                if _old_type and _old_type != command_name:
+                    # Engine switch (pythonshell <-> glueetl): Glue can't change a job's type
+                    # with UpdateJob, so delete and re-create under the same name. Never while
+                    # a run is active (that would kill CDC mid-apply).
+                    _act = _active_runs(glue, name)
+                    if _act:
+                        raise Exception(
+                            f"{name} is a {_old_type} job and this run wants {command_name}; "
+                            f"switching needs a delete + re-create, but run(s) {_act} are "
+                            f"active. Stop them (aws glue batch-stop-job-run) and retry.")
+                    print(f"(info) {name}: switching job type {_old_type} -> {command_name} "
+                          f"(delete + re-create, same name)")
+                    glue.delete_job(JobName=name)
+                    glue.create_job(**job_kwargs)
+                    replaced.append(name)
+                else:
+                    glue.update_job(JobName=name, JobUpdate=upd)
+                    updated.append(name)
             else:
                 raise
 
-    return {"jobs": names, "created": created, "updated": updated, "deleted": []}
+    return {"jobs": names, "created": created, "updated": updated, "replaced": replaced,
+            "deleted": [], "cdcEngine": cdc_engine}

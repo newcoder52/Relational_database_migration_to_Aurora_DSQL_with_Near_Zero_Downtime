@@ -48,7 +48,8 @@ def _connect_dsql(endpoint, user, database):
 
 
 def _latest_cdc_file(s3, bucket, cdc_root, dms_schema, dms_table):
-    """Latest CDC CSV key under <cdc_root>/<schema>/<table>/ (skip processed/ + failed/).
+    """Latest CDC CSV key under <cdc_root>/<schema>/<table>/ (skip processed/ + failed/ and
+    full-load LOAD*.csv files).
     cdc_root may be a '.'/'/'-style sentinel meaning "no subfolder" (DMS S3 target with NO
     BucketFolder -> CDC files share the per-table root <schema>/<table>/). Normalize it the
     same way glue_cdc_continuous.derive_table_prefixes does, so an empty root yields a clean
@@ -66,6 +67,12 @@ def _latest_cdc_file(s3, bucket, cdc_root, dms_schema, dms_table):
             k = o["Key"]
             rel = k[len(prefix):]
             if "/" in rel:            # skip processed/ + failed/ subfolders
+                continue
+            # Skip full-load LOAD*.csv files: with no DMS BucketFolder they share this folder
+            # with the CDC files, and "LOAD..." sorts after "2026..." -- so without this the
+            # latest file would always be a LOAD file, which is never in the CDC ledger, and
+            # cutover would wait until CdcDrainTimedOut. Same filter as the CDC job.
+            if rel.upper().startswith("LOAD"):
                 continue
             if k.lower().endswith(".csv"):
                 # CDC files are timestamp-named -> lexical max == latest.

@@ -1,28 +1,173 @@
 {
-  "Comment": "Per-task startup: ONE state machine per DMS task (TASK_ARN hardcoded). Manages its own Glue jobs from S3 templates. Serialized CDC (default S3 layout).",
-  "StartAt": "StartDmsTask",
+  "Comment": "Shared startup: ONE state machine for every DMS task. Start with {\"taskArn\": \"...\"}. ResolveTask reads s3://<<BUCKET>>/config/pipeline.json, derives the task's folder and Glue job names from the DMS task name, and checks the task before DMS is started. Then: full load -> validate -> resume DMS -> start the CDC job. Driver wheels are checked (and, for the Python-shell CDC job, prepared automatically) BEFORE DMS starts; the run only reports success once the CDC job confirms it reached its poll loop.",
+  "StartAt": "CheckInput",
   "States": {
+    "CheckInput": {
+      "Type": "Choice",
+      "Comment": "Start input must be {\"taskArn\": \"...\"}; everything else comes from config/pipeline.json and the DMS task.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.taskArn",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.taskArn",
+              "IsString": true
+            }
+          ],
+          "Next": "ResolveTask"
+        }
+      ],
+      "Default": "MissingTaskArn"
+    },
+    "MissingTaskArn": {
+      "Type": "Fail",
+      "Error": "MissingTaskArn",
+      "Cause": "Start this workflow with input {\"taskArn\": \"arn:aws:dms:<region>:<account>:task:<id>\"}. Optional: \"taskSuffix\" (override the folder/job name), \"adoptExistingFolder\": true (startup only)."
+    },
+    "ResolveTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "startup",
+          "bucket": "<<BUCKET>>",
+          "settingsKey": "config/pipeline.json",
+          "input.$": "$",
+          "execution.$": "$$.Execution.Id",
+          "stateMachine.$": "$$.StateMachine.Id"
+        }
+      },
+      "ResultSelector": {
+        "taskArnList.$": "$.Payload.taskArnList",
+        "taskName.$": "$.Payload.taskName",
+        "taskSuffix.$": "$.Payload.taskSuffix",
+        "configPrefix.$": "$.Payload.configPrefix",
+        "project.$": "$.Payload.project",
+        "region.$": "$.Payload.region",
+        "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+        "dsqlUser.$": "$.Payload.dsqlUser",
+        "dsqlDatabase.$": "$.Payload.dsqlDatabase",
+        "glueRoleArn.$": "$.Payload.glueRoleArn",
+        "glueConnection.$": "$.Payload.glueConnection",
+        "cdcEngine.$": "$.Payload.cdcEngine",
+        "controlSchema.$": "$.Payload.controlSchema",
+        "cdcJobName.$": "$.Payload.cdcJobName",
+        "dmsS3Base.$": "$.Payload.dmsS3Base",
+        "s3Bucket.$": "$.Payload.s3Bucket",
+        "cdcRoot.$": "$.Payload.cdcRoot",
+        "timestampColumnName.$": "$.Payload.timestampColumnName",
+        "warnings.$": "$.Payload.warnings",
+        "csvNullValue.$": "$.Payload.csvNullValue"
+      },
+      "ResultPath": "$.resolved",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ResolveFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "DriverDiscoveryFullload",
+      "Comment": "Settings + per-task values + pre-start checks + folder-owner safeguard (resolve_task shared mode)."
+    },
+    "ResolveFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the resolve-task error (bad settings, DMS task check, folder owner check).",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
     "StartDmsTask": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
       "Parameters": {
-        "ReplicationTaskArn": "<<TASK_ARN>>",
+        "ReplicationTaskArn.$": "$.taskArn",
         "StartReplicationTaskType": "start-replication"
       },
       "ResultPath": "$.startResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 2, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "InitPollCount", "ResultPath": "$.startError"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "InitPollCount",
+          "ResultPath": "$.startError"
+        }
+      ],
       "Next": "InitPollCount"
     },
-    "InitPollCount": {"Type": "Pass", "Parameters": {"pollCount": 0}, "ResultPath": "$.poll", "Next": "WaitForDms"},
-    "WaitForDms": {"Type": "Wait", "Seconds": 30, "Next": "DescribeDmsTask"},
+    "InitPollCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "pollCount": 0
+      },
+      "ResultPath": "$.poll",
+      "Next": "WaitForDms"
+    },
+    "WaitForDms": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "DescribeDmsTask"
+    },
     "DescribeDmsTask": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
-      "Parameters": {"Filters": [{"Name": "replication-task-arn", "Values": ["<<TASK_ARN>>"]}]},
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "replication-task-arn",
+            "Values.$": "$.resolved.taskArnList"
+          }
+        ]
+      },
       "ResultPath": "$.describeResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "DmsFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DmsFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "IsDmsDone"
     },
     "IsDmsDone": {
@@ -30,27 +175,61 @@
       "Choices": [
         {
           "And": [
-            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored", "IsPresent": true},
-            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored", "NumericGreaterThan": 0}
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored",
+              "NumericGreaterThan": 0
+            }
           ],
           "Next": "DmsFailed"
         },
         {
           "And": [
-            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent", "IsPresent": true},
-            {"Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent", "NumericEquals": 100},
-            {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "stopped"},
-            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "IsPresent": true},
-            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"}
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "NumericEquals": 100
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"
+            }
           ],
-          "Next": "ResolveTask"
+          "Next": "CreateGlueJobs"
         },
-        {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "failed", "Next": "DmsFailed"},
+        {
+          "Variable": "$.describeResult.ReplicationTasks[0].Status",
+          "StringEquals": "failed",
+          "Next": "DmsFailed"
+        },
         {
           "And": [
-            {"Variable": "$.describeResult.ReplicationTasks[0].Status", "StringEquals": "stopped"},
-            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "IsPresent": true},
-            {"Variable": "$.describeResult.ReplicationTasks[0].StopReason", "StringMatches": "*STOPPED_AFTER_FULL_LOAD*"}
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "StringMatches": "*STOPPED_AFTER_FULL_LOAD*"
+            }
           ],
           "Next": "DmsFailed"
         }
@@ -59,54 +238,138 @@
     },
     "IncrementPollCount": {
       "Type": "Pass",
-      "Parameters": {"pollCount.$": "States.MathAdd($.poll.pollCount, 1)"},
+      "Parameters": {
+        "pollCount.$": "States.MathAdd($.poll.pollCount, 1)"
+      },
       "ResultPath": "$.poll",
       "Next": "PollBudgetLeft"
     },
     "PollBudgetLeft": {
       "Type": "Choice",
-      "Choices": [{"Variable": "$.poll.pollCount", "NumericLessThan": 2880, "Next": "WaitForDms"}],
+      "Choices": [
+        {
+          "Variable": "$.poll.pollCount",
+          "NumericLessThan": 2880,
+          "Next": "WaitForDms"
+        }
+      ],
       "Default": "DmsTimedOut"
-    },
-    "ResolveTask": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {"FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>", "Payload": {"taskArn": "<<TASK_ARN>>", "configPrefix": "<<CONFIG_PREFIX>>"}},
-      "ResultSelector": {"dmsS3Base.$": "$.Payload.dmsS3Base", "s3Bucket.$": "$.Payload.s3Bucket", "cdcRoot.$": "$.Payload.cdcRoot", "timestampColumnName.$": "$.Payload.timestampColumnName"},
-      "ResultPath": "$.resolved",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
-      "Next": "DriverDiscoveryFullload"
     },
     "DriverDiscoveryFullload": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {"FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>", "Payload": {"bucket": "<<BUCKET>>", "drivers_prefix": "driver-fullload"}},
-      "ResultSelector": {"extraPyFiles.$": "$.Payload.extraPyFiles"},
+      "Parameters": {
+        "FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket": "<<BUCKET>>",
+          "drivers_prefix": "driver-fullload"
+        }
+      },
+      "ResultSelector": {
+        "extraPyFiles.$": "$.Payload.extraPyFiles"
+      },
       "ResultPath": "$.driverFullload",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DriversFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "DriverDiscoveryValidation"
     },
     "DriverDiscoveryValidation": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {"FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>", "Payload": {"bucket": "<<BUCKET>>", "drivers_prefix": "driver-validation"}},
-      "ResultSelector": {"extraPyFiles.$": "$.Payload.extraPyFiles"},
+      "Parameters": {
+        "FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket": "<<BUCKET>>",
+          "drivers_prefix": "driver-validation"
+        }
+      },
+      "ResultSelector": {
+        "extraPyFiles.$": "$.Payload.extraPyFiles"
+      },
       "ResultPath": "$.driverValidation",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DriversFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "DriverDiscoveryCdc"
     },
     "DriverDiscoveryCdc": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {"FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>", "Payload": {"bucket": "<<BUCKET>>", "drivers_prefix": "driver-cdc"}},
-      "ResultSelector": {"extraPyFiles.$": "$.Payload.extraPyFiles"},
+      "Parameters": {
+        "FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket": "<<BUCKET>>",
+          "drivers_prefix": "driver-cdc",
+          "prepare_for.$": "$.resolved.cdcEngine"
+        }
+      },
+      "ResultSelector": {
+        "extraPyFiles.$": "$.Payload.extraPyFiles"
+      },
       "ResultPath": "$.driverCdc",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
-      "Next": "CreateGlueJobs"
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DriversFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "StartDmsTask",
+      "Comment": "Python-shell CDC engine: the Lambda validates the driver-cdc/ wheels for Python 3.9, strips their Requires-Dist (so Glue's pip never contacts PyPI) into driver-cdc-prepared/<fingerprint>/ once per wheel set, and returns that list. A wrong wheel fails here, before DMS starts. Spark engine: plain driver-cdc/ list."
     },
     "CreateGlueJobs": {
       "Type": "Task",
@@ -118,27 +381,48 @@
           "bucket": "<<BUCKET>>",
           "glue_templates_prefix": "glue-templates",
           "scripts_prefix": "scripts",
-          "project": "<<PROJECT>>",
-          "taskSuffix": "<<TASK_SUFFIX>>",
-          "configPrefix": "<<CONFIG_PREFIX>>",
           "extraPyFiles.$": "$.driverFullload.extraPyFiles",
           "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
-          "glue_role_arn": "<<GLUE_EXEC_ROLE_ARN>>",
-          "region": "<<REGION>>",
-          "dsql_endpoint": "<<DSQL_ENDPOINT>>",
-          "dsql_user": "<<DSQL_USER>>",
-          "dsql_database": "<<DSQL_DATABASE>>",
           "cdc_root.$": "$.resolved.cdcRoot",
           "timestampColumnName.$": "$.resolved.timestampColumnName",
-          "control_schema": "cdc_control",
-          "dms_task_arn": "<<TASK_ARN>>",
-          "glue_connections": "<<GLUE_CONNECTION>>"
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "glue_role_arn.$": "$.resolved.glueRoleArn",
+          "region.$": "$.resolved.region",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema",
+          "dms_task_arn.$": "$.taskArn",
+          "glue_connections.$": "$.resolved.glueConnection",
+          "cdc_engine.$": "$.resolved.cdcEngine",
+          "csv_null_value.$": "$.resolved.csvNullValue"
         }
       },
-      "ResultSelector": {"jobs.$": "$.Payload.jobs"},
+      "ResultSelector": {
+        "jobs.$": "$.Payload.jobs"
+      },
       "ResultPath": "$.glue",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "RunDiscovery"
     },
     "RunDiscovery": {
@@ -146,11 +430,33 @@
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": {
         "JobName.$": "$.glue.jobs.discovery",
-        "Arguments": {"--config_prefix": "<<CONFIG_PREFIX>>"}
+        "Arguments": {
+          "--config_prefix.$": "$.resolved.configPrefix"
+        }
       },
       "ResultPath": "$.discoveryResult",
-      "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "PlanSplit"
     },
     "PlanSplit": {
@@ -159,7 +465,6 @@
       "Parameters": {
         "FunctionName": "<<PLAN_SPLIT_LAMBDA_ARN>>",
         "Payload": {
-          "config_prefix": "<<CONFIG_PREFIX>>",
           "cdc_root.$": "$.resolved.cdcRoot",
           "big_table_row_threshold": 6000000,
           "file_fanout_threshold": 8,
@@ -168,13 +473,34 @@
           "conn_budget": 900,
           "min_writers_per_loader": 100,
           "max_writers_per_loader": 150,
-          "map_max_concurrency": 6
+          "map_max_concurrency": 6,
+          "config_prefix.$": "$.resolved.configPrefix"
         }
       },
-      "ResultSelector": {"groups.$": "$.Payload.groups", "group_count.$": "$.Payload.group_count"},
+      "ResultSelector": {
+        "groups.$": "$.Payload.groups",
+        "group_count.$": "$.Payload.group_count"
+      },
       "ResultPath": "$.plan",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "GroupFanOut"
     },
     "GroupFanOut": {
@@ -198,7 +524,13 @@
         "States": {
           "PickLoaderBySize": {
             "Type": "Choice",
-            "Choices": [{"Variable": "$.kind", "StringEquals": "big", "Next": "GroupLoadBig"}],
+            "Choices": [
+              {
+                "Variable": "$.kind",
+                "StringEquals": "big",
+                "Next": "GroupLoadBig"
+              }
+            ],
             "Default": "GroupLoad"
           },
           "GroupLoad": {
@@ -214,8 +546,28 @@
               }
             },
             "ResultPath": "$.loadResult",
-            "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
-            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupFailed", "ResultPath": "$.error"}],
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "GroupFailed",
+                "ResultPath": "$.error"
+              }
+            ],
             "Next": "GroupValidate"
           },
           "GroupLoadBig": {
@@ -231,8 +583,28 @@
               }
             },
             "ResultPath": "$.loadResult",
-            "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
-            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupFailed", "ResultPath": "$.error"}],
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "GroupFailed",
+                "ResultPath": "$.error"
+              }
+            ],
             "Next": "GroupValidate"
           },
           "GroupValidate": {
@@ -240,25 +612,79 @@
             "Resource": "arn:aws:states:::glue:startJobRun.sync",
             "Parameters": {
               "JobName.$": "$.validateJob",
-              "Arguments": {"--config_prefix.$": "$.config_prefix", "--extra-py-files.$": "$.extraPyFilesValidation"}
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--extra-py-files.$": "$.extraPyFilesValidation"
+              }
             },
             "ResultPath": "$.validateResult",
-            "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
-            "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "GroupValidateFailed", "ResultPath": "$.error"}],
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "GroupValidateFailed",
+                "ResultPath": "$.error"
+              }
+            ],
             "Next": "GroupOk"
           },
-          "GroupOk": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "ok"}, "End": true},
-          "GroupFailed": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "failed"}, "End": true},
-          "GroupValidateFailed": {"Type": "Pass", "Parameters": {"group.$": "$.group_index", "status": "validate_failed"}, "End": true}
+          "GroupOk": {
+            "Type": "Pass",
+            "Parameters": {
+              "group.$": "$.group_index",
+              "status": "ok"
+            },
+            "End": true
+          },
+          "GroupFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "group.$": "$.group_index",
+              "status": "failed"
+            },
+            "End": true
+          },
+          "GroupValidateFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "group.$": "$.group_index",
+              "status": "validate_failed"
+            },
+            "End": true
+          }
         }
       },
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "CollectGroupResults"
     },
     "CollectGroupResults": {
       "Type": "Pass",
       "Comment": "Every group ends with {group, status}: ok | failed (load) | validate_failed.",
-      "Parameters": {"statuses.$": "$.mapResult[*].status"},
+      "Parameters": {
+        "statuses.$": "$.mapResult[*].status"
+      },
       "ResultPath": "$.groupCheck",
       "Next": "EvaluateGroupResults"
     },
@@ -278,22 +704,52 @@
       "Choices": [
         {
           "Or": [
-            {"Variable": "$.groupCheck.anyLoadFailed", "BooleanEquals": true},
-            {"Variable": "$.groupCheck.anyValidateFailed", "BooleanEquals": true}
+            {
+              "Variable": "$.groupCheck.anyLoadFailed",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.groupCheck.anyValidateFailed",
+              "BooleanEquals": true
+            }
           ],
           "Next": "GroupsFailed"
         }
       ],
       "Default": "ResumeDmsToCdc"
     },
-    "GroupsFailed": {"Type": "Fail", "Error": "GroupLoadOrValidateFailed", "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run."},
+    "GroupsFailed": {
+      "Type": "Fail",
+      "Error": "GroupLoadOrValidateFailed",
+      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run."
+    },
     "ResumeDmsToCdc": {
       "Type": "Task",
       "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
-      "Parameters": {"ReplicationTaskArn": "<<TASK_ARN>>", "StartReplicationTaskType": "resume-processing"},
+      "Parameters": {
+        "ReplicationTaskArn.$": "$.taskArn",
+        "StartReplicationTaskType": "resume-processing"
+      },
       "ResultPath": "$.resumeResult",
-      "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 5, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "StartCdcJob"
     },
     "StartCdcJob": {
@@ -301,16 +757,258 @@
       "Resource": "arn:aws:states:::glue:startJobRun",
       "Parameters": {
         "JobName.$": "$.glue.jobs.cdc",
-        "Arguments": {"--config_prefix": "<<CONFIG_PREFIX>>", "--dms_task_arn": "<<TASK_ARN>>", "--extra-py-files.$": "$.driverCdc.extraPyFiles", "--cdc_root.$": "$.resolved.cdcRoot", "--timestamp_column.$": "$.resolved.timestampColumnName"}
+        "Arguments": {
+          "--config_prefix.$": "$.resolved.configPrefix",
+          "--dms_task_arn.$": "$.taskArn",
+          "--cdc_root.$": "$.resolved.cdcRoot",
+          "--timestamp_column.$": "$.resolved.timestampColumnName",
+          "--startup_execution.$": "$$.Execution.Name"
+        }
       },
       "ResultPath": "$.cdcStart",
-      "Retry": [{"ErrorEquals": ["States.ServiceException", "States.Timeout", "Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2.0}],
-      "Catch": [{"ErrorEquals": ["States.ALL"], "Next": "PipelineFailed", "ResultPath": "$.error"}],
-      "Next": "TaskSucceeded"
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "InitCdcCheck",
+      "Comment": "No --extra-py-files here: CreateGlueJobs just saved the right driver setup on the job (Python shell: the driver-cdc/ wheel list; Spark: driver-fullload/ + boto3 via --additional-python-modules). --config_prefix is a RUN argument so cutover can find this run. --startup_execution (this execution's name) tells the CDC run where to write its start marker."
     },
-    "TaskSucceeded": {"Type": "Succeed"},
-    "DmsFailed": {"Type": "Fail", "Error": "DmsTaskFailed", "Cause": "DMS task failed / stopped without cached changes / errored tables at completion."},
-    "DmsTimedOut": {"Type": "Fail", "Error": "DmsPollBudgetExceeded", "Cause": "DMS did not reach STOPPED_AFTER_CACHED_EVENTS within the poll budget."},
-    "PipelineFailed": {"Type": "Fail", "Error": "PipelineFailed", "Cause": "A Glue/Lambda step failed. See execution history."}
+    "TaskSucceeded": {
+      "Type": "Succeed"
+    },
+    "DmsFailed": {
+      "Type": "Fail",
+      "Error": "DmsTaskFailed",
+      "Cause": "DMS task failed / stopped without cached changes / errored tables at completion."
+    },
+    "DmsTimedOut": {
+      "Type": "Fail",
+      "Error": "DmsPollBudgetExceeded",
+      "Cause": "DMS did not reach STOPPED_AFTER_CACHED_EVENTS within the poll budget."
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "A Glue/Lambda step failed. See execution history."
+    },
+    "DriversFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the driver error (wrong/missing wheel for the CDC job, no pg8000). DMS was NOT started.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
+    "InitCdcCheck": {
+      "Type": "Pass",
+      "Comment": "Confirm the CDC run really started: the CDC script writes config/_task/<task>/_cdc_started/<execution name>.json when it enters its poll loop (after Glue installed the drivers, connected to DSQL and loaded the manifest).",
+      "Parameters": {
+        "checks": 0
+      },
+      "ResultPath": "$.cdcCheck",
+      "Next": "WaitForCdcStart"
+    },
+    "WaitForCdcStart": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetCdcRun"
+    },
+    "GetCdcRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "Parameters": {
+        "JobName.$": "$.glue.jobs.cdc",
+        "RunId.$": "$.cdcStart.JobRunId"
+      },
+      "ResultSelector": {
+        "run.$": "$.JobRun"
+      },
+      "ResultPath": "$.cdcRun",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException",
+            "S3.SdkClientException",
+            "S3.S3Exception"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsCdcRunAlive"
+    },
+    "IsCdcRunAlive": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "FAILED"
+                },
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "ERROR"
+                }
+              ]
+            },
+            {
+              "Variable": "$.cdcRun.run.ErrorMessage",
+              "IsPresent": true
+            }
+          ],
+          "Next": "CdcRunFailed"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "FAILED"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "ERROR"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "TIMEOUT"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "STOPPED"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "STOPPING"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "SUCCEEDED"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "EXPIRED"
+            }
+          ],
+          "Next": "CdcRunEnded"
+        }
+      ],
+      "Default": "CheckCdcStarted"
+    },
+    "CdcRunFailed": {
+      "Type": "Fail",
+      "Error": "CdcRunFailed",
+      "CausePath": "$.cdcRun.run.ErrorMessage",
+      "Comment": "The CDC run failed right after starting (Glue's error message is the cause). Full load is done and DMS is capturing changes; fix the cause and start the CDC job again with --config_prefix."
+    },
+    "CdcRunEnded": {
+      "Type": "Fail",
+      "Error": "CdcRunEnded",
+      "Cause": "The CDC run stopped, timed out or ended right after starting. Full load is done and DMS is capturing changes. See the CDC job's run and logs, then start it again with --config_prefix."
+    },
+    "CheckCdcStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+      "Parameters": {
+        "Bucket": "<<BUCKET>>",
+        "Prefix.$": "States.Format('config/_task/{}/_cdc_started/{}.json', $.resolved.taskSuffix, $$.Execution.Name)"
+      },
+      "ResultSelector": {
+        "keyCount.$": "$.KeyCount"
+      },
+      "ResultPath": "$.cdcMarker",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException",
+            "S3.SdkClientException",
+            "S3.S3Exception"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsCdcStarted"
+    },
+    "IsCdcStarted": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cdcMarker.keyCount",
+          "NumericGreaterThan": 0,
+          "Next": "TaskSucceeded"
+        }
+      ],
+      "Default": "CountCdcCheck"
+    },
+    "CountCdcCheck": {
+      "Type": "Pass",
+      "Parameters": {
+        "checks.$": "States.MathAdd($.cdcCheck.checks, 1)"
+      },
+      "ResultPath": "$.cdcCheck",
+      "Next": "CdcCheckBudgetLeft"
+    },
+    "CdcCheckBudgetLeft": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cdcCheck.checks",
+          "NumericLessThan": 90,
+          "Next": "WaitForCdcStart"
+        }
+      ],
+      "Default": "CdcStartNotConfirmed",
+      "Comment": "90 checks x 30 s = 45 min (longer than Glue's ~20 min pip timeout, so a driver install failure shows up as CdcRunFailed first)."
+    },
+    "CdcStartNotConfirmed": {
+      "Type": "Fail",
+      "Error": "CdcStartNotConfirmed",
+      "Cause": "The CDC run is still running but never reported that it reached its poll loop within 45 minutes. Check the CDC job's log (it prints '[startup] entering poll loop.') and that the Glue role can write to config/_task/<task>/_cdc_started/ in the bucket."
+    }
   }
 }
