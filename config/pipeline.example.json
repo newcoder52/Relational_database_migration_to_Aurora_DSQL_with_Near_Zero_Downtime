@@ -8,5 +8,6 @@
   "glue_role_arn": "arn:aws:iam::<account-id>:role/dms-dsql-glue-exec-role",
   "glue_connection": "<exact Glue connection name, or empty string for no VPC>",
   "cdc_engine": "pythonshell",
+  "cdc_spark_fallback": true,
   "control_schema": "cdc_control"
 }

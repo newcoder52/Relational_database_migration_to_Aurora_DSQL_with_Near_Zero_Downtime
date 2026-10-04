@@ -132,7 +132,8 @@ s3://$BUCKET/
 ├── glue-templates/           # the 6 Glue job templates (CDC has a Python shell and a Spark one)
 ├── driver-fullload/          # DSQL driver wheels only        (Spark: discovery + load)
 ├── driver-validation/        # DSQL driver wheels only        (Spark: validate)
-├── driver-cdc/               # DSQL wheels + boto3/botocore, Python 3.9, prepared (CDC)
+├── driver-cdc/               # DSQL wheels + boto3/botocore, Python 3.9 (CDC), as downloaded
+├── driver-cdc-prepared/      # written by the startup workflow: install-ready copies of driver-cdc/
 ├── <schema>/<table>/         # DMS writes its CSVs here (under the endpoint's BucketFolder, if set)
 └── config/
     ├── pipeline.json         # settings for every task (Step 3c)
@@ -150,42 +151,48 @@ s3://$BUCKET/
 **Goal:** create the three roles the pipeline runs as — one for Glue, one for the Lambdas,
 one for Step Functions.
 
-**Do this** (from the repo root):
+**Do this** (from the repo root). First fill in the placeholders, **then** create the roles: the
+trust and policy files contain `<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`, `<<DSQL_CLUSTER_ID>>`,
+`<<PROJECT>>` and `<<GLUE_EXEC_ROLE_NAME>>`, and a role created from an unfilled file trusts or
+allows a literal `<<...>>` name. The commands write filled copies (`*.filled.json`) and leave the
+originals untouched, and work the same on macOS, Linux and CloudShell:
 
 ```bash
-# Glue execution role
+# 1. Fill in the placeholders (writes iam/*.filled.json)
+for f in iam/*.json; do
+  case "$f" in *.filled.json) continue;; esac
+  sed -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
+      -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<DSQL_CLUSTER_ID>>|$DSQL_CLUSTER_ID|g" \
+      -e "s|<<PROJECT>>|$PROJECT|g" \
+      -e "s|<<GLUE_EXEC_ROLE_NAME>>|$PROJECT-glue-exec-role|g" "$f" > "${f%.json}.filled.json"
+done
+grep -l "<<" iam/*.filled.json    # must print nothing
+
+# 2. Glue execution role
 aws iam create-role --role-name $PROJECT-glue-exec-role \
-  --assume-role-policy-document file://iam/glue-exec-role.trust.json
+  --assume-role-policy-document file://iam/glue-exec-role.trust.filled.json
 aws iam put-role-policy --role-name $PROJECT-glue-exec-role \
-  --policy-name glue --policy-document file://iam/glue-exec-role.policy.json
+  --policy-name glue --policy-document file://iam/glue-exec-role.policy.filled.json
 # Only if you use a VPC (GLUE_CONNECTION is set): lets Glue create network interfaces in your subnet
 aws iam put-role-policy --role-name $PROJECT-glue-exec-role \
-  --policy-name glue-vpc --policy-document file://iam/glue-exec-role.vpc-addon.policy.json
+  --policy-name glue-vpc --policy-document file://iam/glue-exec-role.vpc-addon.policy.filled.json
 
-# Lambda execution role
+# 3. Lambda execution role
 aws iam create-role --role-name $PROJECT-lambda-exec-role \
-  --assume-role-policy-document file://iam/lambda-exec-role.trust.json
+  --assume-role-policy-document file://iam/lambda-exec-role.trust.filled.json
 aws iam put-role-policy --role-name $PROJECT-lambda-exec-role \
-  --policy-name lambda --policy-document file://iam/lambda-exec-role.policy.json
+  --policy-name lambda --policy-document file://iam/lambda-exec-role.policy.filled.json
 
-# Step Functions execution role
+# 4. Step Functions execution role
 aws iam create-role --role-name $PROJECT-sfn-exec-role \
-  --assume-role-policy-document file://iam/sfn-exec-role.trust.json
+  --assume-role-policy-document file://iam/sfn-exec-role.trust.filled.json
 aws iam put-role-policy --role-name $PROJECT-sfn-exec-role \
-  --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.json
+  --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.filled.json
 ```
 
-> The policy files use `<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`, `<<DSQL_CLUSTER_ID>>`,
-> `<<PROJECT>>` and `<<GLUE_EXEC_ROLE_NAME>>`
-> placeholders. Substitute your values first — quick one-liner:
-> ```bash
-> sed -i '' -e "s/<<REGION>>/$REGION/g" -e "s/<<ACCOUNT_ID>>/$ACCOUNT_ID/g" \
->           -e "s/<<BUCKET>>/$BUCKET/g" -e "s/<<DSQL_CLUSTER_ID>>/$DSQL_CLUSTER_ID/g" \
->           -e "s/<<PROJECT>>/$PROJECT/g" \
->           -e "s/<<GLUE_EXEC_ROLE_NAME>>/$PROJECT-glue-exec-role/g" iam/*.json
-> grep "<<" iam/*.json    # must print nothing, or a policy will point at a literal <<...>> name
-> ```
-> (On Linux, use `sed -i` without the `''`.)
+> **Created the roles from unfilled files earlier?** Re-run step 1, then fix the trust with
+> `aws iam update-assume-role-policy --role-name $PROJECT-glue-exec-role --policy-document file://iam/glue-exec-role.trust.filled.json`
+> and re-run the `put-role-policy` commands (they overwrite).
 
 **Verify:** `aws iam get-role --role-name $PROJECT-glue-exec-role` returns the role.
 
@@ -234,7 +241,9 @@ aws glue get-connection --name $GLUE_CONNECTION --region $REGION --no-cli-pager 
 - an **S3 gateway endpoint** in its route table (the jobs load their scripts, wheels and CSVs from S3)
 - a route to DSQL: a DSQL VPC endpoint with **private DNS on**, or NAT. If you use an endpoint, its
   security group must allow inbound 5432 from `$SECURITY_GROUP_ID`
-- for the CDC job: the DMS and CloudWatch APIs, through VPC endpoints or NAT
+- optional, for the CDC job: the DMS API (column-rename detection) and CloudWatch (one metric for
+  tables without a primary key), through VPC endpoints or NAT. Without them CDC still applies every
+  change: each call gives up after a few seconds and the log says once what is turned off
 
 > **The two cutover Lambdas connect to DSQL too.** `drain-check` and `drop-tags` need the same
 > network path. After Step 2, put them in the VPC:
@@ -260,7 +269,7 @@ function runs) and by **name**. Here's the full set:
 | Function name | Handler | What it does |
 |---|---|---|
 | `$PROJECT-resolve-task` | `resolve_task.handler` | reads the DMS S3 target endpoint settings |
-| `$PROJECT-driver-discovery` | `driver_discovery.handler` | lists the driver wheels in each `driver-*` folder |
+| `$PROJECT-driver-discovery` | `driver_discovery.handler` | lists the driver wheels in each `driver-*` folder; for the CDC job it checks and prepares `driver-cdc/` (needs 1024 MB, 300 s) |
 | `$PROJECT-plan-split` | `plan_split.handler` | splits the table list into balanced load groups |
 | `$PROJECT-create-glue-jobs` | `create_glue_jobs.handler` | creates the task's Glue jobs from the templates |
 | `$PROJECT-stop-cdc-run` | `stop_cdc_run.handler` | stops the CDC Glue run at cutover |
@@ -547,10 +556,10 @@ aws s3 cp glue-templates/ s3://$BUCKET/glue-templates/ --recursive --exclude "*"
 >   --memory-size 1024 --timeout 300 --no-cli-pager
 > # the startup workflow now checks that the CDC run started (needs s3:ListBucket on config/_task/*)
 > aws iam put-role-policy --role-name $PROJECT-sfn-exec-role \
->   --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.json   # filled in as in Step 1
+>   --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.filled.json   # filled in as in Step 1
 > # resolve-task now refuses a second run for the same task (needs states:ListExecutions/DescribeExecution)
 > aws iam put-role-policy --role-name $PROJECT-lambda-exec-role \
->   --policy-name lambda --policy-document file://iam/lambda-exec-role.policy.json   # filled in as in Step 1
+>   --policy-name lambda --policy-document file://iam/lambda-exec-role.policy.filled.json   # filled in as in Step 1
 > ```
 
 ### 3b — Driver files (the part people get wrong)
@@ -654,6 +663,7 @@ cfg = {
     "glue_role_arn": os.environ["GLUE_ROLE_ARN"],
     "glue_connection": os.environ.get("GLUE_CONNECTION", ""),
     "cdc_engine": "pythonshell",
+    "cdc_spark_fallback": True,
     "control_schema": "cdc_control",
 }
 open("pipeline.json", "w").write(json.dumps(cfg, indent=2) + "\n")
@@ -670,6 +680,7 @@ aws s3 cp pipeline.json s3://$BUCKET/config/pipeline.json
 | `glue_role_arn` | the Glue execution role from Step 1 |
 | `glue_connection` | the Glue network connection the jobs run in, by its **exact** name (one made in the console may be called e.g. `Network connection 1`). Several: comma-separated. `""` = no VPC |
 | `cdc_engine` | `pythonshell` (default; 1 DPU, ~$0.44/h per task) or `spark` (Glue 4.0, 2 × G.1X, ~$0.88/h per task; loads its drivers the same way as the full-load jobs) |
+| `cdc_spark_fallback` | `true` (default): if a Python-shell CDC job's drivers fail, the startup re-creates that task's CDC job as Spark (same name) and carries on (see Step 5c). `false`: stop at `DriversFailed` / `CdcRunFailed` instead |
 | `control_schema` | DSQL schema for the CDC control tables (default `cdc_control`) |
 
 A template with every key is in [`config/pipeline.example.json`](config/pipeline.example.json).
@@ -833,7 +844,11 @@ console.
 2. **Check the driver files (seconds; about a minute the first time).** Lists the three driver
    folders; for a Python-shell CDC job, checks `driver-cdc/` for Python 3.9 and prepares it (Step 3b).
    A wrong or missing wheel stops the run at **`DriversFailed`** with the wheel named, and DMS is
-   never started.
+   never started. **With `cdc_spark_fallback` on (the default)** the run doesn't stop for a
+   Python-shell-only problem (e.g. a wheel that needs Python 3.10, urllib3 2.x, a missing `six`):
+   it checks the three wheels a Spark CDC job takes from `driver-cdc/` (boto3, botocore,
+   s3transfer) and, if they're fine, builds this task's CDC job as Spark. It stops at
+   `DriversFailed` only if neither engine can run.
 3. Start the DMS task → wait for full load to finish (`STOPPED_AFTER_CACHED_EVENTS`), then create
    this task's Glue jobs from the templates (the CDC job as Python shell or Spark, per `cdc_engine`).
 4. Run **Job 1** (discovery) → **Job 2** (load) → **Job 3** (validate), per table group.
@@ -848,6 +863,21 @@ console.
    or stops first, the run ends at **`CdcRunFailed`** (with Glue's error) or **`CdcRunEnded`**; if
    it never confirms within 45 minutes, **`CdcStartNotConfirmed`**. The full load is done and DMS
    is capturing changes in all three cases, so you only need to fix and restart the CDC job.
+7. **Driver failure → Spark, automatically** (`cdc_spark_fallback` on, Python-shell CDC job). If
+   the CDC run fails because Glue couldn't install or import its drivers (pip/`pypi.org` timeouts,
+   `CalledProcessError`, a `.whl` that failed to install or is missing, a wheel for the wrong
+   Python, `No module named 'pg8000'`/`'boto3'`…, `Unknown service: 'dsql'`), the run deletes the
+   CDC job, re-creates it **with the same name** as a Spark job (drivers on the Python path, no
+   pip), starts it with the same arguments and confirms it as in 6. The Spark CDC job takes only
+   the pg8000 stack (pg8000, scramp, asn1crypto, plus python_dateutil/six) **by name** from
+   `driver-fullload/`, or from `driver-validation/` if `driver-fullload/` doesn't have exactly one
+   of each (never mixed; other wheels in the folder are left out). boto3/botocore/s3transfer come
+   from `driver-cdc/`, exactly as for the full-load jobs. This happens once: if the
+   Spark run fails too, the run ends at `CdcRunFailed`. Any other error (DSQL, permissions, data)
+   is left alone and ends at `CdcRunFailed` as before.
+   The switch is recorded in `config/_task/<task name>/_cdc_engine.json` (reason, failed run, Glue's
+   error), so a later startup of this task builds the Spark job straight away. To go back to
+   Python shell for that task, delete that file.
 
 > **If a step fails:** fix the cause, then **start a new execution with the same input.** Each
 > stage skips already-completed work (via S3 status files), and job creation is idempotent — so a
@@ -897,6 +927,8 @@ aws stepfunctions start-execution --state-machine-arn "$CUTOVER_ARN" \
 It stops the DMS task, drain-checks that the last CDC file was applied, stops this task's CDC
 run, removes the pipeline's internal `_cdc_file` tracking column, and deletes this task's Glue
 jobs. It finds the task's folder and jobs by its ARN, so it works even if the DMS task was renamed.
+If a Glue job can't be deleted, the run ends at `GlueJobsNotDeleted` naming it: the migration is
+already cut over, so delete the job by hand or start the cutover again.
 **Then you** repoint your application to Aurora DSQL. Other tasks are unaffected.
 
 ---
@@ -905,6 +937,10 @@ jobs. It finds the task's folder and jobs by its ARN, so it works even if the DM
 
 Steps 1–4 are done once. For each additional DMS task, repeat **Step 5** (pick the task, stage
 its table list, start) and later **Step 6**. Nothing else changes.
+
+To start or cut over **many tasks from one list** with a single trigger, use the optional fleet
+launcher: [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md). It checks every task first and then
+starts the same per-task workflows.
 
 - Each task gets its own folder, its own Glue jobs and its own CDC run. One task failing or
   cutting over never affects another.
@@ -957,6 +993,10 @@ at the same time can open a few thousand.
 | CDC log: `another CDC run is applying this table` | two different CDC jobs (or runs) are applying the same table | find the extra one: `aws glue get-job-runs` on each CDC job, or look for an old per-task workflow's job. Stop all but this task's own CDC job. No change was applied twice |
 | `DriversFailed` with `prepare_cdc_wheels.py is missing from this Lambda's zip` | the Lambdas were updated from an `fn.zip` built before this file was added to `lambdas/` | rebuild `fn.zip` from the current `lambdas/` folder and update the functions (Step 2) |
 | `DriverDiscoveryCdc` fails with `Task timed out` or out of memory | the driver-discovery Lambda still has the old 128 MB / 2 min settings (the first preparation unpacks botocore) | `aws lambda update-function-configuration --function-name $PROJECT-driver-discovery --memory-size 1024 --timeout 300`, then start again |
+| Startup log shows `CdcDriverFallback` and the run succeeds | the Python-shell CDC job's drivers failed, so the job was re-created as Spark (same name) | nothing to fix for the migration. Read the reason in `config/_task/<task name>/_cdc_engine.json`; fix `driver-cdc/` (Step 3b) and delete that file if you want Python shell for this task again |
+| Startup ends at `CdcFallbackFailed` | the CDC drivers failed and re-creating the job as Spark failed (often another run of the CDC job is active) | stop the other run (`aws glue batch-stop-job-run`), then switch the job with `tools/switch_cdc_engine.py` and start it with `--config_prefix` |
+| Cutover ends at `GlueJobsNotDeleted` | DMS is stopped, CDC is drained and stopped and the tracking column is dropped; only deleting a Glue job failed (the cause names it and the error, e.g. a missing `glue:DeleteJob` permission) | fix the cause, then delete the job by hand (`aws glue delete-job --job-name <name>`) or start the cutover again |
+| CDC log: `The DMS API is not reachable` or `CloudWatch is not reachable` | no VPC endpoint or NAT route to that service | nothing is lost: CDC keeps applying. Add a DMS endpoint if you want column renames detected (otherwise a renamed column is added as a new column) |
 | Startup ends at `CdcRunFailed` or `CdcRunEnded` | the CDC run failed or stopped right after starting (the error is Glue's own message) | full load is done and DMS is capturing changes. Read the CDC run's log, fix the cause, then start the CDC job with `--config_prefix` (USAGE_GUIDE → Monitoring) |
 | Startup ends at `CdcStartNotConfirmed` | the CDC run is still running but never wrote its start marker within 45 min | check the CDC log for `entering poll loop` and `start marker`. If the log shows the poll loop, the run is fine: check that the Step Functions role has the `ConfirmCdcStarted` statement (Step 1) and the Glue role can write to `config/_task/` |
 | CDC job fails `...whl installation failed ... CalledProcessError` after ~20 min, or its log shows `pypi.org` timeouts | the job was started with the raw `driver-cdc/` list (an older per-task workflow, or a hand-made start) | use the shared startup (it saves the prepared list on the job), or start the job without `--extra-py-files` so it uses the saved list |
@@ -999,7 +1039,9 @@ support matrix, see **[`ENGINEERING_RECORD.md`](ENGINEERING_RECORD.md)**.
 | `<<GLUE_EXEC_ROLE_NAME>>` | Lambda IAM policy (`iam:PassRole`) | Glue role name | `dms-dsql-glue-exec-role` |
 
 **Read from `config/pipeline.json` at runtime (Step 3c):** `project`, `region`, `dsql_endpoint`,
-`dsql_user`, `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `control_schema`.
+`dsql_user`, `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
+`control_schema`. Per task, `config/_task/<task name>/_cdc_engine.json` (written by an automatic
+switch to Spark) overrides `cdc_engine` for that task.
 
 **Worked out per task at runtime, from the start input `{"taskArn": "..."}`:**
 

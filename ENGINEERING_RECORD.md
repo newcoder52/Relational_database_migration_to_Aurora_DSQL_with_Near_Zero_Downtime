@@ -26,12 +26,13 @@ Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──�
 ```
 
 ### Components
-- **Glue scripts** (`manual_kit/scripts/`): `job1_discovery.py`, `job2_load.py`,
+- **Glue scripts** (`scripts/`): `job1_discovery.py`, `job2_load.py`,
   `job3_validate.py`, `glue_cdc_continuous.py`. Staged to `s3://<bucket>/scripts/`.
-- **Lambdas** (`manual_kit/lambdas/`): `resolve_task`, `driver_discovery`, `create_glue_jobs`,
+- **Lambdas** (`lambdas/`): `resolve_task`, `driver_discovery`, `create_glue_jobs`,
   `plan_split`, `drain_check`, `stop_cdc_run`, `drop_tags`.
-- **State machines** (`manual_kit/stepfunctions/`): `startup.asl.json` (full-load→validate→CDC),
-  `cutover.asl.json` (drain + finalize). One instance per DMS task.
+- **State machines** (`stepfunctions/`): `startup.asl.json` (full-load→validate→CDC),
+  `cutover.asl.json` (drain + finalize), shared by every DMS task (started with `{"taskArn"}`);
+  optional `fleet-startup` / `fleet-cutover` launchers start them for a list of tasks.
 - **Control tables** in DSQL schema `cdc_control`: `cdc_status`, `cdc_file_status`,
   `cdc_chunk_log`, `cdc_apply_exceptions`, `cdc_skipped_ops`, `cdc_validation_failures`.
 
@@ -435,3 +436,63 @@ fills dependency gaps and items 1 and 2 stay hidden.
   date, double, both binary bugs, char, NULLed note) fails naming exactly that column; missing row,
   empty source, whole-table compare, missing status file, not-done table, checksum off, no-md5 DSQL
   (34 checks). All other suites unchanged.
+
+### 2026-10-04 — CDC drivers fail → the CDC job is re-created as Spark automatically
+
+- **Why:** the Python-shell CDC job depends on Glue pip-installing its wheels; behind a firewall any
+  wheel problem ends the run (often after ~20 min). The Spark engine loads drivers like the
+  full-load jobs (sys.path + `--additional-python-modules`, no PyPI) and was already built and
+  tested; only switching to it was manual.
+- **Before DMS starts** (`driver_discovery`, `spark_fallback`): if the wheels fail the Python-shell
+  checks, the three wheels a Spark CDC job takes from `driver-cdc/` are checked (one each of boto3,
+  botocore, s3transfer; boto3/botocore matching; botocore has `dsql`). Good → returns
+  `engine: "spark"` + reason and the CDC job is built as Spark. Bad → `DriversFailed` saying neither
+  engine can run.
+- **When the CDC run starts** (`IsCdcRunAlive` → `CdcDriverFallback` → `IsCdcFallbackSwitched` →
+  `UseSparkCdcJob` → `StartCdcJob`): a FAILED Python-shell run's Glue error is classified by
+  `create_glue_jobs.driver_error_reason` (pip/PyPI, CalledProcessError, .whl install/missing, wrong
+  Python, driver ModuleNotFound/ImportError, `Unknown service: 'dsql'`; the CDC script starts no
+  subprocesses, so CalledProcessError can only be Glue's installer). Driver error → only the CDC
+  job is deleted and re-created with the same name as Spark (refused if another run is active →
+  `CdcFallbackFailed`), started with the same run arguments and confirmed again. Once only; other
+  errors → `CdcRunFailed` unchanged.
+- **Spark CDC drivers picked by name:** `--extra-py-files` = pg8000, scramp, asn1crypto (+
+  python_dateutil, six if present) from `driver-fullload/`, or all from `driver-validation/` when
+  driver-fullload lacks one or has two versions (folders never mixed; any other wheel, e.g. a stray
+  boto3 that would break botocore under Spark, is left out). boto3/botocore/s3transfer still via
+  `--additional-python-modules` from `driver-cdc/` (the two Spark folders hold no boto3 by design).
+- **Sticky:** both paths write `config/_task/<task>/_cdc_engine.json`; `resolve_task` reads it and
+  sets `cdcEngine: "spark"` for later startups (warning says how to undo). Setting
+  `cdc_spark_fallback` (default true) turns both paths off.
+- **Verified:** workflow simulator with the real Lambdas, 59 checks (12 new): driver-check fallback
+  on/off, pip failure → Spark and success, driver error on both engines → one switch then
+  CdcRunFailed, DSQL error → no switch, fallback off, active run → CdcFallbackFailed, sticky
+  engine on the next startup, every JSONPath reached. Driver Lambda with the real wheel sets,
+  36 checks (11 new). Error classifier: 12 real driver messages caught, 13 non-driver messages
+  (DSQL 54000, connection, broken pipe, permissions, script errors) not. Not yet run on real AWS.
+
+### 2026-10-04 — Cleanup batch: cutover success, firewall timeouts, Step 1 order, Word docs, old kit
+
+- **Cutover reported success when Glue jobs weren't deleted.** `DeleteGlueJobs` caught every error
+  into `CutoverSucceeded`, and the delete Lambda only logged per-job errors. Now the Lambda returns
+  them under `failed` and the workflow ends at `GlueJobsNotDeleted` naming each job (the data is
+  already cut over at that point). A job already gone still counts as deleted, so starting the
+  cutover again finishes it.
+- **CDC behind a firewall.** The DMS (DDL watcher) and CloudWatch (one keyless-table metric) clients
+  used boto3's defaults (60 s timeouts, several retries), so with no route each call hung for
+  minutes. They now use 5 s connect / 15 s read / 2 attempts; an unreachable service is logged
+  once and (CloudWatch) turned off for the run. S3 and DSQL clients unchanged.
+- **RUNBOOK Step 1** created the IAM roles before filling in the placeholders. It now writes filled
+  copies (`iam/*.filled.json`, portable `sed`) first and creates the roles from them.
+- **Word docs** (`docs/USAGE_GUIDE.docx`, `docs/CONSIDERATIONS_AND_LIMITATIONS.docx`) brought up
+  to date: shared workflows started with the task ARN, the real S3 layout, automatic driver
+  preparation and Spark fallback, validation of every column, multi-column-key tables, binary and
+  NULL-marker handling, the 10-schema limit, and the safe unblock (set `status='active'`, never
+  delete the `cdc_status` row, which re-applies every file).
+- **`cdc_firewall_fix/` retired.** Its `repo_changes/` held old copies of `create_glue_jobs.py` and
+  `startup.asl.json` that would undo later fixes, and its `prepare_cdc_wheels.py` was an older copy
+  of `lambdas/prepare_cdc_wheels.py`. The switch tool moved to `tools/switch_cdc_engine.py` and now
+  picks Spark drivers by name like the pipeline, uses the prepared `driver-cdc-prepared/` set for
+  Python shell (the raw set would need PyPI), and records the choice in `_cdc_engine.json`.
+- **Verified:** workflow simulator 65 checks (4 new cutover cases); CDC optional-API test 12 checks
+  on both script copies; switch tool 10 checks; all other suites unchanged.

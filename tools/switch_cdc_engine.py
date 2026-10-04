@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-switch_cdc_engine.py -- switch an existing CDC Glue job between Python shell and Spark, in place,
-without redeploying the Lambdas or the state machine. Same job name, same script, same
-connection, same arguments; only the job type and the way drivers are delivered change.
+switch_cdc_engine.py -- switch an existing CDC Glue job between Python shell and Spark, in place, by
+hand. Same job name, same script, same connection, same arguments; only the job type and the way
+drivers are delivered change. The startup workflow does this by itself when the CDC drivers fail
+(cdc_spark_fallback); use this tool for a CDC job you run outside the workflow, or to switch back.
 
-  spark        Glue 4.0 Spark (Python 3.10), 2 x G.1X. Drivers delivered exactly like the full-load
-               jobs (already proven behind a firewall): --extra-py-files = driver-fullload/ wheels
-               (Glue adds them to sys.path, no pip) and boto3/botocore/s3transfer from driver-cdc/
-               via --additional-python-modules. About 2x the hourly cost of Python shell.
-  pythonshell  Glue Python shell (Python 3.9), 1 DPU. --extra-py-files = driver-cdc/ wheels (Glue
-               pip-installs them, so behind a firewall they must be prepared with
-               plan_a_python_shell/prepare_cdc_wheels.py).
+  spark        Glue 4.0 Spark (Python 3.10), 2 x G.1X. Drivers delivered like the full-load jobs and
+               picked the same way as the pipeline does: --extra-py-files = pg8000, scramp,
+               asn1crypto (+ python_dateutil, six) BY NAME from driver-fullload/, or all of them from
+               driver-validation/ if driver-fullload/ lacks one (never mixed; any other wheel is left
+               out); boto3/botocore/s3transfer from driver-cdc/ via --additional-python-modules.
+  pythonshell  Glue Python shell (Python 3.9), 1 DPU. --extra-py-files = the newest complete
+               prepared set in driver-cdc-prepared/ (written by the startup workflow's driver
+               check; Glue pip-installs these without contacting PyPI). Run a startup once, or
+               prepare by hand with lambdas/prepare_cdc_wheels.py, if there is none.
+
+The task's choice is recorded the same way the workflow records it, in
+config/_task/<task>/_cdc_engine.json (written when switching to Spark, removed when switching back),
+so the next startup of the task builds the same kind of CDC job.
 
 Glue cannot change a job's type in place, so the job is deleted and re-created under the same
 name. The old definition is saved to a JSON file first and restored automatically if the
@@ -74,7 +81,74 @@ def create_kwargs_from_job(job):
     return kw
 
 
-def build_target(job, to, fullload, cdc):
+SPARK_REQUIRED = ("pg8000", "scramp", "asn1crypto")
+SPARK_OPTIONAL = ("python-dateutil", "six")
+
+
+def _pkg(uri):
+    import re
+    f = uri.rsplit("/", 1)[-1]
+    return re.sub(r"[-_.]+", "-", f.split("-", 1)[0]).lower() if f.lower().endswith(".whl") else None
+
+
+def pick_spark_drivers(sources):
+    """Same rule as create_glue_jobs: first folder with exactly one of each required wheel."""
+    probs = []
+    for label, uris in sources:
+        by = {}
+        for u in uris:
+            by.setdefault(_pkg(u), []).append(u)
+        bad = [f"no {n}" for n in SPARK_REQUIRED if not by.get(n)]
+        bad += [f"{len(by[n])} {n} wheels" for n in SPARK_REQUIRED if len(by.get(n, [])) > 1]
+        if bad:
+            probs.append(f"{label}: {', '.join(bad)}")
+            continue
+        picked = [by[n][0] for n in SPARK_REQUIRED] + [by[n][0] for n in SPARK_OPTIONAL if len(by.get(n, [])) == 1]
+        return sorted(picked), label, sorted(u.rsplit("/", 1)[-1] for u in uris if u not in picked), None
+    return None, None, [], "; ".join(probs)
+
+
+def newest_prepared_set(s3, bucket, prepared_prefix="driver-cdc-prepared", source_prefix="driver-cdc"):
+    """Wheel list of the newest complete prepared set made from source_prefix, or None."""
+    best, token = None, None
+    pp = prepared_prefix.strip("/") + "/"
+    while True:
+        kw = {"Bucket": bucket, "Prefix": pp}
+        if token:
+            kw["ContinuationToken"] = token
+        r = s3.list_objects_v2(**kw)
+        for o in r.get("Contents", []):
+            if not o["Key"].endswith("/_READY.json"):
+                continue
+            try:
+                doc = json.loads(s3.get_object(Bucket=bucket, Key=o["Key"])["Body"].read())
+            except Exception:
+                continue
+            if not str(doc.get("source", "")).rstrip("/").endswith("/" + source_prefix.strip("/")):
+                continue
+            if best is None or str(doc.get("prepared_at", "")) > str(best.get("prepared_at", "")):
+                best = doc
+        token = r.get("NextContinuationToken")
+        if not token:
+            break
+    if not best or not best.get("wheels"):
+        return None
+    present = set()
+    folder = best["wheels"][0].split("/", 3)[3].rsplit("/", 1)[0] + "/"
+    for w in list_wheels(s3, bucket, folder):
+        present.add(w)
+    return best["wheels"] if all(w in present for w in best["wheels"]) else None
+
+
+def engine_file_key(args):
+    cp = str((args or {}).get("--config_prefix") or "")
+    if not cp.startswith("s3://"):
+        return None, None
+    b, k = cp[5:].split("/", 1) if "/" in cp[5:] else (cp[5:], "")
+    return b, k.rstrip("/") + "/_cdc_engine.json"
+
+
+def build_target(job, to, fullload, cdc, validation=(), prepared=None):
     """Return CreateJob kwargs for the job converted to `to`, plus a list of problems."""
     problems = []
     kw = create_kwargs_from_job(job)
@@ -84,31 +158,36 @@ def build_target(job, to, fullload, cdc):
     for k in ("WorkerType", "NumberOfWorkers", "MaxCapacity"):
         kw.pop(k, None)
     if to == "spark":
-        if not any(_base(w).startswith("pg8000-") for w in fullload):
-            problems.append("no pg8000 wheel in driver-fullload/ (the Spark CDC job loads pg8000 "
-                            "from there, like the full-load jobs)")
-        if any(_base(w).startswith(("boto3-", "botocore-")) for w in fullload):
-            problems.append("driver-fullload/ contains boto3/botocore wheels; on a Spark job's "
-                            "--extra-py-files they cause 'DataNotFoundError: endpoints'")
+        picked, src, ignored, why = pick_spark_drivers([("driver-fullload", fullload),
+                                                        ("driver-validation", list(validation))])
+        if not picked:
+            problems.append("the Spark CDC job needs one wheel each of pg8000, scramp and asn1crypto "
+                            "from driver-fullload/ or driver-validation/: " + why)
+        else:
+            print(f"Spark CDC drivers from {src}: {', '.join(_base(w) for w in picked)}"
+                  + (f" (left out: {', '.join(ignored)})" if ignored else ""))
         mods = [w for w in cdc if _base(w).startswith(SPARK_BOTO3)]
         if len({_base(m).split("-")[0] for m in mods}) != 3:
             problems.append("driver-cdc/ must contain exactly the boto3, botocore and s3transfer "
                             "wheels used for --additional-python-modules (found: "
                             f"{[_base(m) for m in mods]})")
         args.pop("--JOB_NAME", None)                  # Glue sets it; docs: never set it
-        args["--extra-py-files"] = ",".join(fullload)
+        args["--extra-py-files"] = ",".join(picked or [])
         args["--additional-python-modules"] = ",".join(sorted(mods))
         args.setdefault("--job-bookmark-option", "job-bookmark-disable")
         cmd["PythonVersion"] = "3"
         kw.update(GlueVersion="4.0", WorkerType="G.1X", NumberOfWorkers=2)
     else:
-        if not any(_base(w).startswith("pg8000-") for w in cdc):
-            problems.append("no pg8000 wheel in driver-cdc/")
-        if not any(_base(w).startswith("boto3-") for w in cdc):
-            problems.append("no boto3 wheel in driver-cdc/")
+        if not prepared:
+            problems.append("no complete prepared wheel set in driver-cdc-prepared/. A Python-shell job "
+                            "pip-installs its wheels, so it needs the prepared copies: run a startup "
+                            "once (its driver check writes them), or prepare them with "
+                            "lambdas/prepare_cdc_wheels.py")
+        elif not any(_base(w).startswith("pg8000-") for w in prepared) or not any(_base(w).startswith("boto3-") for w in prepared):
+            problems.append("the prepared set has no pg8000 or no boto3 wheel")
         args.pop("--additional-python-modules", None)  # Python shell can't take S3 wheels there
         args.pop("--job-bookmark-option", None)
-        args["--extra-py-files"] = ",".join(cdc)
+        args["--extra-py-files"] = ",".join(prepared or [])
         args["--JOB_NAME"] = job["Name"]               # Python shell does not inject it
         cmd["PythonVersion"] = "3.9"
         kw.update(GlueVersion="3.0", MaxCapacity=1.0)
@@ -136,7 +215,9 @@ def main(argv=None, glue=None, s3=None):
     ap.add_argument("--bucket", required=True)
     ap.add_argument("--to", required=True, choices=["spark", "pythonshell"])
     ap.add_argument("--fullload-prefix", default="driver-fullload")
+    ap.add_argument("--validation-prefix", default="driver-validation")
     ap.add_argument("--cdc-prefix", default="driver-cdc")
+    ap.add_argument("--prepared-prefix", default="driver-cdc-prepared")
     ap.add_argument("--yes", action="store_true", help="apply (default: dry run)")
     ap.add_argument("--backup-dir", default=".", help="where to save the old definition")
     a = ap.parse_args(argv)
@@ -160,8 +241,10 @@ def main(argv=None, glue=None, s3=None):
         return 1
 
     fullload = list_wheels(s3, a.bucket, a.fullload_prefix)
+    validation = list_wheels(s3, a.bucket, a.validation_prefix) if a.to == "spark" else []
     cdc = list_wheels(s3, a.bucket, a.cdc_prefix)
-    new, problems = build_target(job, a.to, fullload, cdc)
+    prepared = newest_prepared_set(s3, a.bucket, a.prepared_prefix, a.cdc_prefix) if a.to == "pythonshell" else None
+    new, problems = build_target(job, a.to, fullload, cdc, validation, prepared)
     if problems:
         print("REFUSED:")
         for p in problems:
@@ -202,6 +285,20 @@ def main(argv=None, glue=None, s3=None):
           (chk.get("Connections") or {}) == (new.get("Connections") or {}))
     print(("DONE" if ok else "CHECK FAILED") + f": {a.job} is now {chk['Command']['Name']}, "
           f"connections {(chk.get('Connections') or {}).get('Connections')}")
+    eb, ek = engine_file_key(new["DefaultArguments"])
+    if eb and ok:
+        try:
+            if a.to == "spark":
+                s3.put_object(Bucket=eb, Key=ek, ContentType="application/json", Body=(json.dumps({
+                    "engine": "spark", "reason": "switched by hand with tools/switch_cdc_engine.py",
+                    "stage": "by hand", "job": a.job, "at": stamp,
+                    "undo": f"delete s3://{eb}/{ek} to build the Python-shell CDC job again"}, indent=2) + "\n").encode())
+                print(f"Recorded in s3://{eb}/{ek}: the next startup of this task builds the Spark CDC job.")
+            else:
+                s3.delete_object(Bucket=eb, Key=ek)
+                print(f"Removed s3://{eb}/{ek} (if it existed): the next startup builds the Python-shell CDC job.")
+        except Exception as e:
+            print(f"WARNING: could not update s3://{eb}/{ek} ({e}); the next startup may build the other engine.")
     print("Start it with:\n  " + start_command(a.job, a.region, new["DefaultArguments"]))
     return 0 if ok else 1
 

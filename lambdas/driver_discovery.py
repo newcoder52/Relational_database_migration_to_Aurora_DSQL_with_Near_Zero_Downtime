@@ -25,11 +25,22 @@ AUTOMATIC PREPARATION FOR THE PYTHON-SHELL CDC JOB  (event "prepare_for": "pytho
   already stripped pass through unchanged. Any other "prepare_for" value (e.g. "spark") or none
   (older per-task workflows) returns the plain list, exactly as before.
 
+SPARK FALLBACK  (event "spark_fallback": true, only with "prepare_for": "pythonshell")
+  If the wheels fail the Python-shell checks above, the CDC job can still run on Spark, which
+  takes only boto3, botocore and s3transfer from driver-cdc/ (pg8000 comes from
+  driver-fullload/, and Spark is Python 3.10, so e.g. scramp 1.4.17 is fine there). Those three
+  are checked (one of each, boto3/botocore matching, botocore knows 'dsql'); if they are good
+  the plain driver-cdc/ list is returned with "engine": "spark" and the reason, and the workflow
+  builds the CDC job as Spark. If they are not, the error says why neither engine can run.
+
 Input event: { "bucket": "...", "drivers_prefix": "driver-cdc",
-               "prepare_for": "pythonshell" (optional), "prepared_prefix": "driver-cdc-prepared" (optional) }
+               "prepare_for": "pythonshell" | "spark" (optional), "prepared_prefix": "driver-cdc-prepared" (optional),
+               "spark_fallback": bool (optional) }
 Returns:     { "extraPyFiles": "s3://...whl,...", "wheels": [...], "count": N,
                "prepared": bool, "reused": bool, "fingerprint": "...", "preparedPrefix": "s3://...",
-               "sourceExtraPyFiles": "s3://<drivers_prefix>/...whl,..." }
+               "sourceExtraPyFiles": "s3://<drivers_prefix>/...whl,...",
+               "engine": "pythonshell" | "spark", "fallbackReason": "" | "why Spark is used" }
+             ("engine"/"fallbackReason" only when "prepare_for" is given.)
 Needs: s3:ListBucket, s3:GetObject, s3:PutObject on the bucket; ~1 GB memory and a 300 s timeout
 for the one-time preparation (botocore is large).
 """
@@ -37,6 +48,7 @@ for the one-time preparation (botocore is large).
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 
@@ -58,6 +70,58 @@ CDC_REQUIRED = ("asn1crypto", "boto3", "botocore", "jmespath", "pg8000", "python
 
 class DriverCheckError(Exception):
     """The driver-cdc/ wheels can't work for the Python-shell CDC job (message says why)."""
+
+
+SPARK_CDC_NEEDS = ("boto3", "botocore", "s3transfer")   # what a Spark CDC job takes from driver-cdc/
+
+
+def _truthy(v):
+    return v if isinstance(v, bool) else str(v or "").strip().lower() in ("true", "1", "yes")
+
+
+def _wheel_name_version(fname):
+    parts = fname[:-4].split("-") if fname.lower().endswith(".whl") else []
+    if len(parts) < 2:
+        return None, None
+    return re.sub(r"[-_.]+", "-", parts[0]).lower(), parts[1]
+
+
+def _release(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+
+
+def _spark_cdc_problems(s3, bucket, objs):
+    """Why a Spark CDC job could NOT run from these wheels ([] = it can)."""
+    found = {}
+    for o in objs:
+        n, v = _wheel_name_version(o["key"].rsplit("/", 1)[-1])
+        if n in SPARK_CDC_NEEDS:
+            found.setdefault(n, []).append((v, o["key"]))
+    probs = []
+    for n in SPARK_CDC_NEEDS:
+        got = found.get(n, [])
+        if not got:
+            probs.append(f"no {n} wheel")
+        elif len(got) > 1:
+            probs.append(f"{len(got)} versions of {n} ({', '.join(v for v, _ in got)})")
+    if probs:
+        return probs
+    v3, vc = found["boto3"][0][0], found["botocore"][0][0]
+    r3, rc = _release(v3), _release(vc)
+    if r3[:2] != rc[:2] or rc < r3:
+        probs.append(f"boto3 {v3} and botocore {vc} don't match")
+    if pcw is not None:
+        path = os.path.join(WORK_DIR, f"drvspark-{int(time.time() * 1000)}-botocore.whl")
+        try:
+            s3.download_file(bucket, found["botocore"][0][1], path)
+            if not pcw._botocore_has_dsql(path):
+                probs.append(f"botocore {vc} has no 'dsql' service (use 1.35 or later)")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return probs
 
 
 def _list_wheels(s3, bucket, prefix):
@@ -87,26 +151,43 @@ def handler(event, context):
     wheels = [f"s3://{bucket}/{o['key']}" for o in objs]
 
     has_pg8000 = any("pg8000" in w.rsplit("/", 1)[-1].lower() for w in wheels)
-    if not has_pg8000:
-        raise Exception(
-            f"No pg8000 wheel found under s3://{bucket}/{drivers_prefix}. Stage the DSQL "
-            f"driver wheels there (e.g. `pip download pg8000 -d drivers/` then upload the "
-            f"pg8000, scramp, asn1crypto wheels). PyPI is not used at runtime by design.")
+    no_pg8000 = (f"No pg8000 wheel found under s3://{bucket}/{drivers_prefix}. Stage the DSQL "
+                 f"driver wheels there (e.g. `pip download pg8000 -d drivers/` then upload the "
+                 f"pg8000, scramp, asn1crypto wheels). PyPI is not used at runtime by design.")
 
     plain = {"extraPyFiles": ",".join(wheels), "wheels": wheels, "count": len(wheels)}
-    if str(event.get("prepare_for") or "").strip().lower() != "pythonshell":
-        return plain
+    prep = str(event.get("prepare_for") or "").strip().lower()
+    if prep != "pythonshell":
+        if not has_pg8000:
+            raise Exception(no_pg8000)
+        return dict(plain, engine="spark", fallbackReason="") if prep == "spark" else plain
 
-    if pcw is None:
-        raise DriverCheckError("prepare_cdc_wheels.py is missing from this Lambda's zip. Rebuild "
-                               "fn.zip from the repo's current lambdas/ folder and update the "
-                               "driver-discovery function (RUNBOOK Step 2).")
     prepared_prefix = (event.get("prepared_prefix") or "driver-cdc-prepared").strip("/") + "/"
     if prepared_prefix.startswith(drivers_prefix) or drivers_prefix.startswith(prepared_prefix):
-        raise DriverCheckError(f"prepared_prefix {prepared_prefix} must not overlap drivers_prefix "
-                               f"{drivers_prefix} (the prepared copies would be listed as inputs).")
-    out = _prepare(s3, bucket, drivers_prefix, prepared_prefix, objs)
+        raise Exception(f"prepared_prefix {prepared_prefix} must not overlap drivers_prefix "
+                        f"{drivers_prefix} (the prepared copies would be listed as inputs).")
+    try:
+        if not has_pg8000:
+            raise DriverCheckError(no_pg8000)
+        if pcw is None:
+            raise DriverCheckError("prepare_cdc_wheels.py is missing from this Lambda's zip. Rebuild "
+                                   "fn.zip from the repo's current lambdas/ folder and update the "
+                                   "driver-discovery function (RUNBOOK Step 2).")
+        out = _prepare(s3, bucket, drivers_prefix, prepared_prefix, objs)
+    except DriverCheckError as e:
+        if not _truthy(event.get("spark_fallback")):
+            raise
+        probs = _spark_cdc_problems(s3, bucket, objs)
+        if probs:
+            raise DriverCheckError(f"{e} The Spark CDC engine can't be used instead either: "
+                                   f"{'; '.join(probs)} in s3://{bucket}/{drivers_prefix}. "
+                                   f"Nothing was started.")
+        reason = f"the Python-shell driver check failed: {e}"[:3000]
+        print(f"driver-cdc: {reason} -> the CDC job will run on Spark "
+              f"(boto3/botocore/s3transfer from s3://{bucket}/{drivers_prefix} are fine for it).")
+        return dict(plain, prepared=False, engine="spark", fallbackReason=reason)
     out["sourceExtraPyFiles"] = plain["extraPyFiles"]
+    out.update(engine="pythonshell", fallbackReason="")
     return out
 
 

@@ -76,8 +76,12 @@ at the final cutover, once CDC has drained and the target matches the source.
 scripts/                    The 4 Glue job scripts  (job1_discovery, job2_load,
                             job3_validate, glue_cdc_continuous)
 lambdas/                    Orchestration lambdas (resolve_task, plan_split, create_glue_jobs,
-                            driver_discovery, drain_check, stop_cdc_run, drop_tags)
-stepfunctions/              startup + cutover state machines (ASL)
+                            driver_discovery, drain_check, stop_cdc_run, drop_tags,
+                            preflight_tasks for the fleet launcher)
+stepfunctions/              startup + cutover state machines (ASL), plus the optional
+                            fleet-startup / fleet-cutover launchers
+tools/                      switch_cdc_engine.py (switch a CDC job Python shell <-> Spark by hand)
+config/                     pipeline.example.json, fleet_tasks.example.csv
 glue-templates/             Glue job-definition templates
 iam/                        Role trust + policy documents
 RUNBOOK.md                  Full step-by-step deploy + operate reference
@@ -85,6 +89,7 @@ USAGE_GUIDE.md              End-to-end operational usage
 ENGINEERING_RECORD.md       Architecture, every bug found + fix, DDL support matrix
 CDC_EDGE_CASE_RESULTS.md    CDC edge-case + data-type limitations (with fixes)
 docs/
+  FLEET_LAUNCHER.md                 Start or cut over many DMS tasks with one trigger
   NO_PK_CDC_UPDATE_TRACKING.md      Design note: no-PK CDC update tracking
   CONSIDERATIONS_AND_LIMITATIONS.docx   Word-format copies of the guides
   PERFORMANCE_GUIDE.docx
@@ -148,7 +153,13 @@ It performs, in order:
 5. **RunDiscovery** (Job 1) → writes `_manifest_index.json` + per-table column mappings.
 6. **PlanSplit + GroupFanOut** → runs **Job 2 load** then **Job 3 validate** per group.
 7. **ResumeDmsToCdc** → resumes DMS from the cached-changes stop into ongoing CDC.
-8. **StartCdcJob** → launches the continuous CDC job.
+8. **StartCdcJob** → launches the continuous CDC job and waits until it confirms it started. If a
+   Python-shell CDC run fails on its drivers (pip/PyPI, a missing or wrong wheel), the job is
+   re-created as Spark with the same name and started again, once (`cdc_spark_fallback`, on by
+   default; recorded in `config/_task/<task name>/_cdc_engine.json`).
+
+To start or cut over many tasks from one list, use the optional fleet launcher
+([`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md)).
 
 After this, full load is in DSQL, validated, and CDC is live. To resume after any failure,
 just start the machine again — each stage skips completed work via its status files.

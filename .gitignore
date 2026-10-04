@@ -22,3 +22,6 @@ venv/
 # Local env / secrets
 .env
 *.pem
+# placeholder-filled copies made by the RUNBOOK commands
+*.filled.json
+*.filled.asl.json

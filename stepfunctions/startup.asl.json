@@ -61,7 +61,8 @@
         "cdcRoot.$": "$.Payload.cdcRoot",
         "timestampColumnName.$": "$.Payload.timestampColumnName",
         "warnings.$": "$.Payload.warnings",
-        "csvNullValue.$": "$.Payload.csvNullValue"
+        "csvNullValue.$": "$.Payload.csvNullValue",
+        "cdcSparkFallback.$": "$.Payload.cdcSparkFallback"
       },
       "ResultPath": "$.resolved",
       "Retry": [
@@ -339,11 +340,14 @@
         "Payload": {
           "bucket": "<<BUCKET>>",
           "drivers_prefix": "driver-cdc",
-          "prepare_for.$": "$.resolved.cdcEngine"
+          "prepare_for.$": "$.resolved.cdcEngine",
+          "spark_fallback.$": "$.resolved.cdcSparkFallback"
         }
       },
       "ResultSelector": {
-        "extraPyFiles.$": "$.Payload.extraPyFiles"
+        "extraPyFiles.$": "$.Payload.extraPyFiles",
+        "engine.$": "$.Payload.engine",
+        "fallbackReason.$": "$.Payload.fallbackReason"
       },
       "ResultPath": "$.driverCdc",
       "Retry": [
@@ -369,7 +373,7 @@
         }
       ],
       "Next": "StartDmsTask",
-      "Comment": "Python-shell CDC engine: the Lambda validates the driver-cdc/ wheels for Python 3.9, strips their Requires-Dist (so Glue's pip never contacts PyPI) into driver-cdc-prepared/<fingerprint>/ once per wheel set, and returns that list. A wrong wheel fails here, before DMS starts. Spark engine: plain driver-cdc/ list."
+      "Comment": "Python-shell CDC engine: the Lambda validates the driver-cdc/ wheels for Python 3.9, strips their Requires-Dist (so Glue's pip never contacts PyPI) into driver-cdc-prepared/<fingerprint>/ once per wheel set, and returns that list. If the wheels fail that check and cdc_spark_fallback is on (the default), it checks the three wheels a Spark CDC job needs (boto3, botocore, s3transfer) and returns engine=spark instead, so the CDC job is built as Spark. Only if neither engine can run does it fail here, before DMS starts. Spark engine: plain driver-cdc/ list."
     },
     "CreateGlueJobs": {
       "Type": "Task",
@@ -396,12 +400,15 @@
           "control_schema.$": "$.resolved.controlSchema",
           "dms_task_arn.$": "$.taskArn",
           "glue_connections.$": "$.resolved.glueConnection",
-          "cdc_engine.$": "$.resolved.cdcEngine",
-          "csv_null_value.$": "$.resolved.csvNullValue"
+          "cdc_engine.$": "$.driverCdc.engine",
+          "csv_null_value.$": "$.resolved.csvNullValue",
+          "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles"
         }
       },
       "ResultSelector": {
-        "jobs.$": "$.Payload.jobs"
+        "jobs.$": "$.Payload.jobs",
+        "cdcEngine.$": "$.Payload.cdcEngine"
       },
       "ResultPath": "$.glue",
       "Retry": [
@@ -886,6 +893,35 @@
             {
               "Variable": "$.cdcRun.run.ErrorMessage",
               "IsPresent": true
+            },
+            {
+              "Variable": "$.glue.cdcEngine",
+              "StringEquals": "pythonshell"
+            },
+            {
+              "Variable": "$.resolved.cdcSparkFallback",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CdcDriverFallback"
+        },
+        {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "FAILED"
+                },
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "ERROR"
+                }
+              ]
+            },
+            {
+              "Variable": "$.cdcRun.run.ErrorMessage",
+              "IsPresent": true
             }
           ],
           "Next": "CdcRunFailed"
@@ -924,13 +960,103 @@
           "Next": "CdcRunEnded"
         }
       ],
-      "Default": "CheckCdcStarted"
+      "Default": "CheckCdcStarted",
+      "Comment": "A Python-shell CDC run that failed goes to CdcDriverFallback first (when cdc_spark_fallback is on): if Glue's error is a driver problem the job is re-created as Spark and started again, once."
     },
     "CdcRunFailed": {
       "Type": "Fail",
       "Error": "CdcRunFailed",
       "CausePath": "$.cdcRun.run.ErrorMessage",
-      "Comment": "The CDC run failed right after starting (Glue's error message is the cause). Full load is done and DMS is capturing changes; fix the cause and start the CDC job again with --config_prefix."
+      "Comment": "The CDC run failed right after starting (Glue's error message is the cause), and either it wasn't a driver problem, the job was already Spark, or cdc_spark_fallback is off. Full load is done and DMS is capturing changes; fix the cause and start the CDC job again with --config_prefix."
+    },
+    "CdcDriverFallback": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "The Python-shell CDC run failed. create-glue-jobs reads Glue's error: if the drivers failed (pip/PyPI, a missing or wrong wheel, a driver module that won't import, a boto3 too old for DSQL) it deletes the CDC job and re-creates it with the same name as a Spark job (drivers on sys.path, no pip), records that in config/_task/<task>/_cdc_engine.json and returns switched=true. Any other error: switched=false and nothing changes.",
+      "Parameters": {
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "cdc_fallback",
+          "bucket": "<<BUCKET>>",
+          "glue_templates_prefix": "glue-templates",
+          "scripts_prefix": "scripts",
+          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
+          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "timestampColumnName.$": "$.resolved.timestampColumnName",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "glue_role_arn.$": "$.resolved.glueRoleArn",
+          "region.$": "$.resolved.region",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema",
+          "dms_task_arn.$": "$.taskArn",
+          "glue_connections.$": "$.resolved.glueConnection",
+          "csv_null_value.$": "$.resolved.csvNullValue",
+          "error_message.$": "$.cdcRun.run.ErrorMessage",
+          "failed_run_id.$": "$.cdcStart.JobRunId",
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles"
+        }
+      },
+      "ResultSelector": {
+        "switched.$": "$.Payload.switched",
+        "reason.$": "$.Payload.reason",
+        "cdcEngine.$": "$.Payload.cdcEngine"
+      },
+      "ResultPath": "$.cdcFallback",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CdcFallbackFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsCdcFallbackSwitched"
+    },
+    "IsCdcFallbackSwitched": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cdcFallback.switched",
+          "BooleanEquals": true,
+          "Next": "UseSparkCdcJob"
+        }
+      ],
+      "Default": "CdcRunFailed"
+    },
+    "UseSparkCdcJob": {
+      "Type": "Pass",
+      "Comment": "The CDC job is Spark from now on; a second failure goes to CdcRunFailed (no loop). Start it again.",
+      "Parameters": {
+        "jobs.$": "$.glue.jobs",
+        "cdcEngine.$": "$.cdcFallback.cdcEngine"
+      },
+      "ResultPath": "$.glue",
+      "Next": "StartCdcJob"
+    },
+    "CdcFallbackFailed": {
+      "Type": "Fail",
+      "Comment": "The Python-shell CDC run failed on its drivers, and re-creating the job as Spark failed too (e.g. another run of the CDC job is active). Full load is done and DMS is capturing changes. Fix the cause, then switch the job (tools/switch_cdc_engine.py) or start it again with --config_prefix.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
     },
     "CdcRunEnded": {
       "Type": "Fail",

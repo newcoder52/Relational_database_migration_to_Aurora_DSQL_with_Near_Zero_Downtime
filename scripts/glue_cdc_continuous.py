@@ -529,11 +529,31 @@ try:
                       config=_S3Config(retries={"max_attempts": 10, "mode": "adaptive"}))
 except Exception:
     s3 = boto3.client('s3', region_name=REGION)
-dms = boto3.client('dms', region_name=REGION)
+# DMS (column-rename detection in the DDL watcher) and CloudWatch (one optional metric) are not
+# needed to apply changes. Behind a firewall with no route to them, boto3's defaults (60 s
+# timeouts, several retries) make each call hang for minutes, so these clients fail fast.
 try:
-    cloudwatch = boto3.client('cloudwatch', region_name=REGION)
+    from botocore.config import Config as _OptConfig
+    _OPTIONAL_API = _OptConfig(connect_timeout=5, read_timeout=15,
+                               retries={"max_attempts": 2, "mode": "standard"})
+    dms = boto3.client('dms', region_name=REGION, config=_OPTIONAL_API)
+except Exception:
+    dms = boto3.client('dms', region_name=REGION)
+try:
+    try:
+        cloudwatch = boto3.client('cloudwatch', region_name=REGION, config=_OPTIONAL_API)
+    except NameError:
+        cloudwatch = boto3.client('cloudwatch', region_name=REGION)
 except Exception:
     cloudwatch = None
+_OPTIONAL_API_DOWN = {"cloudwatch": False, "dms_logged": False}
+
+
+def _is_unreachable(e):
+    """True for errors that mean 'no route to the service' (not a permission or API error)."""
+    n = type(e).__name__
+    return n in ("ConnectTimeoutError", "EndpointConnectionError", "ReadTimeoutError",
+                 "ConnectionClosedError", "ConnectionError") or "Could not connect" in str(e)
 _client_lock = threading.Lock()
 
 # Run-wide txn-age failure tracking for the self-correcting batch-time trigger. The apply
@@ -1400,7 +1420,7 @@ def insert_skipped_op_cur(cur, table_name, cdc_file, dms_timestamp, change_seq, 
 def emit_skipped_update_metric(label, count):
     """Best-effort CloudWatch metric for Tier-2 skipped UPDATEs on a keyless table. Never
     raises (metrics must not affect the apply). Mirrors the guarded cloudwatch usage elsewhere."""
-    if not cloudwatch or count <= 0:
+    if not cloudwatch or count <= 0 or _OPTIONAL_API_DOWN["cloudwatch"]:
         return
     try:
         cloudwatch.put_metric_data(
@@ -1412,7 +1432,13 @@ def emit_skipped_update_metric(label, count):
                 "Unit": "Count",
             }])
     except Exception as e:
-        print(f"    ⚠️ CW metric emit failed (non-fatal) for {label}: {e}")
+        if _is_unreachable(e):
+            _OPTIONAL_API_DOWN["cloudwatch"] = True
+            print(f"    ⚠️ CloudWatch is not reachable from this job ({type(e).__name__}); the "
+                  f"SkippedUpdates metric is turned off for this run (skipped updates are still "
+                  f"recorded in cdc_skipped_ops).")
+        else:
+            print(f"    ⚠️ CW metric emit failed (non-fatal) for {label}: {e}")
 
 
 def record_exception(table_name, cdc_file, row_offset, statement, error):
@@ -1818,6 +1844,15 @@ def build_table_context(entry):
 # =============================================================================
 # DDL WATCHER (background thread)  — preserved from v3, now PER TABLE
 # =============================================================================
+def _note_dms_unreachable(e):
+    """Log once when the DMS API can't be reached (column renames then apply as add-column)."""
+    if _is_unreachable(e) and not _OPTIONAL_API_DOWN["dms_logged"]:
+        _OPTIONAL_API_DOWN["dms_logged"] = True
+        print(f"  ⚠️ The DMS API is not reachable from this job ({type(e).__name__}). Changes are "
+              f"still applied; only column-rename detection is off (a renamed column is added as "
+              f"a new column). Add a DMS VPC endpoint or NAT route to enable it.", flush=True)
+
+
 def ddl_watcher(dms_tables):
     """Poll DMS table-statistics for DDL-count changes per table. dms_tables is a list of
     DMS table names (as DMS reports them, typically UPPERCASE)."""
@@ -1830,7 +1865,8 @@ def ddl_watcher(dms_tables):
             ddls = stats['TableStatistics'][0].get('Ddls', 0) if stats.get('TableStatistics') else 0
             with _ddl_lock:
                 _ddl_state[t] = {"count": ddls, "event": False, "time": None}
-        except Exception:
+        except Exception as e:
+            _note_dms_unreachable(e)
             with _ddl_lock:
                 _ddl_state[t] = {"count": 0, "event": False, "time": None}
     while not _stop_event.is_set():
@@ -1847,8 +1883,8 @@ def ddl_watcher(dms_tables):
                             _ddl_state[t] = {"count": cur_ddl, "event": True,
                                              "time": datetime.now(timezone.utc)}
                             print(f"  ⚡ DDL EVENT for {t} ({prev.get('count',0)} -> {cur_ddl})")
-            except Exception:
-                pass
+            except Exception as e:
+                _note_dms_unreachable(e)
         _stop_event.wait(DDL_WATCH_INTERVAL)
 
 

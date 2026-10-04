@@ -93,9 +93,27 @@ It performs, in order:
 5. **RunDiscovery** (Job1) → writes `_manifest_index.json` + per-table column mappings.
 6. **PlanSplit** + **GroupFanOut** → runs **Job2 load** then **Job3 validate** per group.
 7. **ResumeDmsToCdc** → resumes DMS from cached-changes stop into ongoing CDC.
-8. **StartCdcJob** → launches the continuous CDC job.
+8. **StartCdcJob** → launches the continuous CDC job and confirms it started. A Python-shell run
+   that fails on its drivers is switched to Spark automatically (see below).
 
 After this, full load is in DSQL, validated, and CDC is live.
+
+**Automatic switch to Spark when the CDC drivers fail** (`cdc_spark_fallback` in
+`config/pipeline.json`, default `true`). Two places:
+- *Before DMS starts:* if `driver-cdc/` fails the Python-shell checks but has good boto3, botocore
+  and s3transfer wheels, the CDC job is built as Spark.
+- *When the CDC run starts:* if Glue's error shows a driver problem (pip/`pypi.org`,
+  `CalledProcessError`, a `.whl` failing to install or missing, wrong Python, a driver module that
+  won't import, `Unknown service: 'dsql'`), the CDC job is deleted and re-created with the same
+  name as Spark, started with the same arguments and confirmed again. Once only; other errors are
+  not touched.
+
+The Spark CDC job picks its pg8000 wheels by name from `driver-fullload/` (else
+`driver-validation/`), and boto3/botocore/s3transfer from `driver-cdc/`, the same as the
+full-load jobs. Either way `config/_task/<task name>/_cdc_engine.json` records why, and later startups of that task
+use Spark. Delete the file to go back to Python shell. CDC started by hand later (outside the
+workflow) isn't switched automatically: use `tools/switch_cdc_engine.py`, which picks the drivers
+the same way and records the choice in `_cdc_engine.json`.
 
 ---
 
@@ -270,13 +288,15 @@ missing row would replay all of them from the start.
 
 ## 6. Cutover
 
-When CDC has caught up (all tables `idle`, source≈target), run the **cutover state machine**
-for the task (per `RUNBOOK.md` Step 4). It:
-1. Resolves `cdc_root` (same auto-derive as startup).
+When CDC has caught up (all tables `idle`, source≈target), start the **cutover state machine**
+with the task's ARN (`{"taskArn": "..."}`, RUNBOOK Step 6). It:
+1. Stops the DMS task.
 2. **Drain-checks** each table (latest CDC file applied) until quiesced.
-3. Finalizes and stops the CDC job.
+3. Stops this task's CDC run, drops the `_cdc_file` tracking column, and deletes the task's Glue
+   jobs. If a job can't be deleted it ends at `GlueJobsNotDeleted`, naming it (the data is already
+   cut over; delete the job by hand or start the cutover again).
 
-Then stop the DMS task and repoint the application to DSQL.
+Then repoint the application to DSQL. For many tasks at once, see `docs/FLEET_LAUNCHER.md`.
 
 ---
 
@@ -285,7 +305,7 @@ Then stop the DMS task and repoint the application to DSQL.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Load run "SUCCEEDED" but **0 rows** | a stale per-group `_load_status.json` marks tables `done` → skipped | delete `s3://<bucket>/config/_task/<task name>/_orchestrator/` (recursive) and re-run |
-| CDC job fails `UnknownServiceError: dsql` | CDC job didn't get modern boto3 | ensure `driver-cdc/` has boto3/botocore wheels and the job's `--extra-py-files` is the **cdc** list (not fullload) |
+| CDC job fails `UnknownServiceError: dsql` | CDC job didn't get modern boto3 | ensure `driver-cdc/` has boto3/botocore wheels and the job's `--extra-py-files` is the **cdc** list (not fullload). In the startup workflow this error switches the CDC job to Spark automatically |
 | CDC log: `another CDC run is applying this table` (cycle summary lists the table as applied by another run) | two different CDC jobs or runs are applying the same table | each change is still applied once; find the extra job (old per-task workflow, hand-made copy, a second DMS task with the same table) and stop it |
 | Startup stops at `ResolveFailed`: `Another startup run is already running` | a startup for this task is still running | wait for it or stop it, then start again |
 | CDC startup log: `NOT applied by this job (multi-column primary key)` | the table's primary key has more than one column | expected: run the separate multi-column-key CDC job for it; cutover waits until that job has caught up |
@@ -293,6 +313,7 @@ Then stop the DMS task and repoint the application to DSQL.
 | CDC job fails installing a `.whl` (`CalledProcessError`, `pypi.org` timeouts), often after ~20 min | the run was given the raw `driver-cdc/` list (older per-task workflow, or a hand-made start with `--extra-py-files`) | start it without `--extra-py-files` so it uses the prepared list saved on the job |
 | Startup ends at `CdcRunFailed`, `CdcRunEnded` or `CdcStartNotConfirmed` | the CDC run failed, stopped, or never reached its poll loop | full load is done and DMS is capturing changes: read the CDC log, fix, restart the CDC job with `--config_prefix` |
 | Startup stops at `ResolveFailed` | a DMS task setting, `pipeline.json`, or folder-owner check failed before DMS started | read the execution's error message; RUNBOOK → Troubleshooting lists each case |
+| CDC log: `The DMS API is not reachable` / `CloudWatch is not reachable` | no VPC endpoint or NAT route to that service | CDC keeps applying; only column-rename detection (DMS) or one metric (CloudWatch) is off |
 | CDC job runs but applies 0 rows | `cdc_root` points at the wrong folder | confirm `resolve_task` `cdcRoot` matches where DMS writes; pass `--cdc_root` from `resolve_task` (use `.` for no bucketFolder) |
 | Full-load columns shifted/corrupted | stale `processed/` or CDC files read as full-load | the guards prevent this; ensure a clean S3 (purge `processed/`,`failed/`, old CDC) before a fresh full load |
 | Table `blocked` after a DROP COLUMN, or a rejected row (e.g. NULL into a NOT NULL column) | missing-column guard / DSQL rejected the row | fix the cause (drop the column on target / allow NULL or fix the source row), then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'` — never delete the row |

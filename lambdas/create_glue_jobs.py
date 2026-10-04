@@ -14,7 +14,18 @@ mode="create":
   - Returns the created job names so the state machine can StartJobRun them.
 
 mode="delete":
-  - glue:DeleteJob each per-task job name. Ignores "not found" (idempotent).
+  - glue:DeleteJob each per-task job name. "Not found" counts as deleted (idempotent); any other
+    error is listed under "failed" ({job, error}) so the cutover workflow can stop on it.
+
+mode="cdc_fallback"  (startup workflow, after a Python-shell CDC run FAILED right after start):
+  - Reads the run's Glue error message ("error_message"). If it is a DRIVER problem (Glue's pip
+    install of the --extra-py-files wheels failed, PyPI unreachable, a listed wheel missing, a
+    wheel for the wrong Python, a driver module that can't be imported, a boto3 too old for
+    DSQL), the CDC job is deleted and re-created with the SAME name as a Spark job (drivers go
+    on sys.path, no pip), and s3://<bucket>/config/_task/<task>/_cdc_engine.json records the
+    switch so later startups of this task keep using Spark. Any other error: nothing changes
+    ({"switched": false}). Same payload as mode="create" plus "error_message", "failed_run_id".
+  - Refused (raises) while another run of the CDC job is active.
 
 Template JSON shape (each glue-templates/<role>.json), with <<PLACEHOLDERS>> the Lambda fills:
   {
@@ -34,6 +45,8 @@ Input event: {
   "bucket", "glue_templates_prefix", "scripts_prefix",
   "project", "taskSuffix", "configPrefix", "extraPyFiles",
   "cdcExtraPyFiles",   # optional: driver-cdc wheel list (incl. boto3) for the cdc role's stored default
+  "validationExtraPyFiles",  # optional: driver-validation wheel list; second place a Spark CDC
+                       # job's pg8000 stack is taken from (after extraPyFiles = driver-fullload)
   "glue_role_arn", "region",
   "dsql_endpoint", "dsql_user", "dsql_database",
   "cdc_root", "control_schema", "dms_task_arn",  # dms_task_arn used by the cdc role only
@@ -44,19 +57,25 @@ Input event: {
                        # (the shared startup workflow passes pipeline.json's cdc_engine)
                        # (glue-templates/cdc-spark.json). Also settable with the Lambda env var
                        # CDC_ENGINE. Same job name and same script either way.
+  "cdc_fallback_reason" # optional: set when the driver check fell back to Spark before DMS
+                       # started; the switch is recorded in the task's _cdc_engine.json.
 }
 
 CDC engines:
   pythonshell  Python 3.9, 1 DPU. Glue pip-installs --extra-py-files (driver-cdc/ list), so the
-               wheels must have no Requires-Dist behind a firewall (cdc_firewall_fix/plan_a_python_shell/prepare_cdc_wheels.py).
-  spark        Glue 4.0 Spark (Python 3.10), 2 x G.1X. Identical driver delivery to the full-load
-               jobs: --extra-py-files = driver-fullload/ (added to sys.path, no pip) and boto3 via
-               --additional-python-modules from driver-cdc/. Costs ~2x pythonshell per hour. The
-               script does not use Spark; it just runs on the Spark driver.
+               wheels must have no Requires-Dist behind a firewall (driver-discovery prepares them automatically).
+  spark        Glue 4.0 Spark (Python 3.10), 2 x G.1X. Same driver delivery as the full-load
+               jobs: --extra-py-files = only the pg8000 stack (pg8000, scramp, asn1crypto, plus
+               python_dateutil/six if present), picked BY NAME from driver-fullload/, or from
+               driver-validation/ if driver-fullload/ doesn't hold exactly one of each (any other
+               wheel in the folder is left out); added to sys.path, no pip. boto3 via
+               --additional-python-modules from driver-cdc/ (those two folders hold no boto3 by
+               design). Costs ~2x pythonshell per hour. The script does not use Spark; it just
+               runs on the Spark driver.
   Switching engine on an existing job: Glue cannot change a job's type in place, so the job is
   deleted and re-created with the same name (refused while a run is active).
 Returns: { "jobs": { "load": "<name>", "load-big": "...", "validate": "...", "cdc": "..." },
-           "created": [...], "updated": [...], "deleted": [...] }
+           "created": [...], "updated": [...], "deleted": [...], "failed": [...] (delete mode) }
 """
 
 import json
@@ -68,6 +87,51 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 _ROLES = ["discovery", "load", "load-big", "validate", "cdc"]
 _CDC_ENGINES = {"pythonshell": "cdc", "spark": "cdc-spark"}   # engine -> template file stem
 _ACTIVE_RUN_STATES = {"STARTING", "RUNNING", "STOPPING", "WAITING"}
+
+
+# A Python-shell CDC run that fails with one of these never got as far as the script: Glue could
+# not install or import the drivers. (The CDC script itself never starts a subprocess, so a
+# CalledProcessError can only come from Glue's pip install of the --extra-py-files wheels.)
+_DRIVER_ERROR_PATTERNS = [
+    (r"pypi\.org|files\.pythonhosted\.org|\bpypi\b",
+     "the driver install tried to reach PyPI"),
+    (r"no matching distribution found|could not find a version that satisfies",
+     "pip could not find a driver package"),
+    (r"library file does ?n[o']?t exist",
+     "a driver wheel saved on the job is missing from S3"),
+    (r"\.whl\b[^\n]{0,300}?\b(install(ation)?\s+failed|failed|error|invalid|not found|does ?n[o']?t exist)"
+     r"|\b(install(ation)?\s+failed|failed to install)\b[^\n]{0,300}?\.whl\b",
+     "a driver wheel failed to install"),
+    (r"\b(python\s+)?(module|library|libraries|package)s?\s+install(ation)?\s+failed"
+     r"|installation of python (modules|libraries|packages) failed",
+     "the driver install failed"),
+    (r"calledprocesserror|\bpip3?\b[^\n]{0,300}?(returned non-zero|exit status)",
+     "pip failed while installing the drivers"),
+    (r"requires a different python|requires-python|is not a supported wheel on this platform",
+     "a driver wheel doesn't fit the job's Python version"),
+    (r"no module named '?(pg8000|scramp|asn1crypto|boto3|botocore|s3transfer|dateutil|six|urllib3|jmespath)\b",
+     "a driver module could not be imported"),
+    (r"cannot import name [^\n]{0,120}? from '?(pg8000|scramp|asn1crypto|boto3|botocore|s3transfer|dateutil|urllib3|jmespath)\b",
+     "a driver module is broken or mismatched"),
+    (r"unknown service:? *'?dsql",
+     "the job's boto3 is too old for Aurora DSQL"),
+]
+
+
+def driver_error_reason(message):
+    """Why a CDC run's Glue error message means the drivers failed, or "" if it doesn't."""
+    import re
+    msg = str(message or "")
+    for pattern, why in _DRIVER_ERROR_PATTERNS:
+        if re.search(pattern, msg, re.IGNORECASE):
+            return why
+    return ""
+
+
+def _engine_file_key(config_prefix):
+    cp = str(config_prefix or "")
+    key = cp.split("/", 3)[3] if cp.startswith("s3://") and cp.count("/") >= 3 else cp.lstrip("/")
+    return key.rstrip("/") + "/_cdc_engine.json"
 
 
 def _cdc_engine(event):
@@ -108,6 +172,49 @@ def _job_name(project, task_suffix, role):
 # python-dateutil are left to Glue's bundled versions (they satisfy botocore); s3transfer
 # is included because boto3 pins a matching s3transfer version.
 _SPARK_BOTO3_PREFIXES = ("boto3-", "botocore-", "s3transfer-")
+
+
+# The pg8000 stack a Spark CDC job puts on sys.path. Required: exactly one wheel of each in the
+# folder used. Optional: added if the folder has exactly one (Glue 4.0 also bundles them).
+_SPARK_CDC_REQUIRED = ("pg8000", "scramp", "asn1crypto")
+_SPARK_CDC_OPTIONAL = ("python-dateutil", "six")
+
+
+def _wheel_pkg(uri):
+    """'s3://b/driver-fullload/python_dateutil-2.9.0-py2.py3-none-any.whl' -> 'python-dateutil'."""
+    import re
+    f = uri.rsplit("/", 1)[-1]
+    if not f.lower().endswith(".whl"):
+        return None
+    return re.sub(r"[-_.]+", "-", f.split("-", 1)[0]).lower()
+
+
+def _spark_cdc_drivers(sources):
+    """Pick the Spark CDC job's pg8000 stack by name from the first folder that has exactly one
+    wheel of each required package. sources = [(label, comma-separated S3 URIs), ...] in order
+    of preference. Returns (csv, label, ignored_file_names). Wheels from two folders are never
+    mixed, so pg8000 and scramp always come from the same tested set."""
+    problems = []
+    for label, csv_ in sources:
+        uris = [w.strip() for w in (csv_ or "").split(",") if w.strip()]
+        if not uris:
+            problems.append(f"{label}: no wheels")
+            continue
+        by = {}
+        for u in uris:
+            by.setdefault(_wheel_pkg(u), []).append(u)
+        bad = [f"no {n}" for n in _SPARK_CDC_REQUIRED if not by.get(n)]
+        bad += [f"{len(by[n])} {n} wheels" for n in _SPARK_CDC_REQUIRED if len(by.get(n, [])) > 1]
+        if bad:
+            problems.append(f"{label}: {', '.join(bad)}")
+            continue
+        picked = [by[n][0] for n in _SPARK_CDC_REQUIRED]
+        picked += [by[n][0] for n in _SPARK_CDC_OPTIONAL if len(by.get(n, [])) == 1]
+        ignored = sorted(u.rsplit("/", 1)[-1] for u in uris if u not in picked)
+        return ",".join(sorted(picked)), label, ignored
+    raise Exception("The Spark CDC job needs one wheel each of " + ", ".join(_SPARK_CDC_REQUIRED) +
+                    " from driver-fullload/ or driver-validation/, and neither folder has them: " +
+                    "; ".join(problems) + ". Stage the 5 pg8000 wheels there (RUNBOOK Step 3b).")
 
 
 def _spark_boto3_modules(wheel_csv):
@@ -151,7 +258,9 @@ def handler(event, context):
     names = {role: _job_name(project, task_suffix, role) for role in _ROLES}
 
     if mode == "delete":
-        deleted = []
+        # A job that is already gone counts as deleted. Any other error is returned under
+        # "failed" (the cutover workflow then ends at GlueJobsNotDeleted instead of succeeding).
+        deleted, failed = [], []
         for role, name in names.items():
             try:
                 glue.delete_job(JobName=name)
@@ -159,8 +268,9 @@ def handler(event, context):
             except glue.exceptions.EntityNotFoundException:
                 pass
             except Exception as e:
-                print(f"(warn) delete {name}: {e}")
-        return {"jobs": names, "deleted": deleted, "created": [], "updated": []}
+                print(f"(error) could not delete {name}: {e}")
+                failed.append({"job": name, "error": f"{type(e).__name__}: {e}"[:500]})
+        return {"jobs": names, "deleted": deleted, "failed": failed, "created": [], "updated": []}
 
     # mode == create
     templates_prefix = event["glue_templates_prefix"].strip("/")
@@ -181,9 +291,26 @@ def handler(event, context):
 
     s3 = boto3.client("s3", region_name=REGION)
     created, updated, replaced = [], [], []
-    cdc_engine = _cdc_engine(event)
+    spark_cdc_drivers = None
+    roles, fallback_reason = _ROLES, ""
+    if mode == "cdc_fallback":
+        err_msg = str(event.get("error_message") or "")
+        why = driver_error_reason(err_msg)
+        if not why:
+            print(f"(info) CDC run failed for a reason other than its drivers; job left as is: "
+                  f"{err_msg[:500]}")
+            return {"jobs": names, "switched": False, "reason": "", "cdcEngine": _cdc_engine(event),
+                    "created": [], "updated": [], "replaced": [], "deleted": []}
+        fallback_reason = (f"Python-shell CDC run {event.get('failed_run_id') or ''} failed: {why} "
+                           f"({err_msg[:600]})")
+        print(f"(info) {names['cdc']}: {fallback_reason}. Re-creating it as a Spark job.")
+        roles, cdc_engine = ["cdc"], "spark"
+    else:
+        cdc_engine = _cdc_engine(event)
+        if cdc_engine == "spark" and event.get("cdc_fallback_reason"):
+            fallback_reason = str(event["cdc_fallback_reason"])
 
-    for role in _ROLES:
+    for role in roles:
         tmpl_stem = _CDC_ENGINES[cdc_engine] if role == "cdc" else role
         tmpl = _read_json(s3, bucket, f"{templates_prefix}/{tmpl_stem}.json")
         name = names[role]
@@ -247,16 +374,23 @@ def handler(event, context):
             # Use it for the cdc role's stored default; the startup SM also passes the same
             # list as --extra-py-files at run time (authoritative). Falls back to the shared
             # extraPyFiles if cdcExtraPyFiles was not provided.
-            # Spark CDC engine: keep the driver-fullload list (pg8000 stack only) on
-            # --extra-py-files exactly like the other Spark jobs; boto3 arrives through
+            # Spark CDC engine: only the pg8000 stack on --extra-py-files, picked by name from
+            # driver-fullload/ (else driver-validation/), so a stray wheel in the folder (e.g. a
+            # boto3 that would break botocore under Spark) is left out; boto3 arrives through
             # --additional-python-modules below.
             if command_name == "pythonshell":
                 _cdc_extra = event.get("cdcExtraPyFiles", "") or extra_py_files
                 if _cdc_extra:
                     args["--extra-py-files"] = _cdc_extra
-            elif not extra_py_files:
-                raise Exception(f"Spark CDC job {name} needs the driver-fullload wheel list "
-                                f"(extraPyFiles) for pg8000; it was empty.")
+            else:
+                _csv, _src, _ign = _spark_cdc_drivers(
+                    [("driver-fullload", extra_py_files),
+                     ("driver-validation", event.get("validationExtraPyFiles", ""))])
+                args["--extra-py-files"] = _csv
+                spark_cdc_drivers = {"from": _src, "wheels": _csv.split(","), "ignored": _ign}
+                print(f"(info) {name}: Spark CDC drivers from {_src}: "
+                      f"{', '.join(w.rsplit('/', 1)[-1] for w in _csv.split(','))}"
+                      + (f" (left out: {', '.join(_ign)})" if _ign else ""))
         args.update(tmpl.get("default_arguments", {}) or {})
 
         # Spark jobs: deliver a DSQL-aware boto3 via --additional-python-modules (S3 wheels,
@@ -378,5 +512,26 @@ def handler(event, context):
             else:
                 raise
 
-    return {"jobs": names, "created": created, "updated": updated, "replaced": replaced,
-            "deleted": [], "cdcEngine": cdc_engine}
+    out = {"jobs": names, "created": created, "updated": updated, "replaced": replaced,
+           "deleted": [], "cdcEngine": cdc_engine}
+    if spark_cdc_drivers:
+        out["sparkCdcDrivers"] = spark_cdc_drivers
+    if fallback_reason:
+        # Record the switch so the next startup of this task builds the Spark job straight away
+        # (resolve-task reads this file). Delete the file to go back to Python shell.
+        from datetime import datetime, timezone
+        key = _engine_file_key(config_prefix)
+        doc = {"engine": "spark", "reason": fallback_reason,
+               "stage": "after start" if mode == "cdc_fallback" else "driver check",
+               "failedRunId": event.get("failed_run_id") or None,
+               "errorMessage": str(event.get("error_message") or "")[:2000] or None,
+               "job": names["cdc"],
+               "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "undo": f"delete s3://{bucket}/{key} to build the Python-shell CDC job again"}
+        s3.put_object(Bucket=bucket, Key=key, Body=(json.dumps(doc, indent=2) + "\n").encode("utf-8"),
+                      ContentType="application/json")
+        out["engineFile"] = f"s3://{bucket}/{key}"
+        print(f"(info) CDC engine for this task is now spark; recorded in s3://{bucket}/{key}")
+    if mode == "cdc_fallback":
+        out.update(switched=True, reason=fallback_reason)
+    return out

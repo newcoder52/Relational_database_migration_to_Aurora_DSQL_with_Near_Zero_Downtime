@@ -373,11 +373,39 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "CutoverSucceeded",
+          "Next": "GlueJobsNotDeleted",
           "ResultPath": "$.error"
         }
       ],
-      "Next": "CutoverSucceeded"
+      "Next": "AllGlueJobsDeleted",
+      "Comment": "Deletes this task's 5 Glue jobs. A job already gone counts as deleted; any other failure ends at GlueJobsNotDeleted instead of reporting success."
+    },
+    "AllGlueJobsDeleted": {
+      "Type": "Choice",
+      "Comment": "create-glue-jobs lists jobs it could not delete under 'failed' (older versions return no such list).",
+      "Choices": [
+        {
+          "Variable": "$.deleteJobs.Payload.failed[0]",
+          "IsPresent": true,
+          "Next": "GlueJobsNotDeletedList"
+        }
+      ],
+      "Default": "CutoverSucceeded"
+    },
+    "GlueJobsNotDeletedList": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "GlueJobsNotDeleted",
+        "Cause.$": "States.JsonToString($.deleteJobs.Payload.failed)"
+      },
+      "ResultPath": "$.error",
+      "Next": "GlueJobsNotDeleted"
+    },
+    "GlueJobsNotDeleted": {
+      "Type": "Fail",
+      "Comment": "The migration itself is cut over: DMS is stopped, every CDC file was applied, the CDC job is stopped and the _cdc_file column is dropped. Only deleting the task's Glue jobs failed; the cause names them. Delete them by hand (aws glue delete-job --job-name <name>), or start the cutover again.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
     },
     "CutoverSucceeded": {
       "Type": "Succeed"

@@ -213,7 +213,10 @@ def _endpoint_contract(dms, task, task_arn):
 # Returns the legacy endpoint contract PLUS:
 #   taskArn, taskArnList, taskName, taskSuffix, suffixSource, configPrefix, project, region,
 #   dsqlEndpoint, dsqlUser, dsqlDatabase, glueRoleArn, glueConnection, cdcEngine,
-#   controlSchema, jobNames{discovery,load,load-big,validate,cdc}, cdcJobName, warnings[]
+#   cdcSparkFallback, controlSchema, jobNames{discovery,load,load-big,validate,cdc}, cdcJobName,
+#   warnings[]
+# cdcEngine is "spark" when config/_task/<task>/_cdc_engine.json says an earlier run switched
+# this task's CDC job to Spark (written by create-glue-jobs), whatever pipeline.json says.
 
 SETTINGS_KEY_DEFAULT = "config/pipeline.json"
 SETTINGS_REQUIRED = ("project", "region", "dsql_endpoint", "glue_role_arn")
@@ -222,6 +225,9 @@ SETTINGS_DEFAULTS = {
     "dsql_database": "postgres",
     "glue_connection": "",
     "cdc_engine": "pythonshell",
+    # If the Python-shell CDC job's drivers fail (driver check before DMS starts, or Glue's
+    # install when the CDC run starts), re-create the CDC job as Spark and carry on.
+    "cdc_spark_fallback": True,
     "control_schema": "cdc_control",
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
@@ -305,6 +311,13 @@ def _load_settings(s3, bucket, key, warnings):
         raise SettingsError(f"pipeline.json 'cdc_engine' must be 'pythonshell' or 'spark' "
                             f"(got {cfg['cdc_engine']!r}).")
     cfg["cdc_engine"] = eng
+    fb = cfg["cdc_spark_fallback"]
+    if isinstance(fb, str) and fb.strip().lower() in ("true", "false"):
+        fb = fb.strip().lower() == "true"
+    if not isinstance(fb, bool):
+        raise SettingsError(f"pipeline.json 'cdc_spark_fallback' must be true or false "
+                            f"(got {cfg['cdc_spark_fallback']!r}).")
+    cfg["cdc_spark_fallback"] = fb
     conn = cfg.get("glue_connection") or ""
     if isinstance(conn, list):
         conn = ",".join(str(c).strip() for c in conn if str(c).strip())
@@ -555,6 +568,16 @@ def handler_shared(event, context):
                         f"Glue jobs ({suffix!r}).")
 
     jobs = {role: f"{cfg['project']}-{suffix}-{role}" for role in GLUE_ROLES}
+    # An earlier run of this task switched its CDC job to Spark because the Python-shell
+    # drivers failed (create-glue-jobs wrote this file): keep Spark, don't fail the same way again.
+    cdc_engine = cfg["cdc_engine"]
+    engine_key = f"config/_task/{suffix}/_cdc_engine.json"
+    engine_doc = _get_json(s3, bucket, engine_key) if cdc_engine == "pythonshell" else None
+    if isinstance(engine_doc, dict) and engine_doc.get("engine") == "spark":
+        cdc_engine = "spark"
+        warnings.append(f"This task's CDC job runs on Spark: an earlier run switched it on "
+                        f"{engine_doc.get('at')} because {str(engine_doc.get('reason'))[:400]}. "
+                        f"Delete s3://{bucket}/{engine_key} to use Python shell again.")
     out = dict(contract)
     out.update({
         "taskArn": task_arn,
@@ -571,7 +594,8 @@ def handler_shared(event, context):
         "dsqlDatabase": cfg["dsql_database"],
         "glueRoleArn": cfg["glue_role_arn"],
         "glueConnection": cfg["glue_connection"],
-        "cdcEngine": cfg["cdc_engine"],
+        "cdcEngine": cdc_engine,
+        "cdcSparkFallback": cfg["cdc_spark_fallback"],
         "controlSchema": cfg["control_schema"],
         "jobNames": jobs,
         "cdcJobName": jobs["cdc"],
@@ -580,5 +604,6 @@ def handler_shared(event, context):
     for w in warnings:
         print(f"(warn) {w}")
     print(f"(info) {mode}: task {name!r} -> suffix {suffix!r} ({source}); config "
-          f"{out['configPrefix']}; CDC engine {cfg['cdc_engine']}")
+          f"{out['configPrefix']}; CDC engine {cdc_engine}"
+          f"{'' if cdc_engine == 'spark' or not cfg['cdc_spark_fallback'] else ' (Spark fallback on)'}")
     return out
