@@ -607,6 +607,23 @@ CAST_SUFFIX = {
 }
 
 
+# Binary (bytea) columns. DMS writes an Oracle RAW / BLOB value into its CSV as hexadecimal
+# (e.g. CBDE965C...). Postgres reads '\x<hex>'::bytea as those bytes, but plain '<hex>'::bytea
+# as the ASCII characters of the hex text (twice as many, wrong bytes). So a binary value is
+# normalized to '\x' + lowercase hex; an optional '\x' or '0x' prefix is accepted. Anything that
+# isn't whole-byte hex is left as written and stopped by guard_row (it can't be decoded safely).
+_BYTEA_PREFIX = re.compile(r'^(?:\\x|0[xX])')
+_HEX_BYTES = re.compile(r'^(?:[0-9a-fA-F]{2})*$')
+_BYTEA_CANONICAL = re.compile(r'^\\x(?:[0-9a-f]{2})*$')
+
+
+def to_bytea_hex(v):
+    """'CBDE' / '0xCBDE' / '\\xcbde' -> '\\xcbde' (a backslash, x, then hex). Non-hex input is
+    returned unchanged."""
+    h = _BYTEA_PREFIX.sub('', v, count=1)
+    return '\\x' + h.lower() if _HEX_BYTES.match(h) else v
+
+
 def is_valid_uuid_value(v):
     """True if v is a valid uuid shape (canonical 8-4-4-4-12 OR raw 32-hex). None ok."""
     if v is None:
@@ -790,8 +807,10 @@ def convert_value(raw, category):
         # exactly as v15's full load does, so the SAME source value stores identically in
         # both jobs (no full-load-vs-CDC drift) and the cast never chokes on a good value.
         return _normalize_timestamp_str(vs)
+    if category == 'bytea':
+        return to_bytea_hex(vs)
     if category in ('integer', 'bigint', 'smallint', 'numeric', 'float', 'double', 'real',
-                    'json', 'jsonb', 'bytea'):
+                    'json', 'jsonb'):
         # numeric/structured casts: strip surrounding whitespace so the ::cast never chokes.
         return vs
     # varchar/text/char: pass the ORIGINAL value through (preserve leading/trailing spaces);
@@ -1998,7 +2017,64 @@ def handle_schema_changes(ctx, header, data_rows):
 # =============================================================================
 # CDC FILE IO
 # =============================================================================
-def list_cdc_files(ctx):
+_REFIND_EVERY_SECONDS = 300   # how often to look for a missing table folder in another case
+
+
+def _ci_folder(name, folders):
+    """Exact match, else the single case-insensitive match, else None (also None if ambiguous)."""
+    if name in folders:
+        return name
+    ci = [f for f in folders if f.lower() == name.lower()]
+    return ci[0] if len(ci) == 1 else None
+
+
+def _subfolders(prefix):
+    names, token = [], None
+    while True:
+        kw = {"Bucket": BUCKET, "Prefix": prefix, "Delimiter": "/"}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = _s3_retry(lambda: s3.list_objects_v2(**kw), f"list {prefix or '/'}")
+        names += [cp["Prefix"][len(prefix):].rstrip("/") for cp in resp.get("CommonPrefixes", []) or []]
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return [n for n in names if n]
+
+
+def _refind_table_folder(ctx):
+    """The table's folder doesn't exist under the name in the index. That happens when the table
+    was empty at full load (discovery could only guess the letter case DMS would use) and DMS has
+    since created it in another case. Look at most every _REFIND_EVERY_SECONDS; if a folder that
+    differs only in case exists, switch this table to it. Returns True if it switched."""
+    now = time.monotonic()
+    if now - ctx.get("_refind_at", -1e12) < _REFIND_EVERY_SECONDS:
+        return False
+    ctx["_refind_at"] = now
+    root = (CDC_ROOT or "").strip("/. ")
+    base = f"{root}/" if root else ""
+    parts = ctx["prefixes"]["cdc"][len(base):].rstrip("/").split("/")
+    if len(parts) != 2:
+        return False
+    try:
+        s = _ci_folder(parts[0], _subfolders(base))
+        tb = _ci_folder(parts[1], _subfolders(f"{base}{s}/")) if s else None
+    except Exception as e:
+        print(f"    ⚠️ {ctx['label']}: could not look for its folder in another letter case: {e}")
+        return False
+    if not tb:
+        return False
+    new = f"{base}{s}/{tb}/"
+    if new == ctx["prefixes"]["cdc"]:
+        return False
+    print(f"  ↪ {ctx['label']}: DMS folder is {new} (expected {ctx['prefixes']['cdc']}; "
+          f"letter case differs). Using it.", flush=True)
+    ctx["prefixes"] = {"cdc": new, "processed": new + "processed/", "failed": new + "failed/"}
+    return True
+
+
+def list_cdc_files(ctx, _retried=False):
     """List a table's pending CDC CSVs (sorted by name == DMS timestamp order)."""
     prefix = ctx["prefixes"]["cdc"]
     files = []
@@ -2007,11 +2083,14 @@ def list_cdc_files(ctx):
     # to the next poll (see MIN_FILE_AGE_SECONDS). Compare S3 LastModified to now (UTC).
     now = datetime.now(timezone.utc)
     skipped_too_new = 0
+    saw_any = False   # anything at all under the folder (files or subfolders)
     while True:
         kw = {"Bucket": BUCKET, "Prefix": prefix, "Delimiter": "/"}
         if token:
             kw["ContinuationToken"] = token
         resp = s3.list_objects_v2(**kw)
+        if resp.get("Contents") or resp.get("CommonPrefixes"):
+            saw_any = True
         for o in resp.get("Contents", []):
             key = o["Key"]
             if not (key.endswith(".csv") and "/processed/" not in key and "/failed/" not in key):
@@ -2031,6 +2110,8 @@ def list_cdc_files(ctx):
             token = resp.get("NextContinuationToken")
         else:
             break
+    if not saw_any and not _retried and _refind_table_folder(ctx):
+        return list_cdc_files(ctx, _retried=True)
     files.sort()
     if skipped_too_new:
         print(f"    ⏳ {ctx['label']}: deferring {skipped_too_new} file(s) < "
@@ -2440,6 +2521,11 @@ def guard_row(ctx, values, col_category):
             raise TableBlocked(
                 f"UUID GUARD [{ctx['label']}]: column '{c}' holds a non-uuid value "
                 f"{repr(v)[:120]} — CSV misalignment or bad source data.")
+        if col_category.get(c) == 'bytea' and v is not None and not _BYTEA_CANONICAL.match(v):
+            raise TableBlocked(
+                f"BINARY GUARD [{ctx['label']}]: column '{c}' value {repr(v)[:120]} is not "
+                f"hexadecimal, which is how DMS writes binary (RAW/BLOB) values. Storing it "
+                f"would put the wrong bytes in the table, so the table stops here.")
     for c, limit in ctx["varchar_max"].items():
         v = values.get(c)
         if v is not None:

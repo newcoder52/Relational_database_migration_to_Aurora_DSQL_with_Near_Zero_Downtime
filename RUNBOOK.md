@@ -72,7 +72,9 @@ it never creates target tables.
     folder and Glue job names.
   - An **S3 target endpoint** writing to **your pipeline bucket** ✔ with: `AddColumnName=true` ✔, `TimestampColumnName=dms_timestamp`,
     `Rfc4180=true`, `DatePartitionEnabled=false`, and **no** custom `CdcPath`.
-  - A table mapping that **lowercases** schema/table/column names.
+  - A table mapping that **lowercases** column names. Schema and table names can be in any case:
+    the pipeline finds DMS's folders whatever their case. If the mapping **renames** a schema, the
+    DSQL schema must be the new name, in lowercase.
   - For any **table without a primary key**: configure DMS to emit **insert/delete only**
     (updates are skipped and logged, not applied).
 - [ ] **`pip` and Python 3** available locally (to download the driver files in Step 3).
@@ -131,7 +133,7 @@ s3://$BUCKET/
 ├── driver-fullload/          # DSQL driver wheels only        (Spark: discovery + load)
 ├── driver-validation/        # DSQL driver wheels only        (Spark: validate)
 ├── driver-cdc/               # DSQL wheels + boto3/botocore, Python 3.9, prepared (CDC)
-├── cdc/                      # DMS writes CSVs here — you do NOT upload this
+├── <schema>/<table>/         # DMS writes its CSVs here (under the endpoint's BucketFolder, if set)
 └── config/
     ├── pipeline.json         # settings for every task (Step 3c)
     ├── _task_index/          # written at runtime: task ARN -> folder name
@@ -674,8 +676,8 @@ A template with every key is in [`config/pipeline.example.json`](config/pipeline
 Before editing the live file later, keep a dated copy:
 `aws s3 cp s3://$BUCKET/config/pipeline.json s3://$BUCKET/config/pipeline.json.$(date +%Y%m%d%H%M)`.
 
-> You do **not** upload anything to `s3://$BUCKET/cdc/` — DMS writes there itself (that's your
-> DMS task's S3 target). Each task's table list is uploaded per task, in Step 5.
+> You do **not** upload the table folders DMS writes (`<schema>/<table>/`, under the endpoint's
+> BucketFolder if it has one). Each task's table list is uploaded per task, in Step 5.
 
 ---
 
@@ -785,13 +787,23 @@ while it's being migrated (if you do, the pipeline keeps using the name it start
 ### 5b — Stage the task's table list
 
 Create a CSV listing the tables this task migrates, then upload it. Header row required, two
-columns (`dms_schema,dms_table`); the pipeline lowercases them to find the DSQL target:
+columns (`dms_schema,dms_table`): each table's schema and name **as DMS writes them to S3**,
+meaning after any rename in the DMS table mapping. Letter case doesn't matter:
+
+- discovery finds the folder DMS wrote in any case (`MY_TABLE`, `my_table`, `My_Table`), under
+  the endpoint's BucketFolder if it has one, and every later job uses that folder;
+- the DSQL target is the same names in lowercase (`target_schema.my_table`).
 
 ```csv
 dms_schema,dms_table
-SRC_SCHEMA,MY_TABLE
-SRC_SCHEMA,ANOTHER_TABLE
+TARGET_SCHEMA,MY_TABLE
+target_schema,another_table
 ```
+
+A table with no folder yet (empty at full load) is loaded as empty, with a warning in the
+discovery log; the CDC job picks up its folder when DMS creates it. If **none** of the tables has a
+folder, discovery fails and lists the folders it did find, so a wrong name can't load nothing
+quietly.
 
 ```bash
 aws s3 cp table_manifest.csv "${CONFIG_PREFIX}table_manifest.csv"
@@ -949,8 +961,14 @@ at the same time can open a few thousand.
 | Startup ends at `CdcStartNotConfirmed` | the CDC run is still running but never wrote its start marker within 45 min | check the CDC log for `entering poll loop` and `start marker`. If the log shows the poll loop, the run is fine: check that the Step Functions role has the `ConfirmCdcStarted` statement (Step 1) and the Glue role can write to `config/_task/` |
 | CDC job fails `...whl installation failed ... CalledProcessError` after ~20 min, or its log shows `pypi.org` timeouts | the job was started with the raw `driver-cdc/` list (an older per-task workflow, or a hand-made start) | use the shared startup (it saves the prepared list on the job), or start the job without `--extra-py-files` so it uses the saved list |
 | `CreateGlueJobs` fails `not authorized to perform: iam:PassRole` | `<<GLUE_EXEC_ROLE_NAME>>` wasn't replaced in the Lambda policy | re-run the Step 1 fill-in command and `put-role-policy` for the Lambda role |
+| Discovery fails: `None of the N table(s) in this task has a DMS folder` | the table list names a schema or table DMS didn't write (often the source schema when the DMS mapping renames it), the DMS endpoint writes under a different BucketFolder, or DMS hasn't finished its full load | the error lists the folders that do exist: put those names in the table list (any case), then start the task again. For a task whose tables really are all empty, run discovery with `--allow_all_empty true` |
+| Discovery log: `no folder for table '<name>'` | that table had no rows at full load (normal), or its name in the table list is wrong | if the source table has rows, fix its name in the table list (Step 5b) and start the task again |
 | A driver job fails "no pg8000" | driver folder empty or wrong-platform wheels | re-run the platform-pinned `pip download` (Step 3b) and re-upload |
 | Load "SUCCEEDED" but 0 rows loaded | a stale per-group `_load_status.json` marks tables done | `aws s3 rm ${CONFIG_PREFIX}_orchestrator/ --recursive` (the group plan is rebuilt on the next run), then re-run |
+| Validation fails `CONTENT_DIFF` on a column | the stored values of that column differ from what DMS wrote (the report names the column, the check, and both values) | open `_validation_report.json` in the group's folder; compare a few rows of that column in Oracle and DSQL. Common causes: a DMS mapping or column-type mismatch, or a value rounded by a narrower DSQL type |
+| Validation fails `No full-load status file` | the group's `_load_status.json` is missing, so nothing proves the load ran | re-run the startup workflow (it reloads the group). Run validation by hand with `--require_full_load_done false` only to compare what's in DSQL now |
+| Validation log: `per-value hash check disabled` | the DSQL cluster rejected `md5()` | the other checks still run; nothing to do |
+| Load or CDC stops with `BINARY GUARD` | a binary (RAW/BLOB) column holds a value that isn't hexadecimal, which is how DMS writes binary data | check the DMS mapping for that column; the table stops rather than store wrong bytes |
 | Startup run ends in `GroupsFailed` (`GroupLoadOrValidateFailed`) | a table group's load or validation failed, so the run stopped before resuming DMS | open the `GroupFanOut` step in the execution to see which group failed, read that Glue job run's log, fix it, and start a new execution (finished files and tables are skipped) |
 | CDC job keeps logging `full load not done ... waiting` | the CDC job can't see the per-group status files, or a table's load really isn't done | make sure `s3://$BUCKET/scripts/glue_cdc_continuous.py` is the current version (it reads `_orchestrator/group-*/_load_status.json`), then check `aws s3 ls ${CONFIG_PREFIX}_orchestrator/ --recursive \| grep _load_status` |
 | `processed/_manifest.json` shows `pending_copy` that doesn't go down | S3 copies to `processed/` keep failing (throttling, permissions) | nothing is lost (originals are kept and retried each cycle); see `last_copy_error` in the manifest and the CDC log for `copy to processed/ failed` |

@@ -92,6 +92,12 @@ DSQL_USER = "admin"
 # S3 bucket that DMS writes CSVs into (BucketFolder="" so tables live at bucket root
 # under <schema>/<table>/). Used to derive each table's DMS CSV path from the manifest.
 DMS_BUCKET = "<YOUR_S3_BUCKET>"
+# The DMS endpoint's BucketFolder (passed as --cdc_root; "." = none). Tables live under
+# <BucketFolder>/<schema>/<table>/.
+DMS_BUCKET_FOLDER = ""
+# Discovery fails when NONE of the task's tables has a DMS folder (almost always a table-list
+# or endpoint mismatch). --allow_all_empty true turns that into a warning.
+ALLOW_ALL_EMPTY = False
 
 # Manifest CSV: the customer-maintained authoritative list of tables to process.
 MANIFEST_S3_PATH = "s3://<YOUR_S3_BUCKET>/<SCHEMA>/config/table_manifest.csv"
@@ -116,8 +122,9 @@ INDEX_S3_PATH = CONFIG_PREFIX + "_manifest_index.json"
 # =============================================================================
 def _apply_job1_arg_overrides():
     global CONFIG_PREFIX, INDEX_S3_PATH, MANIFEST_S3_PATH
-    global DSQL_ENDPOINT, DSQL_USER, REGION, DMS_BUCKET
-    optional = ["config_prefix", "dsql_endpoint", "dsql_user", "region", "dms_bucket"]
+    global DSQL_ENDPOINT, DSQL_USER, REGION, DMS_BUCKET, DMS_BUCKET_FOLDER, ALLOW_ALL_EMPTY
+    optional = ["config_prefix", "dsql_endpoint", "dsql_user", "region", "dms_bucket",
+                "cdc_root", "allow_all_empty"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -152,6 +159,11 @@ def _apply_job1_arg_overrides():
         if _db:
             DMS_BUCKET = _db
             print(f"  ↪ DMS_BUCKET overridden -> {DMS_BUCKET}")
+    if "cdc_root" in ov:
+        DMS_BUCKET_FOLDER = (str(ov["cdc_root"]) or "").strip("/. ")
+        print(f"  ↪ DMS BucketFolder -> {DMS_BUCKET_FOLDER or '(none)'}")
+    if "allow_all_empty" in ov:
+        ALLOW_ALL_EMPTY = str(ov["allow_all_empty"]).strip().lower() in ("true", "1", "yes")
 
 
 _apply_job1_arg_overrides()
@@ -417,6 +429,90 @@ def build_primary_key_block(pk_columns, target_columns, type_categories):
     }
 
 
+# =============================================================================
+# FINDING EACH TABLE'S DMS FOLDER (any letter case, with or without a BucketFolder)
+# =============================================================================
+# DMS writes a table to <BucketFolder>/<schema>/<table>/ using the names its table mapping
+# produces (often uppercase from Oracle, lowercase if the mapping lowercases them). The table
+# list may use either case, so the folder is found by listing what DMS actually wrote and
+# matching case-insensitively; an exact match wins if several case variants exist. The found
+# names are written into the index (dms_schema / dms_table / dms_s3_path), which the load,
+# validation, plan-split, CDC and drain-check all read, so every component uses the same folder.
+_SUBFOLDER_CACHE = {}
+
+
+def _list_subfolders(s3_client, bucket, prefix):
+    """Names of the folders directly under s3://bucket/prefix (cached per run)."""
+    key = (bucket, prefix)
+    if key in _SUBFOLDER_CACHE:
+        return _SUBFOLDER_CACHE[key]
+    names, token = [], None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/"}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kw)
+        for cp in resp.get("CommonPrefixes", []) or []:
+            n = cp["Prefix"][len(prefix):].rstrip("/")
+            if n:
+                names.append(n)
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    _SUBFOLDER_CACHE[key] = names
+    return names
+
+
+def _match_folder(name, folders, what, where):
+    """The folder for `name`: exact match first, else the single case-insensitive match.
+    Several case-insensitive matches and no exact one -> error (can't tell which is meant)."""
+    if name in folders:
+        return name
+    ci = [f for f in folders if f.lower() == name.lower()]
+    if len(ci) == 1:
+        return ci[0]
+    if len(ci) > 1:
+        raise Exception(f"{what} {name!r} matches several folders that differ only in letter "
+                        f"case under {where}: {sorted(ci)}. List it with the exact case of the "
+                        f"folder this task's DMS writes to.")
+    return None
+
+
+def _guess_case(name, siblings):
+    """Best guess for a folder DMS hasn't created yet: follow the case its siblings use."""
+    if siblings and all(s.isupper() for s in siblings if any(ch.isalpha() for ch in s)):
+        return name.upper()
+    if siblings and all(s.islower() for s in siblings if any(ch.isalpha() for ch in s)):
+        return name.lower()
+    return name
+
+
+def resolve_table_folder(s3_client, bucket, root, schema, table):
+    """Find the folder DMS wrote this table to. Returns a dict:
+       schema, table : the folder names to use (found, or a best guess if not found)
+       path          : s3://bucket/<root>/<schema>/<table>/
+       found         : True if the table folder exists
+       note          : why it wasn't found (None if found)"""
+    base = f"{root}/" if root else ""
+    where = f"s3://{bucket}/{base}"
+    schemas = _list_subfolders(s3_client, bucket, base)
+    s = _match_folder(schema, schemas, "schema", where)
+    if s is None:
+        s = _guess_case(schema, schemas)
+        return {"schema": s, "table": _guess_case(table, [s]), "found": False,
+                "path": f"{where}{s}/{_guess_case(table, [s])}/",
+                "note": (f"no folder for schema {schema!r} under {where} (any letter case). "
+                         f"Folders there: {sorted(schemas)[:20] or 'none'}")}
+    tables = _list_subfolders(s3_client, bucket, f"{base}{s}/")
+    tb = _match_folder(table, tables, "table", f"{where}{s}/")
+    if tb is None:
+        g = _guess_case(table, tables)
+        return {"schema": s, "table": g, "found": False, "path": f"{where}{s}/{g}/",
+                "note": f"no folder for table {table!r} under {where}{s}/ (any letter case)"}
+    return {"schema": s, "table": tb, "found": True, "path": f"{where}{s}/{tb}/", "note": None}
+
+
 def s3_prefix_has_objects(s3_client, bucket, prefix):
     """True if at least one object exists under prefix (i.e. DMS wrote files)."""
     resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
@@ -498,7 +594,8 @@ def build_mapping_for_table(spec, target_columns, dms_columns, pk_columns):
             "dsql_table": dsql_table,
             "dms_schema": spec['dms_schema'],
             "dms_table": spec['dms_table'],
-            "dms_s3_path": f"s3://{DMS_BUCKET}/{spec['dms_schema']}/{spec['dms_table']}/",
+            "dms_s3_path": spec.get("dms_s3_path")
+                           or f"s3://{DMS_BUCKET}/{spec['dms_schema']}/{spec['dms_table']}/",
             "dms_column_count": len(dms_columns),
             "dms_has_headers": True,
             "target_column_count": len(target_column_names),
@@ -565,6 +662,7 @@ def read_schema_and_pk_resilient(dsql_schema, dsql_table):
 
 index_entries = []
 succeeded, skipped_missing_dsql, skipped_missing_s3, failed = [], [], [], []
+not_found = []   # table-list entries with no DMS folder (any case)
 skipped_duplicate = []
 seen_dsql_tables = {}  # "schema.table" -> first manifest row index that claimed it
 
@@ -573,9 +671,26 @@ for i, spec in enumerate(specs, start=1):
     dms_table = spec['dms_table']
     dsql_schema = spec['dsql_schema']
     dsql_table = spec['dsql_table']
-    dms_s3_path = f"s3://{DMS_BUCKET}/{dms_schema}/{dms_table}/"
-
     print(f"\n[{i}/{len(specs)}] {dms_schema}.{dms_table} -> {dsql_schema}.{dsql_table}")
+    # Find the folder DMS actually wrote (any letter case, under the endpoint's BucketFolder).
+    # From here on dms_schema / dms_table are the FOLDER names, so every later step and every
+    # downstream job reads the same folder.
+    try:
+        _loc = resolve_table_folder(s3_client, DMS_BUCKET, DMS_BUCKET_FOLDER, dms_schema, dms_table)
+    except Exception as _le:
+        print(f"  ✗ ERROR finding the DMS folder for {dms_schema}.{dms_table}: {_le}")
+        failed.append(f"{dms_schema}.{dms_table}: {_le}")
+        continue
+    if (_loc["schema"], _loc["table"]) != (dms_schema, dms_table):
+        print(f"  ↪ DMS folder is {_loc['schema']}/{_loc['table']} "
+              f"(table list says {dms_schema}/{dms_table}; letter case doesn't matter)")
+    if not _loc["found"]:
+        print(f"  ⚠️ {_loc['note']}. Treated as empty at full load; CDC will look for it "
+              f"(any letter case) when changes arrive.")
+        not_found.append(f"{dsql_schema}.{dsql_table}")
+    dms_schema, dms_table = _loc["schema"], _loc["table"]
+    spec = dict(spec, dms_schema=dms_schema, dms_table=dms_table, dms_s3_path=_loc["path"])
+    dms_s3_path = _loc["path"]
 
     # Fix #5: guard against two manifest rows targeting the same DSQL table, which
     # would overwrite the first config JSON and produce a misleading index entry.
@@ -721,6 +836,19 @@ try:
 except Exception:
     pass
 
+# ---- No DMS folder for ANY table: almost always a mismatch, not N empty tables ---------
+if (index_entries and not ALLOW_ALL_EMPTY
+        and all(f"{e['dsql_schema']}.{e['dsql_table']}" in not_found for e in index_entries)):
+    _root = f"s3://{DMS_BUCKET}/" + (f"{DMS_BUCKET_FOLDER}/" if DMS_BUCKET_FOLDER else "")
+    raise Exception(
+        f"None of the {len(index_entries)} table(s) in this task has a DMS folder under {_root}, "
+        f"so the full load would load nothing and report success. Folders there: "
+        f"{sorted(_list_subfolders(s3_client, DMS_BUCKET, (DMS_BUCKET_FOLDER + '/') if DMS_BUCKET_FOLDER else ''))[:20] or 'none'}. "
+        f"Check that the table list names the schema and table DMS writes (letter case doesn't "
+        f"matter; a schema renamed by the DMS table mapping must be listed under its new name) "
+        f"and that DMS has finished its full load. If every table really is empty, run discovery "
+        f"with --allow_all_empty true.")
+
 # ---- Write master index (consumed by Job 2) ------------------------------
 index_doc = {
     "metadata": {
@@ -755,6 +883,7 @@ print(f"  Discovered OK             : {len(succeeded)}")
 print(f"  Skipped (missing in DSQL) : {len(skipped_missing_dsql)} {skipped_missing_dsql or ''}")
 print(f"  Skipped (missing in S3)   : {len(skipped_missing_s3)} {skipped_missing_s3 or ''}")
 print(f"  Skipped (duplicate target): {len(skipped_duplicate)} {skipped_duplicate or ''}")
+print(f"  No DMS folder (empty)     : {len(not_found)} {not_found or ''}")
 print(f"  Failed                    : {len(failed)}")
 for f in failed:
     print(f"      - {f}")

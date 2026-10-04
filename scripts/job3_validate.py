@@ -30,7 +30,8 @@ the CDC job (Python Shell, tiny deltas).
 TWO-TIER (speed)
 ----------------
   Tier 1 (always): per-range COUNT compare — fast, catches missing/extra rows.
-  Tier 2 (CHECKSUM_MODE != "off"): per-range content fingerprint — proves the TRANSFORM
+  Tier 2 (CHECKSUM_MODE="aggregate", the default): per-range, per-column summaries chosen
+          from each column's DSQL type (see CHECKSUM_MODE below) — proves the TRANSFORM
           landed (a count matches even if every value is wrong). Two portable modes:
             "aggregate" (default): per-range column aggregates that need NO special DB
                         function — count(non-null) per col + sum(len) over a canonical
@@ -54,6 +55,7 @@ import json
 import math
 import time
 import threading
+from decimal import Decimal
 import boto3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -95,19 +97,24 @@ VALIDATE_ROWS_PER_RANGE = 250000
 MAX_QUERY_CONCURRENCY = 20
 # Max tables validated concurrently on the driver.
 MAX_PARALLEL_TABLES = 4
-# Content check tier:
-#   "off"       (DEFAULT): per-range COUNT compare only. ALWAYS reliable — counts match
-#               regardless of how each engine renders a value. Catches missing/extra rows.
-#   "aggregate": count + a per-column fingerprint (SUM(length)+COUNT) over the fingerprint
-#               columns. IMPORTANT: a content checksum is only trustworthy for columns whose
-#               SOURCE string form == TARGET ::text form. That holds for TEXT/VARCHAR columns
-#               but NOT for typed columns (numeric/timestamp/uuid render differently as text
-#               on each side), so v4 restricts the checksum to VARCHAR/TEXT columns only
-#               (fp_text_cols below). Typed columns are still covered by the COUNT check.
-#   "md5"     : same restriction; md5(string_agg(...)) — needs md5()+string_agg on DSQL.
-# Start at "off" (count-only, zero false positives); enable "aggregate" for text-content
-# assurance once you've confirmed it behaves on your data.
-CHECKSUM_MODE = "off"
+# Content check:
+#   "aggregate" (DEFAULT): per key range, besides the row count, compare per-column summaries
+#               chosen from each column's REAL DSQL type, so every column is checked:
+#                 text/varchar/char/binary : non-null count, total length, min, max
+#                 uuid                     : non-null count, min, max
+#                 boolean                  : non-null count, number of true values
+#                 integer/numeric          : non-null count, exact sum (after the same
+#                                            rounding the load applies)
+#                 real/double              : non-null count, sum (tiny float tolerance)
+#                 timestamp/date           : non-null count, sum of the instants (microseconds)
+#                 json/other               : non-null count
+#               A wrong, missing, NULLed, truncated, rounded or shifted value changes one of
+#               these, and the report names the column. (Values swapped between two rows of
+#               the same range can cancel out; that is the one thing summaries can't see.)
+#   "off"     : row counts only.
+# Turn it off for a deployment by adding "--checksum_mode": "off" to default_arguments in
+# glue-templates/validate.json. ("md5" is accepted and treated as "aggregate".)
+CHECKSUM_MODE = "aggregate"
 # Only validate tables the load marked done (reads _load_status.json). Off = validate all
 # tables in the manifest.
 REQUIRE_FULL_LOAD_DONE = True
@@ -161,7 +168,7 @@ def _apply_job3_arg_overrides():
     if "checksum_mode" in ov:
         _cm = str(ov["checksum_mode"]).strip().lower()
         if _cm in ("off", "aggregate", "md5"):
-            CHECKSUM_MODE = _cm
+            CHECKSUM_MODE = "aggregate" if _cm == "md5" else _cm
         else:
             print(f"  ⚠️ ignoring invalid checksum_mode={ov['checksum_mode']!r} (use off|aggregate|md5)")
     if "max_parallel_tables" in ov:
@@ -434,6 +441,12 @@ def apply_transform(df, target_columns, type_categories):
         df = df.withColumn(c, when(numv == 1, lit("true")).when(numv == 0, lit("false"))
                            .when(txt.isin(_bt), lit("true")).when(txt.isin(_bf), lit("false"))
                            .otherwise(lit(None)))
+    # (c2) binary: DMS hex text -> '\x' + lowercase hex (same rule as the loader)
+    for c in [n for n in df.columns if type_categories.get(n) == 'bytea']:
+        hexpart = regexp_replace(col(c), r'^(\\x|0[xX])', '')
+        df = df.withColumn(c, when(col(c).isNull(), lit(None))
+                           .when(hexpart.rlike(r'^([0-9a-fA-F]{2})*$'), concat(lit('\\x'), lower(hexpart)))
+                           .otherwise(col(c)))
     # (d) timestamptz / date
     for c in [n for n in df.columns if type_categories.get(n) == 'timestamptz']:
         df = df.withColumn(c, normalize_timestamp(c, "yyyy-MM-dd HH:mm:ss.SSSSSS"))
@@ -458,12 +471,19 @@ def load_manifest(s3):
 
 
 def load_full_load_status(s3):
+    """{table: status} from this group's _load_status.json, or None if the file doesn't exist.
+    Any other read error is raised (a permissions or network problem must not look like
+    "nothing to validate")."""
     bucket, key = split_s3(CONFIG_PREFIX.rstrip('/') + '/_load_status.json')
     try:
-        doc = json.loads(s3.get_object(Bucket=bucket, Key=key)['Body'].read().decode('utf-8'))
-        return {k: (v or {}).get('status') for k, v in (doc.get('tables', {}) or {}).items()}
-    except Exception:
-        return {}
+        body = s3.get_object(Bucket=bucket, Key=key)['Body'].read()
+    except Exception as e:
+        code = str((getattr(e, "response", None) or {}).get("Error", {}).get("Code", ""))
+        if code in ("NoSuchKey", "404", "NotFound"):
+            return None
+        raise
+    doc = json.loads(body.decode('utf-8'))
+    return {k: (v or {}).get('status') for k, v in (doc.get('tables', {}) or {}).items()}
 
 
 def load_config(s3, entry):
@@ -514,94 +534,238 @@ def _range_predicate_sql(pk_col, pk_kind, lo, hi, is_top):
     return pred
 
 
-def target_range_fingerprint(conn, dsql_schema, dsql_table, pk_col, pk_kind,
-                             lo, hi, is_top, fp_cols):
-    """Compute (count, checksum) for one range on the DSQL target. checksum is None in
-    count-only mode. 'aggregate' mode: sum of per-column text lengths + non-null counts —
-    portable, no special function. 'md5' mode: md5 over an ordered concat (needs md5()+
-    string_agg)."""
-    pred = _range_predicate_sql(pk_col, pk_kind, lo, hi, is_top)
+def read_target_column_types(conn, dsql_schema, dsql_table):
+    """{column: (data_type, numeric_precision, numeric_scale, datetime_precision)} from DSQL."""
     cur = conn.cursor()
     try:
-        if CHECKSUM_MODE == "off" or not fp_cols:
-            cur.execute(f'SELECT count(*) FROM {dsql_schema}.{dsql_table} WHERE {pred}')
-            return (int(cur.fetchone()[0]), None)
-        if CHECKSUM_MODE == "md5":
-            row_expr = " || '|' || ".join(f'COALESCE("{c}"::text, \'\')' for c in fp_cols)
-            cur.execute(
-                f'SELECT count(*), md5(COALESCE(string_agg(({row_expr}), \'\' '
-                f'ORDER BY "{pk_col}"), \'\')) '
-                f'FROM {dsql_schema}.{dsql_table} WHERE {pred}')
-            r = cur.fetchone()
-            return (int(r[0]), r[1])
-        # aggregate (default, portable): count + sum(len of each col) + non-null counts
-        parts = ["count(*)"]
-        for c in fp_cols:
-            parts.append(f'COALESCE(SUM(length(COALESCE("{c}"::text, \'\'))), 0)')
-            parts.append(f'COUNT("{c}")')
-        cur.execute(f'SELECT {", ".join(parts)} FROM {dsql_schema}.{dsql_table} WHERE {pred}')
-        r = cur.fetchone()
-        cnt = int(r[0])
-        fp = "|".join(str(x) for x in r[1:])
-        return (cnt, fp)
+        cur.execute(
+            "SELECT column_name, data_type, numeric_precision, numeric_scale, datetime_precision "
+            "FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+            (dsql_schema, dsql_table))
+        return {r[0]: (r[1], r[2], r[3], r[4]) for r in cur.fetchall()}
     finally:
         cur.close()
 
 
-def source_range_fingerprints(df, pk_src_col, pk_kind, ranges, fp_src_cols):
-    """Compute per-range (count, checksum) on the transformed SOURCE dataframe, in ONE pass
-    using groupBy over a range-bucket column. Mirrors target_range_fingerprint's math so
-    the two fingerprints are comparable."""
+def column_kind(data_type):
+    """How a column is summarized, from its DSQL data_type."""
+    dt = (data_type or "").lower()
+    if dt in ("character varying", "text", "varchar"):
+        return "text"
+    if dt in ("character", "char", "bpchar"):
+        return "char"
+    if dt == "uuid":
+        return "uuid"
+    if dt == "bytea":
+        return "bytea"
+    if dt == "boolean":
+        return "bool"
+    if dt in ("smallint", "integer", "bigint"):
+        return "int"
+    if dt in ("numeric", "decimal"):
+        return "numeric"
+    if dt in ("real", "double precision"):
+        return "float"
+    if dt.startswith("timestamp"):
+        return "ts"
+    if dt == "date":
+        return "date"
+    return "count"
+
+
+_TS_FMT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
+_HEX = "0123456789abcdef"
+_HASH_DIGITS = 6          # first 6 hex digits of md5 (24 bits) per value
+_HASH_STATE = {"ok": None}
+_HASH_LOCK = threading.Lock()
+
+
+def _hash_sql(text_expr):
+    """DSQL: the first _HASH_DIGITS hex digits of md5(value) as an integer, using only
+    md5/substr/strpos (no bit-string casts)."""
+    h = f"md5({text_expr})"
+    terms = [f"(strpos('{_HEX}', substr({h}, {i + 1}, 1)) - 1)::bigint * {16 ** (_HASH_DIGITS - 1 - i)}"
+             for i in range(_HASH_DIGITS)]
+    return "(" + " + ".join(terms) + ")"
+
+
+def hash_supported():
+    """Probe once per run whether DSQL has md5()/strpos(); without them the per-value hash
+    check is dropped (the other checks still run) and the run log says so."""
+    with _HASH_LOCK:
+        if _HASH_STATE["ok"] is None:
+            try:
+                conn = connect_dsql(autocommit=True)
+                try:
+                    cur = conn.cursor()
+                    cur.execute(f"SELECT {_hash_sql(chr(39) + 'abc' + chr(39))}")
+                    got = int(cur.fetchone()[0])
+                    cur.close()
+                finally:
+                    conn.close()
+                # md5('abc') = 900150983cd24fb0d6963f7d28e17f72
+                _HASH_STATE["ok"] = (got == int("900150983cd24fb0d6963f7d28e17f72"[:_HASH_DIGITS], 16))
+                if not _HASH_STATE["ok"]:
+                    print(f"  ⚠️ DSQL md5 check returned {got}; per-value hash check disabled")
+            except Exception as e:
+                _HASH_STATE["ok"] = False
+                print(f"  ⚠️ DSQL has no usable md5()/strpos() ({type(e).__name__}: {e}); "
+                      f"per-value hash check disabled, other checks still run")
+        return _HASH_STATE["ok"]
+
+
+def build_metrics(columns, target_types, with_hash=False):
+    """Per-column summaries with the same meaning on both sides. Each metric is a dict:
+         col, check, src (fn(F, column) -> Spark aggregate), sql (DSQL aggregate),
+         cmp ('exact' | 'decimal' | 'float'), tol (allowed difference: per row for decimal,
+         relative for float), empty (its value over zero rows)."""
+    m = []
+    for c in columns:
+        dt, prec, scale, dtp = target_types[c]
+        kind = column_kind(dt)
+        q = '"' + c.replace('"', '""') + '"'
+        tick = '`' + c.replace('`', '``') + '`'
+
+        def add(check, src, sql, cmp="exact", tol=0, empty=0, _c=c, _k=kind, _dt=dt):
+            m.append({"col": _c, "kind": _k, "type": _dt, "check": check, "src": src,
+                      "sql": sql, "cmp": cmp, "tol": tol, "empty": empty})
+
+        add("non-null count", lambda F, x: F.count(x), f"COUNT({q})")
+        if kind in ("text", "char", "uuid", "bytea"):
+            # Source value = what the load stored. Target ::text = the stored value as text
+            # (lowercase canonical uuid; '\x' + lowercase hex for binary; char(n) without its
+            # padding, so the source drops trailing spaces for char columns too). DSQL uses the
+            # C collation (byte order), the same order Spark uses for min/max on strings.
+            if kind == "char":
+                s = lambda F, x: F.rtrim(x)
+            else:
+                s = lambda F, x: x
+            t_ = q if kind == "text" else f"({q})::text"
+            if kind != "uuid":
+                add("total length", lambda F, x, s=s: F.coalesce(F.sum(F.length(s(F, x))), F.lit(0)),
+                    f"COALESCE(SUM(length({t_})), 0)")
+            add("min", lambda F, x, s=s: F.min(s(F, x)), f"MIN({t_})", empty=None)
+            add("max", lambda F, x, s=s: F.max(s(F, x)), f"MAX({t_})", empty=None)
+            if with_hash:
+                # Sum of a per-value hash: catches a changed value even when its length and the
+                # column's min/max stay the same. md5 is over the UTF-8 bytes on both sides.
+                add("value hash sum",
+                    lambda F, x, s=s: F.coalesce(F.sum(F.conv(F.substring(F.md5(s(F, x)), 1, _HASH_DIGITS),
+                                                              16, 10).cast("decimal(38,0)")),
+                                                 F.lit(0).cast("decimal(38,0)")),
+                    f"COALESCE(SUM({_hash_sql(t_)}), 0)", "decimal", 0)
+        elif kind == "bool":
+            add("true count",
+                lambda F, x: F.coalesce(F.sum(F.when(x == F.lit("true"), 1).otherwise(0)), F.lit(0)),
+                f"COALESCE(SUM(CASE WHEN {q} THEN 1 ELSE 0 END), 0)")
+        elif kind == "int":
+            # The load casts '%s::numeric::bigint': numeric -> integer rounds half away from
+            # zero, which is what Spark's round() does.
+            add("sum", lambda F, x: F.coalesce(F.sum(F.round(x.cast("decimal(38,6)"), 0).cast("decimal(38,0)")),
+                                              F.lit(0).cast("decimal(38,0)")),
+                f"COALESCE(SUM({q}), 0)", "decimal", 0)
+        elif kind == "numeric":
+            # numeric(p,s) stores the value rounded to s places (half away from zero); Spark's
+            # cast to decimal(38,s) rounds the same way. Unconstrained or very wide numerics are
+            # summed at 10 places with a matching tolerance.
+            exact = scale is not None and 0 <= int(scale) <= 18 and (prec is None or int(prec) <= 31)
+            s_eff = int(scale) if exact else 10
+            add("sum", lambda F, x, s_eff=s_eff: F.coalesce(F.sum(x.cast(f"decimal(38,{s_eff})")),
+                                                           F.lit(0).cast(f"decimal(38,{s_eff})")),
+                f"COALESCE(SUM({q}), 0)", "decimal", 0 if exact else 10 ** -s_eff)
+        elif kind == "float":
+            add("sum", lambda F, x: F.coalesce(F.sum(x.cast("double")), F.lit(0.0)),
+                f"COALESCE(SUM(({q})::double precision), 0)", "float",
+                1e-6 if (dt or "").lower() == "real" else 1e-9)
+        elif kind in ("ts", "date"):
+            fmt = _TS_FMT if kind == "ts" else "yyyy-MM-dd"
+            p6 = 6 if (dtp is None or kind == "date") else max(0, min(6, int(dtp)))
+            add("sum of instants (us)",
+                lambda F, x, tick=tick, fmt=fmt: F.coalesce(F.sum(F.expr(
+                    f"CAST(unix_micros(to_timestamp({tick}, '{fmt}')) AS DECIMAL(38,0))")),
+                    F.lit(0).cast("decimal(38,0)")),
+                f"COALESCE(SUM(EXTRACT(EPOCH FROM {q}) * 1000000), 0)", "decimal",
+                0 if p6 >= 6 else 10 ** (6 - p6))
+    return m
+
+
+def _same(metric, s, t, rows):
+    """Do the two summaries agree?"""
+    if s is None or t is None:
+        return s is None and t is None
+    if metric["cmp"] == "exact":
+        if isinstance(s, str) or isinstance(t, str):
+            return str(s) == str(t)
+        return Decimal(str(s)) == Decimal(str(t))
+    if metric["cmp"] == "decimal":
+        diff = abs(Decimal(str(s)) - Decimal(str(t)))
+        return diff <= Decimal(str(metric["tol"])) * max(1, int(rows or 0))
+    a, b = float(s), float(t)
+    return abs(a - b) <= metric["tol"] * max(1.0, abs(a), abs(b))
+
+
+def target_range_summary(conn, dsql_schema, dsql_table, pred, metrics):
+    """(row count, [metric values]) for one range of the DSQL target (pred None = whole table)."""
+    parts = ["count(*)"] + [m["sql"] for m in metrics]
+    where = f" WHERE {pred}" if pred else ""
+    cur = conn.cursor()
+    try:
+        cur.execute(f'SELECT {", ".join(parts)} FROM {dsql_schema}.{dsql_table}{where}')
+        r = cur.fetchone()
+        return int(r[0]), list(r[1:])
+    finally:
+        cur.close()
+
+
+def source_range_summaries(df, pk_src_col, pk_kind, ranges, metrics):
+    """{range index: (row count, [metric values])} on the transformed SOURCE, in one pass.
+    pk_kind None = the whole table as a single range."""
     from pyspark.sql import functions as F
-    if pk_kind == "uuid":
-        keyc = F.lower(F.regexp_replace(F.col(pk_src_col), "-", ""))
-    elif pk_kind == "text":
-        keyc = F.col(pk_src_col).cast("string")
+    if pk_kind is None:
+        bucket = F.lit(0)
     else:
-        keyc = F.col(pk_src_col).cast("long").cast("string")
-
-    # Assign each row to a range index via a CASE ladder on the half-open bounds.
-    bucket = F.lit(-1)
-    for i, (lo, hi) in enumerate(ranges):
-        is_top = (i == len(ranges) - 1)
-        if pk_kind == "integer":
-            lo_c, hi_c = F.lit(int(lo)), F.lit(int(hi))
-            keyi = F.col(pk_src_col).cast("long")
-            cond = (keyi >= lo_c) if is_top else ((keyi >= lo_c) & (keyi < hi_c))
+        if pk_kind == "uuid":
+            keyc = F.lower(F.regexp_replace(F.col(pk_src_col), "-", ""))
         else:
-            lo_c, hi_c = F.lit(str(lo)), F.lit(str(hi))
-            cond = (keyc >= lo_c) if is_top else ((keyc >= lo_c) & (keyc < hi_c))
-        bucket = F.when(cond, F.lit(i)).otherwise(bucket)
+            keyc = F.col(pk_src_col).cast("string")
+        bucket = F.lit(-1)
+        for i, (lo, hi) in enumerate(ranges):
+            is_top = (i == len(ranges) - 1)
+            if pk_kind == "integer":
+                keyi = F.col(pk_src_col).cast("long")
+                cond = (keyi >= F.lit(int(lo))) if is_top else \
+                    ((keyi >= F.lit(int(lo))) & (keyi < F.lit(int(hi))))
+            else:
+                cond = (keyc >= F.lit(str(lo))) if is_top else \
+                    ((keyc >= F.lit(str(lo))) & (keyc < F.lit(str(hi))))
+            bucket = F.when(cond, F.lit(i)).otherwise(bucket)
     dfb = df.withColumn("_rng", bucket)
-
-    aggs = [F.count(F.lit(1)).alias("cnt")]
-    if CHECKSUM_MODE == "aggregate" and fp_src_cols:
-        for c in fp_src_cols:
-            aggs.append(F.coalesce(F.sum(F.length(F.coalesce(F.col(c).cast("string"), F.lit("")))),
-                                   F.lit(0)).alias(f"len_{c}"))
-            aggs.append(F.count(F.col(c)).alias(f"nn_{c}"))
-    grouped = dfb.groupBy("_rng").agg(*aggs).collect()
-
+    aggs = [F.count(F.lit(1)).alias("_cnt")]
+    for j, m in enumerate(metrics):
+        aggs.append(m["src"](F, F.col(m["col"])).alias(f"_m{j}"))
     out = {}
-    for row in grouped:
+    for row in dfb.groupBy("_rng").agg(*aggs).collect():
         ri = row["_rng"]
         if ri is None or ri < 0:
             continue
-        cnt = int(row["cnt"])
-        if CHECKSUM_MODE == "aggregate" and fp_src_cols:
-            # Interleave "len|nonnull" per column, in fp_src_cols order — MUST match the
-            # target side, which emits SUM(length), COUNT(col) per column in the same order.
-            fp = "|".join(sum(([str(int(row[f"len_{c}"])), str(int(row[f"nn_{c}"]))]
-                               for c in fp_src_cols), []))
-        else:
-            fp = None
-        out[ri] = (cnt, fp)
+        out[ri] = (int(row["_cnt"]), [row[f"_m{j}"] for j in range(len(metrics))])
     return out
 
 
+def _target_query(dsql_schema, dsql_table, pred, metrics):
+    conn = connect_dsql(autocommit=True)
+    try:
+        return target_range_summary(conn, dsql_schema, dsql_table, pred, metrics)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def validate_one_table(s3, entry):
-    """Validate ONE table: plan ranges, compute source fingerprints (Spark, one pass) and
-    target fingerprints (DSQL, parallel), compare. Returns a result dict."""
+    """Validate ONE table: plan ranges, summarize the source (Spark, one pass) and the target
+    (DSQL, parallel), compare. Every table ends as match, mismatch or error — never skipped."""
     config = load_config(s3, entry)
     meta = config.get('metadata', {})
     dsql_schema = meta.get('dsql_schema') or entry['dsql_schema']
@@ -615,119 +779,119 @@ def validate_one_table(s3, entry):
     pk_meta = meta.get('primary_key', {}) or {}
     pk_cols = pk_meta.get('columns') or []
     pk_kind = pk_meta.get('pk_kind')
-    span_recoverable = bool(pk_meta.get('span_recoverable'))
+    rangeable = len(pk_cols) == 1 and bool(pk_kind) and bool(pk_meta.get('span_recoverable'))
+    pk_col = pk_cols[0] if rangeable else None
+    notes = []
+    if not rangeable:
+        notes.append("whole table compared as one range (no single-column key that can be "
+                     "split into ranges)")
+        pk_kind = None
 
-    if len(pk_cols) != 1 or not pk_kind or not span_recoverable:
-        return {"table": label, "status": "skipped",
-                "reason": "no single-column rangeable PK (cannot range-validate)"}
+    conn = connect_dsql(autocommit=True)
+    try:
+        target_types = read_target_column_types(conn, dsql_schema, dsql_table)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not target_types:
+        return {"table": label, "status": "error", "reason": "target table not found in DSQL"}
 
-    pk_col = pk_cols[0]
-    # Resolve the DMS/source column name for the PK (pre-rename).
-    pk_src = pk_col
-    for m in config.get('column_mapping', []):
-        if isinstance(m, dict) and m.get('action') == 'map' \
-                and (m.get('target_column', '').lower() == pk_col.lower()):
-            pk_src = m.get('dms_column_name')
-            break
-
-    # Fingerprint columns (Tier-2 content check only): restrict to VARCHAR/TEXT columns,
-    # because a content checksum is only comparable when the SOURCE string form equals the
-    # TARGET ::text form — true for text/varchar, NOT for typed columns (numeric/timestamp/
-    # uuid render differently as text on each engine, which would false-positive). Typed
-    # columns are still validated by the per-range COUNT check. Bounded to K for speed.
-    K = 24
-    fp_cols = [c for c in target_columns
-               if type_categories.get(c, 'varchar') in ('varchar', 'text')][:K]
-
-    # ---- SOURCE: read + transform + bounds + per-range fingerprints (Spark) ----
+    # ---- SOURCE: read, rename DMS columns to their target names, THEN transform ----
+    # Same order as the load: the per-type conversions are keyed by TARGET column name, so
+    # renaming first is what makes them apply when DMS writes the names in another case.
     df = read_dms_csv(dms_s3_path, dms_has_headers)
-    # match df column for pk_src (case/space-insensitive)
-    matched_pk = None
-    for dc in df.columns:
-        if dc.lower().strip() == str(pk_src).lower().strip():
-            matched_pk = dc
-            break
-    if matched_pk is None:
-        return {"table": label, "status": "error", "reason": f"PK source col {pk_src!r} not in CSV"}
-
-    df_t = apply_transform(df, target_columns, type_categories)
-    # rename df columns to target names where mapped, so fp col names line up with DSQL
     rename = {}
-    for m in config.get('column_mapping', []):
-        if isinstance(m, dict) and m.get('action') == 'map':
-            dmsn, tgtn = m.get('dms_column_name'), m.get('target_column')
-            for dc in df_t.columns:
+    for mp in config.get('column_mapping', []):
+        if isinstance(mp, dict) and mp.get('action') == 'map':
+            dmsn, tgtn = mp.get('dms_column_name'), mp.get('target_column')
+            for dc in df.columns:
                 if dc.lower().strip() == str(dmsn).lower().strip():
                     rename[dc] = tgtn
     for old, new in rename.items():
-        if old != new and old in df_t.columns:
-            df_t = df_t.withColumnRenamed(old, new)
-    pk_target_name = rename.get(matched_pk, pk_col)
+        if old != new and old in df.columns:
+            df = df.withColumnRenamed(old, new)
+    df_t = apply_transform(df, target_columns, type_categories)
+    if rangeable and pk_col not in df_t.columns:
+        return {"table": label, "status": "error",
+                "reason": f"key column {pk_col!r} not found in the DMS CSV"}
 
-    mn, mx, total = spark_pk_bounds(df_t, pk_target_name, pk_kind)
-    if total == 0 or mn is None:
-        return {"table": label, "status": "empty", "source_rows": 0}
+    # Compared: every target column the source provides (the others get their DSQL DEFAULT).
+    compared = [c for c in target_columns if c in df_t.columns and c in target_types]
+    not_in_source = [c for c in target_columns if c not in df_t.columns]
+    if not_in_source:
+        notes.append(f"not in the DMS CSV (filled by DSQL defaults), not compared: {not_in_source}")
+    metrics = build_metrics(compared, target_types, with_hash=hash_supported()) \
+        if CHECKSUM_MODE != "off" else []
 
-    if pk_kind == "uuid":
-        ranges = plan_ranges_hex(mn, mx, total, VALIDATE_ROWS_PER_RANGE)
+    if rangeable:
+        mn, mx, total = spark_pk_bounds(df_t, pk_col, pk_kind)
     else:
-        ranges = plan_ranges(mn, mx, total, VALIDATE_ROWS_PER_RANGE) if pk_kind == "integer" \
-            else [(mn, mx)]   # text: single span (portable); refine later if needed
+        mn = mx = None
+        total = df_t.count()
 
-    # Both sides MUST fingerprint the SAME ordered column set, or the checksums won't line
-    # up. Use only columns present in the transformed source df (df_t), in target-column
-    # order — and pass this SAME list to the target side below.
-    fp_src_cols = [c for c in fp_cols if c in df_t.columns]
-    src_fps = source_range_fingerprints(df_t, pk_target_name, pk_kind, ranges, fp_src_cols)
+    if total == 0:
+        ranges = [(None, None)]
+        src = {}
+        rangeable_now = False
+    else:
+        rangeable_now = rangeable
+        if not rangeable:
+            ranges = [(None, None)]
+        elif pk_kind == "uuid":
+            ranges = plan_ranges_hex(mn, mx, total, VALIDATE_ROWS_PER_RANGE)
+        elif pk_kind == "integer":
+            ranges = plan_ranges(mn, mx, total, VALIDATE_ROWS_PER_RANGE)
+        else:
+            ranges = [(mn, mx)]
+        src = source_range_summaries(df_t, pk_col if rangeable else None,
+                                     pk_kind if rangeable else None, ranges, metrics)
 
-    # ---- TARGET: per-range fingerprints (DSQL, parallel) ----
-    tgt_fps = {}
+    # ---- TARGET: per-range summaries (DSQL, parallel) ----
+    tgt = {}
     lock = threading.Lock()
 
     def _one(i_rg):
         i, (lo, hi) = i_rg
-        is_top = (i == len(ranges) - 1)
-        conn = connect_dsql(autocommit=True)
-        try:
-            # SAME column set + order as the source side (fp_src_cols) so fingerprints align.
-            cnt, fp = target_range_fingerprint(conn, dsql_schema, dsql_table, pk_col, pk_kind,
-                                                lo, hi, is_top, fp_src_cols)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        pred = None if not rangeable_now else \
+            _range_predicate_sql(pk_col, pk_kind, lo, hi, i == len(ranges) - 1)
+        res = _target_query(dsql_schema, dsql_table, pred, metrics)
         with lock:
-            tgt_fps[i] = (cnt, fp)
+            tgt[i] = res
 
     with ThreadPoolExecutor(max_workers=max(1, MAX_QUERY_CONCURRENCY),
                             thread_name_prefix="vquery") as pool:
-        futs = [pool.submit(_one, (i, rg)) for i, rg in enumerate(ranges)]
-        for f in as_completed(futs):
+        for f in as_completed([pool.submit(_one, (i, rg)) for i, rg in enumerate(ranges)]):
             f.result()
 
     # ---- COMPARE ----
-    mismatches = []
-    src_total = 0
-    tgt_total = 0
+    mismatches, bad_cols = [], set()
+    src_total = tgt_total = 0
+    empty_vals = [mt["empty"] for mt in metrics]
     for i, (lo, hi) in enumerate(ranges):
-        s_cnt, s_fp = src_fps.get(i, (0, None))
-        t_cnt, t_fp = tgt_fps.get(i, (0, None))
+        s_cnt, s_vals = src.get(i, (0, empty_vals))
+        t_cnt, t_vals = tgt.get(i, (0, empty_vals))
         src_total += s_cnt
         tgt_total += t_cnt
+        rng = ["whole table"] if lo is None else [str(lo), str(hi)]
         if s_cnt != t_cnt:
-            mismatches.append({"range": [str(lo), str(hi)], "type": "COUNT_DIFF",
-                               "source": s_cnt, "target": t_cnt})
-        elif CHECKSUM_MODE != "off" and s_fp is not None and t_fp is not None and s_fp != t_fp:
-            mismatches.append({"range": [str(lo), str(hi)], "type": "CHECKSUM_DIFF",
-                               "source_fp": str(s_fp)[:120], "target_fp": str(t_fp)[:120]})
+            mismatches.append({"range": rng, "type": "COUNT_DIFF", "source": s_cnt, "target": t_cnt})
+            continue
+        for j, mt in enumerate(metrics):
+            if not _same(mt, s_vals[j], t_vals[j], s_cnt):
+                bad_cols.add(mt["col"])
+                mismatches.append({"range": rng, "type": "CONTENT_DIFF", "column": mt["col"],
+                                   "column_type": mt["type"], "check": mt["check"],
+                                   "source": str(s_vals[j])[:120], "target": str(t_vals[j])[:120]})
 
     status = "match" if (not mismatches and src_total == tgt_total) else "mismatch"
     return {
         "table": label, "status": status, "ranges": len(ranges),
         "source_rows": src_total, "target_rows": tgt_total,
-        "checksum_mode": CHECKSUM_MODE, "mismatches": mismatches[:50],
-        "mismatch_count": len(mismatches),
+        "checksum_mode": CHECKSUM_MODE, "columns_compared": len(compared) if metrics else 0,
+        "columns_differing": sorted(bad_cols),
+        "mismatches": mismatches[:50], "mismatch_count": len(mismatches), "notes": notes,
     }
 
 
@@ -742,20 +906,31 @@ print("=" * 70)
 
 s3_main = make_boto_client('s3')
 tables = load_manifest(s3_main)
-load_status = load_full_load_status(s3_main) if REQUIRE_FULL_LOAD_DONE else {}
-
-worklist = []
-for entry in tables:
-    label = f"{entry['dsql_schema']}.{entry['dsql_table']}"
-    if REQUIRE_FULL_LOAD_DONE and load_status.get(label) != "done":
-        print(f"  ⏭  SKIP {label} (full load status={load_status.get(label)!r})")
-        continue
-    worklist.append(entry)
-
-print(f"  Validating {len(worklist)} table(s)")
-
 results = []
 _rlock = threading.Lock()
+worklist = []
+if REQUIRE_FULL_LOAD_DONE:
+    load_status = load_full_load_status(s3_main)
+    if load_status is None:
+        raise Exception(
+            f"No full-load status file at {CONFIG_PREFIX.rstrip('/')}/_load_status.json, so there is "
+            f"no record that these {len(tables)} table(s) were loaded. Validation will not report "
+            f"success without checking anything. Run the load for this group first, or start "
+            f"validation with --require_full_load_done false to compare whatever is in DSQL now.")
+    for entry in tables:
+        label = f"{entry['dsql_schema']}.{entry['dsql_table']}"
+        st = load_status.get(label)
+        if st != "done":
+            # A table in this group that the load didn't finish is a failure, not a skip.
+            results.append({"table": label, "status": "error",
+                            "reason": f"full load not marked done (status={st!r})"})
+            print(f"  ✗ {label}: full load not marked done (status={st!r})")
+            continue
+        worklist.append(entry)
+else:
+    worklist = list(tables)
+
+print(f"  Validating {len(worklist)} table(s)")
 
 
 def _run(entry):
@@ -768,8 +943,11 @@ def _run(entry):
     with _rlock:
         results.append(r)
     print(f"  • {r['table']}: {r['status']}"
-          + (f" ({r.get('mismatch_count', 0)} mismatch range(s), "
-             f"src={r.get('source_rows')} tgt={r.get('target_rows')})"
+          + (f" ({r.get('mismatch_count', 0)} difference(s), "
+             f"src={r.get('source_rows')} tgt={r.get('target_rows')}, "
+             f"columns compared={r.get('columns_compared', 0)}"
+             + (f", differing={r['columns_differing']}" if r.get('columns_differing') else "")
+             + ")"
              if r['status'] in ('match', 'mismatch') else
              f" — {r.get('reason', '')}"))
     return r
@@ -788,7 +966,7 @@ else:
 matched = [r for r in results if r["status"] == "match"]
 mismatched = [r for r in results if r["status"] == "mismatch"]
 errored = [r for r in results if r["status"] in ("error",)]
-skipped = [r for r in results if r["status"] in ("skipped", "empty")]
+skipped = [r for r in results if r["status"] not in ("match", "mismatch", "error")]
 
 print(f"\n{'='*70}")
 print("JOB 3 VALIDATION SUMMARY")
@@ -799,8 +977,8 @@ print(f"  MISMATCH  : {len(mismatched)}")
 print(f"  ERROR     : {len(errored)}")
 print(f"  SKIPPED   : {len(skipped)}")
 for r in mismatched:
-    print(f"    ✗ {r['table']}: {r['mismatch_count']} range(s) differ "
-          f"(src={r['source_rows']} tgt={r['target_rows']})")
+    print(f"    ✗ {r['table']}: {r['mismatch_count']} difference(s) "
+          f"(src={r['source_rows']} tgt={r['target_rows']}; columns: {r.get('columns_differing') or '-'})")
     for m in r["mismatches"][:5]:
         print(f"        {m}")
 for r in errored:
@@ -818,6 +996,8 @@ except Exception as e:
 
 job.commit()
 
-if mismatched or errored:
-    raise Exception(f"Validation found {len(mismatched)} mismatched + {len(errored)} errored "
+if not results:
+    raise Exception("Validation checked no tables, which can't be reported as success.")
+if mismatched or errored or skipped:
+    raise Exception(f"Validation found {len(mismatched)} mismatched + {len(errored)} errored + {len(skipped)} unchecked "
                     f"table(s). See _validation_report.json.")

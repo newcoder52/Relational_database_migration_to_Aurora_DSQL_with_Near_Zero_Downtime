@@ -47,7 +47,26 @@ def _connect_dsql(endpoint, user, database):
                           password=token, ssl_context=ctx)
 
 
-def _latest_cdc_file(s3, bucket, cdc_root, dms_schema, dms_table):
+def _ci_subfolder(s3, bucket, prefix, name):
+    """Folder under prefix matching name: exact, else the single case-insensitive match."""
+    names, token = [], None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/"}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        names += [cp["Prefix"][len(prefix):].rstrip("/") for cp in resp.get("CommonPrefixes", []) or []]
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    if name in names:
+        return name
+    ci = [n for n in names if n.lower() == name.lower()]
+    return ci[0] if len(ci) == 1 else None
+
+
+def _latest_cdc_file(s3, bucket, cdc_root, dms_schema, dms_table, _retried=False):
     """Latest CDC CSV key under <cdc_root>/<schema>/<table>/ (skip processed/ + failed/ and
     full-load LOAD*.csv files).
     cdc_root may be a '.'/'/'-style sentinel meaning "no subfolder" (DMS S3 target with NO
@@ -58,11 +77,14 @@ def _latest_cdc_file(s3, bucket, cdc_root, dms_schema, dms_table):
     prefix = f"{root}/{dms_schema}/{dms_table}/" if root else f"{dms_schema}/{dms_table}/"
     latest = None
     token = None
+    saw_any = False
     while True:
         kw = {"Bucket": bucket, "Prefix": prefix}
         if token:
             kw["ContinuationToken"] = token
         resp = s3.list_objects_v2(**kw)
+        if resp.get("Contents"):
+            saw_any = True
         for o in resp.get("Contents", []):
             k = o["Key"]
             rel = k[len(prefix):]
@@ -82,6 +104,14 @@ def _latest_cdc_file(s3, bucket, cdc_root, dms_schema, dms_table):
             token = resp.get("NextContinuationToken")
         else:
             break
+    if not saw_any and not _retried:
+        # No folder under the recorded name: DMS may have created it in another letter case
+        # (a table that was empty at full load). Same lookup as the CDC job.
+        base = f"{root}/" if root else ""
+        s = _ci_subfolder(s3, bucket, base, dms_schema)
+        t = _ci_subfolder(s3, bucket, f"{base}{s}/", dms_table) if s else None
+        if t and (s, t) != (dms_schema, dms_table):
+            return _latest_cdc_file(s3, bucket, cdc_root, s, t, _retried=True)
     return latest
 
 

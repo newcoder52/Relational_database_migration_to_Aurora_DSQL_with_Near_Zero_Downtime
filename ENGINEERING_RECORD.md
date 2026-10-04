@@ -382,3 +382,56 @@ fills dependency gaps and items 1 and 2 stay hidden.
   legacy path (46 workflow checks); all other suites unchanged.
 - **Not changed:** data already loaded by earlier versions (USAGE_GUIDE §4b explains how to find
   and fix it).
+
+### 2026-10-03 — Table-list names in any case; DMS BucketFolder honoured by discovery
+
+- **Before:** discovery built each table's path as `<bucket>/<schema>/<table>/` from the table list
+  exactly as typed, ignoring the endpoint's BucketFolder, and never checked the folder existed. A
+  case mismatch (table list `SRC_SCHEMA`, DMS folder `src_schema`, or the reverse) or a BucketFolder
+  made discovery see no files: the table was marked empty, the load succeeded with 0 rows, CDC
+  watched an empty folder and the drain check treated it as caught up, so cutover succeeded with
+  an empty table and no error anywhere.
+- **Now:** discovery receives the BucketFolder (`--cdc_root`, from the endpoint via
+  create-glue-jobs) and lists the folders DMS actually wrote, matching schema and table
+  case-insensitively (an exact match wins; two case variants with no exact match fail that table).
+  The folder names it finds go into the index (`dms_schema`, `dms_table`, `dms_s3_path`), which the
+  load, validation, plan-split, CDC job and drain check all read. If no table in the task has a
+  folder, discovery fails before writing the index and lists the folders it found
+  (`--allow_all_empty true` overrides). A table with no folder yet is loaded as empty with a
+  warning and its folder name guessed in its siblings' case; the CDC job and drain check look for
+  it in any case if the guessed folder never appears (every 5 minutes at most in the CDC job).
+- **Verified:** the real discovery script run end to end with simulated S3, DSQL and Spark, then
+  its index fed to the real CDC listing and drain check: uppercase, lowercase and mixed-case
+  table lists against uppercase folders; a lowercase BucketFolder layout; exact-match preference;
+  the ambiguous case; an empty table; the all-missing failure; a table later created in another
+  case (18 checks). All other suites unchanged (47 workflow checks).
+
+### 2026-10-04 — Validation checks every column; binary columns stored as real bytes
+
+- **Validation gaps (before):** content was count-only by default (the optional checksum covered
+  text columns only), a missing `_load_status.json` validated 0 tables and passed, tables whose key
+  couldn't be range-split were skipped and the job still passed, and an empty source passed without
+  looking at the target. Also found while testing: the validator converted values before renaming
+  DMS's column names to the DSQL names (the load does the reverse), so with differently-cased
+  names its uuid/boolean/timestamp conversions were skipped. Harmless while only counts were
+  compared, it would have produced false mismatches once content was compared. Fixed.
+- **Validation (now):** per key range, row count plus per-column summaries chosen from the column's
+  real DSQL type (read from information_schema): text/char/binary = non-null count, total length,
+  min, max, sum of a per-value md5 hash; uuid = count, min, max, hash; boolean = true count;
+  integer/numeric = exact sum after the load's rounding; float = sum with tolerance;
+  timestamp/date = sum of instants in microseconds; json/other = count. The md5 hash is probed once
+  per run and dropped (with a log line) if DSQL rejects it. Missing status file, a table not marked
+  `done`, or zero tables checked all fail. A table without a range-splittable key is compared as
+  one whole-table range. An empty source requires an empty target. `--checksum_mode off` gives
+  counts only.
+- **Binary (before):** DMS writes RAW/BLOB as hex text; the load and CDC cast it as `'<hex>'::bytea`,
+  which stores the ASCII of the hex text. **Now:** both convert to `'\x' + lowercase hex` and stop the
+  table (`BINARY GUARD`) on a non-hex value. In the schemas tested so far every RAW column maps to
+  `uuid` (no `bytea` columns), so this is for future schemas.
+- **Verified:** the real validation script run with a Spark stand-in and a DSQL stand-in following
+  PostgreSQL semantics, against a table loaded by the real conversion code: all 15 column types
+  match when correct, and each of 15 single-column corruptions (NULLed text, same-length text
+  change, trimmed spaces, different uuid, wrong cents, integer, boolean, timestamp ±1h and ±1µs,
+  date, double, both binary bugs, char, NULLed note) fails naming exactly that column; missing row,
+  empty source, whole-table compare, missing status file, not-done table, checksum off, no-md5 DSQL
+  (34 checks). All other suites unchanged.

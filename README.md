@@ -11,7 +11,7 @@ Aurora DSQL, and **AWS Step Functions** to orchestrate one migration task end to
 Source DB ──DMS (full load + CDC)──▶ S3 (CSV) ──AWS Glue──▶ Amazon Aurora DSQL
                                       │   Job 1  discover schema + PK/type metadata
               full load: LOAD*.csv ───┤   Job 2  load (Spark, per-file parallel)
-              CDC:  <ts>.csv (Op col)─┘   Job 3  validate (count + optional checksum)
+              CDC:  <ts>.csv (Op col)─┘   Job 3  validate (counts + every column's content)
                                           CDC job  continuous apply (long-running)
 ```
 
@@ -67,7 +67,7 @@ at the final cutover, once CDC has drained and the target matches the source.
 |-----|------|--------------|
 | **Job 1 — Discovery** | `scripts/job1_discovery.py` | Reads the DSQL target schema (authoritative for column set/order) and builds per-table type + primary-key metadata. Writes `_manifest_index.json` + per-table column-mapping JSONs. |
 | **Job 2 — Load** | `scripts/job2_load.py` | Full-load apply (Spark, driver-side pg8000). Large tables load via **per-file parallelism** (250 MB files, up to 30 in parallel); per-file S3 resume; exact per-file no-loss gate. |
-| **Job 3 — Validate** | `scripts/job3_validate.py` | Post-load validation: per-range **count compare** (default), with an **optional content checksum** tier (`aggregate`/`md5`) for text columns on rangeable single-column PKs. |
+| **Job 3 — Validate** | `scripts/job3_validate.py` | Post-load validation, per key range: row counts plus a content check of **every column**, chosen from its DSQL type (text: count, length, min/max, value hash; numbers: exact sum after the load's rounding; timestamps/dates: sum of instants; boolean: true count; binary: as text). Names the column that differs. Fails instead of skipping (missing status file, table not loaded, key that can't be split = whole-table compare). |
 | **CDC — Continuous** | `scripts/glue_cdc_continuous.py` | Long-running Python-shell job that applies inserts/updates/deletes to DSQL, multi-table, with crash-proof resume via DSQL `cdc_control` tables and a no-missed/no-dup guarantee. |
 
 ## Repository layout
@@ -104,8 +104,9 @@ docs/
 - **DMS task** of type `full-load-and-cdc` with `StopTaskCachedChangesApplied=true`, and an
   **S3 target endpoint** with `AddColumnName=true`, `TimestampColumnName=dms_timestamp`,
   `Rfc4180=true`, `DatePartitionEnabled=false`, and no custom `CdcPath`.
-- A DMS **table mapping that lowercases** schema/table/column names (so S3 paths + columns
-  match the DSQL target).
+- A DMS **table mapping that lowercases** column names. Schema and table names can be in any
+  case: the pipeline finds DMS's folders case-insensitively and loads into the lowercased names.
+  The task's table list names each table as DMS writes it (after any schema rename).
 - For **no-PK tables**: configure DMS to emit **insert/delete only** (updates are skipped and
   logged — see the no-PK design note).
 
@@ -213,8 +214,9 @@ See `ENGINEERING_RECORD.md` and `CDC_EDGE_CASE_RESULTS.md` for detail.
   `cdc_control.cdc_file_status`.
 - **DROP COLUMN** during CDC blocks the affected table (resumable after operator remediation).
 - **In-place CHANGE DATA TYPE** is not detected by the header-diff schema reconciliation.
-- Content-checksum validation covers single-column integer/UUID PK tables; composite /
-  fractional-numeric PK tables are **count-validated** only.
+- Validation compares per-range summaries, not individual rows: values swapped between two rows
+  of the same range can cancel out. Tables whose key can't be split into ranges are compared as
+  one whole-table range.
 - CDC requires the source schema to exist in the Oracle LogMiner dictionary before capture
   (a schema created after the dictionary build needs a DBA dictionary rebuild).
 - **No-PK tables:** inserts and deletes are applied; **updates are skipped and logged** to

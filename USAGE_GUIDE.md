@@ -39,9 +39,10 @@ the Engineering Record before relying on schema-change replication.**
    - `AddColumnName = true` (CSVs have header rows),
    - `DatePartitionEnabled = false`,
    - no `CdcPath` / `PreserveTransactions`,
-   - `BucketFolder` empty (or a folder you're OK with — it becomes `cdc_root`).
+   - `BucketFolder` empty, or any folder: every job reads it from the endpoint.
 3. **DMS task** created as `full-load-and-cdc` with `StopTaskCachedChangesApplied=true`, and a
-   table mapping that **lowercases** schema/table/columns:
+   table mapping that **lowercases** columns (schema and table names may stay in any case; this
+   example also renames the schema and lowercases tables):
    ```json
    {"rules":[
      {"rule-type":"selection","rule-id":"1","rule-name":"1",
@@ -57,7 +58,9 @@ the Engineering Record before relying on schema-change replication.**
 4. **Target tables exist in DSQL** (created from your clean DDLs) in the lowercased target
    schema, with a single-column PK where possible (multi-column PK tables can't CDC-apply
    cleanly; range-validation needs an integer PK).
-5. **Manifest** staged: `s3://<bucket>/config/_task/<task name>/table_manifest.csv`
+5. **Manifest** staged: `s3://<bucket>/config/_task/<task name>/table_manifest.csv`, naming each
+   table as DMS writes it to S3 (after any schema rename), in any letter case. The DSQL target is
+   the lowercased name. Discovery fails if none of the tables has a DMS folder.
    ```
    dms_schema,dms_table
    target_schema,table_a
@@ -218,7 +221,16 @@ FROM cdc_control.cdc_file_status WHERE table_name = 'target_schema.table' ORDER 
 SELECT * FROM cdc_control.cdc_apply_exceptions WHERE table_name = 'target_schema.table';
 ```
 
-**Full-load validation report:** `s3://<bucket>/config/_task/<task name>/_orchestrator/group-<n>/_validation_report.json` (one per table group)
+**Full-load validation report:** `s3://<bucket>/config/_task/<task name>/_orchestrator/group-<n>/_validation_report.json` (one per table group).
+Each table gets `match`, `mismatch` or `error`, never skipped. Besides row counts per key range,
+every column is checked by its DSQL type; a `CONTENT_DIFF` entry names the column, the check and
+both values. To switch the content check off for a deployment, add `"--checksum_mode": "off"` to
+`default_arguments` in `glue-templates/validate.json`.
+
+**Binary columns (Oracle RAW, LONG RAW, BLOB → DSQL `bytea`).** DMS writes them to the CSV as
+hexadecimal; the load and CDC store the real bytes. A value that isn't hexadecimal stops the
+table (`BINARY GUARD`) instead of storing wrong bytes. RAW columns mapped to `uuid` (as in most
+of these schemas) are unaffected.
 (`match` / `mismatch` / `skipped` per table; `skipped` = no single-column rangeable integer PK,
 which is by-design — the count is still checked by Job2's `_load_status.json`).
 

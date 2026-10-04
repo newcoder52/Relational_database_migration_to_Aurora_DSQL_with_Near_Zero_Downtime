@@ -72,6 +72,7 @@ CONTINUE-ON-FAILURE: a failed table is logged and the loop continues; a per-tabl
 summary is printed and the job exits non-zero if any table failed.
 """
 
+import re
 import sys
 import time
 import json
@@ -1270,6 +1271,7 @@ DATE_INPUT_FORMATS = TIMESTAMP_INPUT_FORMATS
 # Canonical + raw uuid shapes for the uuid guard.
 UUID_CANONICAL_RE = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 UUID_RAW_HEX_RE = r'^[0-9a-fA-F]{32}$'
+_BYTEA_CANONICAL_RE = re.compile(r'^\\x(?:[0-9a-f]{2})*$')   # stored binary form
 
 # Pre-compiled matchers for the inline (driver-side, per-row) uuid guard. Using
 # Python `re` here (not Spark rlike) keeps the check inside the existing streaming
@@ -2412,6 +2414,21 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
             .otherwise(raw)
         )
 
+    # (b1) BINARY (bytea): DMS writes an Oracle RAW / BLOB value as hexadecimal text. Postgres
+    # reads '\x<hex>'::bytea as those bytes but plain '<hex>'::bytea as the ASCII characters of
+    # the hex (twice as many, wrong bytes). Normalize to '\x' + lowercase hex (an optional
+    # '\x' / '0x' prefix is accepted). Non-hex values pass through unchanged and are stopped
+    # by the binary guard in _guard_row (they can't be decoded safely).
+    bytea_cols = sorted([n for n in df.columns if type_categories.get(n) == 'bytea'])
+    for col_name in bytea_cols:
+        raw = col(col_name)
+        hexpart = regexp_replace(raw, r'^(\\x|0[xX])', '')
+        df = df.withColumn(
+            col_name,
+            when(raw.isNull(), lit(None))
+            .when(hexpart.rlike(r'^([0-9a-fA-F]{2})*$'), concat(lit('\\x'), lower(hexpart)))
+            .otherwise(raw))
+
     # (b2) The uuid shape guard is NOT a separate Spark scan here — that would read the
     # whole input twice and, with multiLine=true non-splittable reads, double the parse
     # cost. Instead the shape check runs INLINE in flatten_chunk() on the rows already
@@ -2466,11 +2483,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     # NUMBER with unexpected scale mapped to a DSQL integer) is SILENTLY ROUNDED, not
     # rejected. Intentional and low-probability; for strict rejection, change the target
     # column type or fail on non-integer input upstream in Job 1.
-    # NOTE (bytea): '%s::bytea' expects DMS to have emitted the hex-escape ("\x..") form,
-    # and the blanket trim() in step (a) also trims bytea-category columns — if a bytea
-    # value legitimately has leading/trailing whitespace bytes, trim() would corrupt it.
-    # bytea is uncommon in these migrations and this path is NOT verified against real
-    # DMS bytea output; validate before relying on a bytea column.
+    # NOTE (bytea): step (b1) turns DMS's hex text into the '\x<hex>' form, so '%s::bytea'
+    # stores the real bytes. Trimming is harmless here: the value is hex text, not raw bytes.
     cast_map = {
         'uuid': '%s::uuid', 'boolean': '%s::boolean', 'timestamptz': '%s::timestamptz',
         'bigint': '%s::numeric::bigint', 'integer': '%s::numeric::integer',
@@ -2539,9 +2553,16 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                       and c not in varchar_max_len]
 
     def _guard_row(d):
-        """Per-row shape guards (uuid format + varchar length + LOB byte size), shared by
-        the bind-param (flatten_chunk) and literal (build_literal_values) INSERT paths so
-        BOTH enforce identical correctness checks. Raises loudly on a violation."""
+        """Per-row shape guards (uuid format + binary hex + varchar length + LOB byte size),
+        shared by the bind-param (flatten_chunk) and literal (build_literal_values) INSERT
+        paths so BOTH enforce identical correctness checks. Raises loudly on a violation."""
+        for bc in bytea_cols:
+            bv = d.get(bc)
+            if bv is not None and not _BYTEA_CANONICAL_RE.match(bv):
+                raise Exception(
+                    f"BINARY GUARD [{dsql_schema}.{dsql_table}]: column '{bc}' value "
+                    f"{repr(bv)[:160]} is not hexadecimal, which is how DMS writes binary "
+                    f"(RAW/BLOB) values. Storing it would put the wrong bytes in the table.")
         for gc in guard_uuid_cols:
             gv = d.get(gc)
             if not is_valid_uuid_value(gv):
@@ -2575,6 +2596,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                 continue
             if isinstance(lv, (bytes, bytearray)):
                 lv_bytes = len(lv)
+            elif lc in bytea_cols:
+                lv_bytes = max(0, len(lv) - 2) // 2      # '\\x' + 2 hex chars per byte
             else:
                 # CHAR-COUNT PRE-FILTER (v16 perf re-vet): UTF-8 is 1-4 bytes/char, so
                 # char length bounds byte length. Skip the full .encode() (an O(n) pass

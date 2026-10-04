@@ -214,6 +214,10 @@ def handler(event, context):
         }
         if extra_py_files:
             args["--extra-py-files"] = extra_py_files
+        if role == "discovery" and "cdc_root" in event:
+            # The DMS endpoint's BucketFolder ("." = none), so discovery finds each table's
+            # folder where DMS really writes it (same root the CDC job and drain check use).
+            args["--cdc_root"] = cdc_root
         if role != "discovery" and event.get("csv_null_value") is not None:
             # Glue can't pass an empty argument value, so an empty marker travels as __EMPTY__.
             _nv = str(event["csv_null_value"])
