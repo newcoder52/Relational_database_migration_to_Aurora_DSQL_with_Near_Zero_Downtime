@@ -1,0 +1,314 @@
+{
+  "Comment": "Fleet cutover launcher, started once by hand with {\"bucket\": \"<pipeline bucket>\", \"inputPrefix\": \"<folder of fleet_tasks.csv>\"} (optional \"tasksFile\", default fleet_tasks.csv). Preflight checks every task first (any problem: PreflightFailed, nothing started), then starts one <<PROJECT>>-cutover execution per task, 5 at a time, without waiting for it to finish. Tasks whose cutover is already running are skipped, so the fleet can be started again after a partial failure. FleetStarted means every task's cutover was started and was still running after 30 s (past its own input checks); watch each child execution for the outcome. CUTOVER IS IRREVERSIBLE PER TASK.",
+  "StartAt": "CheckFleetInput",
+  "States": {
+    "CheckFleetInput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.bucket",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.bucket",
+              "IsString": true
+            },
+            {
+              "Variable": "$.inputPrefix",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.inputPrefix",
+              "IsString": true
+            }
+          ],
+          "Next": "Preflight"
+        }
+      ],
+      "Default": "MissingFleetInput"
+    },
+    "MissingFleetInput": {
+      "Type": "Fail",
+      "Error": "MissingFleetInput",
+      "Cause": "Start the cutover fleet with input {\"bucket\": \"<pipeline bucket>\", \"inputPrefix\": \"<folder of fleet_tasks.csv, e.g. config>\"}; optional \"tasksFile\"."
+    },
+    "Preflight": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Checks every task before any is started (preflight-tasks Lambda, reusing resolve_task's rules). Any problem: PreflightFailed with the row-by-row list.",
+      "Parameters": {
+        "FunctionName": "<<PREFLIGHT_TASKS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "cutover",
+          "bucket.$": "$.bucket",
+          "inputPrefix.$": "$.inputPrefix",
+          "fleetInput.$": "$",
+          "stateMachineArn": "<<CUTOVER_STATE_MACHINE_ARN>>"
+        }
+      },
+      "ResultSelector": {
+        "tasks.$": "$.Payload.tasks",
+        "count.$": "$.Payload.count",
+        "toStart.$": "$.Payload.toStart",
+        "skipped.$": "$.Payload.skipped",
+        "distinctSchemas.$": "$.Payload.distinctSchemas",
+        "warnings.$": "$.Payload.warnings"
+      },
+      "ResultPath": "$.preflight",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PreflightFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "FanOut"
+    },
+    "PreflightFailed": {
+      "Type": "Fail",
+      "Comment": "No task's cutover was started. The cause lists every problem found.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
+    "FanOut": {
+      "Type": "Map",
+      "Comment": "One item per task, 5 at a time (also limits how fast Glue jobs are created). Each item starts the task's workflow and does not wait for it to finish.",
+      "ItemsPath": "$.preflight.tasks",
+      "MaxConcurrency": 5,
+      "Parameters": {
+        "taskArn.$": "$$.Map.Item.Value.taskArn",
+        "taskSuffix.$": "$$.Map.Item.Value.taskSuffix",
+        "skip.$": "$$.Map.Item.Value.skip",
+        "runningExecution.$": "$$.Map.Item.Value.runningExecution",
+        "runName.$": "$$.Map.Item.Value.runName",
+        "input.$": "$$.Map.Item.Value.input"
+      },
+      "Iterator": {
+        "StartAt": "IsSkipped",
+        "States": {
+          "IsSkipped": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.skip",
+                "IsNull": true,
+                "Next": "StartChild"
+              }
+            ],
+            "Default": "Skipped"
+          },
+          "Skipped": {
+            "Type": "Pass",
+            "Comment": "Preflight found this task's cutover already running; not started again.",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "status": "skipped",
+              "reason.$": "$.skip",
+              "runningExecution.$": "$.runningExecution",
+              "started": false
+            },
+            "End": true
+          },
+          "StartChild": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:sfn:startExecution",
+            "Comment": "Start this task's cutover with the same input you'd give it by hand: taskArn, plus taskSuffix only if the CSV sets one.",
+            "Parameters": {
+              "StateMachineArn": "<<CUTOVER_STATE_MACHINE_ARN>>",
+              "Name.$": "$.runName",
+              "Input.$": "States.JsonToString($.input)"
+            },
+            "ResultSelector": {
+              "executionArn.$": "$.ExecutionArn",
+              "startDate.$": "$.StartDate"
+            },
+            "ResultPath": "$.child",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Sfn.ExecutionLimitExceededException",
+                  "Sfn.SfnException",
+                  "States.Timeout"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ChildFailedToStart",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "WaitVerify"
+          },
+          "WaitVerify": {
+            "Type": "Wait",
+            "Comment": "Give the cutover time to pass its own input checks (ResolveTask), then confirm it is still running.",
+            "Seconds": 30,
+            "Next": "VerifyChild"
+          },
+          "VerifyChild": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:sfn:describeExecution",
+            "Parameters": {
+              "ExecutionArn.$": "$.child.executionArn"
+            },
+            "ResultSelector": {
+              "status.$": "$.Status"
+            },
+            "ResultPath": "$.verify",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Sfn.SfnException",
+                  "States.Timeout"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ChildFailedToStart",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IsChildStarted"
+          },
+          "IsChildStarted": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Or": [
+                  {
+                    "Variable": "$.verify.status",
+                    "StringEquals": "RUNNING"
+                  },
+                  {
+                    "Variable": "$.verify.status",
+                    "StringEquals": "SUCCEEDED"
+                  }
+                ],
+                "Next": "ChildStarted"
+              }
+            ],
+            "Default": "ChildStopped"
+          },
+          "ChildStarted": {
+            "Type": "Pass",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "executionArn.$": "$.child.executionArn",
+              "status": "started",
+              "childStatus.$": "$.verify.status",
+              "started": true
+            },
+            "End": true
+          },
+          "ChildStopped": {
+            "Type": "Pass",
+            "Comment": "The cutover ended within 30 s (usually its input checks failed: see that execution).",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "executionArn.$": "$.child.executionArn",
+              "status": "not_started",
+              "childStatus.$": "$.verify.status",
+              "started": false
+            },
+            "End": true
+          },
+          "ChildFailedToStart": {
+            "Type": "Pass",
+            "Comment": "Starting or checking the execution failed (error kept); the other tasks are still started.",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "status": "not_started",
+              "error.$": "$.error",
+              "started": false
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultSelector": {
+        "statuses.$": "$[*].status",
+        "tasks.$": "$[*]"
+      },
+      "ResultPath": "$.results",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FleetFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "EvalNotStarted"
+    },
+    "EvalNotStarted": {
+      "Type": "Pass",
+      "Parameters": {
+        "anyNotStarted.$": "States.ArrayContains($.results.statuses, 'not_started')"
+      },
+      "ResultPath": "$.eval",
+      "Next": "AnyNotStartedChoice"
+    },
+    "AnyNotStartedChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.eval.anyNotStarted",
+          "BooleanEquals": true,
+          "Next": "FleetStartIncomplete"
+        }
+      ],
+      "Default": "FleetStarted"
+    },
+    "FleetStarted": {
+      "Type": "Succeed",
+      "Comment": "Every task's cutover was started (or skipped as already started). See $.results.tasks."
+    },
+    "FleetStartIncomplete": {
+      "Type": "Fail",
+      "Error": "FleetStartIncomplete",
+      "Cause": "At least one task's cutover did not start (status not_started in the execution output's results.tasks, with the error or the child's status). The others were started. Fix those tasks and start the fleet again with the same input: tasks already started are skipped."
+    },
+    "FleetFailed": {
+      "Type": "Fail",
+      "Comment": "The fan-out itself failed unexpectedly.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}
