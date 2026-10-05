@@ -75,6 +75,14 @@ cp config/params.example.csv params.csv
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
 | `max_composite_forks` | optional | `8` | max composite-PK tables forked out of one task (each gets its own always-on CDC + load/validate jobs); over the cap, startup fails early at `PlanSplitFailed` naming the tables |
 | `max_big_cdc_forks` | optional | `8` | max big single-/no-PK tables that get their own `bg` CDC job; over the cap they stay on the main CDC job with a warning (not a failure) |
+| `big_table_row_threshold` | optional | `6000000` | int ≥ 1. A table with ≥ this many rows is big (own load-big group + own bg CDC job). Applies to tasks started after publish; never re-assigns a table whose CDC started |
+| `file_fanout_threshold` | optional | `8` | int ≥ 1. A table with ≥ this many LOAD part-files is also big |
+| `max_groups` | optional | `10` | int ≥ 1. Cap on load/validate groups per task (= CDC job pool size) |
+| `map_max_concurrency` | optional | `6` | int 1–40. Groups/forks that load+validate at once (also the GroupFanOut Map concurrency) |
+| `max_files_in_parallel` | optional | `30` | int ≥ 1. Per-loader cap on LOAD files read at once |
+| `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders |
+| `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency; ≤ max_writers_per_loader |
+| `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency; ≥ min_writers_per_loader |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection; both-or-neither with `security_group_id` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection; both-or-neither with `subnet_id` |
@@ -336,7 +344,7 @@ rm -rf /tmp/_cdc_check && python3 lambdas/prepare_cdc_wheels.py _cdc/ /tmp/_cdc_
 
 ## Step 3c — config/pipeline.json
 
-*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Fourteen of the `params.csv` values
+*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Twenty-two of the `params.csv` values
 become `config/pipeline.json`. Each key maps straight across (defaults applied where you left a row
 out); `account_id`, `subnet_id`, `security_group_id` are **not** written. Don't copy
 `config/pipeline.example.json` as-is — its `description` holds `<bucket>`, and any value with `<`/`>`
@@ -358,6 +366,14 @@ is rejected at run time.
 | `cdc_validation_sample` | `cdc_validation_sample` | `20` |
 | `max_composite_forks` | `max_composite_forks` | `8` |
 | `max_big_cdc_forks` | `max_big_cdc_forks` | `8` |
+| `big_table_row_threshold` | `big_table_row_threshold` | `6000000` |
+| `file_fanout_threshold` | `file_fanout_threshold` | `8` |
+| `max_groups` | `max_groups` | `10` |
+| `map_max_concurrency` | `map_max_concurrency` | `6` |
+| `max_files_in_parallel` | `max_files_in_parallel` | `30` |
+| `conn_budget` | `conn_budget` | `900` |
+| `min_writers_per_loader` | `min_writers_per_loader` | `100` |
+| `max_writers_per_loader` | `max_writers_per_loader` | `150` |
 
 Write it from the export block and upload it to the fixed key `config/pipeline.json`:
 
@@ -380,6 +396,14 @@ cfg = {
     "cdc_validation_sample": 20,
     "max_composite_forks": 8,
     "max_big_cdc_forks": 8,
+    "big_table_row_threshold": 6000000,
+    "file_fanout_threshold": 8,
+    "max_groups": 10,
+    "map_max_concurrency": 6,
+    "max_files_in_parallel": 30,
+    "conn_budget": 900,
+    "min_writers_per_loader": 100,
+    "max_writers_per_loader": 150,
 }
 open("pipeline.json", "w").write(json.dumps(cfg, indent=2) + "\n")
 print(json.dumps(cfg, indent=2))

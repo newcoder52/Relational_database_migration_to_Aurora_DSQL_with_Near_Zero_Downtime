@@ -84,9 +84,9 @@ time (scripts, templates, driver wheels, `config/pipeline.json`, `config/params.
   - **Composite (multi-column) primary keys** get their own `ck` fork — a dedicated load, validate
     and CDC job (`<project>-<task>-ck-<slug>-{load,validate,cdc}`, CDC script
     `scripts/glue_cdc_composite.py`), scoped to that one table.
-  - **Big single-/no-PK tables** (FullLoadRows ≥ the big-table threshold — **6,000,000 rows or 8+
-    part-files**, fixed in `stepfunctions/startup.asl.json`, see
-    [RUNBOOK §10 Planning thresholds](RUNBOOK.md#planning-thresholds-fixed-in-the-startup-workflow)) get
+  - **Big single-/no-PK tables** (FullLoadRows ≥ the big-table threshold — default **6,000,000
+    rows or 8+ part-files**, both now `params.csv` settings; see
+    [RUNBOOK §10 Tuning big tables and fan-out](RUNBOOK.md#tuning-big-tables-and-fan-out)) get
     their own `bg` CDC job (`<project>-<task>-bg-<slug>-cdc`, main CDC script); their load and
     validate stay on the shared `load-big` + `validate` jobs.
   - The **main CDC job** applies the remaining small single-/no-PK tables.

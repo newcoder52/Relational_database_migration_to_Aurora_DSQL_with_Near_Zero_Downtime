@@ -252,6 +252,20 @@ SETTINGS_DEFAULTS = {
     # Max BIG single/no-PK tables that get their own CDC job (bg fork). Overflow stays on the
     # main CDC job (serial apply) with a warning — NOT a failure. See DESIGN_FORK.md §6.
     "max_big_cdc_forks": 8,
+    # ── PLANNING THRESHOLDS (read by plan_split via the resolved payload) ─────────────────
+    # These used to be fixed literals in the PlanSplit state of stepfunctions/startup.asl.json;
+    # they are now settings so operators can tune them per deployment. Defaults equal the former
+    # literals, so a pipeline.json without them plans exactly as before. plan_split uses them to
+    # decide which tables are "big" (own load-big group + own bg CDC job), how many groups to
+    # pack into, how many loaders run at once, and the per-loader DSQL writer concurrency.
+    "big_table_row_threshold": 6000000,   # FullLoadRows >= this => table is "big"
+    "file_fanout_threshold": 8,           # num LOAD part-files >= this => table is "big"
+    "max_groups": 10,                     # cap on load/validate groups (== CDC job pool size)
+    "map_max_concurrency": 6,             # how many loaders plan_split lets run at once
+    "max_files_in_parallel": 30,          # per-loader LOAD-file read cap (--max_files_in_parallel)
+    "conn_budget": 900,                   # DSQL connection budget shared across in-flight loaders
+    "min_writers_per_loader": 100,        # floor for a small group's --max_write_concurrency
+    "max_writers_per_loader": 150,        # ceiling for a small group's --max_write_concurrency
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
 GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
@@ -410,6 +424,56 @@ def _validate_settings(cfg, warnings):
     if mbf < 1:
         raise SettingsError(f"pipeline.json 'max_big_cdc_forks' must be >= 1 (got {mbf}).")
     cfg["max_big_cdc_forks"] = mbf
+
+    # ── PLANNING THRESHOLDS ──────────────────────────────────────────────────────────────
+    # Each is a positive integer; map_max_concurrency additionally caps at 40 (plan_split uses it
+    # as the loader concurrency, which also feeds the GroupFanOut Map — Step Functions allows at
+    # most 40 there). min_writers_per_loader must be <= max_writers_per_loader. Accept ints or
+    # digit strings (params.csv values arrive as strings); reject bools and anything non-integer.
+    def _pos_int(key, lo=1, hi=None):
+        v = cfg.get(key, SETTINGS_DEFAULTS[key])
+        if isinstance(v, bool):  # bool is an int subclass; a bare true/false is a mistake
+            raise SettingsError(f"pipeline.json {key!r} must be an integer (got {v!r}).")
+        if isinstance(v, str):
+            s = v.strip()
+            if not re.fullmatch(r"-?\d+", s):
+                raise SettingsError(f"pipeline.json {key!r} must be an integer (got {v!r}).")
+            v = int(s)
+        if not isinstance(v, int):
+            raise SettingsError(f"pipeline.json {key!r} must be an integer (got {v!r}).")
+        if v < lo:
+            raise SettingsError(f"pipeline.json {key!r} must be >= {lo} (got {v}).")
+        if hi is not None and v > hi:
+            raise SettingsError(f"pipeline.json {key!r} must be between {lo} and {hi} (got {v}).")
+        cfg[key] = v
+        return v
+
+    _pos_int("big_table_row_threshold")
+    _pos_int("file_fanout_threshold")
+    _pos_int("max_groups")
+    map_max = _pos_int("map_max_concurrency", lo=1, hi=40)
+    _pos_int("max_files_in_parallel")
+    conn_budget = _pos_int("conn_budget")
+    min_w = _pos_int("min_writers_per_loader")
+    max_w = _pos_int("max_writers_per_loader")
+    if min_w > max_w:
+        raise SettingsError(f"pipeline.json 'min_writers_per_loader' ({min_w}) must be <= "
+                            f"'max_writers_per_loader' ({max_w}).")
+    # Connection-budget sanity (warnings only — plan_split never exceeds conn_budget; it packs
+    # loaders_in_flight = min(groups, map_max_concurrency, conn_budget // min_writers) and sets
+    # writers_per_loader = max(min_w, min(max_w, conn_budget // loaders_in_flight), so a tight
+    # budget just squeezes per-loader writers down toward min_writers).
+    if conn_budget > 5000:   # DSQL allows 10,000 connections/cluster; >half from one task's loaders is a lot
+        warnings.append(f"pipeline.json conn_budget={conn_budget} is a large share of DSQL's "
+                        f"10,000 connections-per-cluster limit; a single task's loaders could "
+                        f"crowd out other tasks/CDC jobs. Lower it unless you sized for it.")
+    if max_w * map_max > conn_budget:
+        warnings.append(f"pipeline.json max_writers_per_loader ({max_w}) x map_max_concurrency "
+                        f"({map_max}) = {max_w * map_max} exceeds conn_budget ({conn_budget}); "
+                        f"plan_split will cap concurrent loaders so the DSQL connection budget "
+                        f"holds, squeezing per-loader writers below max_writers_per_loader. Raise "
+                        f"conn_budget (watch the DSQL connection limit) or lower the writers/"
+                        f"concurrency to use the full per-loader width.")
     return cfg
 
 
@@ -750,6 +814,14 @@ def handler_shared(event, context):
         "cdcJobName": jobs["cdc"],
         "maxCompositeForks": cfg["max_composite_forks"],
         "maxBigCdcForks": cfg["max_big_cdc_forks"],
+        "bigTableRowThreshold": cfg["big_table_row_threshold"],
+        "fileFanoutThreshold": cfg["file_fanout_threshold"],
+        "maxGroups": cfg["max_groups"],
+        "mapMaxConcurrency": cfg["map_max_concurrency"],
+        "maxFilesInParallel": cfg["max_files_in_parallel"],
+        "connBudget": cfg["conn_budget"],
+        "minWritersPerLoader": cfg["min_writers_per_loader"],
+        "maxWritersPerLoader": cfg["max_writers_per_loader"],
         "warnings": warnings,
     })
     for w in warnings:

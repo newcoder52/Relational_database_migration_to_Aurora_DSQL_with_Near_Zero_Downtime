@@ -75,6 +75,15 @@ OPTIONAL_DEFAULTS = {
     "cdc_validation_sample": "20",
     "max_composite_forks": "8",
     "max_big_cdc_forks": "8",
+    # Planning thresholds (plan_split fan-out knobs; defaults equal the former ASL literals).
+    "big_table_row_threshold": "6000000",
+    "file_fanout_threshold": "8",
+    "max_groups": "10",
+    "map_max_concurrency": "6",
+    "max_files_in_parallel": "30",
+    "conn_budget": "900",
+    "min_writers_per_loader": "100",
+    "max_writers_per_loader": "150",
 }
 # Setup-only keys: consumed by tools/setup.sh (Glue network connection), never in pipeline.json.
 SETUP_ONLY = ("subnet_id", "security_group_id")
@@ -91,9 +100,30 @@ ALLOWED = tuple(REQUIRED) + tuple(OPTIONAL_DEFAULTS) + _DERIVED_DEFAULT + SETUP_
 PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_database",
                  "glue_role_arn", "glue_connection", "cdc_engine", "cdc_spark_fallback",
                  "control_schema", "cdc_validation", "cdc_validation_sample",
-                 "max_composite_forks", "max_big_cdc_forks")
+                 "max_composite_forks", "max_big_cdc_forks",
+                 "big_table_row_threshold", "file_fanout_threshold", "max_groups",
+                 "map_max_concurrency", "max_files_in_parallel", "conn_budget",
+                 "min_writers_per_loader", "max_writers_per_loader")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
+
+# Integer params with (lower, upper) bounds. upper=None means unbounded above. These mirror the
+# ranges resolve_task._validate_settings enforces, so parse() can collect the same problems the
+# pipeline would otherwise only raise at build time. map_max_concurrency caps at 40 (the Step
+# Functions Map concurrency plan_split's loader concurrency also feeds).
+_PLANNING_INT_KEYS = (
+    ("cdc_validation_sample", 0, None),
+    ("max_composite_forks", 1, None),
+    ("max_big_cdc_forks", 1, None),
+    ("big_table_row_threshold", 1, None),
+    ("file_fanout_threshold", 1, None),
+    ("max_groups", 1, None),
+    ("map_max_concurrency", 1, 40),
+    ("max_files_in_parallel", 1, None),
+    ("conn_budget", 1, None),
+    ("min_writers_per_loader", 1, None),
+    ("max_writers_per_loader", 1, None),
+)
 
 
 class ParamsError(Exception):
@@ -176,6 +206,30 @@ def parse(text):
     if have_subnet != have_sg:
         errors.append("subnet_id and security_group_id must be set together or not at all "
                       "(set both for a Glue VPC connection, or neither).")
+
+    # Planning/fork integer keys the operator set must be whole numbers in range (collected here
+    # so every problem shows at once, like the checks above; the SAME rules are enforced
+    # authoritatively by resolve_task._validate_settings when the pipeline.json is read/built).
+    # Only values actually present in the CSV are checked — omitted keys take known-good defaults.
+    ints = {}
+    for key, lo, hi in _PLANNING_INT_KEYS:
+        if key not in raw:
+            continue
+        s = str(raw[key]).strip()
+        if not re.fullmatch(r"-?\d+", s):
+            errors.append(f"{key} must be a whole number (got {raw[key]!r}).")
+            continue
+        n = int(s)
+        if n < lo or (hi is not None and n > hi):
+            rng = f">= {lo}" if hi is None else f"between {lo} and {hi}"
+            errors.append(f"{key} must be {rng} (got {n}).")
+            continue
+        ints[key] = n
+    # min_writers_per_loader <= max_writers_per_loader (only when both parsed cleanly).
+    if "min_writers_per_loader" in ints and "max_writers_per_loader" in ints:
+        if ints["min_writers_per_loader"] > ints["max_writers_per_loader"]:
+            errors.append(f"min_writers_per_loader ({ints['min_writers_per_loader']}) must be "
+                          f"<= max_writers_per_loader ({ints['max_writers_per_loader']}).")
 
     # Assemble the full params dict: defaults first, then the operator's values.
     params = dict(OPTIONAL_DEFAULTS)

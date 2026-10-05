@@ -33,11 +33,29 @@ PIPELINE_KEYS = set(P.PIPELINE_KEYS)
 # Every key the parser knows, by category (for the "documented key is real" direction).
 KNOWN = set(P.REQUIRED) | set(P.OPTIONAL_DEFAULTS) | set(P.SETUP_ONLY) | set(P._DERIVED_DEFAULT)
 
-# Numbers written out in English that the RUNBOOK may use for the pipeline-key count.
-_NUM_WORDS = {
-    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
-    "fifteen": 15, "sixteen": 16,
-}
+# Numbers written out in English that the RUNBOOK may use for the pipeline-key count. Supports
+# plain words and hyphenated compounds up to the 20s–90s (e.g. "Twenty-two" -> 22).
+_ONES = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+         "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+         "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17,
+         "eighteen": 18, "nineteen": 19}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+         "eighty": 80, "ninety": 90}
+
+
+def _word_to_int(word):
+    w = word.strip().lower()
+    if w.isdigit():
+        return int(w)
+    if w in _ONES:
+        return _ONES[w]
+    if w in _TENS:
+        return _TENS[w]
+    if "-" in w:
+        a, _, b = w.partition("-")
+        if a in _TENS and b in _ONES and _ONES[b] < 10:
+            return _TENS[a] + _ONES[b]
+    return None
 
 failures = []
 
@@ -110,15 +128,13 @@ def main():
     _check("RUNBOOK §3 table", _first_col_backtick_keys(sec3), ALLOWED)
 
     # ---- RUNBOOK pipeline-key count sentence ("<N> keys end up in config/pipeline.json") ----
-    mcount = re.search(r"([A-Za-z]+)\s+keys end up in\s+`?config/pipeline\.json`?", runbook)
+    mcount = re.search(r"([A-Za-z]+(?:-[A-Za-z]+)?|\d+)\s+keys end up in\s+`?config/pipeline\.json`?",
+                       runbook)
     if not mcount:
         failures.append("RUNBOOK: could not find the '<N> keys end up in config/pipeline.json' "
                         "sentence")
     else:
-        word = mcount.group(1).lower()
-        n = _NUM_WORDS.get(word)
-        if n is None and word.isdigit():
-            n = int(word)
+        n = _word_to_int(mcount.group(1))
         if n != len(PIPELINE_KEYS):
             failures.append(f"RUNBOOK: pipeline-key count says {mcount.group(1)!r} "
                             f"(={n}) but PIPELINE_KEYS has {len(PIPELINE_KEYS)}")

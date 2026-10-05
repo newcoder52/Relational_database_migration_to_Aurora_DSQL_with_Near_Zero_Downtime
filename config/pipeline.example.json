@@ -13,5 +13,13 @@
   "cdc_validation": true,
   "cdc_validation_sample": 20,
   "max_composite_forks": 8,
-  "max_big_cdc_forks": 8
+  "max_big_cdc_forks": 8,
+  "big_table_row_threshold": 6000000,
+  "file_fanout_threshold": 8,
+  "max_groups": 10,
+  "map_max_concurrency": 6,
+  "max_files_in_parallel": 30,
+  "conn_budget": 900,
+  "min_writers_per_loader": 100,
+  "max_writers_per_loader": 150
 }

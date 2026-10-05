@@ -193,14 +193,24 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
 | `max_composite_forks` | optional | `8` | max composite-PK tables that may be forked out of **one** task (each runs its own always-on CDC job, plus its own load/validate jobs). A task with **more** composite tables than this fails early at startup `PlanSplitFailed` — the cause names the tables — and **no** Glue jobs are created. Raise it (mind Glue job/concurrent-run and DSQL connection quotas) or split the task |
 | `max_big_cdc_forks` | optional | `8` | max **big** single-/no-PK tables that get their **own** CDC job (`bg` fork); each big table keeps the shared `load-big` + `validate`. Big tables **past** the cap are **not** a failure — they stay on the **main** CDC job (serial apply) with a warning. Raise it to give more big tables their own CDC job |
+| `big_table_row_threshold` | optional | `6000000` | int ≥ 1. A table with **≥ this many** full-load rows is **big** (own `load-big` group **and** its own `bg` CDC job). Lower to treat more tables as big; raise for fewer. Applies only to tasks **started after** this is published; never re-assigns a table whose CDC already started |
+| `file_fanout_threshold` | optional | `8` | int ≥ 1. A table with **≥ this many** LOAD part-files is also **big** (same effect as the row threshold). Same apply-after-publish / no-reassign rule |
+| `max_groups` | optional | `10` | int ≥ 1. Cap on load/validate groups per task (**= the pre-created CDC job pool size**); big tables each take one group, small tables bin-pack into the rest. Raise it to spread small tables across more lanes |
+| `map_max_concurrency` | optional | `6` | int **1–40**. How many groups/forks load+validate **at once** (also the `GroupFanOut` Map concurrency). Higher = faster but more concurrent Glue runs and DSQL connections |
+| `max_files_in_parallel` | optional | `30` | int ≥ 1. Per-loader cap on LOAD files read at once |
+| `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders; sets writers-per-loader (the planner never exceeds it) |
+| `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency. Must be **≤** `max_writers_per_loader` |
+| `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency. Must be **≥** `min_writers_per_loader` |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
-Fourteen keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Twenty-two keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
 `control_schema`, `cdc_validation`, `cdc_validation_sample`, `max_composite_forks`,
-`max_big_cdc_forks`. `account_id`, `subnet_id` and
+`max_big_cdc_forks`, `big_table_row_threshold`, `file_fanout_threshold`, `max_groups`,
+`map_max_concurrency`, `max_files_in_parallel`, `conn_budget`, `min_writers_per_loader`,
+`max_writers_per_loader`. `account_id`, `subnet_id` and
 `security_group_id` are used only by setup.
 
 ---
@@ -400,8 +410,9 @@ per-task `startup` refuses a second run of a task that is already running.
   - a **composite (multi-column) PK** table gets its own **`ck` fork** — a dedicated load, validate
     and CDC job `$PROJECT-$TASK_NAME-ck-<slug>-{load,validate,cdc}` (CDC via
     `scripts/glue_cdc_composite.py`), scoped to that one table;
-  - a **big** single-/no-PK table (FullLoadRows ≥ the big-table threshold — **6,000,000 rows or 8+
-    part-files**, fixed in the startup workflow; see [Planning thresholds](#planning-thresholds-fixed-in-the-startup-workflow)) gets
+  - a **big** single-/no-PK table (FullLoadRows ≥ the big-table threshold — default **6,000,000
+    rows or 8+ part-files**, both `params.csv` settings; see
+    [Tuning big tables and fan-out](#tuning-big-tables-and-fan-out)) gets
     its own **`bg` CDC job** `$PROJECT-$TASK_NAME-bg-<slug>-cdc` (main CDC script) while keeping the
     shared `load-big` + `validate` jobs;
   - the **main CDC job** applies the remaining small single-/no-PK tables.
@@ -758,24 +769,36 @@ s3://<bucket>/
     └── _task/<task name>/    # one folder per DMS task (table list, owner record, group status, CDC markers)
 ```
 
-### Planning thresholds (fixed in the startup workflow)
+### Tuning big tables and fan-out
 
-The fan-out planner (`plan_split`) is driven by a set of knobs that are **not** `params.csv` keys —
-they are passed as **fixed literals** in the `PlanSplit` state of `stepfunctions/startup.asl.json`.
-Only `max_composite_forks` / `max_big_cdc_forks` come from `params.csv` (resolved per task); the rest
-are the same for every task. To change one, edit `stepfunctions/startup.asl.json` and re-run setup
-(`tools/setup.sh`) so the state machine is re-deployed. **Don't** look for these in `params.csv`.
+The fan-out planner (`plan_split`) is driven by eight `params.csv` settings (full rows, defaults
+and valid ranges in [§3](#3-fill-in-paramscsv)). The defaults equal the values the pipeline used
+before these were settings, so leaving them out plans exactly as before. Two rules apply to all of
+them:
 
-| Knob (PlanSplit literal) | Value | What it controls |
-|---|---|---|
-| `big_table_row_threshold` | `6000000` | a table with **≥ 6,000,000 rows** (OR `≥ file_fanout_threshold` LOAD files) is **big**: it gets its **own** load-big group **and** its own `bg` CDC job |
-| `file_fanout_threshold` | `8` | a table with **≥ 8** LOAD part-files is **big** (same effect as the row threshold) |
-| `max_files_in_parallel` | `30` | per-loader cap on LOAD files read at once (big groups also drive `--max_write_concurrency` from it) |
-| `max_groups` | `10` | total load/validate groups per task = the pre-created CDC job pool size (big tables each take one) |
-| `conn_budget` | `900` | DSQL connection budget shared across in-flight loaders; sets writers-per-loader |
-| `min_writers_per_loader` | `100` | floor for `--max_write_concurrency` on a small group's load |
-| `max_writers_per_loader` | `150` | ceiling for `--max_write_concurrency` on a small group's load |
-| `map_max_concurrency` | `6` | how many groups/forks load+validate at once (the GroupFanOut Map concurrency) |
+- a change takes effect only for tasks **started after** the new `pipeline.json` is published
+  (settings are read once per run, at `ResolveTask`);
+- a change **never re-assigns** a table whose CDC job already started — the owners recorded in
+  `config/_task/<task>/_jobs.json` win, and `plan_split` only logs a warning if a new threshold
+  *would* move a table (so a tuning change can't double-apply a table). To actually re-assign, cut
+  the task over (which stops and deletes its CDC jobs) and start it fresh.
+
+What to change, and why:
+
+- **Treat more/fewer tables as "big"** (own `load-big` group + own `bg` CDC job): lower/raise
+  `big_table_row_threshold` (rows) or `file_fanout_threshold` (part-files). More big tables = more
+  always-on `bg` CDC jobs (watch `max_big_cdc_forks` and the Glue concurrent-run quota).
+- **Spread small tables across more lanes:** raise `max_groups` (= the CDC job pool size).
+- **Go faster at the cost of more concurrency:** raise `map_max_concurrency` (1–40). Each extra
+  concurrent loader uses more Glue DPU and opens more DSQL connections at once.
+- **Pace DSQL writes:** `conn_budget` is the connection budget the planner shares across in-flight
+  loaders; `min_writers_per_loader`/`max_writers_per_loader` bound each loader's write concurrency.
+  The planner never exceeds `conn_budget` — if `max_writers_per_loader × map_max_concurrency`
+  exceeds it, per-loader writers are squeezed below `max_writers_per_loader` (resolve warns).
+
+Mind the quotas when raising any of these: the **Glue concurrent-job-runs** quota (~30/account,
+adjustable) and **DPU** limits, and DSQL connections (10,000/cluster, 100/s). See
+[Limits](#limits).
 
 ### Limits
 
@@ -890,6 +913,11 @@ See [§8](#8-if-something-fails) for the recovery keyed to each state, and
 - `plan_split` reads `max_composite_forks` and `max_big_cdc_forks` (passed via the resolved
   `maxCompositeForks` / `maxBigCdcForks`) to cap composite `ck` forks (over the cap → startup
   `PlanSplitFailed`) and big `bg` CDC forks (over the cap → stay on the main CDC job with a warning).
+  It also reads the eight planning thresholds — `big_table_row_threshold`, `file_fanout_threshold`,
+  `max_groups`, `map_max_concurrency`, `max_files_in_parallel`, `conn_budget`,
+  `min_writers_per_loader`, `max_writers_per_loader` (resolved as `bigTableRowThreshold` etc.) — to
+  decide which tables are big, how many groups to pack into, and the loader/writer concurrency. The
+  resolved `mapMaxConcurrency` also drives the `GroupFanOut` Map's `MaxConcurrencyPath`.
 - `create_glue_jobs` sets `cdc_validation` / `cdc_validation_sample` on every CDC job it creates
   (as `--cdc_validation` / `--cdc_validation_sample`), and builds all the task's jobs under
   `glue_role_arn` / `glue_connection` with the chosen `cdc_engine`.

@@ -68,7 +68,15 @@
         "cdcValidationSample.$": "$.Payload.cdcValidationSample",
         "accountId.$": "$.Payload.accountId",
         "maxCompositeForks.$": "$.Payload.maxCompositeForks",
-        "maxBigCdcForks.$": "$.Payload.maxBigCdcForks"
+        "maxBigCdcForks.$": "$.Payload.maxBigCdcForks",
+        "bigTableRowThreshold.$": "$.Payload.bigTableRowThreshold",
+        "fileFanoutThreshold.$": "$.Payload.fileFanoutThreshold",
+        "maxGroups.$": "$.Payload.maxGroups",
+        "mapMaxConcurrency.$": "$.Payload.mapMaxConcurrency",
+        "maxFilesInParallel.$": "$.Payload.maxFilesInParallel",
+        "connBudget.$": "$.Payload.connBudget",
+        "minWritersPerLoader.$": "$.Payload.minWritersPerLoader",
+        "maxWritersPerLoader.$": "$.Payload.maxWritersPerLoader"
       },
       "ResultPath": "$.resolved",
       "Retry": [
@@ -621,14 +629,14 @@
         "FunctionName": "<<PLAN_SPLIT_LAMBDA_ARN>>",
         "Payload": {
           "cdc_root.$": "$.resolved.cdcRoot",
-          "big_table_row_threshold": 6000000,
-          "file_fanout_threshold": 8,
-          "max_files_in_parallel": 30,
-          "max_groups": 10,
-          "conn_budget": 900,
-          "min_writers_per_loader": 100,
-          "max_writers_per_loader": 150,
-          "map_max_concurrency": 6,
+          "big_table_row_threshold.$": "$.resolved.bigTableRowThreshold",
+          "file_fanout_threshold.$": "$.resolved.fileFanoutThreshold",
+          "max_files_in_parallel.$": "$.resolved.maxFilesInParallel",
+          "max_groups.$": "$.resolved.maxGroups",
+          "conn_budget.$": "$.resolved.connBudget",
+          "min_writers_per_loader.$": "$.resolved.minWritersPerLoader",
+          "max_writers_per_loader.$": "$.resolved.maxWritersPerLoader",
+          "map_max_concurrency.$": "$.resolved.mapMaxConcurrency",
           "config_prefix.$": "$.resolved.configPrefix",
           "project.$": "$.resolved.project",
           "taskSuffix.$": "$.resolved.taskSuffix",
@@ -732,7 +740,7 @@
     "GroupFanOut": {
       "Type": "Map",
       "ItemsPath": "$.plan.groups",
-      "MaxConcurrency": 6,
+      "MaxConcurrencyPath": "$.resolved.mapMaxConcurrency",
       "Parameters": {
         "group_index.$": "$$.Map.Item.Value.group_index",
         "config_prefix.$": "$$.Map.Item.Value.config_prefix",

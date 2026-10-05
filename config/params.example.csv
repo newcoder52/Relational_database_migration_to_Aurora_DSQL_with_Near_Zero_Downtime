@@ -45,6 +45,31 @@ max_composite_forks,8
 # keeps its normal load/validate (shared load-big + validate); only CDC is forked. Overflow beyond
 # this cap stays on the MAIN CDC job (serial apply) with a warning — NOT a failure.
 max_big_cdc_forks,8
+
+# ---- planning thresholds (plan_split fan-out knobs; defaults equal the former fixed values) ----
+# Changing one of these affects only tasks STARTED AFTER the new pipeline.json is published, and
+# it never re-assigns a table whose CDC job already started (recorded owners win). All are whole
+# numbers.
+# big_table_row_threshold: a table with >= this many full-load rows is "big" (own load-big group
+#   AND its own bg CDC job). Lower it to treat more tables as big; raise it to treat fewer.
+big_table_row_threshold,6000000
+# file_fanout_threshold: a table with >= this many LOAD part-files is also "big" (same effect).
+file_fanout_threshold,8
+# max_groups: cap on load/validate groups per task (== the pre-created CDC job pool size). Big
+#   tables each take one group; small tables bin-pack into the rest.
+max_groups,10
+# map_max_concurrency: how many groups/forks load+validate at once (1-40; also the GroupFanOut
+#   Map concurrency). Higher = faster but more concurrent Glue runs and DSQL connections.
+map_max_concurrency,6
+# max_files_in_parallel: per-loader cap on LOAD files read at once.
+max_files_in_parallel,30
+# conn_budget: DSQL connection budget shared across in-flight loaders; sets writers-per-loader.
+conn_budget,900
+# min_writers_per_loader / max_writers_per_loader: floor/ceiling for a small group's DSQL write
+#   concurrency (min <= max).
+min_writers_per_loader,100
+max_writers_per_loader,150
+
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
 # Only set it if your Glue role name differs from <project>-glue-exec-role.
 glue_role_arn,arn:aws:iam::123456789012:role/dms-dsql-glue-exec-role
