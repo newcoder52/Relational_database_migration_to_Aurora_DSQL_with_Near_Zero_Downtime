@@ -814,6 +814,15 @@ for i, spec in enumerate(specs, start=1):
             "pk_columns": config['metadata']['primary_key']['columns'],
             "pk_span_recoverable": config['metadata']['primary_key']['span_recoverable'],
             "pk_kind": config['metadata']['primary_key'].get('pk_kind'),
+            # ADDITIVE: pk_mode is the CDC-job OWNERSHIP tri-state, distinct from the single-
+            # column pk_kind above. composite = multi-column PK (owned by the composite CDC
+            # job, glue_cdc_composite.py); single = one-column PK; none = no PK. The main CDC
+            # job applies single+none, the composite CDC job applies composite — exact split,
+            # no table applied by both. create-glue-jobs/startup use pk_mode to decide whether
+            # to create/start the composite job for this task.
+            "pk_mode": ("composite" if len(config['metadata']['primary_key']['columns']) > 1
+                        else ("single" if config['metadata']['primary_key']['columns']
+                              else "none")),
             # EMPTY-AT-DISCOVERY: no full-load file (legit 0 source rows). full_load_rows=0
             # so plan-split sizes it as tiny; empty_at_discovery lets the full-load status be
             # marked 'done' immediately (nothing to load) so the CDC gate opens and any CDC

@@ -11,8 +11,8 @@ endpoint/user/db, Glue connection, ...) live in one file next to fleet_tasks.csv
 nobody retypes an export block.
 
 THE FILE
-  s3://<bucket>/<inputPrefix>/params.csv   (default name params.csv; the execution input
-                                            "paramsFile" can point at a different name)
+  s3://<bucket>/config/params.csv   (default name params.csv; the execution input
+                                     "paramsFile" can point at a different name in config/)
   Header row:  parameter,value
   One row per key. Blank lines and lines whose first field starts with '#' are ignored.
   Every value is trimmed. A duplicate key or an unknown key is an error (the message lists the

@@ -4,7 +4,7 @@ _Comprehensive record of the pipeline architecture, every bug found and fixed, a
 empirically-tested DDL support/limitations. Companion to `RUNBOOK.md` (deploy steps) and
 `USAGE_GUIDE.md` (end-to-end operation)._
 
-Last validated: 2026-10-04 (state-machine / script simulations against the real Lambda and Glue
+Last validated: 2026-10-05 (state-machine / script simulations against the real Lambda and Glue
 code; see the dated entries in §6). The last **real-AWS** end-to-end run was earlier (a test
 account in `us-east-1`, a DSQL cluster) and is captured in §5 as a historical snapshot — the
 post-2026-10-01 features (shared workflows, fleet launcher, runtime Spark CDC fallback,
@@ -374,9 +374,10 @@ fills dependency gaps and items 1 and 2 stay hidden.
   case had no code behind it.
 - **Now:** `build_table_context` raises `MultiColumnKeyTable` for those tables (even if a logical
   key is declared); `main()` lists them at startup and never processes them, so their
-  `cdc_control` rows stay free for the separate multi-column-key CDC job. A task whose tables all
+  `cdc_control` rows stay free for the separate composite CDC job. A task whose tables all
   have multi-column keys starts, writes its start marker and stays idle. The drain check is
   unchanged and still waits for them, so cutover can't finish before that job has caught up.
+  (The separate composite CDC job that applies these tables was added 2026-10-05 — see that entry.)
 - **Verified:** the real `build_table_context` and `main()` with a mix of single-key, keyless and
   multi-column-key tables (10 checks); the copy-fix (38) and two-run (12) suites still pass.
 
@@ -498,10 +499,11 @@ fills dependency gaps and items 1 and 2 stay hidden.
   `config/fleet_tasks.example.csv`. (IAM later consolidated to one combined file per service —
   `iam/glue.json`, `iam/lambda.json`, `iam/stepfunctions.json` — so the former separate
   `preflight-tasks`/`fleet-startup`/`fleet-cutover` roles were merged into the lambda and sfn roles.)
-- **How it works:** manual trigger, input `{"bucket","inputPrefix"}`. It reads
-  `config/pipeline.json` (the same file every task uses — it does **not** write it) and
-  `config/<inputPrefix>/fleet_tasks.csv` (columns `task_arn`, optional `task_suffix`, optional
-  `adopt_existing_folder`). The task suffix defaults to the DMS task name. The `Preflight` state
+- **How it works:** manual trigger, input `{"bucket"}`. It reads
+  `config/pipeline.json` (the same file every task uses — it does **not** write it, other than the
+  `params.csv` safe-publish) and `config/fleet_tasks.csv` (columns `task_arn`, optional
+  `task_suffix`, optional `adopt_existing_folder`). Operator files always live in the fixed folder
+  `config/`. The task suffix defaults to the DMS task name. The `Preflight` state
   (`preflight_tasks`, reusing `resolve_task`'s rules) validates each task's ARN/readiness and
   estimates, from each task's selection rules, that the DSQL database stays within ≤ 9 of the
   operator's own schemas (10-schema cap, `cdc_control` is the 10th; the exact count is enforced
@@ -582,6 +584,37 @@ fills dependency gaps and items 1 and 2 stay hidden.
 
 ---
 
+### 2026-10-05 — Operator files fixed to config/; composite-key CDC job added
+
+- **inputPrefix removed.** Operator files are always read from the one fixed folder
+  `s3://<bucket>/config/`: `config/params.csv`, `config/fleet_tasks.csv`, `config/pipeline.json`.
+  The fleet start input is now `{"bucket":"<bucket>"}` only (optional `tasksFile`); `CheckFleetInput`
+  in both `fleet-startup`/`fleet-cutover` requires `bucket` alone, and `MissingFleetInput` names a
+  missing `bucket`. `preflight_tasks` reads from the `BASE_PREFIX = "config/"` constant; an old
+  caller that still passes a prefix field has it ignored with a single warning (not a failure). The
+  former "params.csv plus a second pipeline.json in the operator folder is ambiguous" rule and its
+  no-params local-vs-canonical guard are gone, because params.csv and the generated pipeline.json
+  share `config/` by design. `tools/setup.sh` now requires an `s3://<bucket>/config/params.csv`
+  path (or a local path with `--bucket`) and rejects any other key with a clear message.
+- **Composite-key (multi-column-PK) CDC job added.** `job1_discovery` records a per-table
+  `pk_mode` (single/composite/none) in `_manifest_index.json`. After `RunDiscovery`, startup's new
+  `EnsureCompositeJob` state (`create-glue-jobs` mode `ensure_composite`) creates one
+  `<project>-<suffix>-cdc-composite` Glue job (`scripts/glue_cdc_composite.py`, templates
+  `glue-templates/cdc-composite{,-spark}.json`) only when this run's index has a composite-PK table,
+  then `HasCompositeToStart`/`StartCdcCompositeJob` start it next to the main CDC job and confirm its
+  start marker (90 × 30 s). The main CDC job keeps skipping composite tables; the composite job
+  applies only them (disjoint, no double-apply). Cutover's `HasCompositeToStop`/`StopCdcCompositeRun`
+  stops it (tolerant if absent) and `DeleteGlueJobs` removes it by name. A task with no composite-PK
+  tables gets no extra job. New Fail states: `EnsureCompositeFailed`, `CompositeStartNotConfirmed`.
+  No IAM change (the composite Glue job reuses the glue-exec-role; the sfn grants are prefix-wide).
+- **Verified (offline, no AWS):** py_compile all `scripts/*.py lambdas/*.py tools/*.py`; JSON parse
+  all templates/stepfunctions/config/iam; ASL reachability startup 57 / cutover 28 / fleet-startup 10
+  / fleet-cutover 10 (all reachable, 0 dangling); `setup.sh` `bash -n` + shellcheck clean, VPC and
+  no-VPC dry-runs (5 scripts + 8 templates incl. the composite script and both composite templates),
+  wrong-path rejection; suites composite 61, auto-table-list all checks, iam 95, params 54 + 19.
+
+---
+
 ## 7. Known issues still open (not yet fixed in this release)
 
 These are real bugs in the code at this HEAD; they are documented, with workarounds, in
@@ -604,6 +637,3 @@ honest about what is **not** fixed:
 5. **Case-folder latent bug.** A table empty at full load whose DMS folder differs only in letter
    case can be mis-matched permanently and reported caught up at cutover
    (`CDC_EDGE_CASE_RESULTS.md` §2.8). Does not affect tables that have data at full load.
-6. **Composite-key CDC job not in the repo.** Multi-column-PK tables are skipped by the main CDC
-   job (2026-10-03 entry); the separate job they require is not shipped here, so cutover waits for
-   them indefinitely until it exists.

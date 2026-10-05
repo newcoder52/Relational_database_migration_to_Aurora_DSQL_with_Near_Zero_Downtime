@@ -286,6 +286,19 @@ def _put_json(s3, bucket, key, doc):
                   ContentType="application/json")
 
 
+def _task_has_composite_tables(s3, bucket, index_key):
+    """True if the task's manifest index has >=1 multi-column-PK table (pk_mode == 'composite',
+    written by job1_discovery). Best-effort: index missing/unreadable -> False (no composite
+    job started). Used to gate the composite CDC job in startup/cutover."""
+    idx = _get_json(s3, bucket, index_key)
+    if not isinstance(idx, dict):
+        return False
+    for t in idx.get("tables", []):
+        if t.get("pk_mode") == "composite" or len(t.get("pk_columns") or []) > 1:
+            return True
+    return False
+
+
 def _load_settings(s3, bucket, key, warnings):
     doc = _get_json(s3, bucket, key)
     if doc is None:
@@ -589,6 +602,12 @@ def handler_shared(event, context):
                         f"Glue jobs ({suffix!r}).")
 
     jobs = {role: f"{cfg['project']}-{suffix}-{role}" for role in GLUE_ROLES}
+    # COMPOSITE CDC job: a second CDC job (<project>-<suffix>-cdc-composite) that applies ONLY
+    # multi-column-PK tables. Its name is always resolvable; hasCompositeTables (read from the
+    # manifest index pk_mode) tells startup/cutover whether to start/stop it for this task.
+    composite_cdc_job = f"{cfg['project']}-{suffix}-cdc-composite"
+    has_composite_tables = _task_has_composite_tables(
+        s3, bucket, f"config/_task/{suffix}/_manifest_index.json")
     # An earlier run of this task switched its CDC job to Spark because the Python-shell
     # drivers failed (create-glue-jobs wrote this file): keep Spark, don't fail the same way again.
     cdc_engine = cfg["cdc_engine"]
@@ -620,6 +639,8 @@ def handler_shared(event, context):
         "controlSchema": cfg["control_schema"],
         "jobNames": jobs,
         "cdcJobName": jobs["cdc"],
+        "compositeCdcJobName": composite_cdc_job,
+        "hasCompositeTables": has_composite_tables,
         "warnings": warnings,
     })
     for w in warnings:

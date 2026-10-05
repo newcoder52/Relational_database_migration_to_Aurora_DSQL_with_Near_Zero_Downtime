@@ -3,8 +3,12 @@
 # from a single parameters CSV. Run from the repo root.
 #
 # Usage:
-#   tools/setup.sh s3://<bucket>/<prefix>/params.csv [--with-drivers] [--dry-run]
+#   tools/setup.sh s3://<bucket>/config/params.csv [--with-drivers] [--dry-run]
 #   tools/setup.sh <local-path-to-params.csv> --bucket <bucket> [--with-drivers] [--dry-run]
+#
+# Operator files live in ONE fixed folder: s3://<bucket>/config/ (params.csv, fleet_tasks.csv,
+# and the generated pipeline.json). An s3:// params path MUST be s3://<bucket>/config/params.csv;
+# any other key is rejected with a clear message.
 #
 # What it does (create-or-update, safe to re-run), mirroring RUNBOOK Steps 1-4:
 #   1. Fill the 3 combined iam/*.json files and create/update all 3 roles — one per service
@@ -36,8 +40,9 @@ WITH_DRIVERS=0
 DRY_RUN=0
 
 usage() {
-  echo "Usage: tools/setup.sh s3://<bucket>/<prefix>/params.csv [--with-drivers] [--dry-run]" >&2
+  echo "Usage: tools/setup.sh s3://<bucket>/config/params.csv [--with-drivers] [--dry-run]" >&2
   echo "       tools/setup.sh <local params.csv> --bucket <bucket> [--with-drivers] [--dry-run]" >&2
+  echo "       (operator files live in s3://<bucket>/config/: params.csv, fleet_tasks.csv, pipeline.json)" >&2
   exit 2
 }
 
@@ -90,10 +95,20 @@ BUCKET=""
 PARAMS_LOCAL=""
 case "$PARAMS_ARG" in
   s3://*)
-    # s3://bucket/key... -> bucket is the first path segment
+    # s3://bucket/key... -> bucket is the first path segment, key is the rest.
     rest="${PARAMS_ARG#s3://}"
     BUCKET="${rest%%/*}"
+    KEY="${rest#*/}"
     [ -n "$BUCKET" ] || { echo "could not read bucket from $PARAMS_ARG" >&2; exit 2; }
+    # Operator files live in the fixed folder config/. The params CSV must be at config/params.csv
+    # (same folder as fleet_tasks.csv and the generated pipeline.json).
+    if [ "$KEY" != "config/params.csv" ]; then
+      echo "ERROR: params.csv must be at s3://$BUCKET/config/params.csv (got key '$KEY')." >&2
+      echo "       Operator files live in the fixed folder config/. Upload it there and re-run:" >&2
+      echo "       aws s3 cp params.csv s3://$BUCKET/config/params.csv" >&2
+      echo "       tools/setup.sh s3://$BUCKET/config/params.csv" >&2
+      exit 2
+    fi
     PARAMS_LOCAL="$TMPDIR_SETUP/params.csv"
     if [ "$DRY_RUN" -eq 1 ]; then
       { printf 'DRYRUN(read):'; printf ' %q' aws s3 cp "$PARAMS_ARG" "$PARAMS_LOCAL"; printf '\n'; } >&2
@@ -361,7 +376,7 @@ fi
 # Step 3a — Glue scripts and job templates to S3
 # =============================================================================================
 echo "--- Step 3a: scripts and templates to S3 ---"
-for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py; do
+for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py glue_cdc_composite.py; do
   run aws s3 cp "scripts/$f" "s3://$BUCKET/scripts/$f"
 done
 mkdir -p "$TMPDIR_SETUP/glue-templates"
@@ -532,8 +547,9 @@ echo "bucket          : $BUCKET"
 echo "roles (3)       : $P_PROJECT-{glue,lambda,sfn}-exec-role (one per service; lambda runs all 8 Lambdas incl. preflight-tasks, sfn runs all 4 state machines incl. the fleets)"
 echo "lambdas (8)     : $P_PROJECT-{resolve-task,driver-discovery,plan-split,create-glue-jobs,stop-cdc-run,drain-check,drop-tags,preflight-tasks}"
 echo "state machines(4): $P_PROJECT-{startup,cutover,fleet-startup,fleet-cutover}"
-echo "glue scripts    : 4 uploaded to s3://$BUCKET/scripts/"
-echo "glue templates  : 6 uploaded to s3://$BUCKET/glue-templates/"
+_tmpl_files=(glue-templates/*.json)
+echo "glue scripts    : 5 uploaded to s3://$BUCKET/scripts/"
+echo "glue templates  : ${#_tmpl_files[@]} uploaded to s3://$BUCKET/glue-templates/"
 if [ "$WITH_DRIVERS" -eq 1 ]; then echo "drivers         : staged to driver-fullload/validation/cdc"; else echo "drivers         : NOT staged (re-run with --with-drivers)"; fi
 if [ "$HAVE_VPC" -eq 1 ]; then echo "glue connection : $P_GLUE_CONNECTION ($P_SUBNET_ID / $P_SECURITY_GROUP_ID)"; else echo "glue connection : none (no VPC)"; fi
 if [ "$PUBLISH_SETTINGS" -eq 1 ]; then echo "pipeline.json   : published from params.csv"; else echo "pipeline.json   : left unchanged (identical, running, or dry-run)"; fi

@@ -1,6 +1,6 @@
 # config/params.example.csv — the pipeline's "export" values in one file.
 #
-# Copy this to s3://<bucket>/<inputPrefix>/params.csv (next to fleet_tasks.csv) and replace the
+# Copy this to s3://<bucket>/config/params.csv (next to config/fleet_tasks.csv) and replace the
 # placeholder values with your own. The fleet reads it, builds config/pipeline.json from it, and
 # (when no run is in progress) publishes it — so nobody retypes an export block. tools/setup.sh
 # reads the same file at one-time setup.

@@ -16,11 +16,11 @@ writes to the source only at cutover, once CDC has caught up and the target matc
 ## How it works
 
 The **fleet** is the only way to start and cut over tasks. You launch `fleet-startup` (and later
-`fleet-cutover`) once, by hand, with `{"bucket": "<bucket>", "inputPrefix": "config"}`; it reads
+`fleet-cutover`) once, by hand, with `{"bucket": "<bucket>"}`; it reads
 `s3://<bucket>/config/fleet_tasks.csv` and runs the per-task **startup** (or **cutover**) state
-machine for each row. `inputPrefix` is always `"config"` (the fixed folder holding `params.csv` and
-`fleet_tasks.csv`). **One DMS task is one row in `config/fleet_tasks.csv`**; a new wave is just a
-new `config/fleet_tasks.csv` and another trigger.
+machine for each row. Operator files always live in the fixed folder `s3://<bucket>/config/`
+(`params.csv`, `fleet_tasks.csv`, `pipeline.json`). **One DMS task is one row in
+`config/fleet_tasks.csv`**; a new wave is just a new `config/fleet_tasks.csv` and another trigger.
 
 For each task, startup then:
 
@@ -79,9 +79,12 @@ time (scripts, templates, driver wheels, `config/pipeline.json`, `config/params.
 
 - **DSQL schemas:** at most 10 per database (not adjustable); the CDC job adds `cdc_control`, so keep
   ≤ 9 of your own. The fleet preflight enforces it per task.
-- **Multi-column (composite) primary keys:** these tables are loaded and validated, but the CDC job
-  does not apply their ongoing changes — it lists them at startup and leaves them untouched. Their
-  full load is correct; changes after full load are not tracked. (Current limitation.)
+- **Multi-column (composite) primary keys:** these tables are loaded and validated, and their
+  ongoing CDC changes are applied by a **separate composite CDC job** (`<project>-<task>-cdc-composite`,
+  script `scripts/glue_cdc_composite.py`). After discovery, startup creates and starts it
+  automatically whenever the task has at least one composite-PK table; the main CDC job applies
+  single- and no-PK tables, the composite job applies the composite ones, and cutover stops and
+  deletes both. A task with no composite-PK tables gets no extra job.
 - **Tables without a primary key:** inserts and deletes are applied; **updates are skipped and
   logged** to `cdc_control.cdc_skipped_ops`, unless you declare a stable logical key.
 - **Schema changes during CDC:** `ADD COLUMN` and `RENAME COLUMN` are handled automatically (rename
@@ -109,7 +112,7 @@ lambdas/              The 8 orchestration Lambdas (resolve_task, driver_discover
                       and params_csv.py (the shared params.csv parser)
 stepfunctions/        startup + cutover per-task state machines, and the
                       fleet-startup / fleet-cutover launchers that drive them
-glue-templates/       The 6 Glue job templates (discovery, load, load-big, validate, cdc, cdc-spark)
+glue-templates/       The 8 Glue job templates (discovery, load, load-big, validate, cdc, cdc-spark, cdc-composite, cdc-composite-spark)
 iam/                  The 3 combined role files (glue.json, lambda.json, stepfunctions.json)
 config/               pipeline.example.json, params.example.csv, fleet_tasks.example.csv
 tools/                setup.sh (one-command setup from params.csv),

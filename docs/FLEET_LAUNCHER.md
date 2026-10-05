@@ -26,20 +26,20 @@ the fleet behaves once it exists.
 ## Inputs
 
 **Settings:** the same `s3://<bucket>/config/pipeline.json` every task already uses
-([RUNBOOK Step 3c](../RUNBOOK.md#4-set-up)). The fleet never writes it directly.
-If you keep a `pipeline.json` next to the task list too, it must be identical, or preflight stops
-(the per-task workflows would not use it).
+([RUNBOOK Step 3c](../RUNBOOK.md#4-set-up)). The fleet never writes it directly
+(other than the `params.csv` safe-publish below). It lives in the one fixed folder,
+`s3://<bucket>/config/pipeline.json`.
 
-**Settings from `params.csv` (optional):** if `s3://<bucket>/<inputPrefix>/params.csv` exists next
-to the task list, preflight validates it (shared parser `lambdas/params_csv.py`), builds the
-`config/pipeline.json` it describes, and — **startup only, and only when no `startup`/`cutover`/fleet
-execution is running (other than this fleet run)** — backs up the old `config/pipeline.json` to a
-dated `config/pipeline.json.<UTC>` key and publishes the new one, then reads it back to verify. If
-the candidate equals the live file nothing is written; if a cutover, or anything is running, or
-listing executions fails, it stops at `PreflightFailed` and writes nothing (fail closed). A
-`params.csv` plus a second `<inputPrefix>/pipeline.json` is ambiguous and fails. No `params.csv` →
-exactly today's behaviour. The output reports `paramsPublished` / `backupKey` / `paramsReason`. See
-the [safe-publish rule](../RUNBOOK.md#4-set-up).
+**Settings from `params.csv` (optional):** if `s3://<bucket>/config/params.csv` exists, preflight
+validates it (shared parser `lambdas/params_csv.py`), builds the `config/pipeline.json` it
+describes, and — **startup only, and only when no `startup`/`cutover`/fleet execution is running
+(other than this fleet run)** — backs up the old `config/pipeline.json` to a dated
+`config/pipeline.json.<UTC>` key and publishes the new one, then reads it back to verify. If the
+candidate equals the live file nothing is written; if a cutover, or anything is running, or listing
+executions fails, it stops at `PreflightFailed` and writes nothing (fail closed). `params.csv` and
+the generated `pipeline.json` share `config/` by design, so there is no second-copy ambiguity. No
+`params.csv` → the live `config/pipeline.json` is used as-is. The output reports `paramsPublished` /
+`backupKey` / `paramsReason`. See the [safe-publish rule](../RUNBOOK.md#4-set-up).
 
 **Task list:** a CSV in the bucket, e.g. `s3://<bucket>/config/fleet_tasks.csv`
 ([example](../config/fleet_tasks.example.csv)):
@@ -56,11 +56,13 @@ nothing to upload. To load fewer tables, change the DMS task's selection rules.
 **Start input** (both fleets):
 
 ```json
-{ "bucket": "<pipeline bucket>", "inputPrefix": "config" }
+{ "bucket": "<pipeline bucket>" }
 ```
 
-`inputPrefix` is the folder holding the task list; add `"tasksFile": "wave2.csv"` to use another
-file name. Missing `bucket` or `inputPrefix` ends at `MissingFleetInput`.
+Operator files are read from the fixed folder `s3://<bucket>/config/` (`fleet_tasks.csv`,
+`params.csv`, `pipeline.json`); add `"tasksFile": "wave2.csv"` to use another task-list file name
+in that folder. Missing `bucket` ends at `MissingFleetInput`. (The old prefix field was removed; if
+an old caller still passes one, it is ignored with a warning and files are read from `config/`.)
 
 ## What preflight checks (nothing starts if any task fails)
 
@@ -107,7 +109,7 @@ if the Lambda can't list executions), the per-task workflow refuses a second run
   `not_started`, the error or the child execution's status. The others were started.
 - `PreflightFailed`: a task failed a check; **nothing was started**. The cause lists every problem
   by row.
-- `MissingFleetInput`: the start input was missing `bucket` or `inputPrefix`.
+- `MissingFleetInput`: the start input was missing `bucket`.
 - `FleetFailed`: the fan-out itself failed unexpectedly.
 
 ## Limits

@@ -1,5 +1,5 @@
 {
-  "Comment": "Fleet startup launcher, started once by hand with {\"bucket\": \"<pipeline bucket>\", \"inputPrefix\": \"<folder of fleet_tasks.csv>\"} (optional \"tasksFile\", default fleet_tasks.csv). Preflight checks every task first (any problem: PreflightFailed, nothing started), then starts one <<PROJECT>>-startup execution per task, 5 at a time, without waiting for it to finish. Tasks whose startup is already running or whose full load already finished are skipped, so the fleet can be started again after a partial failure. FleetStarted means every task's startup was started and was still running after 30 s (past its own input checks); watch each child execution for the outcome.",
+  "Comment": "Fleet startup launcher, started once by hand with {\"bucket\": \"<pipeline bucket>\"} (optional \"tasksFile\", default fleet_tasks.csv). Operator files are read from the fixed folder s3://<bucket>/config/ (fleet_tasks.csv, params.csv, pipeline.json). Preflight checks every task first (any problem: PreflightFailed, nothing started), then starts one <<PROJECT>>-startup execution per task, 5 at a time, without waiting for it to finish. Tasks whose startup is already running or whose full load already finished are skipped, so the fleet can be started again after a partial failure. FleetStarted means every task's startup was started and was still running after 30 s (past its own input checks); watch each child execution for the outcome.",
   "StartAt": "CheckFleetInput",
   "States": {
     "CheckFleetInput": {
@@ -14,14 +14,6 @@
             {
               "Variable": "$.bucket",
               "IsString": true
-            },
-            {
-              "Variable": "$.inputPrefix",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.inputPrefix",
-              "IsString": true
             }
           ],
           "Next": "Preflight"
@@ -32,7 +24,7 @@
     "MissingFleetInput": {
       "Type": "Fail",
       "Error": "MissingFleetInput",
-      "Cause": "Start the startup fleet with input {\"bucket\": \"<pipeline bucket>\", \"inputPrefix\": \"<folder of fleet_tasks.csv, e.g. config>\"}; optional \"tasksFile\"."
+      "Cause": "Start the startup fleet with input {\"bucket\": \"<pipeline bucket>\"}; optional \"tasksFile\". Operator files are read from s3://<bucket>/config/."
     },
     "Preflight": {
       "Type": "Task",
@@ -43,7 +35,6 @@
         "Payload": {
           "mode": "startup",
           "bucket.$": "$.bucket",
-          "inputPrefix.$": "$.inputPrefix",
           "fleetInput.$": "$",
           "stateMachineArn": "<<STARTUP_STATE_MACHINE_ARN>>",
           "fleetExecutionId.$": "$$.Execution.Id"

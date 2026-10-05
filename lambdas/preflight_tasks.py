@@ -9,13 +9,15 @@ PreflightError and the fleet stops at PreflightFailed: nothing is started (fail-
 It reuses resolve_task's own functions (same Lambda zip), so it can never pass a task that the
 per-task workflow would refuse.
 
-INPUTS
+INPUTS  (all operator files live in the one fixed folder s3://<bucket>/config/)
   - s3://<bucket>/config/pipeline.json   the shared settings EVERY task's workflow reads. Checked
-                                         with resolve_task's full settings check. Never written.
-                                         If <inputPrefix>/pipeline.json also exists it must be
-                                         identical, otherwise preflight fails (the per-task
-                                         workflows would not use it).
-  - s3://<bucket>/<inputPrefix>/<tasksFile, default fleet_tasks.csv>   the task list. Header row:
+                                         with resolve_task's full settings check. Written only by
+                                         the params.csv safe-publish below (same folder).
+  - s3://<bucket>/config/params.csv      optional. If present, parsed and (when safe) published to
+                                         config/pipeline.json. params.csv and pipeline.json share
+                                         config/ by design, so there is no "second pipeline.json"
+                                         ambiguity.
+  - s3://<bucket>/config/<tasksFile, default fleet_tasks.csv>   the task list. Header row:
         task_arn               REQUIRED  arn:aws:dms:<region>:<acct>:task:<id>
         task_suffix            optional  folder/job-name override. Blank = what the pipeline
                                          would use anyway: the folder recorded for this task ARN
@@ -71,6 +73,9 @@ import params_csv as pc       # same zip: the one params.csv parser / pipeline.j
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 SETTINGS_KEY = rt.SETTINGS_KEY_DEFAULT          # config/pipeline.json
+# Operator files (fleet_tasks.csv, params.csv) and the generated pipeline.json all live in this
+# one fixed folder. inputPrefix was removed by design, so there is a single place to look.
+BASE_PREFIX = "config/"
 # The <=9 distinct-DSQL-schema cap lives in resolve_task (rt._MAX_DISTINCT_SCHEMAS): preflight's
 # pre-start estimate and each task's authoritative BuildTableList check share the one constant.
 _TRUE = {"true", "1", "yes", "y"}
@@ -220,13 +225,8 @@ def _handle_params_csv(s3, event, fleet_input, bucket, base, mode, warnings):
             f"runs the {sm_name!r} workflow (project {sm_project!r}). They must match. Nothing "
             f"was started.")
 
-    # D2: a second pipeline.json next to the task list is ambiguous.
-    local_key = base + "pipeline.json"
-    if local_key != SETTINGS_KEY and _get_text(s3, bucket, local_key) is not None:
-        raise PreflightError(
-            f"both s3://{bucket}/{params_key} and s3://{bucket}/{local_key} exist. Use one: "
-            f"the params CSV builds {SETTINGS_KEY} for you, so remove {local_key}. Nothing was "
-            f"started.")
+    # params.csv and the generated pipeline.json share config/ by design (inputPrefix removed),
+    # so there is no "second pipeline.json next to the task list" ambiguity to check any more.
 
     # D3: compare the candidate with the live canonical pipeline.json.
     live_text = _get_text(s3, bucket, SETTINGS_KEY)
@@ -305,14 +305,20 @@ def handler(event, context):
     mode = str(event.get("mode") or "startup").strip().lower()
     if mode not in ("startup", "cutover"):
         raise PreflightError(f"mode must be 'startup' or 'cutover' (got {mode!r}).")
-    input_prefix = str(event.get("inputPrefix") or fleet_input.get("inputPrefix") or "").strip().strip("/")
-    tasks_file = str(fleet_input.get("tasksFile") or event.get("tasksFile") or "fleet_tasks.csv").strip().lstrip("/")
-    base = (input_prefix + "/") if input_prefix else ""
-    tasks_key = base + tasks_file
-
     s3 = boto3.client("s3", region_name=REGION)
     dms = boto3.client("dms", region_name=REGION)
     errors, warnings = [], []
+
+    tasks_file = str(fleet_input.get("tasksFile") or event.get("tasksFile") or "fleet_tasks.csv").strip().lstrip("/")
+    # Operator files live in ONE fixed folder: s3://<bucket>/config/ (config/params.csv,
+    # config/fleet_tasks.csv, config/pipeline.json). inputPrefix was removed. If an old caller
+    # still passes one, ignore it with a single warning (don't fail) and read from config/.
+    stray_prefix = str(event.get("inputPrefix") or fleet_input.get("inputPrefix") or "").strip()
+    if stray_prefix:
+        warnings.append(f"inputPrefix={stray_prefix!r} was passed but is no longer used; operator "
+                        f"files are always read from config/. Ignoring it.")
+    base = BASE_PREFIX
+    tasks_key = base + tasks_file
 
     # --- params.csv (optional): build and, when safe, publish config/pipeline.json from it ---
     # Done BEFORE the settings are loaded, so the checks below run against the published file.
@@ -324,24 +330,9 @@ def handler(event, context):
         cfg = rt._load_settings(s3, bucket, SETTINGS_KEY, warnings)
     except rt.SettingsError as e:
         raise PreflightError(f"Shared settings problem, nothing was started: {e}")
-    if params_result is None:
-        # No params.csv: keep the original local-vs-canonical pipeline.json guard unchanged.
-        local_key = base + "pipeline.json"
-        if local_key != SETTINGS_KEY:
-            local = _get_text(s3, bucket, local_key)
-            if local is not None:
-                try:
-                    same = json.loads(local) == json.loads(_get_text(s3, bucket, SETTINGS_KEY))
-                except ValueError:
-                    same = False
-                if not same:
-                    raise PreflightError(
-                        f"s3://{bucket}/{local_key} differs from s3://{bucket}/{SETTINGS_KEY}. Every "
-                        f"task's workflow reads {SETTINGS_KEY}, so the fleet won't run with a different "
-                        f"copy next to the task list. Either make {SETTINGS_KEY} the settings you want "
-                        f"(keep a dated copy first: aws s3 cp s3://{bucket}/{SETTINGS_KEY} "
-                        f"s3://{bucket}/{SETTINGS_KEY}.$(date +%Y%m%d%H%M)), or remove {local_key}. "
-                        f"Nothing was started.")
+    # No local-vs-canonical pipeline.json guard needed: with inputPrefix removed the only
+    # pipeline.json location is config/pipeline.json (== SETTINGS_KEY), the file every per-task
+    # workflow reads and the one params.csv publishes to.
     project = cfg["project"]
 
     # --- task list ---

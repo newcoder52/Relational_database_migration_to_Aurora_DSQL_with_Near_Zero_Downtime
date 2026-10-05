@@ -1,0 +1,10 @@
+{
+  "role": "cdc-composite",
+  "script": "glue_cdc_composite.py",
+  "command_name": "pythonshell",
+  "glue_version": "3.0",
+  "max_capacity": 1,
+  "timeout_minutes": 10080,
+  "max_concurrent_runs": 1,
+  "default_arguments": {}
+}

@@ -151,12 +151,14 @@ file survives).
 - **Was:** a table whose primary key has more than one column was treated as keyless — every
   UPDATE was skipped, DELETEs matched on every column, and a `_cdc_file` column was added.
 - **Now:** the main CDC job raises `MultiColumnKeyTable` and **never processes** these tables; it
-  lists them at startup and leaves their `cdc_control` rows for a **separate composite-key CDC
-  job**. That job must write `cdc_control.cdc_file_status` the same way (see
-  `RUNBOOK.md` → [Rules for many tasks](RUNBOOK.md#rules-for-the-task-list)). The drain check still
-  waits for those tables, so **cutover cannot finish until the separate job has caught up**.
-- **Not in the repo:** the separate composite-key CDC job is not shipped here (known gap — see
-  `RUNBOOK.md` → [Known issues](RUNBOOK.md#8-if-something-fails) and the checklist WP10).
+  lists them at startup and leaves their `cdc_control` rows for the **separate composite CDC job**,
+  which writes `cdc_control.cdc_file_status` the same way (see
+  `RUNBOOK.md` → [Rules for the task list](RUNBOOK.md#rules-for-the-task-list)). The drain check still
+  waits for those tables, so **cutover cannot finish until the composite job has caught up**.
+- **Now in the repo:** the composite CDC job is shipped as `scripts/glue_cdc_composite.py` with
+  templates `glue-templates/cdc-composite{,-spark}.json`. Startup creates and starts
+  `<project>-<task>-cdc-composite` automatically after discovery whenever the task has a composite-PK
+  table; cutover stops and deletes it. A task with no composite-PK tables gets no extra job.
 - All CDC results in §1–§2 are for **single-column-PK** tables only.
 
 ### 2.7 Binary (RAW/BLOB → bytea) stored as ASCII of the hex text (silent) ✅ FIXED 2026-10-04 (simulator only)
@@ -198,7 +200,7 @@ file survives).
 | **varchar leading/trailing spaces** | BREAK — stripped, silent | MEDIUM | **FIXED** — CDC 2026-09-23; full load/validation 2026-10-03 (§2.2) |
 | **NULL look-alike text (NA/N/A/NONE/(NULL)/\N/null)** | BREAK — silently NULL | HIGH | **FIXED 2026-10-03** (§2.5) |
 | **binary RAW/BLOB → bytea** | BREAK — ASCII-of-hex, silent | MEDIUM | **FIXED 2026-10-04, simulator only** (§2.7) |
-| multi-column-PK table CDC | not applied by main job | — | **CHANGED 2026-10-03**; separate job required, not in repo (§2.6) |
+| multi-column-PK table CDC | not applied by main job | — | **CHANGED 2026-10-03**; applied by the separate composite CDC job, now shipped (§2.6) |
 | smallest-normal double (~2.2e-308) | BREAK — underflow to 0 | LOW | Open; root cause unconfirmed (§2.3) |
 | new-schema LogMiner gap | BREAK — zero CDC captured, silent | HIGH | Open (DBA-side; §4) |
 
@@ -248,9 +250,6 @@ binary/bytea (§2.7). What remains:
    (the pipeline cannot detect this today — §4).
 2. **smallest-normal double → 0.0 (LOW):** confirm where the loss happens (check the DMS CSV in
    S3) or accept as a known boundary; validation can't flag it (§2.3).
-3. **composite-key CDC job (not in repo):** the separate multi-column-PK job that §2.6 relies on
-   is not shipped here; until it exists, multi-column-PK tables are not migrated and cutover
-   waits (checklist WP10).
 
 **Re-test needed on real AWS / Spark CDC** (none of the Oct 2–4 changes were re-run against these
 edge cases):

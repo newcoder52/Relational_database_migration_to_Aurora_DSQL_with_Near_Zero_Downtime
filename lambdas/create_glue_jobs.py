@@ -86,7 +86,36 @@ import boto3
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 _ROLES = ["discovery", "load", "load-big", "validate", "cdc"]
 _CDC_ENGINES = {"pythonshell": "cdc", "spark": "cdc-spark"}   # engine -> template file stem
+# COMPOSITE CDC job: a second CDC job that applies ONLY multi-column-PK tables (the main cdc job
+# skips them). Same engine/fallback rules as cdc; its own template stems + script.
+_CDC_COMPOSITE_ROLE = "cdc-composite"
+_CDC_COMPOSITE_ENGINES = {"pythonshell": "cdc-composite", "spark": "cdc-composite-spark"}
+_CDC_ROLES = ("cdc", _CDC_COMPOSITE_ROLE)   # roles wired like the CDC job (args, engine, drivers)
 _ACTIVE_RUN_STATES = {"STARTING", "RUNNING", "STOPPING", "WAITING"}
+
+
+def _task_has_composite_tables(s3_client, bucket, config_prefix):
+    """True if THIS task's manifest index has at least one multi-column-PK table (pk_mode ==
+    'composite', written by job1_discovery). Used to decide whether to create/delete the
+    composite CDC job: no composite tables -> no composite job. Best-effort: if the index can't
+    be read (not written yet), returns False so we never create a composite job for a task that
+    has none. config_prefix is an s3://.../ prefix; the index is <config_prefix>_manifest_index.json."""
+    try:
+        if not str(config_prefix).startswith("s3://"):
+            return False
+        _b, _, _k = config_prefix[len("s3://"):].partition("/")
+        key = _k.rstrip("/") + "/_manifest_index.json" if _k and not _k.endswith("/") \
+            else _k + "_manifest_index.json"
+        obj = s3_client.get_object(Bucket=_b, Key=key)
+        idx = json.loads(obj["Body"].read())
+        for t in idx.get("tables", []):
+            if t.get("pk_mode") == "composite" or len(t.get("pk_columns") or []) > 1:
+                return True
+        return False
+    except Exception as e:
+        print(f"(info) composite-table check: could not read index under {config_prefix} "
+              f"({type(e).__name__}: {e}); assuming NO composite tables.")
+        return False
 
 
 # A Python-shell CDC run that fails with one of these never got as far as the script: Glue could
@@ -256,6 +285,10 @@ def handler(event, context):
 
     glue = boto3.client("glue", region_name=REGION)
     names = {role: _job_name(project, task_suffix, role) for role in _ROLES}
+    # The composite CDC job name is always resolvable (delete mode removes it idempotently even
+    # if it was never created; _job_name enforces the 255-char limit). Whether it is CREATED is
+    # decided below from the task's composite-table count.
+    names[_CDC_COMPOSITE_ROLE] = _job_name(project, task_suffix, _CDC_COMPOSITE_ROLE)
 
     if mode == "delete":
         # A job that is already gone counts as deleted. Any other error is returned under
@@ -293,6 +326,8 @@ def handler(event, context):
     created, updated, replaced = [], [], []
     spark_cdc_drivers = None
     roles, fallback_reason = _ROLES, ""
+    # ensure_composite result (only meaningful in that mode).
+    has_composite = False
     if mode == "cdc_fallback":
         err_msg = str(event.get("error_message") or "")
         why = driver_error_reason(err_msg)
@@ -301,21 +336,49 @@ def handler(event, context):
                   f"{err_msg[:500]}")
             return {"jobs": names, "switched": False, "reason": "", "cdcEngine": _cdc_engine(event),
                     "created": [], "updated": [], "replaced": [], "deleted": []}
+        # Which CDC job fell back: the main cdc job (default) or the composite one. The startup
+        # SM passes fallback_role when it is the composite job's Spark fallback.
+        _fb_role = event.get("fallback_role", "cdc")
+        if _fb_role not in _CDC_ROLES:
+            _fb_role = "cdc"
         fallback_reason = (f"Python-shell CDC run {event.get('failed_run_id') or ''} failed: {why} "
                            f"({err_msg[:600]})")
-        print(f"(info) {names['cdc']}: {fallback_reason}. Re-creating it as a Spark job.")
-        roles, cdc_engine = ["cdc"], "spark"
+        print(f"(info) {names[_fb_role]}: {fallback_reason}. Re-creating it as a Spark job.")
+        roles, cdc_engine = [_fb_role], "spark"
+    elif mode == "ensure_composite":
+        # Called by the startup SM AFTER RunDiscovery, when THIS run's _manifest_index.json
+        # (with pk_mode, written by job1_discovery) finally exists. Decide composite ownership
+        # from that fresh index and create ONLY the composite CDC job if any table is composite.
+        # (create mode runs BEFORE discovery and therefore can NOT see pk_mode, so composite
+        # creation was moved here — see MERGE_NOTES.md.) No composite tables -> create nothing
+        # and report hasCompositeTables=false so startup skips the composite start cleanly.
+        cdc_engine = _cdc_engine(event)
+        if cdc_engine == "spark" and event.get("cdc_fallback_reason"):
+            fallback_reason = str(event["cdc_fallback_reason"])
+        has_composite = _task_has_composite_tables(s3, bucket, config_prefix)
+        if has_composite:
+            roles = [_CDC_COMPOSITE_ROLE]
+            print(f"(info) ensure_composite: task has composite-PK table(s); creating/updating "
+                  f"composite CDC job {names[_CDC_COMPOSITE_ROLE]}.")
+        else:
+            roles = []
+            print("(info) ensure_composite: task has no composite-PK tables; composite CDC job "
+                  "NOT created.")
     else:
+        # mode == create: the full per-task job set EXCEPT the composite CDC job. The composite
+        # job cannot be decided here because discovery (which writes pk_mode) has not run yet;
+        # it is created later by the ensure_composite call after RunDiscovery.
         cdc_engine = _cdc_engine(event)
         if cdc_engine == "spark" and event.get("cdc_fallback_reason"):
             fallback_reason = str(event["cdc_fallback_reason"])
 
     for role in roles:
-        tmpl_stem = _CDC_ENGINES[cdc_engine] if role == "cdc" else role
+        tmpl_stem = (_CDC_COMPOSITE_ENGINES[cdc_engine] if role == _CDC_COMPOSITE_ROLE
+                     else _CDC_ENGINES[cdc_engine] if role == "cdc" else role)
         tmpl = _read_json(s3, bucket, f"{templates_prefix}/{tmpl_stem}.json")
         name = names[role]
         command_name = tmpl.get("command_name", "glueetl")
-        if role == "cdc" and (command_name == "pythonshell") != (cdc_engine == "pythonshell"):
+        if role in _CDC_ROLES and (command_name == "pythonshell") != (cdc_engine == "pythonshell"):
             raise Exception(f"{tmpl_stem}.json has command_name={command_name!r}, which does not "
                             f"match cdc_engine={cdc_engine!r}")
         script_key = tmpl["script"]
@@ -349,7 +412,7 @@ def handler(event, context):
             # Glue can't pass an empty argument value, so an empty marker travels as __EMPTY__.
             _nv = str(event["csv_null_value"])
             args["--csv_null_value"] = _nv if _nv != "" else "__EMPTY__"
-        if role == "cdc":
+        if role in _CDC_ROLES:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema
             _ts_col = event.get("timestampColumnName")
@@ -514,9 +577,14 @@ def handler(event, context):
 
     out = {"jobs": names, "created": created, "updated": updated, "replaced": replaced,
            "deleted": [], "cdcEngine": cdc_engine}
+    if mode == "ensure_composite":
+        # The startup SM reads these into $.composite to decide whether to start the composite
+        # CDC job (and with what job name). Computed from THIS run's discovery index.
+        out["hasCompositeTables"] = has_composite
+        out["compositeCdcJobName"] = names[_CDC_COMPOSITE_ROLE]
     if spark_cdc_drivers:
         out["sparkCdcDrivers"] = spark_cdc_drivers
-    if fallback_reason:
+    if fallback_reason and mode != "ensure_composite":
         # Record the switch so the next startup of this task builds the Spark job straight away
         # (resolve-task reads this file). Delete the file to go back to Python shell.
         from datetime import datetime, timezone
@@ -525,7 +593,7 @@ def handler(event, context):
                "stage": "after start" if mode == "cdc_fallback" else "driver check",
                "failedRunId": event.get("failed_run_id") or None,
                "errorMessage": str(event.get("error_message") or "")[:2000] or None,
-               "job": names["cdc"],
+               "job": names[_fb_role] if mode == "cdc_fallback" else names["cdc"],
                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "undo": f"delete s3://{bucket}/{key} to build the Python-shell CDC job again"}
         s3.put_object(Bucket=bucket, Key=key, Body=(json.dumps(doc, indent=2) + "\n").encode("utf-8"),

@@ -275,7 +275,7 @@ Lambda provides, and everything else from `config/pipeline.json` at run time.
 *Replaces in setup.sh: Step 3a.*
 
 ```bash
-for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py; do
+for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py glue_cdc_composite.py; do
   aws s3 cp "scripts/$f" "s3://$BUCKET/scripts/$f"
 done
 mkdir -p _filled/glue-templates
@@ -287,7 +287,7 @@ aws s3 cp _filled/glue-templates/ "s3://$BUCKET/glue-templates/" --recursive --e
 **Verify** S3 matches the repo scripts (a mismatch means a job runs an old script):
 
 ```bash
-for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py; do
+for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py glue_cdc_composite.py; do
   if command -v sha256sum >/dev/null 2>&1; then H="sha256sum"; else H="shasum -a 256"; fi
   L=$($H < "scripts/$f" | cut -c1-16); S=$(aws s3 cp "s3://$BUCKET/scripts/$f" - | $H | cut -c1-16)
   [ "$L" = "$S" ] && echo "OK    $f" || echo "STALE $f  (repo $L, S3 $S)"
@@ -446,11 +446,11 @@ The same checks as the RUNBOOK:
 aws iam list-roles --query "Roles[?starts_with(RoleName,'$PROJECT-')].RoleName" --output table                     # 3
 aws lambda list-functions --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName" --output table   # 8
 aws stepfunctions list-state-machines --query "stateMachines[?starts_with(name,'$PROJECT-')].name" --output table   # 4
-aws s3 ls "s3://$BUCKET/scripts/"            # 4 Glue scripts
-aws s3 ls "s3://$BUCKET/glue-templates/"     # 6 templates
+aws s3 ls "s3://$BUCKET/scripts/"            # 5 Glue scripts
+aws s3 ls "s3://$BUCKET/glue-templates/"     # 8 templates
 aws s3 cp "s3://$BUCKET/config/pipeline.json" -   # the settings every run reads
 ```
 
 Setup is complete. Upload `config/fleet_tasks.csv` and trigger `fleet-startup` with
-`{"bucket":"<bucket>","inputPrefix":"config"}`
+`{"bucket":"<bucket>"}`
 ([RUNBOOK §5](../RUNBOOK.md#5-run-tasks-with-the-fleet)).

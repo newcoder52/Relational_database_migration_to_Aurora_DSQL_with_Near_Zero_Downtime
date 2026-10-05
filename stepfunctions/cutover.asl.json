@@ -308,6 +308,65 @@
           "ResultPath": "$.error"
         }
       ],
+      "Next": "HasCompositeToStop"
+    },
+    "HasCompositeToStop": {
+      "Type": "Choice",
+      "Comment": "Stop the composite CDC run too, but only if this task has composite-PK tables (so a task with none skips cleanly).",
+      "Choices": [
+        {
+          "Variable": "$.resolved.hasCompositeTables",
+          "BooleanEquals": true,
+          "Next": "StopCdcCompositeRun"
+        }
+      ],
+      "Default": "DropTags"
+    },
+    "StopCdcCompositeRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Stop the composite CDC job's run for THIS task (same stop-cdc-run Lambda, composite job name, same per-task config prefix).",
+      "Parameters": {
+        "FunctionName": "<<STOP_CDC_RUN_LAMBDA_ARN>>",
+        "Payload": {
+          "cdcJobName.$": "$.resolved.compositeCdcJobName",
+          "configPrefix.$": "$.resolved.configPrefix"
+        }
+      },
+      "ResultPath": "$.stopCompositeRun",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.EntityNotFoundException"
+          ],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Glue.EntityNotFoundException"
+          ],
+          "Comment": "The composite CDC job does not exist for this task (none was created, or it was already deleted). Nothing to stop; DeleteGlueJobs removes it by name anyway. Do not fail cutover.",
+          "Next": "DropTags",
+          "ResultPath": "$.stopCompositeRun"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
       "Next": "DropTags"
     },
     "DropTags": {

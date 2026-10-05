@@ -3,15 +3,15 @@
 Follow this top to bottom. It is plain AWS CLI, the same on **macOS, Linux and AWS CloudShell**.
 
 The pipeline runs tasks **one way only: through the fleet.** You trigger `fleet-startup` (and later
-`fleet-cutover`) once, with `{"bucket":"<bucket>","inputPrefix":"config"}`; the fleet reads
+`fleet-cutover`) once, with `{"bucket":"<bucket>"}`; the fleet reads
 `s3://<bucket>/config/fleet_tasks.csv` and starts the per-task `startup` (or `cutover`) state machine
 for every row. **One DMS task is one row in that CSV**; a new wave is just a new
 `config/fleet_tasks.csv` and another trigger. You never start a per-task state machine yourself — the
 per-task machines appear only in [Reference](#10-reference), as what the fleet runs.
 
-`inputPrefix` is **always `"config"`** — it is the fixed folder that holds everything the operator
-provides (`params.csv`, `fleet_tasks.csv`), so the fleet reads `config/params.csv` and
-`config/fleet_tasks.csv`. Pass it exactly as `"config"` on every trigger.
+Operator files always live in the one fixed folder `s3://<bucket>/config/` — `params.csv`,
+`fleet_tasks.csv`, and the generated `pipeline.json`. The fleet reads `config/params.csv` and
+`config/fleet_tasks.csv` from there; there is nothing else to point it at.
 
 - One-time setup (§4) with `tools/setup.sh`: minutes, plus driver wheels.
 - Running tasks after that (§5–§7): a few minutes of your time, plus the load and CDC that run on
@@ -247,8 +247,8 @@ PROJECT="<project>"; REGION="<region>"; BUCKET="<bucket>"; export AWS_PAGER=""
 aws iam list-roles --query "Roles[?starts_with(RoleName,'$PROJECT-')].RoleName" --output table                     # 3
 aws lambda list-functions --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName" --output table   # 8
 aws stepfunctions list-state-machines --query "stateMachines[?starts_with(name,'$PROJECT-')].name" --output table   # 4
-aws s3 ls "s3://$BUCKET/scripts/"            # 4 Glue scripts
-aws s3 ls "s3://$BUCKET/glue-templates/"     # 6 templates
+aws s3 ls "s3://$BUCKET/scripts/"            # 5 Glue scripts
+aws s3 ls "s3://$BUCKET/glue-templates/"     # 8 templates
 aws s3 cp "s3://$BUCKET/config/pipeline.json" -   # the published settings
 ```
 
@@ -330,10 +330,10 @@ export AWS_PAGER=""
 aws s3 cp fleet_tasks.csv "s3://$BUCKET/config/fleet_tasks.csv"
 SM="arn:aws:states:$REGION:$ACCOUNT_ID:stateMachine"
 aws stepfunctions start-execution --state-machine-arn "$SM:$PROJECT-fleet-startup" \
-  --input "{\"bucket\":\"$BUCKET\",\"inputPrefix\":\"config\"}"
+  --input "{\"bucket\":\"$BUCKET\"}"
 ```
 
-The fleet is started with `{"bucket":"<bucket>","inputPrefix":"config"}` and always reads from the
+The fleet is started with `{"bucket":"<bucket>"}` and always reads from the
 fixed `config/` folder in that bucket: the settings `config/pipeline.json`, and the task list
 `config/fleet_tasks.csv`. It runs **preflight** (checks every task), then starts one
 `$PROJECT-startup` execution per task, **5 at a time**, and confirms each got past its own input
@@ -346,7 +346,7 @@ checks. A new wave is just a new `config/fleet_tasks.csv` and another trigger.
 | `FleetStarted` | every task was started (or skipped as already started) and each started one was still running 30 s later — i.e. past its own input checks. **It does not mean the migrations succeeded.** | watch each `$PROJECT-startup` child ([§6](#6-watch-progress)) |
 | `FleetStartIncomplete` | at least one task did **not** start. `results.tasks` in the output lists each with `status` (`started`/`skipped`/`not_started`) and the error for `not_started`. The others started | fix the listed tasks, trigger the fleet again — already-started tasks are skipped |
 | `PreflightFailed` | a problem was found **before anything started** (settings, task list, or specific rows). **Nothing started** | fix every listed problem, trigger the fleet again |
-| `MissingFleetInput` | the input lacked `bucket` or `inputPrefix` as a string | start again with `{"bucket":"<bucket>","inputPrefix":"config"}` |
+| `MissingFleetInput` | the input lacked `bucket` as a string | start again with `{"bucket":"<bucket>"}` |
 
 If a `config/params.csv` is present, a **startup** fleet (and only when nothing is running) safely
 (re)publishes `config/pipeline.json` from it before starting tasks — the same
@@ -373,11 +373,13 @@ per-task `startup` refuses a second run of a task that is already running.
 - **Reusing a deleted task's name:** the pipeline refuses a folder another task ARN created (its old
   status files would make CDC skip tables this task never loaded). Preflight fails that row with the
   `aws s3 mv` command to archive the old folder to `config/_archive/`.
-- **Tables with a multi-column (composite) primary key** are loaded and validated normally, but the
-  CDC job does **not** apply their ongoing changes: it detects the composite key, lists those tables
-  at startup, and leaves them untouched (nothing applies their inserts/updates/deletes). Treat this
-  as a current limitation — a composite-key table's full load is correct, but it will not track
-  changes during CDC.
+- **Tables with a multi-column (composite) primary key** are loaded and validated normally, and
+  their ongoing CDC changes are applied by a **separate composite CDC job**. After discovery, if the
+  task has at least one composite-PK table, startup creates and starts one extra Glue job
+  `$PROJECT-$TASK_NAME-cdc-composite` (script `scripts/glue_cdc_composite.py`) next to the main CDC
+  job and confirms it started; the main CDC job keeps applying single- and no-PK tables, and the
+  composite job applies only the composite-PK ones (no table is applied by both). A task with no
+  composite-PK tables gets no extra job. Cutover drains, stops and deletes both CDC jobs.
 - **Schema limit:** a startup task may load into at most **9** distinct DSQL schemas (DSQL allows 10
   per database; `cdc_control` uses one). This is enforced per task while its table list is built
   (before any Glue job); preflight also estimates it from each task's selection rules and fails early
@@ -502,8 +504,10 @@ wrong loses data silently.
 - [ ] **Each task's CDC run is RUNNING** ([§6](#6-watch-progress)). Cutover doesn't verify this; if a
       run isn't running, that task's cutover stops DMS and waits the full drain budget (~12 h) before
       failing.
-- [ ] **Composite-key (multi-column-PK) tables:** remember the CDC job does not track their changes
-      (it lists and skips them; see [Rules for the task list](#rules-for-the-task-list)). Only cut
+- [ ] **Composite-key (multi-column-PK) tables:** their ongoing changes are tracked by the separate
+      composite CDC job (`$PROJECT-$TASK_NAME-cdc-composite`), created and started automatically when
+      the task has any (see [Rules for the task list](#rules-for-the-task-list)). Confirm that job's
+      run is RUNNING too before cutover. Only cut
       over once you've accounted for that — their full load is in DSQL, but no changes since full
       load were applied.
 
@@ -522,14 +526,14 @@ export AWS_PAGER=""
 aws s3 cp fleet_tasks.csv "s3://$BUCKET/config/fleet_tasks.csv"
 SM="arn:aws:states:$REGION:$ACCOUNT_ID:stateMachine"
 aws stepfunctions start-execution --state-machine-arn "$SM:$PROJECT-fleet-cutover" \
-  --input "{\"bucket\":\"$BUCKET\",\"inputPrefix\":\"config\"}"
+  --input "{\"bucket\":\"$BUCKET\"}"
 ```
 
 The result states are the same as a startup fleet ([§5](#5-run-tasks-with-the-fleet)):
 `FleetStarted` means each cutover **started**, not that it finished — watch each child. Each
 `$PROJECT-cutover` child, for its one task: stops the DMS task (up to ~1 h), waits until each table's
 last CDC file is applied (`DrainCheck`; up to ~12 h), stops this task's CDC run, drops the internal
-`_cdc_file` column, and deletes this task's five Glue jobs. It finds the task by its ARN, so a
+`_cdc_file` column, and deletes this task's Glue jobs (the five `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus `-cdc-composite` when the task has composite-PK tables). It finds the task by its ARN, so a
 renamed task still cuts over its original folder and jobs.
 
 > **† A cutover fleet re-triggers cutover for EVERY task in the CSV**, including ones already cut
@@ -544,7 +548,7 @@ Each child ends at one of:
 | Ends at | Meaning | What to do |
 |---|---|---|
 | `CutoverSucceeded` | done | point the application at Aurora DSQL |
-| `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed (named in the error; the five jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`) | delete it by hand: `aws glue delete-job --job-name <name>`. **Do not re-list this task in a cutover fleet** |
+| `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed (named in the error; the jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus `-cdc-composite` when the task has composite-PK tables) | delete it by hand: `aws glue delete-job --job-name <name>`. **Do not re-list this task in a cutover fleet** |
 | `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed for this task | fix the error shown, re-run cutover for this task via the fleet |
 | `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`) | DMS is stopped; a table's last file wasn't applied within ~12 h | fix the cause ([§8](#8-if-something-fails)), then **finish by hand** ([§8](#8-if-something-fails)) |
 | `CutoverFailed` at a step **after DMS was stopped** | DMS is stopped | open the failed state, fix it, then **finish by hand** ([§8](#8-if-something-fails)) |
@@ -565,7 +569,7 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 
 | State / error (fleet or child) | Cause | What to do |
 |---|---|---|
-| **Fleet** `MissingFleetInput` | the input lacked `bucket` or `inputPrefix` as a string | trigger again with `{"bucket":"<bucket>","inputPrefix":"config"}` |
+| **Fleet** `MissingFleetInput` | the input lacked `bucket` as a string | trigger again with `{"bucket":"<bucket>"}` |
 | **Fleet** `PreflightFailed` | a problem before anything started: a `config/pipeline.json`/`config/params.csv` problem, a missing/empty or bad/duplicate task row, a folder owned by another task, too many DSQL schemas in a task, or (with `config/params.csv`) a settings change blocked because a run is in progress / a cutover / executions can't be listed | fix each problem the cause lists; nothing started, so trigger the fleet again |
 | **Fleet** `FleetStartIncomplete` | some tasks didn't start (`results.tasks` names them) | fix those tasks, trigger the fleet again — started/running/past-full-load tasks are skipped |
 | **Fleet** `FleetFailed` | the fan-out itself failed (rare) | re-trigger; if it recurs, check the sfn role (§4) can start and describe the per-task executions |
@@ -580,6 +584,8 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Startup** `PipelineFailed` at `ResumeDmsToCdc` | load done and validated; DMS probably still paused | **don't re-trigger the fleet for this task.** If DMS is still stopped, resume it: `aws dms start-replication-task --replication-task-arn "$TASK_ARN" --start-replication-task-type resume-processing`, then **start the CDC job by hand** (below) |
 | **Startup** `CdcRunFailed`/`CdcRunEnded`/`CdcFallbackFailed`, or `PipelineFailed` at `StartCdcJob`/`GetCdcRun`/`CheckCdcStarted` | load done; **DMS is in CDC**, capturing changes to S3 | **don't re-trigger the fleet** (it skips this task). Check whether a CDC run is already RUNNING ([§6](#6-watch-progress)); if not, fix the cause in the CDC log and **start the CDC job by hand** (below). Nothing is lost while it's down — DMS keeps writing change files |
 | **Startup** `CdcStartNotConfirmed` | the CDC run is running but didn't write its start marker in 45 min | check the CDC log ([§6](#6-watch-progress)). If it shows `entering poll loop`, CDC is fine and the marker couldn't be written — check the Glue role can write `config/_task/<task>/_cdc_started/` |
+| **Startup** `EnsureCompositeFailed` | creating the composite CDC job after discovery failed (template/engine/role problem); the main CDC job was not started | fix the cause (the Lambda error names it), re-trigger the fleet for this task — nothing is past full load |
+| **Startup** `CompositeStartNotConfirmed` | the composite CDC run didn't write its start marker in 45 min (the main CDC job is running) | check the `-cdc-composite` run's log ([§6](#6-watch-progress)); if it shows `entering poll loop`, check the Glue role can write `config/_task/<task>/_cdc_started/`. Investigate before cutover |
 | **Startup** execution shows `CdcDriverFallback` then succeeds | the Python-shell drivers failed; the job is now Spark | nothing to fix. The reason is in `config/_task/<task name>/_cdc_engine.json`; fix `driver-cdc/` and delete that file to go back to Python shell |
 | **Cutover** `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed | fix the error, re-run cutover for this task via the fleet (keep only this task in the CSV, or remove already-cut-over tasks first) |
 | **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **finish by hand** (below). **Do not re-list this task in a cutover fleet** — its first step would fail on the already-stopped DMS task |
@@ -620,8 +626,8 @@ RUN=$(aws glue get-job-runs --job-name "$PROJECT-$TASK_NAME-cdc" \
 [ -n "$RUN" ] && aws glue batch-stop-job-run --job-name "$PROJECT-$TASK_NAME-cdc" --job-run-ids "$RUN"
 # 3. In DSQL, for each of this task's tables (quote the names):
 #      ALTER TABLE "<schema>"."<table>" DROP COLUMN IF EXISTS "_cdc_file";
-# 4. Delete this task's five Glue jobs
-for r in discovery load load-big validate cdc; do
+# 4. Delete this task's Glue jobs (cdc-composite is a no-op if the task had no composite-PK tables)
+for r in discovery load load-big validate cdc cdc-composite; do
   aws glue delete-job --job-name "$PROJECT-$TASK_NAME-$r"
 done
 ```
@@ -674,8 +680,8 @@ One bucket, fixed folder names (baked into the templates):
 
 ```
 s3://<bucket>/
-├── scripts/                  # the 4 Glue scripts
-├── glue-templates/           # the 6 Glue job templates
+├── scripts/                  # the 5 Glue scripts
+├── glue-templates/           # the 8 Glue job templates
 ├── driver-fullload/          # pg8000 stack only — Spark discovery + load
 ├── driver-validation/        # pg8000 stack only — Spark validate
 ├── driver-cdc/               # pg8000 stack + boto3 set for Python 3.9 (CDC)
@@ -725,16 +731,19 @@ The load/discovery/validate templates each allow 10 concurrent runs; the CDC tem
 | `BuildTableList` | `resolve-task` | build the table list from `describe_table_statistics` + the task mappings; enforce ≤ 9 DSQL schemas |
 | `CreateGlueJobs` | `create-glue-jobs` | create `<project>-<task>-<role>` jobs from `glue-templates/` in your Glue connection |
 | `RunDiscovery` | Glue job 1 | writes `_manifest_index.json` |
+| `EnsureCompositeJob` | `create-glue-jobs` | after discovery: if any table has a composite PK, create `<project>-<task>-cdc-composite`; else do nothing |
 | `PlanSplit` | `plan-split` | writes per-group manifests under `_orchestrator/group-<n>/` |
 | `GroupFanOut` | Glue jobs 2 and 3 | load then validate each group (up to 6 groups at once) |
 | `ResumeDmsToCdc`, `StartCdcJob` | DMS API, Glue | resume DMS into CDC; start the CDC job (with `--config_prefix` as a run argument) |
 | `GetCdcRun` / `CheckCdcStarted` | Glue, S3 | wait up to 45 min for the CDC run's start marker |
+| `StartCdcCompositeJob` / `CheckCompositeStarted` | Glue, S3 | if the task has composite-PK tables, start `-cdc-composite` and wait up to 45 min for its start marker |
 | `CdcDriverFallback` → `UseSparkCdcJob` | `create-glue-jobs` | on a driver failure, re-create the CDC job as Spark (once) |
 | cutover `StopCdcDmsTask` → `IsCdcTaskStopped` | DMS API | stop the DMS task (poll 15 s × 240 ≈ 1 h) |
 | cutover `DrainCheck` | `drain-check` | wait (10 s × 4320 ≈ 12 h) until each table's latest CDC file is applied |
 | cutover `StopCdcRun` | `stop-cdc-run` | stop this task's CDC run (found by `--config_prefix`) |
+| cutover `StopCdcCompositeRun` | `stop-cdc-run` | stop the composite CDC run too, if the task has composite-PK tables (tolerant if the job is absent) |
 | cutover `DropTags` | `drop-tags` | drop the `_cdc_file` column |
-| cutover `DeleteGlueJobs` → `AllGlueJobsDeleted` | `create-glue-jobs` | delete this task's five Glue jobs; any failure → `GlueJobsNotDeleted` |
+| cutover `DeleteGlueJobs` → `AllGlueJobsDeleted` | `create-glue-jobs` | delete this task's Glue jobs (the five, plus `-cdc-composite` by name, idempotent); any failure → `GlueJobsNotDeleted` |
 
 **CDC correctness:** a table with a real primary key (or a declared `logical_key`) gets correct
 inserts, updates and deletes. A table without one gets inserts and deletes; updates are skipped and
@@ -752,7 +761,7 @@ are not applied ([Rules for the task list](#rules-for-the-task-list)).
 
 | Step | Runs | Does |
 |---|---|---|
-| `CheckFleetInput` | — | requires `bucket` and `inputPrefix` (use `"config"`) as strings, else `MissingFleetInput` |
+| `CheckFleetInput` | — | requires `bucket` as a string, else `MissingFleetInput` |
 | `Preflight` | `preflight-tasks` | reads `config/fleet_tasks.csv` and checks every task (reusing `resolve_task`'s rules); any problem → `PreflightFailed`, nothing started. If `config/params.csv` is present, builds `config/pipeline.json` from it and (startup only, nothing running) publishes it under the [safe-publish rule](#the-safe-publish-rule-how-pipelinejson-is-published-from-paramscsv), reporting `paramsPublished`/`backupKey`/`paramsReason` |
 | `FanOut` (Map, 5 at a time) | `sfn:startExecution`, `sfn:describeExecution` | per row: skip if `already_running` / `past_full_load`; else start the per-task `startup`/`cutover`, wait 30 s, confirm it is RUNNING/SUCCEEDED |
 | `EvalNotStarted` → `FleetStarted` / `FleetStartIncomplete` | — | `FleetStartIncomplete` if any task is `not_started`, else `FleetStarted` |
@@ -763,8 +772,9 @@ itself failed). Success `FleetStarted` means every task started or was skipped a
 not that the migrations finished.
 
 **Per-task startup:** `MissingTaskArn`, `ResolveFailed`, `DriversFailed` (before DMS) · `DmsFailed`
-(`DmsTaskFailed`), `DmsTimedOut` (`DmsPollBudgetExceeded`), `BuildTableListFailed`, `GroupsFailed`,
+(`DmsTaskFailed`), `DmsTimedOut` (`DmsPollBudgetExceeded`), `BuildTableListFailed`, `EnsureCompositeFailed`, `GroupsFailed`,
 `PipelineFailed` (before DMS resumes) · `CdcRunFailed`, `CdcRunEnded`, `CdcStartNotConfirmed`,
+`CompositeStartNotConfirmed`,
 `CdcFallbackFailed`, `PipelineFailed` (after DMS is in CDC).
 
 **Per-task cutover:** `MissingTaskArn`, `ResolveFailed` (nothing touched) · `CutoverFailed` (DMS may
@@ -786,8 +796,9 @@ See [§8](#8-if-something-fails) for the recovery keyed to each state, and
 
 **Worked out per task, from the row's `taskArn`** (plus `taskSuffix` / `adoptExistingFolder`): the
 task name (the DMS task's name, or `task_suffix`; after the first startup, the name recorded in
-`config/_task_index/<task id>.json`), its config folder `config/_task/<task name>/`, its five Glue
-job names `<project>-<task name>-{discovery,load,load-big,validate,cdc}`, its owner record
+`config/_task_index/<task id>.json`), its config folder `config/_task/<task name>/`, its Glue
+job names `<project>-<task name>-{discovery,load,load-big,validate,cdc}` (plus `-cdc-composite` if it
+has composite-PK tables), its owner record
 `_task.json`, and its S3 layout (from the DMS S3 endpoint's `BucketFolder`, `TimestampColumnName`,
 `CsvNullValue`, …).
 
