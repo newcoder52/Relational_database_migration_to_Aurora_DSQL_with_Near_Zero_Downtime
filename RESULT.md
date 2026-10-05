@@ -163,3 +163,99 @@ job args). `conn_budget` is now also passed to the validate job (caps parallelis
 - `stepfunctions/cutover.asl.json` — **B19:** removed the two obsolete `$.Payload` composite reads.
 - `stepfunctions/startup.asl.json` — B18: carry the 3 new validate settings resolve→create/ensure.
 - (`glue-templates/` unchanged — validate args are injected by `create_glue_jobs`, not baked in.)
+
+
+---
+
+# (appended) RESULT — data-safety guardrails (G1–G10)
+
+This work was rebased on top of the B19/B18 fixes above. The guardrails RESULT follows.
+
+Built offline (no AWS touched) on a fresh clone of
+`github.com/newcoder52/Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime`.
+Remote HEAD at start was `5e4adf8` (confirmed with `git ls-remote`), and this work was built on
+that HEAD. The final commit sha is recorded in `DONE` (and at the bottom of this file) after the
+rebase onto whatever `main` was at push time.
+
+Goal: whatever the (unconfirmable) cause of the weekend incident where DSQL tables went to 0 /
+far below the DMS/source counts, the pipeline must **refuse, or stop and flag the table**, never
+silently delete — and a loss must be detected within one CDC poll cycle. The scenario matrix is
+`WHAT_IF.md`; one+ test per row is in `tests/test_guardrails.py`.
+
+## The guardrails, defaults, and why
+
+| Guard | What it does | Default | Why that default |
+|---|---|---|---|
+| **G1** No destructive op once CDC started | `job2_load` refuses ANY whole-table/range blank once CDC has started for the table. Checks the task's `_cdc_started` S3 marker AND the table's `cdc_status` row; **fail-closed** if either can't be read | on | A reblank after CDC has applied deltas is exactly the way the whole post-full-load delta set is silently wiped. Fail-closed because "can't tell" must not mean "go ahead and delete" |
+| **G2** Destructive blank gated to a workflow / explicit manual flag | A manual (no-workflow) run may still WRITE (empty-table load, per-file resume that deletes nothing). A destructive **blank** in a manual run is refused unless `--allow_manual_destructive=true`; a RUNNING Step Functions execution blanks without the flag. CDC is **not** gated by G2 (CDC never empties a table) | manual blank refused without flag | Operators MUST be able to run jobs by hand (restart CDC after the 7-day timeout, re-run a load/validate). Only the irreversible action is gated, and only with an explicit, audited opt-in |
+| **G3** Per-table lock | Before writing, load/CDC take a per-table lock row in `cdc_control.cdc_control_lock` (conditional INSERT / OCC; stale locks expire after the heartbeat timeout). A 2nd load **fails closed**; a 2nd CDC run **skips with a WARNING** (the position fence remains the correctness backstop) | on, 1800s stale timeout | One writer per table prevents concurrent reblank+reload (duplicates) and two DMS tasks / forks clashing on one target |
+| **G4** Blank sanity | Before any blank: refuse unless the table was previously attempted by THIS task (owner/resume record), and refuse if its current count > expected `FullLoadRows × (1 + margin)` | on, margin 0.05 | A count above expectation means the table holds rows this run never owned (mis-targeted / shared table) — not ours to empty |
+| **G5** Audit log | A row is written to `cdc_control.audit_log` BEFORE every destructive action (blank, range blank, mass delete, `_cdc_file` purge) and on every refusal: time, task, job, run id, execution id, table, action, rows before, rows deleted, reason. `CREATE TABLE` only, no DEFAULT-on-ALTER | always on | The actual weekend op was un-attributable. Writing first means even a crash mid-op leaves a record |
+| **G6** CDC mass-delete guard | Per file, if net DELETEs would remove > `cdc_max_delete_fraction` AND > `cdc_max_delete_rows` of the table's current rows, the table is **blocked** and nothing from that file is applied | fraction 0.5, rows 100000 | Both thresholds must trip so a tiny table's normal churn never blocks, while a corrupt file deleting most of a large table does. Operator unblocks one file with `cdc_status.allow_mass_delete=true` after verifying vs source; fraction ≥ 1 turns it off |
+| **G7** No-PK delete precision + exact purge | A no-PK content DELETE that would match more rows than its D ops require **blocks** the table (DSQL has no ctid / verifiable bounded delete). The `_cdc_file` purge is asserted to be an exact single-equality on the file key only | always on | Prevents a duplicate-row content DELETE over-deleting, and a future edit widening the purge from touching other files' rows |
+| **G8** Ordering / high-water / gap / new-LOAD | CDC refuses a file at/under the high-water (replay/regression), a gap (a later file already done), or a new `LOAD*` file appearing after CDC started (a DMS reload under CDC) | always on | Catches a hand-reset `cdc_status` replaying from zero, skipped files, leftover old-run files, and a DMS "reload table" that would reblank/clobber the target |
+| **G9** Drift detector | Every `cdc_drift_check_minutes` the CDC job compares the live DSQL count to `full_load_rows + inserts_applied − deletes_applied` (new counters on `cdc_status`, add-if-missing like B17). Beyond `cdc_drift_tolerance`: ERROR log, `audit_log` row, `DsqlRowDrift` CloudWatch metric, and (if `cdc_drift_action=block`) set the table `blocked` | check 30 min, tolerance 0, action warn | Detects a slow leak from ANY cause within one check window instead of days. tolerance 0 is exact for PK tables; raise slightly for no-PK. `warn` default so detection never itself stops the pipeline unless the operator opts into `block` |
+| **G10** Validate & cutover vs DMS | Validate also compares the DSQL count to DMS `describe_table_statistics` FullLoadRows (not only the S3 source) and FAILs on a mismatch (`DMS_COUNT_DIFF`). Cutover's pre-check compares DSQL to `FullLoadRows + Inserts − Deletes` and refuses (`CountMismatch`) beyond tolerance unless an explicit override is given | tolerance 0 | A PASS that only checked the S3 source can hide a shortfall vs the authoritative DMS figure; cutover must not promote a short target |
+
+Composite-key tables get the SAME guards: `scripts/glue_cdc_composite.py` carries the identical
+helpers and wiring, and the shared pure helpers are **byte-identical** to
+`scripts/glue_cdc_continuous.py` (enforced by `test_shared_helpers_byte_identical`). Spark CDC runs
+the same scripts (templates reference them; `test_spark_cdc_uses_same_scripts`).
+
+## New settings (flow params.csv → params_csv.py → pipeline.json → resolve_task → payload → job args)
+
+`cdc_max_delete_fraction` (0.5), `cdc_max_delete_rows` (100000), `cdc_drift_check_minutes` (30),
+`cdc_drift_tolerance` (0), `cdc_drift_action` (warn). Added to `OPTIONAL_DEFAULTS` / `PIPELINE_KEYS`
+/ validation in `lambdas/params_csv.py`, to `SETTINGS_DEFAULTS` / `_validate_settings` / the payload
+in `lambdas/resolve_task.py`, forwarded to every CDC job as `--cdc_*` in `lambdas/create_glue_jobs.py`
+and wired through `stepfunctions/startup.asl.json`. Documented in RUNBOOK §3 (pipeline-key count
+40 → 45), `config/params.example.csv`, `config/pipeline.example.json`, `docs/MANUAL_SETUP.md`.
+`test_docs_params.py` passes (51 ALLOWED keys, 45 pipeline keys).
+
+Load/validate run-flags (not pipeline.json settings): `--allow_manual_destructive`,
+`--blank_guard_enabled`, `--blank_expected_margin`, `--startup_execution` / `--startup_execution_arn`
+(load, G2), `--dms_task_arn` / `--count_mismatch_tolerance` (validate, G10).
+
+## IAM change
+
+`iam/glue.json` gains `states:DescribeExecution` (new `StatesDescribeExecutionForBlankGuard`
+statement). G2's "is a workflow driving this run?" probe calls `describe_execution`; without the
+permission the probe fails and the blank fails closed (safe), so a **customer-managed Glue policy
+must also grant `states:DescribeExecution`** for a legitimate workflow-driven reblank to be
+permitted. The B13 IAM allow-list test already includes this action. No other IAM change.
+
+## Behaviour changes a running deployment would notice
+
+- A load that previously auto-reblanked-on-resume now **also** passes G1/G2/G3/G4 first and writes
+  G5 audit rows. On a normal workflow-driven resume (RUNNING execution, previously-attempted table,
+  count within expectation, CDC not yet started) it behaves exactly as before. A **console/manual**
+  reblank now refuses unless `--allow_manual_destructive=true` is passed.
+- CDC now reads the table count before applying a delete-bearing file (G6) and runs a periodic
+  drift check (G9) — a few extra read-only round-trips, not on the row hot path.
+- CDC can newly set a table `blocked` for G6/G7/G8/G9 reasons (previously only schema/bad-row). The
+  unblock is always `UPDATE cdc_control.cdc_status SET status='active' …` (RUNBOOK §"Safety
+  guardrails").
+- New `cdc_control` objects created on first run: `audit_log` (table), `cdc_control_lock` (table),
+  and four `cdc_status` columns (`full_load_rows`, `inserts_applied`, `deletes_applied`,
+  `allow_mass_delete`) added if missing (no DEFAULT-on-ALTER). The existing static B17 test still
+  passes (no `ADD COLUMN ... DEFAULT` anywhere).
+- Validate can newly FAIL a table with `DMS_COUNT_DIFF` (G10) and cutover with `CountMismatch`
+  when the DSQL count disagrees with the DMS figure — only when `--dms_task_arn` is wired.
+
+## Tests
+
+`tests/test_guardrails.py` — 78 checks, one+ per WHAT_IF row (manual CDC allowed + lock respected,
+manual load onto empty allowed, manual blank refused without the flag and allowed+audited with it,
+an 80%-of-1M delete blocked, no-PK over-match blocked, out-of-order/gap/new-LOAD blocked, injected
+drift fires + metric + audit, cutover count mismatch fails, every override). All existing suites
+stay green: `test_asl_paths`, `test_b17_b13`, `test_docs_params`, `test_e2e_fixes`,
+`test_existing_roles`, `test_fix6`, `test_planning_settings` — including `test_e2e_fixes.py` and
+`test_b17_b13.py`. All offline; the fake DSQL enforces the 3000-row/txn cap.
+
+## Commit
+
+Final sha: see `DONE`. Built on remote HEAD `5e4adf8`, then rebased onto `main` at push time
+(`dd88d83`, the parallel B19/B18 commit), keeping BOTH this work and the B19/B18 changes (RESULT.md
+add/add kept both; RUNBOOK pipeline-key count merged to 48; create_glue_jobs + job3_validate kept
+both sides' args/globals). Plain `git push` as `newcoder52 <aash.798@gmail.com>`, verified in a
+second fresh clone.

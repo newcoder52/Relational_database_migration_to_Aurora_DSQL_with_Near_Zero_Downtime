@@ -196,6 +196,14 @@ VALIDATE_HASH = "all"
 CONN_RECYCLE_SECONDS = 50 * 60
 GLUE_API_TIMEOUT = 5
 
+# G10 SAFETY GUARDRAIL (validate side): also compare the DSQL count to the authoritative DMS
+# describe_table_statistics FullLoadRows (not only the S3-derived source count) and FAIL on a
+# mismatch beyond COUNT_MISMATCH_TOLERANCE. Needs the DMS task ARN (--dms_task_arn) +
+# dms:DescribeTableStatistics (already granted on the Glue role). Absent ARN -> the check is a
+# no-op (validate falls back to the S3 comparison only). See WHAT_IF.md / RUNBOOK.
+DMS_TASK_ARN = None
+COUNT_MISMATCH_TOLERANCE = 0
+
 # =============================================================================
 # OPTIONAL GLUE ARG OVERLAY  (orchestrator wiring — mirrors v16's _apply_v6_arg_overrides)
 # =============================================================================
@@ -218,12 +226,14 @@ def _apply_job3_arg_overrides():
     global REQUIRE_FULL_LOAD_DONE
     global VALIDATE_PARALLELISM, CONN_BUDGET, VALIDATE_HASH
     global VALIDATE_TARGET_SECONDS_PER_RANGE
+    global DMS_TASK_ARN, COUNT_MISMATCH_TOLERANCE
     optional = ["config_prefix", "index_s3_key", "dsql_endpoint", "dsql_user",
                 "dsql_database", "region", "dsql_endpoint_candidates",
                 "checksum_mode", "max_parallel_tables", "validate_rows_per_range",
                 "max_query_concurrency", "require_full_load_done", "csv_null_value",
                 "validate_parallelism", "conn_budget", "validate_hash",
-                "validate_target_seconds_per_range"]
+                "validate_target_seconds_per_range",
+                "dms_task_arn", "count_mismatch_tolerance"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -296,6 +306,14 @@ def _apply_job3_arg_overrides():
         print(f"  ↪ CSV_NULL_VALUE (DMS null marker) -> {CSV_NULL_VALUE!r}")
     if "require_full_load_done" in ov:
         REQUIRE_FULL_LOAD_DONE = str(ov["require_full_load_done"]).strip().lower() in ("true", "1", "yes")
+    if "dms_task_arn" in ov and str(ov["dms_task_arn"]).strip():
+        DMS_TASK_ARN = str(ov["dms_task_arn"]).strip()
+        print(f"  ↪ DMS_TASK_ARN set -> G10 DSQL-vs-FullLoadRows check enabled")
+    if "count_mismatch_tolerance" in ov and ov["count_mismatch_tolerance"] is not None:
+        try:
+            COUNT_MISMATCH_TOLERANCE = max(0, int(ov["count_mismatch_tolerance"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid count_mismatch_tolerance={ov['count_mismatch_tolerance']!r}")
 
 
 _apply_job3_arg_overrides()
@@ -1345,6 +1363,68 @@ def _first_pk_rangeable(pk_meta):
     return (None, None)
 
 
+def guard_count_vs_dms(dsql_count, dms_full_load_rows, inserts=0, deletes=0, tolerance=0):
+    """G10 (PURE): compare the live DSQL row count to the authoritative DMS accounting
+    (FullLoadRows + inserts − deletes). For validate (pre-CDC) inserts/deletes are 0, so this is
+    DSQL vs FullLoadRows. For cutover (post-CDC drain) pass the applied insert/delete counts.
+    Returns (ok, delta, expected, reason). ok is True when |dsql − expected| <= tolerance.
+    dms_full_load_rows None -> (True, 0, None, "") (no DMS figure to compare; caller falls back
+    to its S3-derived check). A negative delta means the TARGET IS SHORT (the dangerous case)."""
+    if dms_full_load_rows is None:
+        return True, 0, None, ""
+    try:
+        live = int(dsql_count or 0)
+        flr = int(dms_full_load_rows)
+        ins = int(inserts or 0)
+        dels = int(deletes or 0)
+        tol = float(tolerance or 0)
+    except (TypeError, ValueError):
+        return False, 0, None, (f"could not evaluate the count equation "
+                                f"(dsql={dsql_count!r}, FullLoadRows={dms_full_load_rows!r}) — "
+                                f"failing closed")
+    expected = flr + ins - dels
+    delta = live - expected
+    if abs(delta) <= tol:
+        return True, delta, expected, ""
+    where = "SHORT (possible data loss)" if delta < 0 else "OVER (possible duplicate/replay)"
+    return False, delta, expected, (
+        f"DSQL count {live:,} vs DMS FullLoadRows+inserts-deletes {expected:,} "
+        f"(FullLoadRows={flr:,}, +{ins:,} -{dels:,}); delta {delta:+,} exceeds tolerance {tol} "
+        f"— target is {where}.")
+
+
+def dms_full_load_rows_for(dms, task_arn, folder_schema, folder_table):
+    """G10 helper: best-effort DMS FullLoadRows for one table via describe_table_statistics
+    (paginated on Marker). Matches on SchemaName.TableName case-insensitively against the DMS
+    folder names. Returns an int, or None if DMS is unreachable / the table isn't reported (so
+    guard_count_vs_dms degrades to 'no comparison' rather than failing the run on a DMS blip).
+    Read-only; never raises."""
+    if not dms or not task_arn:
+        return None
+    want = (str(folder_schema).lower(), str(folder_table).lower())
+    marker = None
+    try:
+        while True:
+            kw = {"ReplicationTaskArn": task_arn}
+            if marker:
+                kw["Marker"] = marker
+            resp = dms.describe_table_statistics(**kw)
+            for st in resp.get("TableStatistics", []):
+                sch = str(st.get("SchemaName") or "").lower()
+                tbl = str(st.get("TableName") or "").lower()
+                if (sch, tbl) == want:
+                    flr = st.get("FullLoadRows")
+                    return int(flr) if flr is not None else None
+            marker = resp.get("Marker")
+            if not marker:
+                break
+    except Exception as e:
+        print(f"  (G10) DMS FullLoadRows lookup skipped for {folder_schema}.{folder_table} "
+              f"(non-fatal: {e})")
+        return None
+    return None
+
+
 def validate_one_table(s3, entry):
     """Validate ONE table: plan ranges, summarize the source (Spark, one pass) and the target
     (DSQL, parallel), compare. Every table ends as match, mismatch or error — never skipped."""
@@ -1582,6 +1662,28 @@ def validate_one_table(s3, entry):
     }
 
     status = "match" if (not mismatches and src_total == tgt_total) else "mismatch"
+    # ── G10: ALSO compare the DSQL target count to the authoritative DMS FullLoadRows (not only
+    # the S3-derived source count). A PASS that only checked the S3 source can hide a shortfall
+    # vs DMS; this cross-check FAILS the table on a mismatch beyond COUNT_MISMATCH_TOLERANCE.
+    # No-op when --dms_task_arn is absent (falls back to the S3 comparison above).
+    if DMS_TASK_ARN:
+        try:
+            _dms = make_boto_client('dms')
+        except Exception:
+            _dms = None
+        _folder_schema = meta.get('dms_folder_schema') or meta.get('source_schema') or dsql_schema
+        _folder_table = meta.get('dms_folder_table') or meta.get('source_table') or dsql_table
+        _flr = dms_full_load_rows_for(_dms, DMS_TASK_ARN, _folder_schema, _folder_table)
+        _ok10, _delta10, _exp10, _why10 = guard_count_vs_dms(
+            tgt_total, _flr, inserts=0, deletes=0, tolerance=COUNT_MISMATCH_TOLERANCE)
+        if _flr is not None:
+            notes.append(f"G10 DMS FullLoadRows check: DSQL={tgt_total:,} vs FullLoadRows="
+                         f"{_flr:,} ({'OK' if _ok10 else 'MISMATCH'})")
+            if not _ok10:
+                status = "mismatch"
+                mismatches.append({"range": ["whole table"], "type": "DMS_COUNT_DIFF",
+                                   "source": _exp10, "target": tgt_total, "detail": _why10})
+                print(f"    ❌ G10 [{label}]: {_why10}")
     return {
         "table": label, "status": status, "ranges": len(ranges),
         "source_rows": src_total, "target_rows": tgt_total,

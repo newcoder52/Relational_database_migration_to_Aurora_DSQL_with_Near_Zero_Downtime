@@ -72,6 +72,11 @@ cp config/params.example.csv params.csv
 | `cdc_spark_fallback` | optional | `true` | on a Python-shell CDC driver failure, re-create that task's CDC job as Spark |
 | `cdc_validation` | optional | `true` | Tier-2 CDC validation on; cutover stops at `CdcValidationFailed` on unresolved `cdc_control.cdc_validation_failures`. `false` disables |
 | `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = all) |
+| `cdc_max_delete_fraction` | optional | `0.5` | G6: a CDC file deleting > this fraction (and > `cdc_max_delete_rows`) of a table blocks it; `>= 1` disables |
+| `cdc_max_delete_rows` | optional | `100000` | G6: absolute delete floor; both thresholds must be crossed |
+| `cdc_drift_check_minutes` | optional | `30` | G9: minutes between DSQL-vs-expected count checks; `0` = off |
+| `cdc_drift_tolerance` | optional | `0` | G9: allowed row difference before drift fires |
+| `cdc_drift_action` | optional | `warn` | G9: `warn` or `block` on drift |
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
 | `max_composite_forks` | optional | `8` | max composite-PK tables forked out of one task (each gets its own always-on CDC + load/validate jobs); over the cap, startup fails early at `PlanSplitFailed` naming the tables |
 | `max_big_cdc_forks` | optional | `8` | max big single-/no-PK tables that get their own `bg` CDC job; over the cap they stay on the main CDC job with a warning (not a failure) |
@@ -398,6 +403,11 @@ is rejected at run time.
 | `control_schema` | `control_schema` | `cdc_control` |
 | `cdc_validation` | `cdc_validation` | `true` |
 | `cdc_validation_sample` | `cdc_validation_sample` | `20` |
+| `cdc_max_delete_fraction` | `cdc_max_delete_fraction` | `0.5` |
+| `cdc_max_delete_rows` | `cdc_max_delete_rows` | `100000` |
+| `cdc_drift_check_minutes` | `cdc_drift_check_minutes` | `30` |
+| `cdc_drift_tolerance` | `cdc_drift_tolerance` | `0` |
+| `cdc_drift_action` | `cdc_drift_action` | `warn` |
 | `max_composite_forks` | `max_composite_forks` | `8` |
 | `max_big_cdc_forks` | `max_big_cdc_forks` | `8` |
 | `big_table_row_threshold` | `big_table_row_threshold` | `6000000` |
@@ -449,6 +459,11 @@ cfg = {
     "control_schema": "cdc_control",
     "cdc_validation": True,
     "cdc_validation_sample": 20,
+    "cdc_max_delete_fraction": 0.5,
+    "cdc_max_delete_rows": 100000,
+    "cdc_drift_check_minutes": 30,
+    "cdc_drift_tolerance": 0,
+    "cdc_drift_action": "warn",
     "max_composite_forks": 8,
     "max_big_cdc_forks": 8,
     "big_table_row_threshold": 6000000,

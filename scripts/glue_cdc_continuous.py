@@ -349,6 +349,18 @@ VALIDATION_RETRY_DELAY_SECONDS = 5       # re-check a mismatch after this, befor
 VALIDATION_MAX_FAILURES_PER_TABLE = 100  # circuit breaker: stop validating a table past this
 
 # =============================================================================
+# SAFETY GUARDRAILS (data-loss protection; see WHAT_IF.md / RUNBOOK "Safety guardrails")
+# Defaults are SAFE. Each override is an explicit --cdc_* arg (set by create_glue_jobs from
+# pipeline.json). G6 mass-delete guard + G9 drift detector read these.
+# =============================================================================
+CDC_MAX_DELETE_FRACTION = 0.5    # G6: a file deleting > this fraction AND > CDC_MAX_DELETE_ROWS
+CDC_MAX_DELETE_ROWS = 100000     #     of a table's current rows blocks it; fraction >= 1 = off
+CDC_DRIFT_CHECK_MINUTES = 30     # G9: minutes between live-count-vs-expected checks (0 = off)
+CDC_DRIFT_TOLERANCE = 0.0        # G9: allowed |live − expected| row difference before firing
+CDC_DRIFT_ACTION = "warn"        # G9: "warn" (log+metric+audit) or "block" (also set 'blocked')
+_DRIFT_LAST_RUN = {}             # G9: per-table monotonic clock of the last drift check (throttle)
+
+# =============================================================================
 # DSQL TRANSACTION LIMITS + RETRY TUNING  (borrowed verbatim from job2 v15)
 # =============================================================================
 DSQL_MAX_ROWS_PER_TXN = 3000          # DSQL per-transaction row cap (hard DSQL limit)
@@ -467,6 +479,8 @@ def _apply_cdc_arg_overrides():
     global DMS_TIMESTAMP_COLUMN, SINGLE_SWAP_IS_RENAME
     global VALIDATION_ENABLED, VALIDATION_SAMPLE_PER_FILE
     global CDC_OWNER_SELF, CDC_OWNERS_KEY
+    global CDC_MAX_DELETE_FRACTION, CDC_MAX_DELETE_ROWS
+    global CDC_DRIFT_CHECK_MINUTES, CDC_DRIFT_TOLERANCE, CDC_DRIFT_ACTION
     optional = ["config_prefix", "index_s3_key", "load_status_key", "s3_bucket", "cdc_root",
                 "dsql_endpoint", "dsql_database", "dsql_user", "region",
                 "dsql_endpoint_candidates",
@@ -474,6 +488,8 @@ def _apply_cdc_arg_overrides():
                 "max_parallel_tables", "require_full_load_done", "poll_interval",
                 "timestamp_column", "single_swap_is_rename", "csv_null_value",
                 "cdc_validation", "cdc_validation_sample",
+                "cdc_max_delete_fraction", "cdc_max_delete_rows",
+                "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
                 "cdc_owner_self", "cdc_owners_key"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
@@ -553,6 +569,40 @@ def _apply_cdc_arg_overrides():
             print(f"  ↪ VALIDATION_SAMPLE_PER_FILE overridden -> {VALIDATION_SAMPLE_PER_FILE}")
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid cdc_validation_sample={ov['cdc_validation_sample']!r}")
+    # ── SAFETY GUARDRAIL overrides (G6 mass-delete, G9 drift). A bad value is IGNORED (keep the
+    # SAFE default) with a warning — never silently turns a guard off through a parse error.
+    if "cdc_max_delete_fraction" in ov and ov["cdc_max_delete_fraction"] is not None:
+        try:
+            CDC_MAX_DELETE_FRACTION = max(0.0, float(ov["cdc_max_delete_fraction"]))
+            print(f"  ↪ CDC_MAX_DELETE_FRACTION overridden -> {CDC_MAX_DELETE_FRACTION}")
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid cdc_max_delete_fraction={ov['cdc_max_delete_fraction']!r}")
+    if "cdc_max_delete_rows" in ov and ov["cdc_max_delete_rows"] is not None:
+        try:
+            CDC_MAX_DELETE_ROWS = max(0, int(ov["cdc_max_delete_rows"]))
+            print(f"  ↪ CDC_MAX_DELETE_ROWS overridden -> {CDC_MAX_DELETE_ROWS}")
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid cdc_max_delete_rows={ov['cdc_max_delete_rows']!r}")
+    if "cdc_drift_check_minutes" in ov and ov["cdc_drift_check_minutes"] is not None:
+        try:
+            CDC_DRIFT_CHECK_MINUTES = max(0, int(ov["cdc_drift_check_minutes"]))
+            print(f"  ↪ CDC_DRIFT_CHECK_MINUTES overridden -> {CDC_DRIFT_CHECK_MINUTES}")
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid cdc_drift_check_minutes={ov['cdc_drift_check_minutes']!r}")
+    if "cdc_drift_tolerance" in ov and ov["cdc_drift_tolerance"] is not None:
+        try:
+            CDC_DRIFT_TOLERANCE = max(0.0, float(ov["cdc_drift_tolerance"]))
+            print(f"  ↪ CDC_DRIFT_TOLERANCE overridden -> {CDC_DRIFT_TOLERANCE}")
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid cdc_drift_tolerance={ov['cdc_drift_tolerance']!r}")
+    if "cdc_drift_action" in ov and ov["cdc_drift_action"] is not None:
+        _da = str(ov["cdc_drift_action"]).strip().lower()
+        if _da in ("warn", "block"):
+            CDC_DRIFT_ACTION = _da
+            print(f"  ↪ CDC_DRIFT_ACTION overridden -> {CDC_DRIFT_ACTION}")
+        else:
+            print(f"  ⚠️ ignoring invalid cdc_drift_action={ov['cdc_drift_action']!r} "
+                  f"(must be warn|block)")
 
 
 _apply_cdc_arg_overrides()
@@ -1297,6 +1347,285 @@ def _ensure_resolved_column(cur):
             break
 
 
+def _ensure_cdc_status_guardrail_columns(cur):
+    """G9/G6 upgrade path: idempotently ensure cdc_control.cdc_status has the drift counters
+    (full_load_rows, inserts_applied, deletes_applied) and the G6 override flag
+    (allow_mass_delete) on an OLDER control table that predates them, WITHOUT a DEFAULT on
+    ALTER (DSQL rejects ADD COLUMN ... DEFAULT at parse time, SQLSTATE 0A000). For each column:
+    probe information_schema.columns; only if missing, ADD COLUMN with NO DEFAULT. Existing
+    rows get NULL; readers coalesce NULL to 0/false. `cur` is an autocommit cursor on
+    CONTROL_SCHEMA. A fresh CREATE TABLE already declares all of them, so this is a no-op in the
+    steady state."""
+    for col, decl in (("full_load_rows", "bigint"),
+                      ("inserts_applied", "bigint"),
+                      ("deletes_applied", "bigint"),
+                      ("allow_mass_delete", "boolean")):
+        cur.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s AND column_name = %s LIMIT 1",
+            (CONTROL_SCHEMA, "cdc_status", col))
+        if cur.fetchone() is not None:
+            continue
+        print(f"  ↻ upgrading {CONTROL_SCHEMA}.cdc_status: adding '{col}' (no DEFAULT; DSQL "
+              f"forbids DEFAULT on ALTER)", flush=True)
+        # No DEFAULT, no backfill needed: these are counters/flags read with COALESCE(...,0/false).
+        cur.execute(f"ALTER TABLE {CONTROL_SCHEMA}.cdc_status ADD COLUMN {col} {decl}")
+
+
+def write_audit_log(cur, table_name, action, rows_before, rows_deleted, reason,
+                    task=None, job=None, run_id=None, execution_id=None):
+    """G5: write ONE cdc_control.audit_log row describing a destructive action, BEFORE it runs,
+    so the operation is attributable even if the job then crashes mid-op. `cur` is a cursor the
+    caller commits (the audit write should commit before/with the destructive op). id is a
+    Python uuid4 — never a server-side DEFAULT. Never raises on a formatting issue: the values
+    are coerced to safe types. Returns the id written."""
+    _id = str(uuid.uuid4())
+    def _int_or_none(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    cur.execute(
+        f'INSERT INTO {CONTROL_SCHEMA}.audit_log (id, event_time, task, job, run_id, '
+        f'execution_id, table_name, action, rows_before, rows_deleted, reason) '
+        f'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+        (_id, utc_now_iso(), (task or None), (job or None), (run_id or None),
+         (execution_id or None), table_name, str(action)[:64],
+         _int_or_none(rows_before), _int_or_none(rows_deleted), str(reason)[:8000]))
+    return _id
+
+
+def emit_drift_metric(label, delta):
+    """G9 best-effort CloudWatch metric for row drift (|live − expected|). Never raises — a
+    metric must not affect the apply. Emits into the SAME namespace the pipeline already uses
+    (GlueCDC/NonPK) so no new IAM is needed (the glue role's cloudwatch:PutMetricData is scoped
+    to that namespace). Value is the absolute drift; the sign is in the log + audit_log row."""
+    if not cloudwatch or _OPTIONAL_API_DOWN["cloudwatch"]:
+        return
+    try:
+        cloudwatch.put_metric_data(
+            Namespace="GlueCDC/NonPK",
+            MetricData=[{
+                "MetricName": "DsqlRowDrift",
+                "Dimensions": [{"Name": "Table", "Value": label}],
+                "Value": float(abs(int(delta))),
+                "Unit": "Count",
+            }])
+    except Exception as e:
+        if _is_unreachable(e):
+            _OPTIONAL_API_DOWN["cloudwatch"] = True
+            print(f"    ⚠️ CloudWatch is not reachable from this job ({type(e).__name__}); the "
+                  f"DsqlRowDrift metric is turned off for this run (drift is still logged + "
+                  f"written to {CONTROL_SCHEMA}.audit_log).")
+        else:
+            print(f"    ⚠️ CW drift-metric emit failed (non-fatal) for {label}: {e}")
+
+
+def _read_count_and_allow(conn_holder, dsql_schema, dsql_table, label):
+    """G6 helper: read (current_row_count, allow_mass_delete) for a table on its own session.
+    Read-only; best-effort. On a read failure returns (None, False) so guard_mass_delete fails
+    SAFE (a None count makes it block). allow_mass_delete comes from the table's cdc_status row
+    (NULL -> False). Uses a fresh short txn on conn_holder[0] and leaves it committed."""
+    conn = conn_holder[0]
+    cur = conn.cursor()
+    cnt = None
+    allow = False
+    try:
+        cur.execute(f"SELECT count(*) FROM {dsql_schema}.{dsql_table}")
+        row = cur.fetchone()
+        cnt = int(row[0]) if row and row[0] is not None else 0
+        cur.execute(
+            f"SELECT allow_mass_delete FROM {CONTROL_SCHEMA}.cdc_status WHERE table_name = %s",
+            (label,))
+        r2 = cur.fetchone()
+        allow = bool(r2[0]) if r2 and r2[0] is not None else False
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"    ⚠️ {label}: could not read count/allow_mass_delete for the mass-delete "
+              f"guard ({e}); treating as unknown (guard fails SAFE).")
+        return None, False
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    return cnt, allow
+
+
+def _audit_destructive(conn_holder, label, action, rows_before, rows_deleted, reason):
+    """G5 helper: write a cdc_control.audit_log row for a destructive/blocked CDC action, on the
+    table's own session, as its own short committed txn. Best-effort — audit must never crash
+    the apply (the primary signal is the TableBlocked the caller raises). Fills task/job/run/
+    execution from this run's args."""
+    conn = conn_holder[0]
+    cur = conn.cursor()
+    try:
+        write_audit_log(cur, label, action, rows_before, rows_deleted, reason,
+                        task=CONFIG_PREFIX, job=_run_arg("JOB_NAME"),
+                        run_id=_run_arg("JOB_RUN_ID"), execution_id=_start_token())
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"    ⚠️ {label}: audit_log write failed (non-fatal) for {action}: {e}")
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def _nopk_delete_precision_check(conn_holder, label, dsql_schema, dsql_table,
+                                 delete_ops, content_where_fn):
+    """G7 helper: before applying no-PK content DELETEs, verify none over-matches. Group the D
+    ops by their content predicate (identical rows collapse to one predicate requiring that many
+    deletes), then for each distinct predicate COUNT the matching target rows and compare with
+    guard_nopk_delete_bound. Returns (ok, reason). Read-only; on a read error fails SAFE (not ok)
+    so a precision check that cannot be performed blocks rather than risks over-deletion. Caps
+    the number of distinct predicates probed (bounded cost) — beyond the cap it trusts the mass-
+    delete guard already run and returns ok (the per-op probe is a precision refinement, not the
+    volume guard)."""
+    # Group identical delete predicates -> required delete count per predicate.
+    required = {}
+    for nop in delete_ops:
+        w = content_where_fn(nop["values"])
+        required[w] = required.get(w, 0) + 1
+    _PROBE_CAP = 2000
+    if len(required) > _PROBE_CAP:
+        return True, ""
+    conn = conn_holder[0]
+    cur = conn.cursor()
+    try:
+        for where, need in required.items():
+            cur.execute(f"SELECT count(*) FROM {dsql_schema}.{dsql_table} WHERE {where}")
+            row = cur.fetchone()
+            match_count = int(row[0]) if row and row[0] is not None else 0
+            ok, why = guard_nopk_delete_bound(match_count, need)
+            if not ok:
+                conn.commit()
+                return False, why
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, (f"could not verify no-PK delete precision ({e}) — blocking to be safe")
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    return True, ""
+
+
+def _set_blocked_status(conn_holder, label, reason):
+    """Set a table's cdc_status.status='blocked' with the reason, on its own session as its own
+    short committed txn. Used by the G6/G7/G8/G9 guards when they block a table from
+    process_table (outside an apply txn). upsert_cdc_status creates the row if missing. Mirrors
+    how record_exception blocks a table; best-effort (the returned 'blocked' result + the raised
+    signal are the primary stop)."""
+    conn = conn_holder[0]
+    cur = conn.cursor()
+    try:
+        upsert_cdc_status(cur, label, status="blocked", error=str(reason)[:4000])
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"    ⚠️ {label}: could not persist 'blocked' status (non-fatal; the table is "
+              f"still skipped this cycle): {e}")
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def _advance_cdc_counters(cur, label, n_insert, n_delete):
+    """G9: fold a file's applied INSERT/DELETE net-op counts into the table's running
+    expectation counters on cdc_status (inserts_applied, deletes_applied). COALESCE so a NULL
+    (older row / fresh add-if-missing column) starts at 0. Called by process_table on its own
+    session AFTER a file fully applies (its own short txn), so a crash mid-file never double-
+    counts (the file re-applies from its offset and this runs only once the file is done)."""
+    if not n_insert and not n_delete:
+        return
+    cur.execute(
+        f'UPDATE {CONTROL_SCHEMA}.cdc_status '
+        f'SET inserts_applied = COALESCE(inserts_applied, 0) + %s, '
+        f'    deletes_applied = COALESCE(deletes_applied, 0) + %s '
+        f'WHERE table_name = %s',
+        (int(n_insert or 0), int(n_delete or 0), label))
+
+
+def _maybe_run_drift_check(conn_holder, label, dsql_schema, dsql_table):
+    """G9 drift detector, run periodically (every CDC_DRIFT_CHECK_MINUTES) per table. Reads the
+    live DSQL count and the tracked expectation (full_load_rows + inserts_applied −
+    deletes_applied) and compares via guard_drift. Beyond CDC_DRIFT_TOLERANCE it logs ERROR,
+    writes cdc_control.audit_log, emits the DsqlRowDrift metric, and — when CDC_DRIFT_ACTION ==
+    'block' — sets the table 'blocked'. Returns the status string to surface ('blocked' or None).
+    Throttled by a module-level per-table last-run clock (_DRIFT_LAST_RUN). Setting
+    CDC_DRIFT_CHECK_MINUTES to 0 turns it off. Never raises (best-effort; read-only unless it
+    blocks)."""
+    if CDC_DRIFT_CHECK_MINUTES <= 0:
+        return None
+    now = time.monotonic()
+    due_after = CDC_DRIFT_CHECK_MINUTES * 60.0
+    last = _DRIFT_LAST_RUN.get(label, 0.0)
+    if last and (now - last) < due_after:
+        return None
+    _DRIFT_LAST_RUN[label] = now
+    conn = conn_holder[0]
+    cur = conn.cursor()
+    try:
+        cur.execute(f"SELECT count(*) FROM {dsql_schema}.{dsql_table}")
+        row = cur.fetchone()
+        live = int(row[0]) if row and row[0] is not None else 0
+        cur.execute(
+            f'SELECT COALESCE(full_load_rows,0), COALESCE(inserts_applied,0), '
+            f'COALESCE(deletes_applied,0) FROM {CONTROL_SCHEMA}.cdc_status '
+            f'WHERE table_name = %s', (label,))
+        r2 = cur.fetchone()
+        flr, ins, dels = (int(r2[0]), int(r2[1]), int(r2[2])) if r2 else (0, 0, 0)
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"    ⚠️ {label}: drift check read failed (non-fatal, retry next window): {e}")
+        return None
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+    fired, delta, expected = guard_drift(live, flr, ins, dels, CDC_DRIFT_TOLERANCE)
+    if not fired:
+        return None
+    msg = (f"ROW DRIFT [{label}]: live DSQL count {live:,} vs expected {expected:,} "
+           f"(full_load_rows+inserts-deletes); delta {delta:+,} exceeds tolerance "
+           f"{CDC_DRIFT_TOLERANCE}. "
+           + ("Target is SHORT — possible data loss." if delta < 0
+              else "Target has MORE rows than expected — possible duplicate/replay."))
+    print(f"    ❌ {msg}", flush=True)
+    emit_drift_metric(label, delta)
+    _audit_destructive(conn_holder, label, "drift_detected",
+                       rows_before=live, rows_deleted=0, reason=msg)
+    if CDC_DRIFT_ACTION == "block":
+        _set_blocked_status(conn_holder, label, msg)
+        return "blocked"
+    return None
+
+
 def _ensure_control_tables_once():
     conn = connect_dsql_with_retry(autocommit=True, what="ensure_control_tables")
     cur = conn.cursor()
@@ -1312,7 +1641,11 @@ def _ensure_control_tables_once():
                 watermark_ts      varchar(64),
                 rows_applied      bigint,
                 error             varchar(4000),
-                status_time       timestamptz
+                status_time       timestamptz,
+                full_load_rows    bigint,
+                inserts_applied   bigint,
+                deletes_applied   bigint,
+                allow_mass_delete boolean
             )
         """)
         # NOTE: the PK id is supplied by Python (uuid4), NOT a server-side
@@ -1435,6 +1768,31 @@ def _ensure_control_tables_once():
                 skipped_time    timestamptz
             )
         """)
+        # G5 AUDIT LOG — one durable row written BEFORE every destructive action (whole-table
+        # blank, range blank, CDC mass-delete, _cdc_file purge) so the actual operation that
+        # emptied/shrank a table is always attributable, even if the job then crashes. id is a
+        # Python uuid4 (DSQL has no guaranteed server-side gen_random_uuid() DDL default — same
+        # reason as cdc_apply_exceptions). CREATE TABLE only; no DEFAULT-on-ALTER anywhere.
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.audit_log (
+                id              uuid PRIMARY KEY,
+                event_time      timestamptz,
+                task            varchar(512),
+                job             varchar(256),
+                run_id          varchar(256),
+                execution_id    varchar(512),
+                table_name      varchar(512),
+                action          varchar(64),
+                rows_before     bigint,
+                rows_deleted    bigint,
+                reason          varchar(8000)
+            )
+        """)
+        # G9 upgrade path: an OLDER cdc_status table predates the drift counters + the G6
+        # allow_mass_delete flag. Add any missing column with NO DEFAULT (DSQL forbids
+        # DEFAULT-on-ALTER, SQLSTATE 0A000) — new rows set them explicitly; readers treat NULL
+        # as "unknown/0". Same add-if-missing pattern as _ensure_resolved_column (B17).
+        _ensure_cdc_status_guardrail_columns(cur)
         print(f"  ✓ control tables ready in {CONTROL_SCHEMA}")
     finally:
         cur.close()
@@ -2497,6 +2855,41 @@ def list_cdc_files(ctx, _retried=False):
     return files
 
 
+def list_load_files(ctx):
+    """G8 helper: list a table's full-load LOAD*.csv files in its CDC folder (sorted). CDC
+    normally EXCLUDES these (list_cdc_files skips LOAD*). The guardrail needs to SEE them: a new
+    LOAD* appearing after CDC started is a DMS 'reload table' that must block the table rather
+    than be silently ignored. Read-only; applies the same processed/failed exclusion as
+    list_cdc_files. Never raises (returns [] on any list error)."""
+    prefix = ctx["prefixes"]["cdc"]
+    out = []
+    token = None
+    try:
+        while True:
+            kw = {"Bucket": BUCKET, "Prefix": prefix, "Delimiter": "/"}
+            if token:
+                kw["ContinuationToken"] = token
+            resp = s3.list_objects_v2(**kw)
+            for o in resp.get("Contents", []):
+                key = o["Key"]
+                if not (key.endswith(".csv") and "/processed/" not in key
+                        and "/failed/" not in key):
+                    continue
+                fname = key.rsplit("/", 1)[-1]
+                if fname.upper().startswith("LOAD"):
+                    out.append(key)
+            if resp.get("IsTruncated"):
+                token = resp.get("NextContinuationToken")
+            else:
+                break
+    except Exception as e:
+        print(f"    ⚠️ {ctx['label']}: could not list LOAD* files for the reload guard "
+              f"({e}); skipping that check this cycle.")
+        return []
+    out.sort()
+    return out
+
+
 def read_cdc_file(key):
     """Read a CDC CSV -> (header_lowercased, data_rows). First row is the header."""
     obj = s3.get_object(Bucket=BUCKET, Key=key)
@@ -2767,6 +3160,173 @@ def check_position_cur(cur, table_name, expected, target):
         return "already"
     raise _PositionMoved(f"{table_name}: checkpoint is now {_fmt_pos(got)}, but this run "
                          f"left it at {_fmt_pos(expected)}")
+
+
+# =============================================================================================
+# SAFETY GUARDRAILS — shared pure decision helpers (G6/G7/G8/G9). BYTE-IDENTICAL between
+# scripts/glue_cdc_continuous.py and scripts/glue_cdc_composite.py (a static test enforces it).
+# Each is a pure function (no DB/S3/clock): it takes already-read numbers/strings and returns a
+# decision, so the apply paths stay testable offline and the guard logic can never diverge
+# between the single-PK and composite engines. All default SAFE (block / refuse). The callers
+# wire them into the hot paths and own the actual DSQL/CloudWatch side effects.
+# =============================================================================================
+
+def guard_mass_delete(current_count, n_delete, allow_mass_delete,
+                      max_fraction, max_rows):
+    """G6 CDC mass-delete guard. Decide whether applying `n_delete` net DELETE ops to a table
+    that currently has `current_count` rows is a suspected mass-delete that must be BLOCKED
+    (apply nothing from this file / cycle) rather than silently wiping the table.
+
+    BLOCK  iff  (not allow_mass_delete)
+            AND max_fraction < 1              (fraction >= 1 turns the guard off entirely)
+            AND current_count > 0
+            AND n_delete > max_fraction * current_count   (removes > the fraction)
+            AND n_delete > max_rows                        (AND > the absolute floor)
+
+    Requiring BOTH thresholds means a tiny table's normal churn (e.g. delete 3 of 4 rows) never
+    trips it, while a corrupt/misparsed file deleting most of a large table does. Returns
+    (blocked: bool, reason: str). reason is "" when not blocked."""
+    try:
+        cc = int(current_count or 0)
+        nd = int(n_delete or 0)
+    except (TypeError, ValueError):
+        # Unparseable counts -> fail SAFE (block) with a clear reason; the caller surfaces it.
+        return True, (f"mass-delete guard could not read counts "
+                      f"(current={current_count!r}, deletes={n_delete!r}) — blocking to be safe")
+    if allow_mass_delete:
+        return False, ""
+    if max_fraction is None or float(max_fraction) >= 1.0:
+        return False, ""      # guard disabled by setting
+    if cc <= 0 or nd <= 0:
+        return False, ""
+    frac_hit = nd > float(max_fraction) * cc
+    rows_hit = nd > int(max_rows)
+    if frac_hit and rows_hit:
+        pct = (100.0 * nd / cc) if cc else 0.0
+        return True, (f"would DELETE {nd:,} of {cc:,} row(s) ({pct:.1f}%), exceeding both "
+                      f"cdc_max_delete_fraction={max_fraction} and cdc_max_delete_rows="
+                      f"{int(max_rows):,}. Suspected mass delete (bad/corrupt file) vs a real "
+                      f"one. Nothing from this file was applied; the table is BLOCKED. Verify "
+                      f"against the SOURCE, then to apply this one file set "
+                      f"cdc_status.allow_mass_delete=true for this table (UPDATE, never DELETE "
+                      f"the row) and set status='active'. See RUNBOOK 'Safety guardrails'.")
+    return False, ""
+
+
+def guard_nopk_delete_bound(match_count, required_deletes):
+    """G7 no-PK delete precision. A full-row content DELETE on a no-PK table deletes EVERY row
+    that matches the predicate. Under the no-duplicate-rows contract that is one row per D op,
+    but if the target holds duplicates a single content DELETE removes more rows than the file's
+    D ops intend. Given how many rows currently MATCH the content predicate (`match_count`) and
+    how many the file requires removed (`required_deletes`), decide:
+      ok=True            matches <= required -> safe to apply the content DELETE as-is;
+      ok=False (block)   matches  > required -> would over-delete. DSQL has no ctid and no
+                         portable bounded-delete we can verify offline, so the SAFE action is to
+                         BLOCK the table with a clear error rather than guess which rows to keep.
+    Returns (ok: bool, reason: str)."""
+    try:
+        m = int(match_count or 0)
+        r = int(required_deletes or 0)
+    except (TypeError, ValueError):
+        return False, (f"no-PK delete guard could not read counts (match={match_count!r}, "
+                       f"required={required_deletes!r}) — blocking to be safe")
+    if m <= r:
+        return True, ""
+    return False, (f"a no-PK content-match DELETE matches {m} target row(s) but the file "
+                   f"requires only {r} removed — duplicate rows would be over-deleted. The "
+                   f"table is BLOCKED (nothing applied). Investigate the duplicates / source, "
+                   f"then resume with status='active'. See RUNBOOK 'Safety guardrails' (G7).")
+
+
+def purge_predicate_is_exact(sql, file_tag_column, file_literal):
+    """G7 _cdc_file purge safety. Confirm a no-PK file-reload purge statement deletes ONLY the
+    rows tagged with the EXACT current file key — never a prefix/LIKE/other file. Expects the
+    canonical shape `DELETE FROM <t> WHERE "<tag>" = <literal>` with the given tag column and
+    file literal and no additional predicate. Returns True iff it is an exact single-equality
+    on the tag column to this file's literal."""
+    flat = " ".join(str(sql).split())
+    low = flat.lower()
+    if not low.startswith("delete from "):
+        return False
+    # No wildcard / range / set operators that could widen the match beyond one exact key.
+    for bad in (" like ", " ilike ", " in (", " <", " >", " != ", "<>", " or ", " not "):
+        if bad in low:
+            return False
+    needle = f'"{file_tag_column}" = {file_literal}'
+    if needle not in flat:
+        return False
+    # Exactly one WHERE equality: the predicate after WHERE must be just the tag equality.
+    where_at = low.find(" where ")
+    if where_at < 0:
+        return False
+    pred = flat[where_at + len(" where "):].strip().rstrip(";").strip()
+    return pred == needle
+
+
+def guard_file_order(pending_key, last_done_file, done_files):
+    """G8 ordering / high-water / gap guard. CDC files complete strictly in sort order per
+    table, so for a file about to be applied:
+      BLOCK if it is NOT strictly after the recorded high-water mark `last_done_file`
+             (an older or equal file reappearing -> replay/regression risk), or
+      BLOCK if there is a GAP: a known done file sorts AFTER `pending_key` yet `pending_key`
+             was never applied (files were applied out of order / one was skipped).
+    `done_files` is the set/list of file keys already marked done (the ledger). Returns
+    (ok: bool, reason: str)."""
+    pk = pending_key or ""
+    hw = last_done_file or ""
+    if hw and pk <= hw:
+        return False, (f"file {pk.rsplit('/', 1)[-1]} sorts at/under the high-water mark "
+                       f"{hw.rsplit('/', 1)[-1]} — it is older than, or equal to, the last "
+                       f"applied file. Applying it would replay/regress already-applied data. "
+                       f"The table is BLOCKED. Investigate the high-water (a hand-edited/reset "
+                       f"cdc_status, or a leftover file from an older run). See RUNBOOK "
+                       f"'Safety guardrails' (G8).")
+    for d in (done_files or []):
+        if d and d > pk:
+            return False, (f"gap detected: file {pk.rsplit('/', 1)[-1]} would be applied now, "
+                           f"but a LATER file {d.rsplit('/', 1)[-1]} is already marked done — "
+                           f"a file between them was skipped or arrived late. The table is "
+                           f"BLOCKED to avoid applying changes out of order. See RUNBOOK "
+                           f"'Safety guardrails' (G8).")
+    return True, ""
+
+
+def guard_new_load_after_cdc(load_file_keys, cdc_started):
+    """G8 DMS table-reload guard. Once CDC has started for a table, a NEW `LOAD*` file appearing
+    in that table's folder is a DMS full-load RELOAD of the table — it must NOT be ignored and
+    must NOT be applied as a CDC change file; it means someone reran the full load under a live
+    CDC stream, which would reblank/clobber the target. If `cdc_started` is truthy and any LOAD
+    file is present, BLOCK the table. Returns (ok: bool, reason: str)."""
+    if not cdc_started:
+        return True, ""
+    loads = [k for k in (load_file_keys or []) if k]
+    if not loads:
+        return True, ""
+    return False, (f"{len(loads)} new LOAD* file(s) appeared in this table's folder AFTER CDC "
+                   f"started (e.g. {loads[0].rsplit('/', 1)[-1]}) — a DMS 'reload table' under a "
+                   f"live CDC stream. The table is BLOCKED: a reload would reblank/clobber the "
+                   f"target. Do a controlled reload via a NEW DMS task (RUNBOOK §9), not under "
+                   f"the running CDC. See RUNBOOK 'Safety guardrails' (G8).")
+
+
+def guard_drift(live_count, full_load_rows, inserts_applied, deletes_applied, tolerance):
+    """G9 drift detector. Compare the live DSQL row count to the independently tracked
+    expectation (full_load_rows + inserts_applied − deletes_applied). Returns
+    (fired: bool, delta: int, expected: int). `fired` is True when |live − expected| > tolerance.
+    `delta` is live − expected (negative == target is SHORT, the dangerous direction)."""
+    try:
+        live = int(live_count or 0)
+        flr = int(full_load_rows or 0)
+        ins = int(inserts_applied or 0)
+        dels = int(deletes_applied or 0)
+        tol = float(tolerance or 0)
+    except (TypeError, ValueError):
+        # Can't evaluate -> report fired so the caller logs/audits rather than silently passing.
+        return True, 0, 0
+    expected = flr + ins - dels
+    delta = live - expected
+    return (abs(delta) > tol), delta, expected
+
 
 
 def dsql_type_to_category(data_type):
@@ -3041,6 +3601,26 @@ def apply_file(ctx, cdc_key, start_offset, conn_holder, prior_watermark=None, po
     if vstats["skipped_short"]:
         print(f"    ⚠️ {label} {cdc_key.split('/')[-1]}: skipped "
               f"{vstats['skipped_short']} malformed (<2-field) line(s)")
+
+    # ── G6 MASS-DELETE GUARD (BEFORE any chunk is built/applied, so a trip applies NOTHING
+    # from this file). If this file's net DELETE ops would remove more than
+    # cdc_max_delete_fraction AND more than cdc_max_delete_rows of the table's CURRENT rows,
+    # the table is BLOCKED and the file left in place for an operator to verify vs the source.
+    # One-time per-file override: cdc_status.allow_mass_delete=true. Uses the table's own
+    # session (conn_holder) read-only; never mutates anything.
+    _n_delete = vstats.get("n_delete", 0)
+    if _n_delete > 0:
+        _cur_cnt, _allow = _read_count_and_allow(conn_holder, dsql_schema, dsql_table, label)
+        _blocked, _why = guard_mass_delete(_cur_cnt, _n_delete, _allow,
+                                           CDC_MAX_DELETE_FRACTION, CDC_MAX_DELETE_ROWS)
+        if _blocked:
+            _audit_destructive(conn_holder, label, "cdc_mass_delete_blocked",
+                               rows_before=_cur_cnt, rows_deleted=0,
+                               reason=f"{cdc_key.split('/')[-1]}: {_why}")
+            raise TableBlocked(f"MASS-DELETE GUARD [{label}] {cdc_key.split('/')[-1]}: {_why}")
+    # G9: stash this file's net INSERT/DELETE counts so process_table can advance the running
+    # expectation counters (cdc_status.inserts_applied/deletes_applied) after the file applies.
+    ctx["_last_file_io"] = (vstats.get("n_insert", 0), vstats.get("n_delete", 0))
 
     quoted_cols = ", ".join(f'"{c}"' for c in insert_cols)
     cast_suffix = {c: CAST_SUFFIX.get(col_category.get(c, 'varchar'), '') for c in insert_cols}
@@ -3649,6 +4229,43 @@ def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=No
     purge_sql = (f'DELETE FROM {dsql_schema}.{dsql_table} '
                  f'WHERE "{NONPK_FILE_TAG_COLUMN}" = {file_lit}')
 
+    # ── G7 PURGE SAFETY: the file-reload purge must delete ONLY rows tagged with THIS exact
+    # file key — never a prefix/LIKE/other file. Assert the canonical exact-equality shape
+    # before it is ever executed; a future edit that widened it trips here (fail SAFE: block).
+    if not purge_predicate_is_exact(purge_sql, NONPK_FILE_TAG_COLUMN, file_lit):
+        raise TableBlocked(
+            f"PURGE GUARD [{label}] {cdc_key.split('/')[-1]}: the _cdc_file purge predicate is "
+            f"not an exact single-equality on \"{NONPK_FILE_TAG_COLUMN}\" to this file's key — "
+            f"refusing to run it (it could delete other files' rows). This is a code bug.")
+
+    # ── G6 MASS-DELETE GUARD (no-PK): a keyless D op is one content DELETE. If the file's net
+    # DELETEs exceed cdc_max_delete_fraction AND cdc_max_delete_rows of the table's CURRENT
+    # rows, block and apply NOTHING. One-time override: cdc_status.allow_mass_delete=true.
+    if delete_ops:
+        _cur_cnt, _allow = _read_count_and_allow(conn_holder, dsql_schema, dsql_table, label)
+        _blocked, _why = guard_mass_delete(_cur_cnt, len(delete_ops), _allow,
+                                           CDC_MAX_DELETE_FRACTION, CDC_MAX_DELETE_ROWS)
+        if _blocked:
+            _audit_destructive(conn_holder, label, "cdc_mass_delete_blocked",
+                               rows_before=_cur_cnt, rows_deleted=0,
+                               reason=f"{cdc_key.split('/')[-1]}: {_why}")
+            raise TableBlocked(f"MASS-DELETE GUARD [{label}] {cdc_key.split('/')[-1]}: {_why}")
+        # ── G7 NO-PK DELETE PRECISION: a full-row content DELETE removes EVERY matching row.
+        # Each D net-op intends exactly one row (no-duplicate-rows contract). Count the matches
+        # per distinct delete predicate first; if any matches more rows than the D ops sharing
+        # it require, over-deletion would occur -> BLOCK (DSQL has no ctid / verifiable bounded
+        # delete, so blocking is the SAFE action).
+        _ok, _why7 = _nopk_delete_precision_check(conn_holder, label, dsql_schema, dsql_table,
+                                                  delete_ops, _content_where)
+        if not _ok:
+            _audit_destructive(conn_holder, label, "cdc_nopk_overmatch_blocked",
+                               rows_before=_cur_cnt, rows_deleted=0,
+                               reason=f"{cdc_key.split('/')[-1]}: {_why7}")
+            raise TableBlocked(f"NO-PK DELETE GUARD [{label}] {cdc_key.split('/')[-1]}: {_why7}")
+    # G9: stash this file's net INSERT/DELETE counts so process_table can advance the running
+    # expectation counters (cdc_status.inserts_applied/deletes_applied) after the file applies.
+    ctx["_last_file_io"] = (vstats.get("n_insert", 0), vstats.get("n_delete", 0))
+
     # WITHIN-FILE CHUNKING (never across files). Pack op_units into chunks by the DSQL
     # per-txn budget: at most (3000 - reserve) ops per chunk (reserve 3 control rows:
     # cdc_status checkpoint + cdc_chunk_log + final-chunk file-committed), and keep the chunk
@@ -3902,6 +4519,9 @@ def process_table(ctx, load_status_map=None):
     a delta on top of a half-loaded table."""
     label = ctx["label"]
 
+    # Guardrail helpers (G9 drift check) read the table identity from ctx; bind them once here.
+    dsql_schema, dsql_table = ctx["dsql_schema"], ctx["dsql_table"]
+
     # FULL-LOAD ELIGIBILITY GATE (cheap early-exit, before opening any DSQL connection):
     # skip a table whose full load isn't 'done' yet. This auto-sequences full-load -> CDC:
     # the moment the load job marks the table done, the next poll picks it up.
@@ -4028,6 +4648,37 @@ def process_table(ctx, load_status_map=None):
             return {"table": label, "status": "idle", "files": 0, "rows": 0}
         _mf["busy"] = True
 
+        # ── G8 DMS TABLE-RELOAD GUARD: once CDC has advanced for this table (a high-water
+        # mark exists OR a file is in progress), a NEW LOAD*.csv appearing in its folder is a
+        # DMS 'reload table' under a live CDC stream — block rather than ignore it (a reload
+        # would reblank/clobber the target). Checked ONCE per cycle, before any apply.
+        _cdc_started = bool(last_done) or bool(in_progress)
+        _ok8, _why8 = guard_new_load_after_cdc(list_load_files(ctx), _cdc_started)
+        if not _ok8:
+            _audit_destructive(conn_holder, label, "cdc_new_load_after_start_blocked",
+                               rows_before=None, rows_deleted=0, reason=_why8)
+            _set_blocked_status(conn_holder, label, _why8)
+            _mf["status"] = "blocked"
+            print(f"    ⛔ {label} BLOCKED: {_why8}")
+            return {"table": label, "status": "blocked", "files": 0, "rows": 0, "error": _why8}
+
+        # ── G8 ORDERING / HIGH-WATER / GAP GUARD: every pending file must sort strictly AFTER
+        # the high-water mark and in order. A file at/under the high-water (replay/regression,
+        # e.g. a hand-reset cdc_status) or a gap (a later file already applied) blocks the
+        # table. `_done8` grows as we apply, so an out-of-order pending list is caught too.
+        _done8 = [last_done] if last_done else []
+        for _pk in pending:
+            _ok8b, _why8b = guard_file_order(_pk, last_done, _done8)
+            if not _ok8b:
+                _audit_destructive(conn_holder, label, "cdc_file_order_blocked",
+                                   rows_before=None, rows_deleted=0, reason=_why8b)
+                _set_blocked_status(conn_holder, label, _why8b)
+                _mf["status"] = "blocked"
+                print(f"    ⛔ {label} BLOCKED: {_why8b}")
+                return {"table": label, "status": "blocked", "files": 0, "rows": 0,
+                        "error": _why8b}
+            _done8.append(_pk)
+
         # Guarantee the cdc_status row EXISTS before any chunk runs, so the per-chunk
         # checkpoint (update_cdc_status) is a pure UPDATE on the hot path — no SELECT,
         # no INSERT, no 23505 risk fused to a data transaction. One-time, own txn, with the
@@ -4104,6 +4755,18 @@ def process_table(ctx, load_status_map=None):
             except Exception as e:
                 print(f"    ⚠️ copy to processed/ failed after retries (non-fatal: original kept, "
                       f"retried next cycle; DSQL is source of truth): {e}")
+            # G9: advance the running expectation counters for this file (its own short txn on
+            # the table's session). ctx["_last_file_io"] was stashed by the apply fn.
+            _io = ctx.get("_last_file_io") or (0, 0)
+            if _io != (0, 0):
+                def _adv(c, _io=_io):
+                    _advance_cdc_counters(c, label, _io[0], _io[1])
+                    conn_holder[0].commit()
+                try:
+                    run_control_op(conn_holder, label, _adv, "advance_cdc_counters")
+                except Exception as _ce:
+                    print(f"    ⚠️ {label}: drift counter advance failed (non-fatal): {_ce}")
+                ctx["_last_file_io"] = (0, 0)
             files_done += 1
             resume_offset = 0
             in_progress = None
@@ -4111,6 +4774,11 @@ def process_table(ctx, load_status_map=None):
         _commit_status(status="idle", in_progress_file=None, last_offset=0,
                        _expect=pos_box["pos"], _target=None)
         _mf["status"] = "idle"
+        # G9: periodic drift detector (throttled to CDC_DRIFT_CHECK_MINUTES per table). Compares
+        # the live DSQL count to full_load_rows+inserts-deletes; on drift logs ERROR, writes
+        # audit_log, emits the DsqlRowDrift metric, and (action=block) sets the table 'blocked'.
+        if _maybe_run_drift_check(conn_holder, label, dsql_schema, dsql_table) == "blocked":
+            _mf["status"] = "blocked"
     except _PositionMoved as pm:
         # Another CDC run is applying this table (or an operator just blocked it). Nothing
         # from the step that noticed was committed. Leave the table to the other run for this

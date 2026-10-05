@@ -705,6 +705,15 @@ def handler(event, context):
             _cb = event.get("connBudget")
             if _cb not in (None, ""):
                 args["--conn_budget"] = str(_cb)
+            # G10: validate also cross-checks the DSQL count against DMS FullLoadRows. Pass the
+            # DMS task ARN + the mismatch tolerance (reuses cdc_drift_tolerance). Absent -> the
+            # G10 check is a no-op (validate falls back to the S3 source comparison).
+            if dms_task_arn:
+                args["--dms_task_arn"] = dms_task_arn
+            _cmt = event.get("cdc_drift_tolerance")
+            if _cmt is not None and str(_cmt).strip() != "":
+                args["--count_mismatch_tolerance"] = str(_cmt)
+            # (both B18 throughput controls and the G10 DMS cross-check are set on validate)
         if is_cdc:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema
@@ -720,6 +729,19 @@ def handler(event, context):
             _cvs = event.get("cdc_validation_sample")
             if _cvs is not None:
                 args["--cdc_validation_sample"] = str(_cvs)
+            # SAFETY GUARDRAILS (G6 mass-delete, G9 drift) — passed to EVERY CDC job (main,
+            # spark, composite, composite-spark) so the engine/key shape never changes the
+            # guard behaviour. Absent from the event (older workflows) -> the CDC script's
+            # built-in SAFE defaults apply (fraction 0.5, rows 100000, drift check 30 min,
+            # tolerance 0, action warn). camelCase keys mirror resolve_task's payload.
+            for _ek, _ak in (("cdc_max_delete_fraction", "--cdc_max_delete_fraction"),
+                             ("cdc_max_delete_rows", "--cdc_max_delete_rows"),
+                             ("cdc_drift_check_minutes", "--cdc_drift_check_minutes"),
+                             ("cdc_drift_tolerance", "--cdc_drift_tolerance"),
+                             ("cdc_drift_action", "--cdc_drift_action")):
+                _v = event.get(_ek)
+                if _v is not None and str(_v).strip() != "":
+                    args[_ak] = str(_v)
             # OWNERSHIP: this CDC job applies a table only if _jobs.json cdcOwners[table] matches.
             args["--cdc_owner_self"] = spec.get("owner_slug") or "main"
             args["--cdc_owners_key"] = reg_key

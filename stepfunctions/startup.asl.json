@@ -66,6 +66,11 @@
         "cdcSparkFallback.$": "$.Payload.cdcSparkFallback",
         "cdcValidation.$": "$.Payload.cdcValidation",
         "cdcValidationSample.$": "$.Payload.cdcValidationSample",
+        "cdcMaxDeleteFraction.$": "$.Payload.cdcMaxDeleteFraction",
+        "cdcMaxDeleteRows.$": "$.Payload.cdcMaxDeleteRows",
+        "cdcDriftCheckMinutes.$": "$.Payload.cdcDriftCheckMinutes",
+        "cdcDriftTolerance.$": "$.Payload.cdcDriftTolerance",
+        "cdcDriftAction.$": "$.Payload.cdcDriftAction",
         "accountId.$": "$.Payload.accountId",
         "maxCompositeForks.$": "$.Payload.maxCompositeForks",
         "maxBigCdcForks.$": "$.Payload.maxBigCdcForks",
@@ -580,6 +585,11 @@
           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
           "cdc_validation.$": "$.resolved.cdcValidation",
           "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+          "cdc_max_delete_fraction.$": "$.resolved.cdcMaxDeleteFraction",
+          "cdc_max_delete_rows.$": "$.resolved.cdcMaxDeleteRows",
+          "cdc_drift_check_minutes.$": "$.resolved.cdcDriftCheckMinutes",
+          "cdc_drift_tolerance.$": "$.resolved.cdcDriftTolerance",
+          "cdc_drift_action.$": "$.resolved.cdcDriftAction",
           "glueVersion.$": "$.resolved.glueVersion",
           "discoveryWorkerType.$": "$.resolved.discoveryWorkerType",
           "discoveryNumWorkers.$": "$.resolved.discoveryNumWorkers",
@@ -750,6 +760,11 @@
           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
           "cdc_validation.$": "$.resolved.cdcValidation",
           "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+          "cdc_max_delete_fraction.$": "$.resolved.cdcMaxDeleteFraction",
+          "cdc_max_delete_rows.$": "$.resolved.cdcMaxDeleteRows",
+          "cdc_drift_check_minutes.$": "$.resolved.cdcDriftCheckMinutes",
+          "cdc_drift_tolerance.$": "$.resolved.cdcDriftTolerance",
+          "cdc_drift_action.$": "$.resolved.cdcDriftAction",
           "glueVersion.$": "$.resolved.glueVersion",
           "loadWorkerType.$": "$.resolved.loadWorkerType",
           "loadNumWorkers.$": "$.resolved.loadNumWorkers",
@@ -843,7 +858,9 @@
                 "--extra-py-files.$": "$.extraPyFilesFullload",
                 "--max_files_in_parallel.$": "$.load_args['--max_files_in_parallel']",
                 "--writers_per_file.$": "$.load_args['--writers_per_file']",
-                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']"
+                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']",
+                "--startup_execution.$": "$$.Execution.Name",
+                "--startup_execution_arn.$": "$$.Execution.Id"
               }
             },
             "ResultPath": "$.loadResult",
@@ -881,7 +898,9 @@
                 "--extra-py-files.$": "$.extraPyFilesFullload",
                 "--max_files_in_parallel.$": "$.load_args['--max_files_in_parallel']",
                 "--writers_per_file.$": "$.load_args['--writers_per_file']",
-                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']"
+                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']",
+                "--startup_execution.$": "$$.Execution.Name",
+                "--startup_execution_arn.$": "$$.Execution.Id"
               }
             },
             "ResultPath": "$.loadResult",

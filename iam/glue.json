@@ -40,6 +40,13 @@
         "Resource": ["*"]
       },
       {
+        "Sid": "StatesDescribeExecutionForBlankGuard",
+        "_comment": "G2 safety guardrail: the load job (job2_load) refuses a whole-table/range blank unless --startup_execution's Step Functions execution is RUNNING (states:DescribeExecution). Without this the blank path fails closed (safe), so a customer-managed Glue policy MUST also grant this for the guardrail to allow a legitimate workflow-driven reblank.",
+        "Effect": "Allow",
+        "Action": ["states:DescribeExecution"],
+        "Resource": ["*"]
+      },
+      {
         "Sid": "CloudWatchLogs",
         "Effect": "Allow",
         "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],

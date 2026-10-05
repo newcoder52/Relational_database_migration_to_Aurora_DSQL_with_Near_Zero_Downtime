@@ -50,3 +50,39 @@ Sync: ~/Downloads/dms-s3-glue-dsql-migration/ backed up to
 (byte-identical to repo); its .git was not touched. Sync target suites green.
 
 All existing suites green (9/9).
+
+
+==================== (appended) data-safety guardrails ====================
+
+DONE — data-safety guardrails (G1–G10)
+
+Built offline (no AWS touched) on remote HEAD 5e4adf8, then rebased onto main at push time
+(dd88d83 = the parallel B19/B18 commit), resolving conflicts by KEEPING BOTH sides:
+  - RESULT.md (add/add): both the B19/B18 result and the guardrails result are kept.
+  - RUNBOOK.md: pipeline-key count merged to 48 (43 from B18/B19 + 5 new guardrail keys);
+    both key lists kept.
+  - lambdas/create_glue_jobs.py: both B18 validate throughput args and the G10 DMS args kept.
+  - scripts/job3_validate.py: both B18 globals/args and the G10 globals/args kept.
+
+Guardrails: G1 (no blank once CDC started), G2 (destructive blank only from a RUNNING workflow
+or an explicit --allow_manual_destructive manual run; manual loads/validates/CDC always allowed),
+G3 (per-table lock), G4 (blank sanity vs DMS FullLoadRows), G5 (audit_log before every destructive
+op), G6 (CDC mass-delete guard), G7 (no-PK delete precision + exact _cdc_file purge), G8 (ordering/
+high-water/gap/new-LOAD), G9 (drift detector + DsqlRowDrift metric), G10 (validate & cutover vs DMS
+FullLoadRows(+I-D), new CountMismatch state).
+
+Shared CDC helpers byte-identical across glue_cdc_continuous.py and glue_cdc_composite.py; Spark CDC
+uses the same scripts. New settings cdc_max_delete_fraction / cdc_max_delete_rows /
+cdc_drift_check_minutes / cdc_drift_tolerance / cdc_drift_action flow params.csv -> pipeline.json ->
+resolve_task payload -> create_glue_jobs job args. iam/glue.json adds states:DescribeExecution.
+
+Tests: tests/test_guardrails.py (78 checks, one+ per WHAT_IF row). ALL existing suites green,
+including test_e2e_fixes.py, test_b17_b13.py, and the B18/B19 suites (test_asl_payload_contract.py,
+test_b18_validate_throughput.py). Offline; fake DSQL enforces the 3000-row/txn cap. The static DSQL
+rule (no ADD COLUMN ... DEFAULT) still passes.
+
+Commit as newcoder52 <aash.798@gmail.com>, plain git push (no tokens, no force), verified in a
+second fresh clone.
+
+Final commit sha: the HEAD of main after this push (git log -1). The parent is dd88d83 (B19/B18),
+whose parent is 5e4adf8. Verified by re-cloning and confirming origin/main == this commit.

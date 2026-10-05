@@ -80,6 +80,7 @@ import ssl
 import socket
 import datetime
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 import pg8000
@@ -146,6 +147,30 @@ RESET_STATUS = False
 # customer table still hits the empty-gate and is refused if non-empty. Set False to
 # restore strict "refuse if non-empty".
 AUTO_REBLANK_ON_RESUME = True  # per-file resume ON (skip done files; redo failed file — PK via commit-probe, no-PK via whole-table reblank)
+
+# =============================================================================
+# SAFETY GUARDRAILS (data-loss protection; see WHAT_IF.md / RUNBOOK "Safety guardrails").
+# Defaults are SAFE. These gate the ONLY code that can empty a whole target table (the
+# auto-reblank / range-blank). Manual (hand/console) runs are fully supported — a manual load
+# or validate may WRITE (onto empty tables, or a per-file resume that deletes nothing). The
+# ONLY thing gated is a DESTRUCTIVE action (whole-table or range blank):
+#   G1: no blank once CDC has started (own override: --blank_guard_enabled false).
+#   G2: a blank in a run NO workflow started is refused UNLESS the operator passes
+#       --allow_manual_destructive=true (then: audit "manual override" + loud WARNING; G1 and
+#       G4 still apply). A workflow-driven run (a RUNNING Step Functions execution) blanks
+#       without the flag, as before.
+#   G3: per-table lock (one writer).
+#   G4: blank only a previously-attempted table whose count is <= expected*(1+margin).
+#   G5: audit_log row BEFORE every destructive op (and on refusal).
+# =============================================================================
+CONTROL_SCHEMA = "cdc_control"           # control schema holding cdc_status / audit_log / lock
+STARTUP_EXECUTION = None                 # --startup_execution (Step Functions execution NAME)
+STARTUP_EXECUTION_ARN = None             # --startup_execution_arn (execution ARN for describe)
+ALLOW_MANUAL_DESTRUCTIVE = False         # G2: operator flag to permit a blank in a manual run
+BLANK_GUARD_ENABLED = True               # master switch for G1/G2/G4 (lock G3 is separate)
+BLANK_EXPECTED_MARGIN = 0.05             # G4: refuse a blank if count > expected*(1+margin)
+LOCK_HEARTBEAT_TIMEOUT_SECONDS = 1800    # G3: a lock older than this is stale and may be taken
+_HELD_TABLE_LOCKS = set()                # G3: tables this run currently holds a lock for
 
 GLUE_API_TIMEOUT = 5
 
@@ -471,6 +496,8 @@ def _apply_v6_arg_overrides():
     global CONFIG_PREFIX, INDEX_S3_PATH, STATUS_S3_PATH   # v16: per-group prefix override
     global DSQL_ENDPOINT, DSQL_USER, DSQL_DATABASE, REGION   # kit: connection overlay
     global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
+    global CONTROL_SCHEMA, STARTUP_EXECUTION, STARTUP_EXECUTION_ARN
+    global BLANK_GUARD_ENABLED, BLANK_EXPECTED_MARGIN, ALLOW_MANUAL_DESTRUCTIVE
     optional = ["write_mode", "large_table_bytes_threshold", "target_rows_per_partition",
                 "max_write_concurrency", "v6_parallel_enabled",
                 "max_files_in_parallel",   # v16
@@ -480,6 +507,8 @@ def _apply_v6_arg_overrides():
                 "dsql_endpoint_candidates",   # ordered PrivateLink/public failover list (CSV)
                 "chunk_fanout_enabled", "intra_table_writers", "force_v5_tables",
                 "auto_reblank_on_resume", "per_table_write_concurrency",
+                "control_schema", "startup_execution", "startup_execution_arn",
+                "blank_guard_enabled", "blank_expected_margin", "allow_manual_destructive",
                 "verbose_chunks", "verbose_chunk_every", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
@@ -583,6 +612,27 @@ def _apply_v6_arg_overrides():
         FORCE_V5_TABLES = {t.strip().lower() for t in raw.split(",") if t.strip()}
     if "auto_reblank_on_resume" in ov:
         AUTO_REBLANK_ON_RESUME = str(ov["auto_reblank_on_resume"]).strip().lower() in ("true", "1", "yes")
+    # ── SAFETY GUARDRAIL overrides (G1/G2/G4). The execution context (G2) is required for a
+    # blank; absent -> the blank fails closed (safe). A bad value keeps the SAFE default.
+    if "control_schema" in ov and str(ov["control_schema"]).strip():
+        CONTROL_SCHEMA = str(ov["control_schema"]).strip()
+    if "startup_execution" in ov and str(ov["startup_execution"]).strip():
+        STARTUP_EXECUTION = str(ov["startup_execution"]).strip()
+    if "startup_execution_arn" in ov and str(ov["startup_execution_arn"]).strip():
+        STARTUP_EXECUTION_ARN = str(ov["startup_execution_arn"]).strip()
+    if "blank_guard_enabled" in ov:
+        BLANK_GUARD_ENABLED = str(ov["blank_guard_enabled"]).strip().lower() in ("true", "1", "yes")
+        print(f"  ↪ BLANK_GUARD_ENABLED overridden -> {BLANK_GUARD_ENABLED}")
+    if "blank_expected_margin" in ov:
+        try:
+            BLANK_EXPECTED_MARGIN = max(0.0, float(ov["blank_expected_margin"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid blank_expected_margin={ov['blank_expected_margin']!r}")
+    if "allow_manual_destructive" in ov:
+        ALLOW_MANUAL_DESTRUCTIVE = str(ov["allow_manual_destructive"]).strip().lower() in ("true", "1", "yes")
+        if ALLOW_MANUAL_DESTRUCTIVE:
+            print(f"  ↪ ALLOW_MANUAL_DESTRUCTIVE=true -> a destructive blank is permitted in a "
+                  f"MANUAL (no-workflow) run (G1 no-CDC-started + G4 count sanity still apply)")
     if "verbose_chunks" in ov:
         VERBOSE_CHUNKS = str(ov["verbose_chunks"]).strip().lower() in ("true", "1", "yes")
     if "verbose_chunk_every" in ov:
@@ -1968,6 +2018,388 @@ def assert_not_cdc_layout(df, dsql_schema, dsql_table):
             f"pathGlobFilter='LOAD*.csv' / _is_full_load_key) and re-run.")
 
 
+# =============================================================================================
+# SAFETY GUARDRAILS for the LOAD job (G1 no-blank-after-CDC, G2 running-execution-only,
+# G3 per-table lock, G4 blank sanity, G5 audit log). These gate the ONLY code that can empty a
+# whole target table (the auto-reblank / range blank). All default SAFE: on any doubt they
+# REFUSE the blank (raise) rather than risk deleting data. See WHAT_IF.md / RUNBOOK.
+# =============================================================================================
+
+def _control_cur():
+    """A short-lived autocommit cursor+conn on the control schema (for guard reads/writes).
+    Returns (conn, cur). Caller closes both."""
+    conn = connect_dsql()
+    try:
+        conn.autocommit = True
+    except Exception:
+        pass
+    return conn, conn.cursor()
+
+
+def _count_rows_for_guard(dsql_schema, dsql_table):
+    """Current row count of a target table, for the blank guards. Returns None on a read error
+    (so guard_blank_count_sane fails SAFE — refuses the blank when the count is unknown)."""
+    try:
+        conn, cur = _control_cur()
+        try:
+            cur.execute(f"SELECT count(*) FROM {dsql_schema}.{dsql_table}")
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            try:
+                cur.close(); conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  ⚠️ {dsql_schema}.{dsql_table}: could not count rows for the blank guard ({e})")
+        return None
+
+
+def _expected_count_from_config(config):
+    """G4 helper: the authoritative expected row count for a table from its config metadata
+    (metadata.expected_source_rows — DMS FullLoadRows). Returns an int, or None when absent so
+    the blank-sanity ceiling check is skipped (the prior-attempt gate still applies)."""
+    try:
+        exp = (config.get('metadata', {}) or {}).get('expected_source_rows')
+        return int(exp) if exp is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def guard_blank_count_sane(current_count, expected_count, previously_attempted, margin):
+    """G4 (PURE): decide whether blanking a table is sane. Refuse unless the table was
+    PREVIOUSLY ATTEMPTED by THIS task (owner record), and refuse if its current row count is
+    above the expected count × (1 + margin) — a count above expectation means the table holds
+    rows this run never owned (mis-targeted schema/table, or a shared table), so emptying it
+    would delete someone else's data. expected_count None (unknown) -> only the prior-attempt
+    gate applies (the count ceiling can't be computed). Returns (ok, reason)."""
+    if not previously_attempted:
+        return False, ("this table was NOT previously attempted by THIS task (no owner/resume "
+                       "record). Refusing to blank a table the pipeline did not load — this is "
+                       "how a mis-targeted or pre-existing customer table gets protected. To "
+                       "reload it properly, use a NEW DMS task (RUNBOOK §9).")
+    try:
+        cc = int(current_count or 0)
+    except (TypeError, ValueError):
+        return False, (f"could not read the current row count ({current_count!r}) — refusing to "
+                       f"blank without knowing how many rows would be destroyed.")
+    if expected_count is not None:
+        try:
+            exp = int(expected_count)
+            ceiling = exp * (1.0 + float(margin))
+            if cc > ceiling:
+                return False, (f"current row count {cc:,} exceeds the expected count {exp:,} × "
+                               f"(1+{margin}) = {ceiling:,.0f}. A table with MORE rows than this "
+                               f"run expects is not this run's to empty (mis-targeted table or a "
+                               f"shared table). Refusing to blank. Verify the target, then use a "
+                               f"NEW DMS task (RUNBOOK §9) if a reload is really intended.")
+        except (TypeError, ValueError):
+            pass
+    return True, ""
+
+
+def _cdc_has_started(dsql_schema, dsql_table):
+    """G1 (I/O): has CDC started for this table/task? Returns (started, how). FAIL-CLOSED: if
+    EITHER signal cannot be read, returns (True, "could not verify ...") so the caller refuses
+    the blank rather than risk wiping CDC-applied deltas. Two independent signals:
+      (a) the task's _cdc_started S3 marker (written by the CDC job when it reaches its poll
+          loop): <CONFIG_PREFIX>_cdc_started/_latest.json;
+      (b) the table's cdc_status row existing in the control schema (CDC created it)."""
+    label = f"{dsql_schema}.{dsql_table}"
+    marker_seen = None
+    try:
+        bucket, key = split_s3(CONFIG_PREFIX)
+        prefix = (key.rstrip("/") + "/_cdc_started/") if key else "_cdc_started/"
+        ws3 = make_boto_client("s3")
+        resp = ws3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+        marker_seen = bool(resp.get("Contents"))
+    except Exception as e:
+        return True, (f"could not read the _cdc_started marker ({e}) — fail-closed: refusing "
+                      f"the blank")
+    row_seen = None
+    try:
+        conn, cur = _control_cur()
+        try:
+            cur.execute(
+                f"SELECT 1 FROM {CONTROL_SCHEMA}.cdc_status WHERE table_name = %s LIMIT 1",
+                (label,))
+            row_seen = cur.fetchone() is not None
+        finally:
+            try:
+                cur.close(); conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        # The control schema / table not existing yet is NOT "started" — but a genuine read
+        # error (connectivity) is ambiguous, so fail-closed on anything that is not a clean
+        # "relation does not exist".
+        msg = str(e).lower()
+        if "does not exist" in msg or "undefined table" in msg or "42p01" in msg:
+            row_seen = False
+        else:
+            return True, (f"could not read cdc_status ({e}) — fail-closed: refusing the blank")
+    if marker_seen:
+        return True, "the task's _cdc_started marker is present"
+    if row_seen:
+        return True, f"a cdc_status row exists for {label}"
+    return False, ""
+
+
+def _workflow_execution_running():
+    """G2 (I/O): is this run driven by a RUNNING Step Functions workflow execution? Returns
+    (state, how) where state is:
+      "running"      a RUNNING execution confirmed (--startup_execution[_arn] + describe OK);
+      "none"         no execution args at all -> this is a MANUAL (hand/console) run;
+      "not_running"  args present but the execution is not RUNNING (stale/finished) or could
+                     not be described (fail-closed on the describe error).
+    A workflow-driven run ("running") may blank without the manual flag. A "none" (manual) run
+    may blank ONLY with --allow_manual_destructive=true. A "not_running" never auto-blanks
+    (an old/finished execution must not drive a destructive op); the operator can still force a
+    manual blank with the flag. Needs states:DescribeExecution (iam/glue.json)."""
+    if not STARTUP_EXECUTION or not STARTUP_EXECUTION_ARN:
+        return "none", ("no --startup_execution / --startup_execution_arn — this is a MANUAL "
+                        "(hand/console) run.")
+    try:
+        sfn = make_boto_client("stepfunctions")
+        resp = sfn.describe_execution(executionArn=STARTUP_EXECUTION_ARN)
+        status = str(resp.get("status") or "").upper()
+        if status == "RUNNING":
+            return "running", f"execution {STARTUP_EXECUTION} is RUNNING"
+        return "not_running", (f"the Step Functions execution {STARTUP_EXECUTION} is "
+                               f"{status or 'UNKNOWN'}, not RUNNING.")
+    except Exception as e:
+        return "not_running", (f"could not describe the Step Functions execution ({e}). (The "
+                               f"Glue role needs states:DescribeExecution; see iam/glue.json "
+                               f"and RUNBOOK 'Safety guardrails'.)")
+
+
+def write_load_audit(dsql_schema, dsql_table, action, rows_before, rows_deleted, reason):
+    """G5 (I/O): write a cdc_control.audit_log row BEFORE a destructive load op (or when one is
+    refused), so the operation is always attributable even if the job then crashes. Best-effort;
+    never raises (the guard decision is the primary control). Creates the schema/table if the
+    CDC job hasn't yet (CREATE IF NOT EXISTS, no DEFAULT-on-ALTER)."""
+    label = f"{dsql_schema}.{dsql_table}"
+    try:
+        conn, cur = _control_cur()
+        try:
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA}")
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.audit_log (
+                    id              uuid PRIMARY KEY,
+                    event_time      timestamptz,
+                    task            varchar(512),
+                    job             varchar(256),
+                    run_id          varchar(256),
+                    execution_id    varchar(512),
+                    table_name      varchar(512),
+                    action          varchar(64),
+                    rows_before     bigint,
+                    rows_deleted    bigint,
+                    reason          varchar(8000)
+                )
+            """)
+            def _int_or_none(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+            cur.execute(
+                f'INSERT INTO {CONTROL_SCHEMA}.audit_log (id, event_time, task, job, run_id, '
+                f'execution_id, table_name, action, rows_before, rows_deleted, reason) '
+                f'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                (str(uuid.uuid4()), utc_now_iso(), CONFIG_PREFIX, _run_arg_load("JOB_NAME"),
+                 _run_arg_load("JOB_RUN_ID"), STARTUP_EXECUTION, label, str(action)[:64],
+                 _int_or_none(rows_before), _int_or_none(rows_deleted), str(reason)[:8000]))
+        finally:
+            try:
+                cur.close(); conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  ⚠️ {label}: audit_log write failed (non-fatal) for {action}: {e}")
+
+
+def _run_arg_load(name):
+    """Value of --<name> from this run's argv, or None (job2 has no _run_arg helper)."""
+    for _i, _a in enumerate(sys.argv):
+        if _a == "--" + name and _i + 1 < len(sys.argv):
+            return sys.argv[_i + 1]
+        if _a.startswith("--" + name + "="):
+            return _a.split("=", 1)[1]
+    return None
+
+
+def take_table_lock(dsql_schema, dsql_table):
+    """G3 (I/O): take a per-table write lock in cdc_control.cdc_control_lock via a conditional
+    INSERT (OCC). Returns (acquired, holder_or_reason). A second concurrent run for the same
+    table does NOT acquire. A STALE lock (heartbeat older than LOCK_HEARTBEAT_TIMEOUT_SECONDS)
+    may be taken over. Creates the lock table if absent. On any error returns (False, reason):
+    the LOAD caller treats a failed acquire as fail-closed (refuse)."""
+    label = f"{dsql_schema}.{dsql_table}"
+    owner = f"{_run_arg_load('JOB_NAME') or 'load'}:{_run_arg_load('JOB_RUN_ID') or 'local'}"
+    now = utc_now_iso()
+    try:
+        conn, cur = _control_cur()
+    except Exception as e:
+        return False, f"could not connect to take the table lock ({e})"
+    try:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA}")
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.cdc_control_lock (
+                table_name    varchar(512) PRIMARY KEY,
+                owner         varchar(256),
+                heartbeat     timestamptz,
+                expiry        timestamptz,
+                acquired_time timestamptz
+            )
+        """)
+        cur.execute(
+            f"SELECT owner, heartbeat FROM {CONTROL_SCHEMA}.cdc_control_lock "
+            f"WHERE table_name = %s", (label,))
+        row = cur.fetchone()
+        if row is not None:
+            held_owner = row[0]
+            if held_owner == owner:
+                cur.execute(
+                    f"UPDATE {CONTROL_SCHEMA}.cdc_control_lock SET heartbeat = %s WHERE "
+                    f"table_name = %s", (now, label))
+                _HELD_TABLE_LOCKS.add(label)
+                return True, owner
+            stale = _lock_is_stale(row[1])
+            if not stale:
+                return False, f"locked by {held_owner} (another load/run is working this table)"
+            # Stale -> take it over (owner-scoped UPDATE).
+            cur.execute(
+                f"UPDATE {CONTROL_SCHEMA}.cdc_control_lock SET owner = %s, heartbeat = %s, "
+                f"acquired_time = %s WHERE table_name = %s AND owner = %s",
+                (owner, now, now, label, held_owner))
+            cur.execute(
+                f"SELECT owner FROM {CONTROL_SCHEMA}.cdc_control_lock WHERE table_name = %s",
+                (label,))
+            r2 = cur.fetchone()
+            if r2 and r2[0] == owner:
+                _HELD_TABLE_LOCKS.add(label)
+                return True, owner
+            return False, f"lost a race to take over the stale lock on {label}"
+        # No row -> conditional INSERT (a concurrent INSERT loses on the PK unique violation).
+        try:
+            cur.execute(
+                f"INSERT INTO {CONTROL_SCHEMA}.cdc_control_lock "
+                f"(table_name, owner, heartbeat, expiry, acquired_time) "
+                f"VALUES (%s, %s, %s, %s, %s)",
+                (label, owner, now, now, now))
+            _HELD_TABLE_LOCKS.add(label)
+            return True, owner
+        except Exception as e:
+            return False, f"another run won the lock insert ({e})"
+    except Exception as e:
+        return False, f"table-lock error ({e})"
+    finally:
+        try:
+            cur.close(); conn.close()
+        except Exception:
+            pass
+
+
+def _lock_is_stale(heartbeat):
+    """True if a lock heartbeat is older than LOCK_HEARTBEAT_TIMEOUT_SECONDS. heartbeat is an
+    ISO string or a datetime; an unparseable value is treated as NOT stale (safe: don't steal)."""
+    if heartbeat is None:
+        return False
+    try:
+        if isinstance(heartbeat, str):
+            hb = datetime.datetime.fromisoformat(heartbeat.replace("Z", "+00:00"))
+        else:
+            hb = heartbeat
+        if hb.tzinfo is None:
+            hb = hb.replace(tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc) - hb).total_seconds()
+        return age > LOCK_HEARTBEAT_TIMEOUT_SECONDS
+    except Exception:
+        return False
+
+
+def release_table_lock(dsql_schema, dsql_table):
+    """G3: release a per-table lock this run holds (owner-scoped DELETE). Best-effort; never
+    raises. Called on exit / after the load completes for the table."""
+    label = f"{dsql_schema}.{dsql_table}"
+    owner = f"{_run_arg_load('JOB_NAME') or 'load'}:{_run_arg_load('JOB_RUN_ID') or 'local'}"
+    try:
+        conn, cur = _control_cur()
+        try:
+            cur.execute(
+                f"DELETE FROM {CONTROL_SCHEMA}.cdc_control_lock WHERE table_name = %s AND "
+                f"owner = %s", (label, owner))
+        finally:
+            try:
+                cur.close(); conn.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  ⚠️ {label}: table-lock release failed (non-fatal): {e}")
+    _HELD_TABLE_LOCKS.discard(label)
+
+
+def assert_blank_allowed(dsql_schema, dsql_table, current_count, expected_count,
+                         previously_attempted, action):
+    """The ONE gate every whole-table / range blank passes through. A manual (hand/console)
+    load/validate may still WRITE — this gates ONLY the destructive blank. Enforces:
+      G1  no blank once CDC has started (own override: --blank_guard_enabled false);
+      G2  a blank in a run NO workflow started is REFUSED unless --allow_manual_destructive=true
+          (then: audit "manual override" + a loud WARNING; G1 and G4 still apply). A RUNNING
+          workflow execution blanks without the flag;
+      G4  blank sanity (prior attempt + count vs expected × margin).
+    Writes a G5 audit_log row BEFORE acting (and on refusal). Raises to REFUSE; returns None to
+    allow. Fully disabled only by --blank_guard_enabled false (documented, explicit)."""
+    label = f"{dsql_schema}.{dsql_table}"
+    if not BLANK_GUARD_ENABLED:
+        write_load_audit(dsql_schema, dsql_table, action, current_count, None,
+                         "BLANK_GUARD_ENABLED=false (guard explicitly disabled by operator)")
+        return
+    # G1 — CDC started? (applies to workflow AND manual runs; its own override is the master
+    # --blank_guard_enabled false, handled above.)
+    started, how = _cdc_has_started(dsql_schema, dsql_table)
+    if started:
+        reason = (f"CDC has started for {label} ({how}). Refusing to blank — a reblank now would "
+                  f"wipe CDC-applied deltas (the weekend-incident class). Reload properly via a "
+                  f"NEW DMS task (RUNBOOK §9).")
+        write_load_audit(dsql_schema, dsql_table, action + "_refused_cdc_started",
+                         current_count, 0, reason)
+        raise Exception(f"BLANK GUARD G1 [{label}]: {reason}")
+    # G2 — is a workflow driving this run? A manual run may WRITE, but a destructive blank in a
+    # manual run needs the explicit --allow_manual_destructive flag.
+    state, how2 = _workflow_execution_running()
+    if state == "running":
+        _g2_note = how2
+    else:
+        if not ALLOW_MANUAL_DESTRUCTIVE:
+            reason = (f"{how2} A destructive blank is only automatic from a RUNNING workflow "
+                      f"execution. To blank from a MANUAL run, re-run with "
+                      f"--allow_manual_destructive=true (G1 no-CDC-started and G4 count sanity "
+                      f"still apply). See RUNBOOK 'Safety guardrails' / 'Manual runs'.")
+            write_load_audit(dsql_schema, dsql_table, action + "_refused_manual_no_flag",
+                             current_count, 0, reason)
+            raise Exception(f"BLANK GUARD G2 [{label}]: {reason}")
+        # Flag set: permit the manual blank. Audit "manual override" FIRST + loud WARNING.
+        _g2_note = f"manual override (--allow_manual_destructive=true); {how2}"
+        write_load_audit(dsql_schema, dsql_table, action + "_manual_override",
+                         current_count, None, "manual override")
+        print(f"  ⚠️⚠️  MANUAL DESTRUCTIVE OVERRIDE [{label}]: {action} is proceeding in a "
+              f"MANUAL run because --allow_manual_destructive=true. {how2} G1 (no CDC started) "
+              f"and G4 (count sanity) still apply. This WILL delete rows — ensure this is "
+              f"intended.", flush=True)
+    # G4 — blank sanity (prior attempt + count vs expected × margin).
+    ok, why = guard_blank_count_sane(current_count, expected_count, previously_attempted,
+                                     BLANK_EXPECTED_MARGIN)
+    if not ok:
+        write_load_audit(dsql_schema, dsql_table, action + "_refused_count_sanity",
+                         current_count, 0, why)
+        raise Exception(f"BLANK GUARD G4 [{label}]: {why}")
+    # Allowed — record the intent BEFORE the destructive op (rows_before captured).
+    write_load_audit(dsql_schema, dsql_table, action, current_count, None,
+                     f"allowed: no CDC started; {_g2_note}; count sanity passed")
+
+
 def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=None,
                       pk_cols=None):
     """V8 CROSS-ATTEMPT RESUME: blank an ENTIRE target table in DSQL-limit-safe batches
@@ -2220,7 +2652,7 @@ def blank_whole_table_composite(dsql_schema, dsql_table, key_cols, batch=2000):
 
 
 def assert_empty_or_register(dsql_schema, dsql_table, resume_ok=False, pk_col=None,
-                             any_col=None, pk_cols=None):
+                             any_col=None, pk_cols=None, expected_count=None):
     """EMPTY-TARGET SAFETY BARRIER — the ONE place the whole-table empty check lives.
 
     Verifies the target table is empty in DSQL and records it as empty-verified for
@@ -2261,16 +2693,43 @@ def assert_empty_or_register(dsql_schema, dsql_table, resume_ok=False, pk_col=No
         # a prior marker (resume_ok=False), so pre-existing customer data is never deleted.
         if resume_ok and AUTO_REBLANK_ON_RESUME:
             _is_composite = len([c for c in (pk_cols or []) if c]) >= 2
-            print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: target non-empty AND "
-                  f"previously-attempted by this pipeline -> auto-reblanking whole table "
-                  f"(batched DELETE) then reloading from scratch (no-dup/no-loss via "
-                  f"source-count gate). pk_col={pk_col!r} "
-                  f"pk_cols={[c for c in (pk_cols or []) if c] or None!r}"
-                  + (" [composite: paging by the FULL key tuple]" if _is_composite else ""))
-            removed = blank_whole_table(dsql_schema, dsql_table, pk_col=pk_col,
-                                        any_col=any_col, pk_cols=pk_cols)
-            print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: cleared {removed:,} prior "
-                  f"row(s); table now empty for a clean reload")
+            # ── SAFETY GUARDRAILS (G1/G2/G4 + G5 audit): before emptying ANY table, read its
+            # current row count and pass through the one gate. It refuses (raises) if CDC has
+            # started (G1), if this run is not driven by a RUNNING workflow execution (G2), or
+            # if the count fails the prior-attempt / expected-ceiling sanity (G4), writing an
+            # audit_log row BEFORE acting either way (G5). resume_ok proves THIS task previously
+            # attempted the table (the owner/resume marker), which G4 requires.
+            _cnt_before = _count_rows_for_guard(dsql_schema, dsql_table)
+            assert_blank_allowed(dsql_schema, dsql_table, _cnt_before, expected_count,
+                                 previously_attempted=bool(resume_ok),
+                                 action="auto_reblank_on_resume")
+            # ── G3 TABLE LOCK: only one run may blank+reload a table. A second concurrent run
+            # fails closed here (load side). Released after the reblank+register.
+            _locked, _lk = take_table_lock(dsql_schema, dsql_table)
+            if not _locked:
+                write_load_audit(dsql_schema, dsql_table, "auto_reblank_lock_refused",
+                                 _cnt_before, 0, f"could not take table lock: {_lk}")
+                raise Exception(
+                    f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk}. Another load run holds "
+                    f"this table's lock; refusing a concurrent reblank+reload (would risk "
+                    f"duplicates or wiping the other run's rows). Let the other run finish, or "
+                    f"clear a stale lock in {CONTROL_SCHEMA}.cdc_control_lock.")
+            try:
+                print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: target non-empty AND "
+                      f"previously-attempted by this pipeline -> auto-reblanking whole table "
+                      f"(batched DELETE) then reloading from scratch (no-dup/no-loss via "
+                      f"source-count gate). pk_col={pk_col!r} "
+                      f"pk_cols={[c for c in (pk_cols or []) if c] or None!r}"
+                      + (" [composite: paging by the FULL key tuple]" if _is_composite else ""))
+                removed = blank_whole_table(dsql_schema, dsql_table, pk_col=pk_col,
+                                            any_col=any_col, pk_cols=pk_cols)
+                write_load_audit(dsql_schema, dsql_table, "auto_reblank_on_resume_done",
+                                 _cnt_before, removed,
+                                 "reblank completed; reloading from source-count gate")
+                print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: cleared {removed:,} prior "
+                      f"row(s); table now empty for a clean reload")
+            finally:
+                release_table_lock(dsql_schema, dsql_table)
             # Re-verify empty after the reblank before registering (defensive).
             vconn = connect_dsql(); vcur = vconn.cursor()
             try:
@@ -3085,7 +3544,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
         assert_empty_or_register(dsql_schema, dsql_table,
                                  resume_ok=_resume_ok_for(dsql_schema, dsql_table),
                                  pk_col=_v5_pk, any_col=_v5_any,
-                                 pk_cols=_v5_pk_cols)
+                                 pk_cols=_v5_pk_cols,
+                                 expected_count=_expected_count_from_config(config))
 
     # ---- STREAM rows from Spark (bounded driver memory) ----
     row_iter = df.toLocalIterator()
@@ -4077,7 +4537,8 @@ def load_one_table_parallel(s3_client, entry, config, pk_col, min_id, max_id, to
                                  resume_ok=_resume_ok_for(dsql_schema, dsql_table),
                                  pk_col=pk_col,
                                  any_col=(target_columns[0] if target_columns else None),
-                                 pk_cols=([pk_col] if pk_col else None))
+                                 pk_cols=([pk_col] if pk_col else None),
+                                 expected_count=_expected_count_from_config(config))
 
     # Plan ranges with the KIND-appropriate planner (all return half-open [lo,hi)).
     if pk_kind == "uuid":
@@ -4387,7 +4848,8 @@ def load_one_table_chunked(s3_client, entry, config):
                                  resume_ok=resume_ok,
                                  pk_col=(_pk_cols[0] if has_single_pk else None),
                                  any_col=(target_columns[0] if target_columns else None),
-                                 pk_cols=_pk_cols)
+                                 pk_cols=_pk_cols,
+                                 expected_count=_expected_count_from_config(config))
         done_map, started_set, prior_done_rows = {}, set(), 0
 
     # Decide, per file, what to do.
@@ -4412,9 +4874,28 @@ def load_one_table_chunked(s3_client, entry, config):
               f"AND the table has NO single-col PK -> cannot safely resume a partial file "
               f"without risking duplicates. Falling back to WHOLE-TABLE REBLANK + full "
               f"reload (the only no-dup path without a PK).", flush=True)
-        blank_whole_table(dsql_schema, dsql_table,
-                          pk_col=None,
-                          any_col=(target_columns[0] if target_columns else None))
+        # SAFETY GUARDRAILS: this reblank empties the whole table, so it passes the SAME gate
+        # as the resume reblank (G1 no-CDC-started, G2 running-execution, G4 count sanity, G5
+        # audit) under the G3 table lock. This path only runs for a file THIS task started
+        # (started_set), so it was previously attempted by this task.
+        _cnt_before = _count_rows_for_guard(dsql_schema, dsql_table)
+        assert_blank_allowed(dsql_schema, dsql_table, _cnt_before, None,
+                             previously_attempted=True, action="nopk_midfile_reblank")
+        _locked, _lk = take_table_lock(dsql_schema, dsql_table)
+        if not _locked:
+            write_load_audit(dsql_schema, dsql_table, "nopk_midfile_reblank_lock_refused",
+                             _cnt_before, 0, f"could not take table lock: {_lk}")
+            raise Exception(
+                f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk}. Another load run holds "
+                f"this table's lock; refusing a concurrent no-PK reblank+reload.")
+        try:
+            blank_whole_table(dsql_schema, dsql_table,
+                              pk_col=None,
+                              any_col=(target_columns[0] if target_columns else None))
+            write_load_audit(dsql_schema, dsql_table, "nopk_midfile_reblank_done",
+                             _cnt_before, None, "no-PK mid-file crash whole-table reblank")
+        finally:
+            release_table_lock(dsql_schema, dsql_table)
         clear_file_status(s3_client, dsql_schema, dsql_table)
         done_map, started_set, prior_done_rows = {}, set(), 0
         to_load = [(uri, False) for uri in all_uris]

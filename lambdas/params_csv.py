@@ -34,6 +34,13 @@ KEYS
     control_schema     = cdc_control
     cdc_validation     = true                (Tier-2 CDC validation on; cutover blocks on failures)
     cdc_validation_sample = 20               (rows re-checked per committed CDC file; 0 = all)
+    cdc_max_delete_fraction = 0.5            (G6 mass-delete guard: max fraction of a table one
+                                              CDC file may delete; >= 1 disables)
+    cdc_max_delete_rows = 100000             (G6: absolute delete floor; both must be crossed)
+    cdc_drift_check_minutes = 30             (G9: minutes between DSQL-vs-expected count checks;
+                                              0 = off)
+    cdc_drift_tolerance = 0                  (G9: allowed row difference before drift fires)
+    cdc_drift_action   = warn                (G9: warn | block on drift)
     glue_role_arn      = arn:aws:iam::<account_id>:role/<project>-glue-exec-role
   Setup-only (used by tools/setup.sh; NOT part of pipeline.json):
     subnet_id, security_group_id            both together, or neither (Glue network connection)
@@ -82,6 +89,25 @@ OPTIONAL_DEFAULTS = {
     "control_schema": "cdc_control",
     "cdc_validation": "true",
     "cdc_validation_sample": "20",
+    # ── SAFETY GUARDRAILS (data-loss protection; see RUNBOOK "Safety guardrails"). ──
+    # cdc_max_delete_fraction / cdc_max_delete_rows (G6): a CDC file (or one poll cycle) whose
+    #   net DELETEs would remove MORE than this FRACTION of a table's current rows AND MORE than
+    #   this ABSOLUTE count blocks the table and applies nothing from that file. Both thresholds
+    #   must be crossed (so a tiny table isn't blocked by normal churn). Set the fraction to a
+    #   value >= 1 to turn the guard off. Operator unblocks per-file with
+    #   cdc_status.allow_mass_delete=true after verifying against the source.
+    "cdc_max_delete_fraction": "0.5",
+    "cdc_max_delete_rows": "100000",
+    # cdc_drift_check_minutes / cdc_drift_tolerance / cdc_drift_action (G9): every N minutes the
+    #   CDC job compares each table's live DSQL count with its tracked expectation
+    #   (full_load_rows + inserts_applied − deletes_applied). A difference beyond the tolerance
+    #   logs ERROR, writes cdc_control.audit_log, emits the DsqlRowDrift CloudWatch metric, and —
+    #   when cdc_drift_action=block — sets the table 'blocked'. tolerance 0 = exact (PK tables);
+    #   raise it slightly for no-PK tables. Set cdc_drift_check_minutes to 0 to turn the periodic
+    #   check off.
+    "cdc_drift_check_minutes": "30",
+    "cdc_drift_tolerance": "0",
+    "cdc_drift_action": "warn",
     "max_composite_forks": "8",
     "max_big_cdc_forks": "8",
     # Planning thresholds (plan_split fan-out knobs; defaults equal the former ASL literals).
@@ -181,6 +207,8 @@ ALLOWED = tuple(dict.fromkeys(ALLOWED))
 PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_database",
                  "glue_role_arn", "glue_connection", "cdc_engine", "cdc_spark_fallback",
                  "control_schema", "cdc_validation", "cdc_validation_sample",
+                 "cdc_max_delete_fraction", "cdc_max_delete_rows",
+                 "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
                  "max_composite_forks", "max_big_cdc_forks",
                  "big_table_row_threshold", "file_fanout_threshold", "big_table_bytes_threshold",
                  "max_groups", "map_max_concurrency", "max_files_in_parallel",
@@ -225,6 +253,8 @@ def role_arn_account(arn):
 # Functions Map concurrency plan_split's loader concurrency also feeds).
 _PLANNING_INT_KEYS = (
     ("cdc_validation_sample", 0, None),
+    ("cdc_max_delete_rows", 0, None),
+    ("cdc_drift_check_minutes", 0, None),
     ("max_composite_forks", 1, None),
     ("max_big_cdc_forks", 1, None),
     ("big_table_row_threshold", 1, None),
@@ -359,6 +389,27 @@ def parse(text):
             errors.append(f"{key} must be {rng} (got {n}).")
             continue
         ints[key] = n
+    # Guardrail float keys (G6/G9): non-negative decimals. Only checked when present in the CSV.
+    #   cdc_max_delete_fraction : fraction of a table's rows a single file may delete before the
+    #                             mass-delete guard trips (>= 1 disables it).
+    #   cdc_drift_tolerance     : allowed |live − expected| row difference before drift fires.
+    for key in ("cdc_max_delete_fraction", "cdc_drift_tolerance"):
+        if key not in raw:
+            continue
+        s = str(raw[key]).strip()
+        try:
+            f = float(s)
+        except (TypeError, ValueError):
+            errors.append(f"{key} must be a non-negative number (got {raw[key]!r}).")
+            continue
+        if f < 0:
+            errors.append(f"{key} must be >= 0 (got {f}).")
+    # Guardrail enum key (G9): cdc_drift_action is 'warn' or 'block'.
+    if "cdc_drift_action" in raw:
+        _da = str(raw["cdc_drift_action"]).strip().lower()
+        if _da not in ("warn", "block"):
+            errors.append(f"cdc_drift_action must be 'warn' or 'block' (got "
+                          f"{raw['cdc_drift_action']!r}).")
     # min_writers_per_loader <= max_writers_per_loader (only when both parsed cleanly).
     if "min_writers_per_loader" in ints and "max_writers_per_loader" in ints:
         if ints["min_writers_per_loader"] > ints["max_writers_per_loader"]:

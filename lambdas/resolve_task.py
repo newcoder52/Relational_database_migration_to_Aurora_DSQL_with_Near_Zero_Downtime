@@ -246,6 +246,18 @@ SETTINGS_DEFAULTS = {
     # --cdc_validation / --cdc_validation_sample (create_glue_jobs).
     "cdc_validation": True,
     "cdc_validation_sample": 20,
+    # ── SAFETY GUARDRAILS (data-loss protection; see RUNBOOK "Safety guardrails"). Passed to
+    # every CDC job (main/spark/composite) as --cdc_max_delete_fraction / --cdc_max_delete_rows
+    # / --cdc_drift_check_minutes / --cdc_drift_tolerance / --cdc_drift_action via
+    # create_glue_jobs. G6 mass-delete guard: a file deleting > fraction AND > rows of the
+    # table's live count blocks it. G9 drift detector: every N minutes compare the live DSQL
+    # count to full_load_rows+inserts−deletes; beyond tolerance log/metric/audit and (block
+    # mode) set 'blocked'. Defaults are SAFE; fraction >= 1 or minutes 0 turns a guard off.
+    "cdc_max_delete_fraction": 0.5,
+    "cdc_max_delete_rows": 100000,
+    "cdc_drift_check_minutes": 30,
+    "cdc_drift_tolerance": 0,
+    "cdc_drift_action": "warn",
     # Max composite-PK tables that may be forked out of ONE task (each gets its own always-on
     # CDC job). plan_split fails early if a task exceeds this. See DESIGN_FORK.md §6.
     "max_composite_forks": 8,
@@ -424,6 +436,48 @@ def _validate_settings(cfg, warnings):
         raise SettingsError(f"pipeline.json 'cdc_validation_sample' must be a non-negative "
                             f"integer (got {cfg['cdc_validation_sample']!r}).")
     cfg["cdc_validation_sample"] = cs
+    # ── SAFETY GUARDRAIL settings validation (G6/G9). Fail-closed on a typo so a guard can't be
+    # silently disabled by a bad value. Floats accept int/float/digit-string; ints a digit
+    # string; the action is an enum.
+    def _nonneg_float(key):
+        v = cfg[key]
+        if isinstance(v, bool):
+            raise SettingsError(f"pipeline.json '{key}' must be a non-negative number "
+                                f"(got {cfg[key]!r}).")
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise SettingsError(f"pipeline.json '{key}' must be a non-negative number "
+                                f"(got {cfg[key]!r}).")
+        if f < 0:
+            raise SettingsError(f"pipeline.json '{key}' must be >= 0 (got {f}).")
+        cfg[key] = f
+
+    def _nonneg_int(key):
+        v = cfg[key]
+        if isinstance(v, bool):
+            raise SettingsError(f"pipeline.json '{key}' must be a non-negative integer "
+                                f"(got {cfg[key]!r}).")
+        if isinstance(v, str):
+            v = v.strip()
+            if not v.isdigit():
+                raise SettingsError(f"pipeline.json '{key}' must be a non-negative integer "
+                                    f"(got {cfg[key]!r}).")
+            v = int(v)
+        if not isinstance(v, int) or v < 0:
+            raise SettingsError(f"pipeline.json '{key}' must be a non-negative integer "
+                                f"(got {cfg[key]!r}).")
+        cfg[key] = v
+
+    _nonneg_float("cdc_max_delete_fraction")
+    _nonneg_int("cdc_max_delete_rows")
+    _nonneg_int("cdc_drift_check_minutes")
+    _nonneg_float("cdc_drift_tolerance")
+    _da = cfg["cdc_drift_action"]
+    if not isinstance(_da, str) or _da.strip().lower() not in ("warn", "block"):
+        raise SettingsError(f"pipeline.json 'cdc_drift_action' must be 'warn' or 'block' "
+                            f"(got {cfg['cdc_drift_action']!r}).")
+    cfg["cdc_drift_action"] = _da.strip().lower()
     conn = cfg.get("glue_connection") or ""
     if isinstance(conn, list):
         conn = ",".join(str(c).strip() for c in conn if str(c).strip())
@@ -902,6 +956,11 @@ def handler_shared(event, context):
         "controlSchema": cfg["control_schema"],
         "cdcValidation": cfg["cdc_validation"],
         "cdcValidationSample": cfg["cdc_validation_sample"],
+        "cdcMaxDeleteFraction": cfg["cdc_max_delete_fraction"],
+        "cdcMaxDeleteRows": cfg["cdc_max_delete_rows"],
+        "cdcDriftCheckMinutes": cfg["cdc_drift_check_minutes"],
+        "cdcDriftTolerance": cfg["cdc_drift_tolerance"],
+        "cdcDriftAction": cfg["cdc_drift_action"],
         "jobNames": jobs,
         "cdcJobName": jobs["cdc"],
         "maxCompositeForks": cfg["max_composite_forks"],

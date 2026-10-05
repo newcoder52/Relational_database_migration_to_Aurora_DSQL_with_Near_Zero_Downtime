@@ -190,6 +190,11 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `cdc_spark_fallback` | optional | `true` | `true`: on a Python-shell CDC driver failure the startup re-creates that task's CDC job as Spark; `false`: stop at `DriversFailed` / `CdcRunFailed` |
 | `cdc_validation` | optional | `true` | Tier-2 CDC validation: each CDC job re-reads a sample of every committed file's rows by key and records persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover **stops** at `CdcValidationFailed` if any unresolved failure exists. Set `false` to disable |
 | `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = check every change — expensive) |
+| `cdc_max_delete_fraction` | optional | `0.5` | **G6 mass-delete guard**: a single CDC file (or one poll cycle) whose net DELETEs would remove more than this fraction of a table's current rows **and** more than `cdc_max_delete_rows` is **blocked** and nothing from that file is applied. Set `>= 1` to disable the guard |
+| `cdc_max_delete_rows` | optional | `100000` | **G6**: the absolute delete floor; both thresholds must be crossed, so a tiny table is never blocked by normal churn |
+| `cdc_drift_check_minutes` | optional | `30` | **G9 drift detector**: minutes between live-DSQL-count vs expected (`full_load_rows + inserts − deletes`) checks per table. `0` = off |
+| `cdc_drift_tolerance` | optional | `0` | **G9**: allowed row difference before drift fires (`0` = exact, for PK tables; raise slightly for no-PK tables) |
+| `cdc_drift_action` | optional | `warn` | **G9**: `warn` (log ERROR + CloudWatch `DsqlRowDrift` + `cdc_control.audit_log`) or `block` (also set the table `blocked`) |
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
 | `max_composite_forks` | optional | `8` | max composite-PK tables that may be forked out of **one** task (each runs its own always-on CDC job, plus its own load/validate jobs). A task with **more** composite tables than this fails early at startup `PlanSplitFailed` — the cause names the tables — and **no** Glue jobs are created. Raise it (mind Glue job/concurrent-run and DSQL connection quotas) or split the task |
 | `max_big_cdc_forks` | optional | `8` | max **big** single-/no-PK tables that get their **own** CDC job (`bg` fork); each big table keeps the shared `load-big` + `validate`. Big tables **past** the cap are **not** a failure — they stay on the **main** CDC job (serial apply) with a warning. Raise it to give more big tables their own CDC job |
@@ -229,9 +234,11 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
-Forty-three keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Forty-eight keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
-`control_schema`, `cdc_validation`, `cdc_validation_sample`, `max_composite_forks`,
+`control_schema`, `cdc_validation`, `cdc_validation_sample`, `cdc_max_delete_fraction`,
+`cdc_max_delete_rows`, `cdc_drift_check_minutes`, `cdc_drift_tolerance`, `cdc_drift_action`,
+`max_composite_forks`,
 `max_big_cdc_forks`, `big_table_row_threshold`, `file_fanout_threshold`, `big_table_bytes_threshold`,
 `max_groups`, `map_max_concurrency`, `max_files_in_parallel`, `writers_per_file`, `conn_budget`,
 `min_writers_per_loader`, `max_writers_per_loader`, `validate_rows_per_range`,
@@ -739,6 +746,13 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Cutover** `CdcValidationFailed` (from `CdcValidationFailedPre`, **before** DMS is stopped) | nothing touched — DMS still running, CDC still running | investigate the unresolved rows (query below), confirm each is explained/benign, then clear them and re-run cutover: `UPDATE cdc_control.cdc_validation_failures SET resolved = true WHERE table_name = '<schema>.<table>';` (never `DELETE` — keep the audit) |
 | **Cutover** `CdcValidationFailed` (from `CdcValidationFailedFinal`, **after** the drain) | DMS is **stopped**; the CDC run, the `_cdc_file` column and the Glue jobs are **untouched** | same `UPDATE … SET resolved = true` after review, then re-run cutover (it re-stops DMS idempotently, re-drains, re-checks). The query: `SELECT table_name, count(*) FROM cdc_control.cdc_validation_failures WHERE resolved IS NOT TRUE GROUP BY table_name;` |
 | **CDC** a table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` ([how to connect](#connect-to-dsql-and-check-progress)) — CDC resumes. **Never delete the row** (applied files stay and would all be replayed) |
+| **CDC** `MASS-DELETE GUARD` — a table is `blocked`, nothing applied from the file (**G6**) | one CDC file's net DELETEs would remove more than `cdc_max_delete_fraction` **and** more than `cdc_max_delete_rows` of the table — a suspected bad/corrupt file vs a real mass delete | verify against the SOURCE. If the deletes are REAL, allow this one file: `UPDATE cdc_control.cdc_status SET allow_mass_delete=true, status='active' WHERE table_name='<schema.table>';` then CDC applies it and the flag self-clears for the next file. If BOGUS, re-export the file from DMS. See §"Safety guardrails" |
+| **CDC** `NO-PK DELETE GUARD` — a table is `blocked` (**G7**) | a no-PK content-match DELETE would remove more rows than the file's D ops intend (duplicate rows) | investigate the duplicate rows / source; once resolved, `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` |
+| **CDC** file-order / high-water / gap / new-LOAD block (**G8**) | a file older than the high-water, a gap, or a new `LOAD*` file after CDC started (a DMS reload under CDC) | check for a hand-edited/reset `cdc_status`, a leftover file from an older run, or a DMS "reload table". Do a controlled reload via a NEW DMS task ([§9](#9-reload-a-task-from-scratch)); then `UPDATE cdc_control.cdc_status SET status='active' …` |
+| **CDC** `ROW DRIFT` ERROR / a table `blocked` when `cdc_drift_action=block` (**G9**) | the live DSQL count diverged from `full_load_rows + inserts_applied − deletes_applied` beyond `cdc_drift_tolerance` | the drift is logged + written to `cdc_control.audit_log` + emitted as the `DsqlRowDrift` metric. Investigate the table against the source; if explained, raise `cdc_drift_tolerance` or set the table `active`; if real loss, reload via a new DMS task ([§9](#9-reload-a-task-from-scratch)) |
+| **Load** `BLANK GUARD G1/G2/G3/G4` — a whole-table or range blank was refused | **G1** CDC already started for the table; **G2** a manual (no-workflow) run tried to blank without `--allow_manual_destructive=true`; **G3** another run holds the table lock; **G4** the table was not previously attempted by this task, or its count is above `expected×(1+margin)` | read the audit row in `cdc_control.audit_log` (the `action` ends `_refused_*`). For a legitimate MANUAL reblank re-run the load with `--allow_manual_destructive=true` (G1/G4 still apply); for a CDC-started table reload via a NEW DMS task ([§9](#9-reload-a-task-from-scratch)); for a lock, let the other run finish or clear a stale row in `cdc_control.cdc_control_lock` |
+| **Validate** `mismatch` with a `DMS_COUNT_DIFF` (**G10**) | the DSQL count disagrees with DMS `describe_table_statistics` FullLoadRows beyond `count_mismatch_tolerance` (not only the S3 source count) | the target is short/over vs the authoritative DMS figure — reload the table ([§9](#9-reload-a-task-from-scratch)) or investigate the DMS task before cutover |
+| **Cutover** `CountMismatch` (**G10**) | per table, the DSQL count ≠ DMS `FullLoadRows + Inserts − Deletes` beyond tolerance | investigate the short/over table; reload if needed, or pass the explicit cutover count-override only when the difference is understood and benign |
 | **CDC** run ends with no error after ~7 days | the 7-day Glue timeout (the 10080-minute maximum) | start the CDC job by hand (below); it resumes from where it left off. Cut over before 7 days where you can |
 | **CDC** Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
 | **CDC/Glue** `Unknown service: 'dsql'` | `driver-cdc/` lacks a current boto3 set | re-stage drivers (§4), re-trigger the fleet |
@@ -746,19 +760,43 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Setup** an `aws` command seems to hang | the CLI pager is waiting | `export AWS_PAGER=""` and re-run; whatever you Ctrl-C'd was still created |
 | **Setup** `create-function`: *role cannot be assumed by Lambda* | the role is seconds old | wait 10 s and re-run `tools/setup.sh` |
 
-**Start the CDC job by hand** (per task; the job keeps its saved settings — pass `--config_prefix` as
-a run argument so cutover can find and stop the run):
+**Start the CDC job by hand** (fully supported — e.g. restart after the 7-day Glue timeout, or
+re-run after unblocking a table). Pass `--config_prefix` so cutover can find and stop the run, and
+`--startup_execution` so the run writes its start marker under a stable name (any string you
+choose; use `manual-<something>` so it is recognisable):
 
 ```bash
 PROJECT="<project>"; BUCKET="<bucket>"; export AWS_PAGER=""
 TASK_NAME="<task name>"
 CONFIG_PREFIX="s3://$BUCKET/config/_task/$TASK_NAME/"
 aws glue start-job-run --job-name "$PROJECT-$TASK_NAME-cdc" \
-  --arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}" --query JobRunId --output text
+  --arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\",\"--startup_execution\":\"manual-$(date +%Y%m%d-%H%M%S)\"}" \
+  --query JobRunId --output text
 ```
 
-Then check it as in [§6](#6-watch-progress). **Don't use the console's Run button** for the CDC job:
-a console run has no `--config_prefix`, so cutover would not find and stop it.
+Then check it as in [§6](#6-watch-progress). A manual CDC run is safe to start: CDC never empties a
+table (so the blank guards do not apply to it), and it is still covered by **G3** (the per-table
+lock + position fence stop two CDC runs clashing on one table), **G6** (mass-delete), **G8**
+(ordering) and **G9** (drift). Only run ONE CDC job per task at a time; a second one for the same
+tables will skip each table with a warning (lock/fence) rather than double-apply.
+
+**Re-run a LOAD for one table by hand** — allowed. A manual load may WRITE onto an empty table or
+per-file-resume (which deletes nothing). It will REFUSE a destructive whole-table blank unless you
+pass `--allow_manual_destructive=true` (and even then **G1** no-blank-after-CDC and **G4** count
+sanity still apply, and a `manual override` row is written to `cdc_control.audit_log`):
+
+```bash
+PROJECT="<project>"; BUCKET="<bucket>"; export AWS_PAGER=""
+TASK_NAME="<task name>"
+CONFIG_PREFIX="s3://$BUCKET/config/_task/$TASK_NAME/"
+# Plain manual load (writes onto an empty table / resumes files; never blanks):
+aws glue start-job-run --job-name "$PROJECT-$TASK_NAME-load" \
+  --arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}" --query JobRunId --output text
+# Manual load that is ALLOWED to reblank (destructive) — use only when you intend to empty+reload:
+aws glue start-job-run --job-name "$PROJECT-$TASK_NAME-load" \
+  --arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\",\"--allow_manual_destructive\":\"true\"}" \
+  --query JobRunId --output text
+```
 
 **Finish a cutover by hand** — now rarely needed: cutover is **re-runnable**, so after a failure
 once DMS is stopped the simplest recovery is to **re-run cutover for this task** (it skips the
@@ -873,6 +911,80 @@ CONFIG_PREFIX="s3://$BUCKET/config/_task/$TASK_NAME/"
    ([§5](#5-run-tasks-with-the-fleet)); the table list is rebuilt from the new task automatically. If
    you reuse the old name, archive the old folder first:
    `aws s3 mv "${CONFIG_PREFIX}" "s3://$BUCKET/config/_archive/$TASK_NAME-$(date +%Y%m%d%H%M)/" --recursive`
+
+## Safety guardrails
+
+Ten guardrails stop a "what if" from silently losing or corrupting target rows, and surface any
+loss within one CDC poll cycle. They default **SAFE** (refuse, or stop and flag the table); every
+override is an explicit setting, SQL flag, or run flag. Full scenario matrix: `WHAT_IF.md`.
+
+| Guard | What it stops | Where | Override |
+|---|---|---|---|
+| **G1** | A load reblank once CDC has started (would wipe CDC deltas). Checks the task's `_cdc_started` marker AND the table's `cdc_status` row; fail-closed if unreadable | load | `--blank_guard_enabled false` (master off) |
+| **G2** | A destructive blank from a run **no workflow started**. Manual loads/validates may still WRITE; a manual blank needs the flag (then audited "manual override" + WARNING; G1/G4 still apply). CDC is never gated by G2 | load | `--allow_manual_destructive=true` |
+| **G3** | Two runs writing one table at once (two loads, or two CDC runs). Load fails closed; CDC skips with a WARNING | load + CDC | lock timeout `LOCK_HEARTBEAT_TIMEOUT_SECONDS` |
+| **G4** | Blanking a table this task did not load, or whose count is above `expected×(1+margin)` | load | `--blank_expected_margin`, `--blank_guard_enabled false` |
+| **G5** | An un-attributable destructive op: a row is written to `cdc_control.audit_log` BEFORE every blank / mass-delete / purge (and on every refusal) | load + CDC | — (always on) |
+| **G6** | A CDC file deleting more than `cdc_max_delete_fraction` **and** `cdc_max_delete_rows` of a table (bad/corrupt file). Table blocked, nothing applied | CDC | `cdc_max_delete_fraction>=1` (off); per-file `cdc_status.allow_mass_delete=true` |
+| **G7** | A no-PK content DELETE over-matching duplicates; the `_cdc_file` purge touching other files | CDC | — (always on; precision check is read-only) |
+| **G8** | A file older than the high-water mark, a gap, or a new `LOAD*` after CDC started (DMS reload) | CDC | — (always on) |
+| **G9** | Slow drift: every `cdc_drift_check_minutes` compares the live count to `full_load_rows + inserts − deletes`; beyond `cdc_drift_tolerance` logs ERROR + `audit_log` + `DsqlRowDrift` metric, optionally blocks | CDC | `cdc_drift_check_minutes=0` (off), `cdc_drift_tolerance`, `cdc_drift_action=warn|block` |
+| **G10** | Validate passing while the DSQL count ≠ DMS `FullLoadRows`; cutover with DSQL ≠ `FullLoadRows + Inserts − Deletes` (new `CountMismatch` fail state) | validate + cutover | `count_mismatch_tolerance`, the cutover count-override run input |
+
+### Reading the audit log
+
+Every destructive action (and refusal) writes one row FIRST, so even a crash mid-op is attributable:
+
+```sql
+SELECT event_time, table_name, action, rows_before, rows_deleted, reason
+FROM cdc_control.audit_log ORDER BY event_time DESC LIMIT 50;
+```
+
+`action` names the op (`auto_reblank_on_resume`, `cdc_mass_delete_blocked`, `drift_detected`,
+`..._refused_cdc_started`, `..._manual_override`, …). `rows_before` is the count just before the op.
+
+### Unblocking (always UPDATE, never DELETE the control row)
+
+- **Mass delete (G6)** — verify against the source, then for the one next file:
+  `UPDATE cdc_control.cdc_status SET allow_mass_delete=true, status='active' WHERE table_name='<schema.table>';`
+- **Drift (G9)** — investigate; if explained, raise `cdc_drift_tolerance` (or set the table
+  `active` if it was blocked); if real loss, reload via a new DMS task ([§9](#9-reload-a-task-from-scratch)).
+- **Lock (G3)** — let the other run finish, or if a run died holding it, clear the stale row:
+  `DELETE FROM cdc_control.cdc_control_lock WHERE table_name='<schema.table>';` (the only control
+  row it is safe to DELETE — it is a lease, not state).
+- **Order / high-water / new-LOAD (G8)** and **CDC blocks generally** —
+  `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` after the
+  cause is fixed. **Never DELETE a `cdc_status` row** (the high-water is lost → every applied file
+  replays).
+
+### Daily count check
+
+Once a day (and before cutover), confirm no table is blocked and no drift is pending:
+
+```sql
+-- any blocked table needs attention:
+SELECT table_name, status, error FROM cdc_control.cdc_status WHERE status = 'blocked';
+-- live vs expected per table (expected = full_load_rows + inserts − deletes):
+SELECT table_name, full_load_rows, inserts_applied, deletes_applied,
+       (COALESCE(full_load_rows,0)+COALESCE(inserts_applied,0)-COALESCE(deletes_applied,0)) AS expected
+FROM cdc_control.cdc_status ORDER BY table_name;
+-- recent drift / destructive events:
+SELECT event_time, table_name, action, rows_before, rows_deleted
+FROM cdc_control.audit_log WHERE action IN ('drift_detected') ORDER BY event_time DESC LIMIT 20;
+```
+
+Compare each table's live DSQL `count(*)` to `expected`; a persistent gap is a loss to investigate
+against the source. The CDC job also emits the `DsqlRowDrift` CloudWatch metric (namespace
+`GlueCDC/NonPK`, dimension `Table`) — alarm on it for always-on detection.
+
+### Supported manual runs
+
+Operators can run jobs by hand; the guards keep them safe. See
+[§8 "Start the CDC job by hand" / "Re-run a LOAD for one table by hand"](#8-if-something-fails)
+for the exact commands. In short: a manual **CDC** run is always allowed (G3/G6/G8/G9 still cover
+it); a manual **load/validate** may always WRITE; only a destructive **blank** in a manual load is
+gated and needs `--allow_manual_destructive=true` (with G1/G4 still enforced and a `manual override`
+audit row written).
 
 ---
 

@@ -37,6 +37,21 @@ control_schema,cdc_control
 cdc_validation,true
 # cdc_validation_sample: rows re-checked per committed CDC file (0 = check every change; costly).
 cdc_validation_sample,20
+# ---- safety guardrails (data-loss protection; see RUNBOOK "Safety guardrails") ----
+# cdc_max_delete_fraction / cdc_max_delete_rows (G6): a single CDC file (or one poll cycle) whose
+#   net DELETEs would remove MORE than this fraction of a table's current rows AND MORE than this
+#   absolute count is BLOCKED and nothing from that file is applied. Both must be crossed. Operator
+#   unblocks one file with cdc_status.allow_mass_delete=true after verifying vs the source. Set the
+#   fraction to 1 (or higher) to turn the guard off.
+cdc_max_delete_fraction,0.5
+cdc_max_delete_rows,100000
+# cdc_drift_check_minutes / cdc_drift_tolerance / cdc_drift_action (G9): every N minutes the CDC job
+#   compares each table's live DSQL count with full_load_rows + inserts_applied - deletes_applied.
+#   Beyond the tolerance it logs ERROR, writes cdc_control.audit_log, emits the DsqlRowDrift metric,
+#   and (action=block) sets the table blocked. minutes 0 = off; tolerance 0 = exact (PK tables).
+cdc_drift_check_minutes,30
+cdc_drift_tolerance,0
+cdc_drift_action,warn
 # max_composite_forks: max composite-PK tables that may be forked out of ONE task. Each composite
 # table runs its own always-on CDC job (plus its own load/validate jobs), so this caps the always-
 # on Glue jobs and DSQL connections per task. Startup fails early (naming the tables) if exceeded.
