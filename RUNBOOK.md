@@ -191,13 +191,16 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `cdc_validation` | optional | `true` | Tier-2 CDC validation: each CDC job re-reads a sample of every committed file's rows by key and records persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover **stops** at `CdcValidationFailed` if any unresolved failure exists. Set `false` to disable |
 | `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = check every change — expensive) |
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
+| `max_composite_forks` | optional | `8` | max composite-PK tables that may be forked out of **one** task (each runs its own always-on CDC job, plus its own load/validate jobs). A task with **more** composite tables than this fails early at startup `PlanSplitFailed` — the cause names the tables — and **no** Glue jobs are created. Raise it (mind Glue job/concurrent-run and DSQL connection quotas) or split the task |
+| `max_big_cdc_forks` | optional | `8` | max **big** single-/no-PK tables that get their **own** CDC job (`bg` fork); each big table keeps the shared `load-big` + `validate`. Big tables **past** the cap are **not** a failure — they stay on the **main** CDC job (serial apply) with a warning. Raise it to give more big tables their own CDC job |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
-Twelve keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Fourteen keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
-`control_schema`, `cdc_validation`, `cdc_validation_sample`. `account_id`, `subnet_id` and
+`control_schema`, `cdc_validation`, `cdc_validation_sample`, `max_composite_forks`,
+`max_big_cdc_forks`. `account_id`, `subnet_id` and
 `security_group_id` are used only by setup.
 
 ---
@@ -397,7 +400,8 @@ per-task `startup` refuses a second run of a task that is already running.
   - a **composite (multi-column) PK** table gets its own **`ck` fork** — a dedicated load, validate
     and CDC job `$PROJECT-$TASK_NAME-ck-<slug>-{load,validate,cdc}` (CDC via
     `scripts/glue_cdc_composite.py`), scoped to that one table;
-  - a **big** single-/no-PK table (FullLoadRows ≥ `big_table_row_threshold`, or many part-files) gets
+  - a **big** single-/no-PK table (FullLoadRows ≥ the big-table threshold — **6,000,000 rows or 8+
+    part-files**, fixed in the startup workflow; see [Planning thresholds](#planning-thresholds-fixed-in-the-startup-workflow)) gets
     its own **`bg` CDC job** `$PROJECT-$TASK_NAME-bg-<slug>-cdc` (main CDC script) while keeping the
     shared `load-big` + `validate` jobs;
   - the **main CDC job** applies the remaining small single-/no-PK tables.
@@ -754,6 +758,25 @@ s3://<bucket>/
     └── _task/<task name>/    # one folder per DMS task (table list, owner record, group status, CDC markers)
 ```
 
+### Planning thresholds (fixed in the startup workflow)
+
+The fan-out planner (`plan_split`) is driven by a set of knobs that are **not** `params.csv` keys —
+they are passed as **fixed literals** in the `PlanSplit` state of `stepfunctions/startup.asl.json`.
+Only `max_composite_forks` / `max_big_cdc_forks` come from `params.csv` (resolved per task); the rest
+are the same for every task. To change one, edit `stepfunctions/startup.asl.json` and re-run setup
+(`tools/setup.sh`) so the state machine is re-deployed. **Don't** look for these in `params.csv`.
+
+| Knob (PlanSplit literal) | Value | What it controls |
+|---|---|---|
+| `big_table_row_threshold` | `6000000` | a table with **≥ 6,000,000 rows** (OR `≥ file_fanout_threshold` LOAD files) is **big**: it gets its **own** load-big group **and** its own `bg` CDC job |
+| `file_fanout_threshold` | `8` | a table with **≥ 8** LOAD part-files is **big** (same effect as the row threshold) |
+| `max_files_in_parallel` | `30` | per-loader cap on LOAD files read at once (big groups also drive `--max_write_concurrency` from it) |
+| `max_groups` | `10` | total load/validate groups per task = the pre-created CDC job pool size (big tables each take one) |
+| `conn_budget` | `900` | DSQL connection budget shared across in-flight loaders; sets writers-per-loader |
+| `min_writers_per_loader` | `100` | floor for `--max_write_concurrency` on a small group's load |
+| `max_writers_per_loader` | `150` | ceiling for `--max_write_concurrency` on a small group's load |
+| `map_max_concurrency` | `6` | how many groups/forks load+validate at once (the GroupFanOut Map concurrency) |
+
 ### Limits
 
 - **DSQL schemas:** at most **9 of your own** per fleet task (DSQL allows 10 per database;
@@ -764,6 +787,13 @@ s3://<bucket>/
   single task can ask for up to 6 × 20 = 120 G.8X workers on its big groups — check your Glue
   concurrent-run and DPU quotas before a large wave. Each load run also opens up to 150 DSQL
   connections (`max_write_concurrency`).
+- **Always-on CDC jobs per task:** each task runs **1 main CDC job + up to `max_composite_forks`
+  `ck` CDC jobs + up to `max_big_cdc_forks` `bg` CDC jobs** (defaults 8 + 8, so up to 17 CDC runs for
+  one task), each holding its own DSQL connections. These run **concurrently** with the task's
+  load/validate runs and with every other task — all against the **AWS Glue concurrent-job-runs
+  quota** (default ~30 per account, adjustable) and the DSQL connection limits (cluster 10,000, rate
+  100/s). `plan_split` warns when a task's CDC count is a large share of the Glue quota; raise the
+  Glue quota (and watch DSQL connections) before fanning out many tasks or many forks at once.
 - **Fleet size:** one fleet execution handles up to a few hundred tasks (the Map's results stay under
   Step Functions' 256 KB state limit to roughly 400 tasks). Split bigger lists.
 - **CDC runtime:** a CDC Glue run stops after 7 days (the 10080-minute Glue maximum) — restart it by
@@ -848,10 +878,27 @@ See [§8](#8-if-something-fails) for the recovery keyed to each state, and
 <details>
 <summary>Where each value comes from</summary>
 
-**Read from `config/pipeline.json` at run time** (by every per-task run and the fleet's preflight):
+**Read from `config/pipeline.json` at run time** (by every per-task run and the fleet's preflight)
+— all fourteen keys `resolve_task` builds into its resolved output:
 `project`, `region`, `dsql_endpoint`, `dsql_user`, `dsql_database`, `glue_role_arn`,
-`glue_connection`, `cdc_engine`, `cdc_spark_fallback`, `control_schema`. Per task,
-`config/_task/<task name>/_cdc_engine.json` (an automatic switch to Spark) overrides `cdc_engine`.
+`glue_connection`, `cdc_engine`, `cdc_spark_fallback`, `control_schema`, `cdc_validation`,
+`cdc_validation_sample`, `max_composite_forks`, `max_big_cdc_forks`. Which component acts on each:
+
+- `resolve_task` reads and validates **all fourteen** (`_load_settings` / `_validate_settings`) and
+  resolves the task's names, S3 layout and `dsql_endpoint` candidates (it derives the private
+  PrivateLink hostname itself; the Glue jobs/Lambdas try each form).
+- `plan_split` reads `max_composite_forks` and `max_big_cdc_forks` (passed via the resolved
+  `maxCompositeForks` / `maxBigCdcForks`) to cap composite `ck` forks (over the cap → startup
+  `PlanSplitFailed`) and big `bg` CDC forks (over the cap → stay on the main CDC job with a warning).
+- `create_glue_jobs` sets `cdc_validation` / `cdc_validation_sample` on every CDC job it creates
+  (as `--cdc_validation` / `--cdc_validation_sample`), and builds all the task's jobs under
+  `glue_role_arn` / `glue_connection` with the chosen `cdc_engine`.
+- the CDC scripts (`scripts/glue_cdc_continuous.py`, `scripts/glue_cdc_composite.py`) read
+  `cdc_validation` / `cdc_validation_sample` (Tier-2 validation) and `control_schema` (the DSQL
+  schema that holds the control tables).
+
+Per task, `config/_task/<task name>/_cdc_engine.json` (an automatic switch to Spark) overrides
+`cdc_engine`.
 
 **Worked out per task, from the row's `taskArn`** (plus `taskSuffix` / `adoptExistingFolder`): the
 task name (the DMS task's name, or `task_suffix`; after the first startup, the name recorded in

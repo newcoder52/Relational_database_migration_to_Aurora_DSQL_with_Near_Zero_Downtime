@@ -11,5 +11,7 @@
   "cdc_spark_fallback": true,
   "control_schema": "cdc_control",
   "cdc_validation": true,
-  "cdc_validation_sample": 20
+  "cdc_validation_sample": 20,
+  "max_composite_forks": 8,
+  "max_big_cdc_forks": 8
 }

@@ -73,6 +73,8 @@ cp config/params.example.csv params.csv
 | `cdc_validation` | optional | `true` | Tier-2 CDC validation on; cutover stops at `CdcValidationFailed` on unresolved `cdc_control.cdc_validation_failures`. `false` disables |
 | `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = all) |
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
+| `max_composite_forks` | optional | `8` | max composite-PK tables forked out of one task (each gets its own always-on CDC + load/validate jobs); over the cap, startup fails early at `PlanSplitFailed` naming the tables |
+| `max_big_cdc_forks` | optional | `8` | max big single-/no-PK tables that get their own `bg` CDC job; over the cap they stay on the main CDC job with a warning (not a failure) |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection; both-or-neither with `security_group_id` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection; both-or-neither with `subnet_id` |
@@ -334,7 +336,7 @@ rm -rf /tmp/_cdc_check && python3 lambdas/prepare_cdc_wheels.py _cdc/ /tmp/_cdc_
 
 ## Step 3c — config/pipeline.json
 
-*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Ten of the `params.csv` values
+*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Fourteen of the `params.csv` values
 become `config/pipeline.json`. Each key maps straight across (defaults applied where you left a row
 out); `account_id`, `subnet_id`, `security_group_id` are **not** written. Don't copy
 `config/pipeline.example.json` as-is — its `description` holds `<bucket>`, and any value with `<`/`>`
@@ -354,6 +356,8 @@ is rejected at run time.
 | `control_schema` | `control_schema` | `cdc_control` |
 | `cdc_validation` | `cdc_validation` | `true` |
 | `cdc_validation_sample` | `cdc_validation_sample` | `20` |
+| `max_composite_forks` | `max_composite_forks` | `8` |
+| `max_big_cdc_forks` | `max_big_cdc_forks` | `8` |
 
 Write it from the export block and upload it to the fixed key `config/pipeline.json`:
 
@@ -374,6 +378,8 @@ cfg = {
     "control_schema": "cdc_control",
     "cdc_validation": True,
     "cdc_validation_sample": 20,
+    "max_composite_forks": 8,
+    "max_big_cdc_forks": 8,
 }
 open("pipeline.json", "w").write(json.dumps(cfg, indent=2) + "\n")
 print(json.dumps(cfg, indent=2))
