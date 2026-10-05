@@ -67,8 +67,8 @@ sync while the application keeps running, and lets you cut over with almost no d
 
 | | What | Steps |
 |---|---|---|
-| **Once** | IAM roles (incl. the fleet and preflight roles), the 7 pipeline Lambdas + the preflight Lambda, files and settings in S3, the per-task `startup`/`cutover` state machines **and** the `fleet-startup`/`fleet-cutover` state machines | 1–4 |
-| **Running tasks** | stage each task's table list, write `fleet_tasks.csv`, trigger `fleet-startup`; later trigger `fleet-cutover` | 5–6 |
+| **Once** | the 3 IAM roles (one per service — glue, lambda, sfn), the 7 pipeline Lambdas + the preflight Lambda (all 8 on the lambda role), files and settings in S3, the per-task `startup`/`cutover` state machines **and** the `fleet-startup`/`fleet-cutover` state machines (all 4 on the sfn role) | 1–4 |
+| **Running tasks** | write `fleet_tasks.csv`, trigger `fleet-startup`; later trigger `fleet-cutover` | 5–6 |
 
 **Terms used below:**
 
@@ -97,7 +97,9 @@ Work through this before Step 1. Each box is a thing the pipeline assumes.
 - [ ] **This repo on your machine**, and your terminal in its root folder. In CloudShell:
       `git clone <this repo>` then `cd` into it. (No GitHub access from CloudShell? Zip the repo,
       upload it with **Actions → Upload file**, and unzip it.)
-- [ ] **An Aurora DSQL cluster**, and its endpoint (looks like `abcd.dsql.us-east-1.on.aws`).
+- [ ] **An Aurora DSQL cluster**, and its endpoint (looks like `abcd.dsql.us-east-1.on.aws`; inside
+      a VPC with no internet, use the VPC endpoint's private DNS name `abcd.dsql-<id>.us-east-1.on.aws`
+      — see `dsql_endpoint` in [Step 3c](#step-3c--pipeline-settings)).
 - [ ] **Target tables already created** in the target schema, each ideally with a **single-column
       primary key**. Tables with a **multi-column** primary key are skipped by the main CDC job and
       need a separate CDC job ([see the rules](#rules-for-the-task-list)).
@@ -172,11 +174,11 @@ export GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
 - **`inputPrefix`** — the folder that holds `fleet_tasks.csv` (normally `config`).
 - **the CSV** — `fleet_tasks.csv` (`task_arn`, optional `task_suffix`, optional
   `adopt_existing_folder`).
-- **the table lists** — each task's `table_manifest.csv`, staged in S3 (Step 5b).
 
-Everything else — region, DSQL endpoint/user/database, Glue role, Glue connection, CDC engine — is
-read at run time from `config/pipeline.json`, which every per-task run already reads. The fleet
-reads that same file; it never writes it.
+Each task's table list is built automatically from the DMS task after full load (nothing to
+upload). Everything else — region, DSQL endpoint/user/database, Glue role, Glue connection, CDC
+engine — is read at run time from `config/pipeline.json`, which every per-task run already reads.
+The fleet reads that same file; it never writes it.
 
 > <a id="load-values"></a>**Coming back in a new shell to run or cut over tasks?** You only need
 > `BUCKET` and `AWS_PAGER=""` to trigger a fleet. If you also want `PROJECT` / `REGION` in the shell
@@ -211,9 +213,11 @@ reads that same file; it never writes it.
 > read from. If you prefer the hand-typed export block, it still works unchanged — `params.csv` is
 > optional.
 >
-> **params.csv is offline-tested; real-AWS test pending.** The parser, the setup-script dry-run and
-> the preflight safe-publish logic all pass an offline test suite (fake S3 / Step Functions / DMS);
-> they have **not** yet been run against live AWS. Run one small live fleet first.
+> **params.csv, the automatic table list, and the 3-role IAM setup are offline-tested; real-AWS test
+> pending.** The parser, the setup-script dry-run and the preflight safe-publish logic — plus the
+> automatic table-list build (`BuildTableList` from the DMS task) and the one-role-per-service IAM
+> (glue/lambda/stepfunctions) — all pass an offline test suite (fake S3 / Step Functions / DMS); they
+> have **not** yet been run against live AWS. Run one small live fleet first.
 
 ---
 
@@ -235,7 +239,8 @@ s3://$BUCKET/
     ├── fleet_tasks.csv       # the task list the fleet reads                    (Step 5)
     ├── _task_index/          # written by the startup: task ARN -> folder name
     └── _task/<task name>/    # one folder per DMS task
-        ├── table_manifest.csv        # you upload this                         (Step 5b)
+        ├── table_manifest.csv        # written by the startup (built from the DMS task)
+        ├── table_list_source.json    # written by the startup: table-list provenance (source=dms)
         ├── _task.json                # written by the startup: which task ARN owns the folder
         ├── _manifest_index.json      # written by discovery
         ├── _orchestrator/group-<n>/  # per-group load status and validation report
@@ -249,60 +254,74 @@ s3://$BUCKET/
 
 *One-time, about 15 minutes. Needs the export block.*
 
-**Goal:** every role the pipeline runs as — the three core roles (Glue, Lambda, Step Functions)
-**and** the three fleet roles (the preflight Lambda's role and the two fleet state-machine roles).
-The fleet is always part of the deployment, so its roles are created here alongside the others.
+**Goal:** every role the pipeline runs as — **one role per AWS service**: the Glue role, the Lambda
+role, and the Step Functions role. All 8 Lambdas (including the fleet's `preflight-tasks`) run as the
+one Lambda role, and all 4 state machines (per-task `startup`/`cutover` **and** `fleet-startup`/
+`fleet-cutover`) run as the one Step Functions role.
 
-The files in `iam/` contain blanks (`<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`,
-`<<DSQL_CLUSTER_ID>>`, `<<PROJECT>>`, `<<GLUE_EXEC_ROLE_NAME>>`). **Fill them in first:** a role
-created from an unfilled file would trust or allow a literal `<<...>>` string. The loop writes
-filled copies (`iam/*.filled.json`) and leaves the originals untouched, so a later `git pull`
-never conflicts.
+> **Upgrade note:** earlier versions created six roles (adding separate `preflight-tasks-role`,
+> `fleet-startup-role`, `fleet-cutover-role`). Those three extra roles are gone — their permissions
+> are merged into the Lambda role and the Step Functions role. If you deployed an earlier version,
+> the old roles are **left in place** (a live run may still reference them) and can be removed once
+> this update is verified:
+> `for r in preflight-tasks-role fleet-startup-role fleet-cutover-role; do aws iam delete-role-policy --role-name "$PROJECT-$r" --policy-name "$PROJECT-$r" 2>/dev/null; aws iam delete-role --role-name "$PROJECT-$r" 2>/dev/null; done`
+
+`iam/` now holds **three** combined files — `iam/glue.json`, `iam/lambda.json`,
+`iam/stepfunctions.json` — each a single JSON document `{"RoleName","TrustPolicy","Policy"[,"VpcPolicy"]}`
+(the Glue file carries a `VpcPolicy`). They contain blanks (`<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`,
+`<<DSQL_CLUSTER_ID>>`, `<<PROJECT>>`, `<<GLUE_EXEC_ROLE_NAME>>`). **Fill and split them first** with
+`python3` (same as `tools/setup.sh`): a role created from an unfilled file would trust or allow a literal
+`<<...>>` string. The step writes filled copies (`iam/*.filled.json`) and leaves the originals untouched,
+so a later `git pull` never conflicts.
 
 ```bash
-# 1. Fill in the blanks for EVERY iam file (core + fleet). Portable: no sed -i.
-for f in iam/*.json; do
-  case "$f" in *.filled.json) continue ;; esac
-  sed -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
-      -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<DSQL_CLUSTER_ID>>|$DSQL_CLUSTER_ID|g" \
-      -e "s|<<PROJECT>>|$PROJECT|g" \
-      -e "s|<<GLUE_EXEC_ROLE_NAME>>|$PROJECT-glue-exec-role|g" "$f" > "${f%.json}.filled.json"
-done
-grep -l "<<" iam/*.filled.json && echo "STOP: a placeholder is still unfilled" \
-                               || echo "no placeholders left in any iam file"
-
-# 2. The three core roles (Glue, Lambda, Step Functions) and their policies
-for r in glue lambda sfn; do
-  aws iam create-role --role-name "$PROJECT-$r-exec-role" \
-    --assume-role-policy-document "file://iam/$r-exec-role.trust.filled.json" \
-    --query Role.RoleName --output text
-  aws iam put-role-policy --role-name "$PROJECT-$r-exec-role" \
-    --policy-name "$r" --policy-document "file://iam/$r-exec-role.policy.filled.json"
-done
-
-# 3. The preflight-tasks role (the fleet's eighth Lambda runs as this; its trust file needs no fill)
-aws iam create-role --role-name "$PROJECT-preflight-tasks-role" \
-  --assume-role-policy-document file://iam/preflight-tasks-role.trust.json \
-  --query Role.RoleName --output text
-aws iam put-role-policy --role-name "$PROJECT-preflight-tasks-role" \
-  --policy-name preflight --policy-document file://iam/preflight-tasks-role.policy.filled.json
-
-# 4. The two fleet state-machine roles (fleet-startup, fleet-cutover)
-for w in startup cutover; do
-  aws iam create-role --role-name "$PROJECT-fleet-$w-role" \
-    --assume-role-policy-document "file://iam/fleet-$w-role.trust.filled.json" \
-    --query Role.RoleName --output text
-  aws iam put-role-policy --role-name "$PROJECT-fleet-$w-role" \
-    --policy-name fleet --policy-document "file://iam/fleet-$w-role.policy.filled.json"
+# 1. Fill the blanks and SPLIT each combined file into trust/policy/vpc parts (python3, like setup.sh).
+#    Writes iam/<svc>.trust.filled.json, iam/<svc>.policy.filled.json, and (glue only) iam/glue.vpc.filled.json.
+for f in iam/glue.json iam/lambda.json iam/stepfunctions.json; do
+  REGION="$REGION" ACCOUNT_ID="$ACCOUNT_ID" BUCKET="$BUCKET" DSQL_CLUSTER_ID="$DSQL_CLUSTER_ID" \
+  PROJECT="$PROJECT" GLUE_ROLE_NAME="$PROJECT-glue-exec-role" \
+  python3 - "$f" <<'PY'
+import json, os, re, sys
+src = sys.argv[1]
+subs = {"<<REGION>>": os.environ["REGION"], "<<ACCOUNT_ID>>": os.environ["ACCOUNT_ID"],
+        "<<BUCKET>>": os.environ["BUCKET"], "<<DSQL_CLUSTER_ID>>": os.environ["DSQL_CLUSTER_ID"],
+        "<<PROJECT>>": os.environ["PROJECT"], "<<GLUE_EXEC_ROLE_NAME>>": os.environ["GLUE_ROLE_NAME"]}
+raw = open(src, encoding="utf-8").read()
+for k, v in subs.items(): raw = raw.replace(k, v)
+left = re.findall(r"<<[^>]*>>", raw)
+if left: sys.exit("STOP: placeholder(s) left in %s: %s" % (src, ", ".join(sorted(set(left)))))
+doc = json.loads(raw)
+base = os.path.splitext(os.path.basename(src))[0]   # glue | lambda | stepfunctions
+def dump(obj, suffix):
+    open("iam/%s.%s.filled.json" % (base, suffix), "w", encoding="utf-8").write(json.dumps(obj, indent=2) + "\n")
+dump(doc["TrustPolicy"], "trust"); dump(doc["Policy"], "policy")
+if doc.get("VpcPolicy"): dump(doc["VpcPolicy"], "vpc")
+print("ROLE=%s" % doc["RoleName"])
+PY
 done
 
-# 5. VPC only (GLUE_CONNECTION is not ""): let Glue make network interfaces in your subnet
+# 2. Create (or update) the three roles — one per service. The inline policy name equals the role name.
+for svc in glue lambda stepfunctions; do
+  case "$svc" in glue|lambda) rname="$PROJECT-$svc-exec-role" ;; stepfunctions) rname="$PROJECT-sfn-exec-role" ;; esac
+  if aws iam get-role --role-name "$rname" >/dev/null 2>&1; then
+    aws iam update-assume-role-policy --role-name "$rname" \
+      --policy-document "file://iam/$svc.trust.filled.json"
+  else
+    aws iam create-role --role-name "$rname" \
+      --assume-role-policy-document "file://iam/$svc.trust.filled.json" \
+      --query Role.RoleName --output text
+  fi
+  aws iam put-role-policy --role-name "$rname" --policy-name "$rname" \
+    --policy-document "file://iam/$svc.policy.filled.json"
+done
+
+# 3. VPC only (GLUE_CONNECTION is not ""): add the Glue networking inline policy 'glue-vpc'.
 aws iam put-role-policy --role-name "$PROJECT-glue-exec-role" \
-  --policy-name glue-vpc --policy-document file://iam/glue-exec-role.vpc-addon.policy.filled.json
+  --policy-name glue-vpc --policy-document file://iam/glue.vpc.filled.json
 ```
 
-**Verify:** all six roles exist:
-`for r in glue-exec lambda-exec sfn-exec preflight-tasks fleet-startup fleet-cutover; do aws iam get-role --role-name "$PROJECT-$r-role" --query Role.RoleName --output text 2>/dev/null || echo "MISSING: $PROJECT-$r-role"; done`
+**Verify:** all three roles exist:
+`for r in glue-exec lambda-exec sfn-exec; do aws iam get-role --role-name "$PROJECT-$r-role" --query Role.RoleName --output text 2>/dev/null || echo "MISSING: $PROJECT-$r-role"; done`
 
 > **Already created a role from an unfilled file?** Run part 1 again, then
 > `aws iam update-assume-role-policy --role-name "$PROJECT-<role>" --policy-document file://iam/<role>.trust.filled.json`
@@ -375,7 +394,7 @@ functions share the **Lambda role** from Step 1, and `preflight-tasks` runs on i
 | `$PROJECT-stop-cdc-run` | `stop_cdc_run.handler` | lambda-exec-role | stops this task's CDC run at cutover |
 | `$PROJECT-drain-check` | `drain_check.handler` | lambda-exec-role | **connects to DSQL:** waits until the last CDC file is applied |
 | `$PROJECT-drop-tags` | `drop_tags.handler` | lambda-exec-role | **connects to DSQL:** drops the internal `_cdc_file` tracking column at cutover |
-| `$PROJECT-preflight-tasks` | `preflight_tasks.handler` | preflight-tasks-role | the fleet's first step: reads `fleet_tasks.csv` and checks every task before any per-task run starts (reuses `resolve_task`'s rules) |
+| `$PROJECT-preflight-tasks` | `preflight_tasks.handler` | lambda-exec-role | the fleet's first step: reads `fleet_tasks.csv` and checks every task before any per-task run starts (reuses `resolve_task`'s rules) |
 
 **1. Build the zip.** It holds every `.py` from `lambdas/` (including `preflight_tasks.py`) plus the
 **`pg8000`** library, which `drain-check` and `drop-tags` import to connect to DSQL. pg8000 is pure
@@ -434,7 +453,7 @@ if aws lambda get-function --function-name "$NAME" >/dev/null 2>&1; then
 else
   aws lambda create-function --function-name "$NAME" --zip-file fileb://fn.zip \
     --handler preflight_tasks.handler --runtime python3.12 --memory-size 256 --timeout 300 \
-    --role "arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-preflight-tasks-role" \
+    --role "$LAMBDA_ROLE_ARN" \
     --query FunctionName --output text
   aws lambda wait function-active-v2 --function-name "$NAME"
 fi
@@ -458,7 +477,7 @@ done
 > **Using the console instead?** For each of the seven core functions: **Author from scratch**,
 > runtime **Python 3.12**, **Use an existing role** → `$PROJECT-lambda-exec-role`; upload the same
 > `fn.zip`; set the handler from the table; set **Memory 1024 MB** and **Timeout 5 min**. For
-> `preflight-tasks`, use `$PROJECT-preflight-tasks-role`, handler `preflight_tasks.handler`, **Memory
+> `preflight-tasks`, use `$PROJECT-lambda-exec-role`, handler `preflight_tasks.handler`, **Memory
 > 256 MB**, **Timeout 5 min**. The 1024 MB / 300 s matters for `driver-discovery` (preparing the CDC
 > wheels) — the error message points back to this step.
 
@@ -574,9 +593,11 @@ Every per-task `startup` and `cutover` run — and the fleet's preflight — rea
 `s3://$BUCKET/config/pipeline.json`. An edit applies to runs started **after** it, not to runs
 already going.
 
-> **params.csv is offline-tested; real-AWS test pending.** The `params.csv` → `pipeline.json` flow
-> below (the parser, `tools/setup.sh --dry-run` and the fleet's safe-publish) passes an offline test
-> suite only; it has **not** been run against live AWS yet. Run one small live fleet first.
+> **params.csv, the automatic table list, and the 3-role IAM setup are offline-tested; real-AWS test
+> pending.** The `params.csv` → `pipeline.json` flow below (the parser, `tools/setup.sh --dry-run`
+> and the fleet's safe-publish), the automatic table-list build (`BuildTableList` from the DMS task),
+> and the one-role-per-service IAM (glue/lambda/stepfunctions) all pass an offline test suite only;
+> they have **not** been run against live AWS yet. Run one small live fleet first.
 
 **The recommended way: one `params.csv`, built by `tools/setup.sh`.** Put every "export" value in a
 single `params.csv` and let setup build `pipeline.json` (and everything else) from it, so nobody
@@ -609,8 +630,9 @@ retypes an export block.
 
 `setup.sh` does Steps 1–4 in one pass (create-or-update, so re-running only fixes drift):
 
-- fills `iam/*.json` and creates/updates **all 6 roles** (glue, lambda, sfn, preflight-tasks,
-  fleet-startup, fleet-cutover);
+- fills + splits `iam/glue.json`, `iam/lambda.json`, `iam/stepfunctions.json` and creates/updates
+  **all 3 roles** — one per service (glue, lambda, sfn); all 8 Lambdas use the lambda role and all 4
+  state machines use the sfn role;
 - creates the Glue network connection when `subnet_id`/`security_group_id` are set (Step 1b);
 - builds `fn.zip` (every `lambdas/*.py` + pg8000) and creates/updates **all 8 Lambdas**;
 - uploads the 4 Glue scripts and the 6 Glue job templates; with `--with-drivers`, also stages the
@@ -635,7 +657,7 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. `dsql_c
 | `account_id` | **required** | — | 12-digit AWS account id (setup/IAM only; never written to `pipeline.json`) |
 | `region` | **required** | — | AWS region of the DMS tasks and pipeline (must equal the task ARN's region) |
 | `project` | **required** | — | short prefix (letters, digits, hyphens) for role, Lambda and job names |
-| `dsql_endpoint` | **required** | — | Aurora DSQL endpoint, e.g. `<cluster>.dsql.<region>.on.aws` |
+| `dsql_endpoint` | **required** | — | Aurora DSQL endpoint, e.g. `<cluster>.dsql.<region>.on.aws`; inside a VPC with no internet use the VPC endpoint's private DNS name `<cluster>.dsql-<id>.<region>.on.aws` (see the note below) |
 | `dsql_user` | optional | `admin` | DSQL user |
 | `dsql_database` | optional | `postgres` | DSQL database |
 | `glue_connection` | optional | `""` (no VPC) | the Glue network connection's **exact** name; `""` = Glue runs with no VPC connection |
@@ -650,6 +672,13 @@ The ten keys that end up in `pipeline.json` are `project`, `region`, `dsql_endpo
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
 `control_schema`. `account_id`, `subnet_id` and `security_group_id` are used only by setup and are
 never written into `pipeline.json`.
+
+> **`dsql_endpoint` inside a VPC (no internet):** when Glue runs in a VPC without internet access
+> (`glue_connection` set), use the DSQL **VPC endpoint's private DNS name**
+> `<cluster>.dsql-<id>.<region>.on.aws` (note the `dsql-<id>`), not the public
+> `<cluster>.dsql.<region>.on.aws` — the public name times out at discovery. Find it with
+> `aws ec2 describe-vpc-endpoints` for service `com.amazonaws.<region>.dsql-<id>` (the endpoint must
+> have private DNS enabled).
 
 ### The safe-publish rule (how `pipeline.json` is published from `params.csv`)
 
@@ -781,8 +810,8 @@ for f in startup cutover; do
 done
 ```
 
-**4. Create the two fleet machines, or update them if they exist.** Each runs on its own fleet role
-from Step 1:
+**4. Create the two fleet machines, or update them if they exist.** Each runs on the shared Step
+Functions role from Step 1 (`$SFN_ROLE_ARN`):
 
 ```bash
 for w in startup cutover; do
@@ -791,11 +820,11 @@ for w in startup cutover; do
   if [ -n "$ARN" ]; then
     aws stepfunctions update-state-machine --state-machine-arn "$ARN" \
       --definition "file://fleet-$w.filled.asl.json" \
-      --role-arn "arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-fleet-$w-role"
+      --role-arn "$SFN_ROLE_ARN"
   else
     aws stepfunctions create-state-machine --name "$PROJECT-fleet-$w" \
       --definition "file://fleet-$w.filled.asl.json" \
-      --role-arn "arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-fleet-$w-role"
+      --role-arn "$SFN_ROLE_ARN"
   fi
 done
 ```
@@ -824,30 +853,11 @@ In a fresh shell, load `BUCKET` and `AWS_PAGER=""` ([Coming back in a new shell]
 Trigger a fleet with `{"bucket","inputPrefix"}` only. The DMS task ARNs go in the CSV, not on the
 command line.
 
-### 5b — upload each task's table list
-
-For **every** task you'll list, stage its table list at
-`s3://$BUCKET/config/_task/<task name>/table_manifest.csv`. `<task name>` is the DMS task's name
-(or the `task_suffix` you give it in the CSV). A CSV with a header row and two columns,
-`dms_schema,dms_table` — each table **as DMS writes it to S3** (i.e. after any rename in the DMS
-table mapping). Letter case doesn't matter: discovery finds DMS's folder in any case, and the DSQL
-target is the same names in lowercase.
-
-```csv
-dms_schema,dms_table
-TARGET_SCHEMA,MY_TABLE
-target_schema,another_table
-```
-
-```bash
-# repeat per task; TASK_NAME is the DMS task name (or its task_suffix)
-aws s3 cp table_manifest.csv "s3://$BUCKET/config/_task/<TASK_NAME>/table_manifest.csv"
-```
-
-A table with no folder yet (no rows at full load) is loaded empty, with a warning; the CDC job
-picks it up when DMS creates the folder. If **none** of a task's tables has a folder, that task's
-discovery fails and lists the folders it did find, so a wrong name can't quietly load nothing.
-Preflight refuses to start a task whose `table_manifest.csv` is missing or empty.
+The table list for each task is built automatically from the DMS task after its full load (the
+per-task `startup` workflow reads it from `describe_table_statistics` and the task's table
+mappings), so there is nothing to upload. To load fewer tables, change the DMS task's selection
+rules. A table with no rows at full load is still included and loaded empty, with a warning; the
+CDC job picks it up when DMS creates the folder.
 
 ### 5c — write `fleet_tasks.csv`
 
@@ -911,8 +921,9 @@ checks); a DMS task ARN in the pipeline's region, listed once, that exists; a fo
 enough for the Glue job names; no two rows on the same folder; a folder not owned by a different
 task. For a startup fleet it also runs each task's pre-start checks (`full-load-and-cdc`,
 `StopTaskCachedChangesApplied=true`, `AddColumnName=true`, the pipeline bucket, not past its full
-load), confirms each `table_manifest.csv` is staged and non-empty, and that the fleet's table lists
-use at most 9 distinct DSQL schemas.
+load) and estimates, from each task's selection rules, that the fleet uses at most 9 distinct DSQL
+schemas (the exact count is only known after full load, so the hard limit is enforced per task
+while the table list is built — before any Glue job is created).
 
 ### 5f — watch each task
 
@@ -1103,9 +1114,11 @@ are confident in the cutover.
   `all_rows_committed=true`). Cutover waits for the newest change file of each such table to be
   marked done, and never stops or deletes that separate job.
 - **Schema limit:** DSQL allows 10 schemas per database and `cdc_control` uses one, so a startup
-  fleet's table lists may use at most 9 distinct DSQL schemas. Schemas already in the database from
-  other tasks also count toward the limit of 10, but preflight can't see them — it prints a warning
-  with the count it does see.
+  task may load into at most 9 distinct DSQL schemas. This is enforced per task while its table
+  list is built from the DMS task (before any Glue job is created); preflight also estimates it up
+  front from each task's selection rules and fails early when even the explicit schema names
+  already exceed 9. Schemas already in the database from other tasks also count toward the limit of
+  10, but the pipeline can't see them — it prints a warning with the count it does see.
 
 ---
 
@@ -1245,8 +1258,9 @@ CONFIG_PREFIX="s3://$BUCKET/config/_task/$TASK_NAME/"
    step 2 — applied change files stay in the folder and would otherwise all be replayed.
 5. **Reload with a DMS task that hasn't run yet, through the fleet.** The pipeline refuses a task
    past its full load, so create a new DMS task with the same settings and table mapping (a new
-   name gives it a new folder), stage its `table_manifest.csv` ([5b](#5b--upload-each-tasks-table-list)),
-   add its ARN as a row in `fleet_tasks.csv`, and trigger `fleet-startup` ([Step 5](#step-5--run-tasks-with-the-fleet)).
+   name gives it a new folder), add its ARN as a row in `fleet_tasks.csv`, and trigger
+   `fleet-startup` ([Step 5](#step-5--run-tasks-with-the-fleet)); the table list is rebuilt from
+   the new task automatically.
    If you reuse the old name, archive the old `config/_task/<name>/` folder first
    (`aws s3 mv "${CONFIG_PREFIX}" "s3://$BUCKET/config/_archive/$TASK_NAME-$(date +%Y%m%d%H%M)/" --recursive`).
 
@@ -1292,8 +1306,9 @@ can be deleted row by row as the bugs are fixed.
 | 4 | **`config/pipeline.example.json` fails the placeholder check.** Its `description` line contains `<bucket>`, and any value with `<`/`>` is rejected, so a copied-as-is template makes every run (and preflight) fail at `ResolveFailed`. | Generate `pipeline.json` with the Step 3c script (it omits `description`). If you must hand-edit, delete the `description` key, or any value containing `<` or `>`. |
 | 5 | **A console "Run" of the CDC job is not stopped by cutover.** Cutover finds the CDC run by its `--config_prefix` **run** argument; a console run (or a `start-job-run` without that argument) has none, so cutover leaves it running. | Always start the CDC job with `--arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}"` (the block in [If a run fails](#if-a-run-fails-how-to-continue)). Never use the console Run button for the CDC job. If one slips through, stop it with `aws glue batch-stop-job-run` after cutover. |
 
-> The **parameters CSV** ([`params.csv`](#params-csv)) is not a bug. It has shipped (offline-tested;
-> real-AWS test pending): copy [`config/params.example.csv`](config/params.example.csv), upload it
+> The **parameters CSV** ([`params.csv`](#params-csv)) is not a bug. It has shipped (params.csv, the
+> automatic table list, and the 3-role IAM setup are offline-tested; real-AWS test pending): copy
+> [`config/params.example.csv`](config/params.example.csv), upload it
 > as `s3://$BUCKET/config/params.csv`, and `tools/setup.sh` and the fleet build `config/pipeline.json`
 > from it ([Step 3c](#step-3c--pipeline-settings)). The hand-edited export block still works if you
 > prefer it.
@@ -1319,14 +1334,14 @@ Grouped by where the problem shows up. For the next step after a failed run, see
 | Symptom | Cause | Fix |
 |---|---|---|
 | `MissingFleetInput` | started without both `bucket` and `inputPrefix` as strings | start with `{"bucket":"...","inputPrefix":"config"}` |
-| `PreflightFailed` | the cause lists one or more problems: a `pipeline.json` problem, a missing/empty task list, a bad or duplicate row, a folder owned by another task, a missing `table_manifest.csv`, or too many DSQL schemas | fix each listed problem (settings in Step 3c, the CSV in [5c](#5c--write-fleet_taskscsv), the table lists in [5b](#5b--upload-each-tasks-table-list)); nothing started, so just trigger the fleet again |
+| `PreflightFailed` | the cause lists one or more problems: a `pipeline.json` problem, a missing/empty task list, a bad or duplicate row, a folder owned by another task, or too many DSQL schemas named in a task's selection rules | fix each listed problem (settings in Step 3c, the CSV in [5c](#5c--write-fleet_taskscsv)); nothing started, so just trigger the fleet again |
 | `PreflightFailed`: `s3://.../pipeline.json differs from .../config/pipeline.json` | a second `pipeline.json` next to the task list differs from the one every task reads | make `config/pipeline.json` the settings you want (keep a dated copy first), or remove the copy next to the task list |
 | `PreflightFailed`: `params.csv has N problem(s)` | `params.csv` failed parse/validation (missing required key, `account_id` not 12 digits, `subnet_id`/`security_group_id` not both-or-neither, an unknown or duplicate key, or a value still holding `<`/`>`) | fix each listed problem in `params.csv` ([Step 3c](#step-3c--pipeline-settings)), re-upload it, trigger the fleet again |
 | `PreflightFailed`: `sets project=… but this fleet runs the …` | `params.csv`'s `project` ≠ the project of the fleet's per-task state machine | set `project` in `params.csv` to match the fleet you're running, re-upload, trigger again |
 | `PreflightFailed`: `both s3://…/params.csv and s3://…/pipeline.json exist` | a `pipeline.json` next to the task list is ambiguous when `params.csv` builds `config/pipeline.json` | remove the `<inputPrefix>/pipeline.json` copy; keep only `params.csv`, trigger again |
 | `PreflightFailed`: `would change …/pipeline.json, but these runs are in progress` | a startup fleet's `params.csv` differs from live settings while a `startup`/`cutover`/fleet execution is running | wait for the named runs to finish (settings are never changed under a running task), then trigger the fleet again |
 | `PreflightFailed`: `settings are never changed at cutover` | a **cutover** fleet's `params.csv` would change `config/pipeline.json` | publish the new settings with a **startup** fleet (or by hand) first, then cut over |
-| `PreflightFailed`: `could not list running executions to safely change …/pipeline.json` | the preflight role can't `states:ListExecutions` on the four workflows, so the safe-publish fails closed | add `states:ListExecutions` for `$PROJECT-{startup,cutover,fleet-startup,fleet-cutover}` to the preflight role (Step 1), trigger again |
+| `PreflightFailed`: `could not list running executions to safely change …/pipeline.json` | the lambda role can't `states:ListExecutions` on the four workflows, so the safe-publish fails closed | confirm the lambda role grants `states:ListExecutions` for `$PROJECT-{startup,cutover,fleet-startup,fleet-cutover}` (Step 1), trigger again |
 | `FleetStartIncomplete` | at least one task didn't start | open `results.tasks` in the execution output; fix the `not_started` tasks, re-trigger the fleet (started ones are skipped) |
 | preflight warning: `could not list running executions` | the preflight role can't `states:ListExecutions`/`DescribeExecution` | the fleet still starts every task and the per-task duplicate-run guard still refuses second runs; add the permissions (Step 1) to get the skip-already-running behaviour back |
 
@@ -1348,8 +1363,9 @@ These show up on a per-task child execution.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Discovery: `None of the N table(s) in this task has a DMS folder` | the table list names a schema/table DMS didn't write (often the source schema when the mapping renames it), a different BucketFolder, or DMS hasn't finished | the error lists the folders that exist; use those names (any case) in the table list and re-trigger the fleet |
-| Discovery log: `no folder for table '<name>'` | the table had no rows at full load (normal), or the name is wrong | if the source table has rows, fix its name ([5b](#5b--upload-each-tasks-table-list)) and re-trigger the fleet |
+| `BuildTableListFailed` | building the table list from the DMS task failed: a table didn't load cleanly (an error/suspended `TableState`), the task's table mapping uses a transformation this pipeline can't reproduce for S3 folder names, or the task loads into more than 9 distinct DSQL schemas | the error names the tables/action/schemas; fix the source or the DMS task (its selection or transformation rules), then re-trigger the fleet. No Glue jobs were created |
+| Discovery: `None of the N table(s) in this task has a DMS folder` | the DMS task mapping renames a schema/table to a name DMS didn't actually write, a different BucketFolder, or DMS hasn't finished | the error lists the folders that exist; adjust the DMS task's table mapping to match and re-trigger the fleet |
+| Discovery log: `no folder for table '<name>'` | the table had no rows at full load (normal) | nothing to do; the CDC job picks it up when DMS first writes the table |
 | Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
 | Any Glue job: `Unknown service: 'dsql'` | `driver-cdc/` lacks a current boto3 set (the Spark jobs take boto3 from it too) | upload it (Step 3b) and re-trigger the fleet |
 | Glue job: `Can't create a connection to host ...dsql... port 5432`, or `Name or service not known` | the job isn't in your VPC | create the connection (Step 1b), set `glue_connection` (3c), re-trigger the fleet. Check: `aws glue get-job --job-name <job> --query Job.Connections` |

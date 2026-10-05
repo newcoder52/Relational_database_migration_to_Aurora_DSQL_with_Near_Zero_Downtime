@@ -29,10 +29,12 @@ CHECKS, every row (all problems collected, then one error):
               the same folder; the folder is not owned by a different task (_task.json).
   startup     resolve_task's pre-start checks on the task and its S3 endpoint
               (full-load-and-cdc, StopTaskCachedChangesApplied, AddColumnName, bucket, not past
-              full load, ...); table_manifest.csv is staged; a folder with files from an earlier
-              run but no owner record needs adopt_existing_folder; the number of distinct DSQL
-              schemas in the fleet's table lists is at most 9 (DSQL's 10-schema limit minus
-              cdc_control).
+              full load, ...); a folder with files from an earlier run but no owner record needs
+              adopt_existing_folder. The table list is built automatically after full load (the
+              per-task workflow's BuildTableList step), so nothing is uploaded; preflight only
+              ESTIMATES the distinct DSQL schemas from each task's selection rules and flags the
+              fleet-wide <=9 cap (the hard check runs per task in BuildTableList, before any Glue
+              job). A wildcard-schema task makes the estimate partial -> warning, not failure.
   cutover     the task was started by the pipeline (owner record present).
 
 SKIPPED, NOT STARTED AGAIN (so re-triggering the fleet after a partial failure only starts the
@@ -69,7 +71,8 @@ import params_csv as pc       # same zip: the one params.csv parser / pipeline.j
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 SETTINGS_KEY = rt.SETTINGS_KEY_DEFAULT          # config/pipeline.json
-MAX_DISTINCT_SCHEMAS = 9                        # DSQL: 10 schemas per database, minus cdc_control
+# The <=9 distinct-DSQL-schema cap lives in resolve_task (rt._MAX_DISTINCT_SCHEMAS): preflight's
+# pre-start estimate and each task's authoritative BuildTableList check share the one constant.
 _TRUE = {"true", "1", "yes", "y"}
 _DEFAULT_PARAMS_FILE = "params.csv"
 
@@ -86,16 +89,6 @@ def _get_text(s3, bucket, key):
         if code in ("NoSuchKey", "404", "NotFound") or type(e).__name__ == "NoSuchKey":
             return None
         raise
-
-
-def _manifest_schemas(text):
-    """Distinct DSQL schemas a table list loads into (dms_schema lowercased, as discovery does)."""
-    out = set()
-    for row in csv.DictReader(io.StringIO(text or "")):
-        s = str(row.get("dms_schema") or "").strip().lower()
-        if s:
-            out.add(s)
-    return out
 
 
 def _running_tasks(state_machine_arn, warnings):
@@ -366,6 +359,7 @@ def handler(event, context):
 
     running = _running_tasks(event.get("stateMachineArn"), warnings)
     out_tasks, suffix_seen, arn_seen, all_schemas = [], {}, {}, set()
+    schema_estimate_unknown = False   # a wildcard-schema task made the pre-start estimate partial
     stamp = time.strftime("%Y%m%d%H%M", time.gmtime())
 
     for i, row in enumerate(rows, start=1):
@@ -437,14 +431,22 @@ def handler(event, context):
                                       f"earlier run (e.g. {leftover}) but no owner record. If they "
                                       f"belong to this task, set adopt_existing_folder=true; "
                                       f"otherwise archive the folder."); continue
-            manifest = _get_text(s3, bucket, prefix + "table_manifest.csv")
-            if manifest is None:
-                errors.append(f"{where}: no table list at s3://{bucket}/{prefix}table_manifest.csv "
-                              f"(RUNBOOK Step 5b)."); continue
-            schemas = _manifest_schemas(manifest)
-            if not schemas:
-                errors.append(f"{where}: s3://{bucket}/{prefix}table_manifest.csv lists no tables."); continue
-            all_schemas |= schemas
+            # The table list is built automatically after full load (state BuildTableList in the
+            # per-task startup workflow), so there is nothing to upload and preflight no longer
+            # requires a table_manifest.csv. Estimate the distinct DSQL schemas from the task's
+            # TableMappings selection rules so the fleet-wide <=9 cap can still be flagged before
+            # launch; the authoritative check runs in BuildTableList (before any Glue job).
+            try:
+                task_rules = rt._parse_table_mappings(task, arn)
+                est_schemas, est_wildcard = rt._estimate_selection_schemas(task_rules)
+            except rt.TableListError as e:
+                errors.append(f"{where}: {e}"); continue
+            all_schemas |= est_schemas
+            if est_wildcard:
+                schema_estimate_unknown = True
+                warnings.append(f"{where}: the task's selection rules use a wildcard schema, so "
+                                f"the distinct-DSQL-schema count can't be known before full load; "
+                                f"the <=9 cap is enforced in BuildTableList.")
         elif not marker:
             errors.append(f"{where}: no owner record s3://{bucket}/{prefix}_task.json, so this task "
                           f"was never started by the pipeline; there is nothing to cut over."); continue
@@ -456,15 +458,25 @@ def handler(event, context):
             "input": child_input,
         })
 
-    if mode == "startup" and len(all_schemas) > MAX_DISTINCT_SCHEMAS:
+    # Pre-start estimate only: the authoritative distinct-DSQL-schema count comes from the real
+    # table statistics in each task's BuildTableList step (which hard-fails before any Glue job).
+    # Here we can only count the EXPLICIT (non-wildcard) schema names from selection rules, so we
+    # fail only when even that lower bound already exceeds the cap (certainly too many); when a
+    # wildcard schema made the count unknown we warn and let BuildTableList enforce it.
+    if mode == "startup" and len(all_schemas) > rt._MAX_DISTINCT_SCHEMAS:
         errors.append(
-            f"The fleet's table lists load into {len(all_schemas)} distinct DSQL schemas "
-            f"({sorted(all_schemas)}); DSQL allows 10 per database and cdc_control takes one, so at "
-            f"most {MAX_DISTINCT_SCHEMAS}. Split the fleet or use fewer schemas.")
-    if mode == "startup" and all_schemas:
-        warnings.append(f"This fleet uses {len(all_schemas)} DSQL schema(s) {sorted(all_schemas)}. "
-                        f"Schemas already in the DSQL database from other tasks also count toward "
-                        f"its limit of 10 (preflight can't see them).")
+            f"The fleet's tasks name {len(all_schemas)} distinct DSQL schemas in their selection "
+            f"rules ({sorted(all_schemas)}); DSQL allows 10 per database and cdc_control takes one, "
+            f"so at most {rt._MAX_DISTINCT_SCHEMAS}. Use fewer schemas (change the tasks' selection "
+            f"rules) or split the fleet.")
+    if mode == "startup" and (all_schemas or schema_estimate_unknown):
+        extra = (" plus one or more wildcard-schema tasks whose schemas can't be counted until "
+                 "full load" if schema_estimate_unknown else "")
+        warnings.append(f"This fleet names {len(all_schemas)} explicit DSQL schema(s) "
+                        f"{sorted(all_schemas)}{extra}; the <=9 cap is enforced per task in "
+                        f"BuildTableList after full load. Schemas already in the DSQL database "
+                        f"from other tasks also count toward its limit of 10 (preflight can't see "
+                        f"them).")
 
     if errors:
         raise PreflightError(f"Fleet preflight found {len(errors)} problem(s); nothing was "

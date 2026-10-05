@@ -1,0 +1,106 @@
+{
+  "RoleName": "<<PROJECT>>-glue-exec-role",
+  "_comment": "Glue job execution role (all Glue jobs: discovery, load, validate, CDC). TrustPolicy + Policy are always applied by tools/setup.sh. VpcPolicy is applied as a SEPARATE inline policy (name 'glue-vpc') ONLY when a Glue network connection is configured (subnet_id + security_group_id set, i.e. glue_connection != \"\").",
+  "TrustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": { "Service": "glue.amazonaws.com" },
+        "Action": "sts:AssumeRole",
+        "Condition": { "StringEquals": { "aws:SourceAccount": "<<ACCOUNT_ID>>" } }
+      }
+    ]
+  },
+  "Policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "S3DataAndScripts",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+        "Resource": ["arn:aws:s3:::<<BUCKET>>/*"]
+      },
+      {
+        "Sid": "S3List",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+        "Resource": ["arn:aws:s3:::<<BUCKET>>"]
+      },
+      {
+        "Sid": "DsqlConnect",
+        "Effect": "Allow",
+        "Action": ["dsql:DbConnectAdmin", "dsql:DbConnect"],
+        "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
+      },
+      {
+        "Sid": "DmsDescribeForCdcDdlWatcher",
+        "Effect": "Allow",
+        "Action": ["dms:DescribeTableStatistics", "dms:DescribeReplicationTasks"],
+        "Resource": ["*"]
+      },
+      {
+        "Sid": "CloudWatchLogs",
+        "Effect": "Allow",
+        "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        "Resource": ["arn:aws:logs:<<REGION>>:*:/aws-glue/*"]
+      },
+      {
+        "Sid": "CloudWatchMetricsForCdc",
+        "Effect": "Allow",
+        "Action": ["cloudwatch:PutMetricData"],
+        "Resource": ["*"],
+        "Condition": {"StringEquals": {"cloudwatch:namespace": "GlueCDC/NonPK"}}
+      }
+    ]
+  },
+  "VpcPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "GlueVpcNetworkInterfaces",
+        "Effect": "Allow",
+        "Action": [
+          "ec2:CreateNetworkInterface",
+          "ec2:DeleteNetworkInterface",
+          "ec2:DescribeNetworkInterfaces",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeVpcs",
+          "ec2:DescribeVpcAttribute",
+          "ec2:DescribeVpcEndpoints",
+          "ec2:DescribeRouteTables"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "GlueVpcEniTags",
+        "Effect": "Allow",
+        "Action": [
+          "ec2:CreateTags",
+          "ec2:DeleteTags"
+        ],
+        "Resource": "arn:aws:ec2:*:*:network-interface/*",
+        "Condition": {
+          "ForAllValues:StringEquals": {
+            "aws:TagKeys": [
+              "aws-glue-service-resource"
+            ]
+          }
+        }
+      },
+      {
+        "Sid": "ReadGlueConnection",
+        "Effect": "Allow",
+        "Action": [
+          "glue:GetConnection",
+          "glue:GetConnections"
+        ],
+        "Resource": [
+          "arn:aws:glue:<<REGION>>:<<ACCOUNT_ID>>:catalog",
+          "arn:aws:glue:<<REGION>>:<<ACCOUNT_ID>>:connection/*"
+        ]
+      }
+    ]
+  }
+}

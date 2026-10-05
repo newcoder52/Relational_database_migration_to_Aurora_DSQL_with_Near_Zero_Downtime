@@ -71,10 +71,15 @@ source only at cutover, once CDC has caught up and the target matches the source
   `account_id`, `region`, `project`, `dsql_endpoint` (plus any optional keys), upload it as
   `s3://<bucket>/config/params.csv`, and run `tools/setup.sh s3://<bucket>/config/params.csv`
   (idempotent; add `--dry-run` to preview, `--with-drivers` to stage the Glue driver wheels). Setup
-  builds all 6 roles, 8 Lambdas, 4 state machines and `config/pipeline.json` from that one file. The
+  builds the 3 IAM roles (one per service — glue, lambda, sfn), 8 Lambdas, 4 state machines and
+  `config/pipeline.json` from that one file. When Glue runs in a VPC with no internet
+  (`glue_connection` set), set `dsql_endpoint` to the DSQL VPC endpoint's private DNS name
+  `<cluster>.dsql-<id>.<region>.on.aws` (not the public `<cluster>.dsql.<region>.on.aws`, which
+  times out at discovery) — see [RUNBOOK Step 3c](RUNBOOK.md#step-3c--pipeline-settings). The
   fleet reads the same `params.csv` and safely (re)publishes `config/pipeline.json` from it at
-  startup. Then run tasks with the fleet. (params.csv is offline-tested; real-AWS test pending —
-  run one small live fleet first. The hand-edited export block still works too.) See
+  startup. Then run tasks with the fleet. (params.csv, the automatic table list, and the 3-role IAM
+  setup are offline-tested; real-AWS test pending — run one small live fleet first. The hand-edited
+  export block still works too.) See
   [`RUNBOOK.md` Step 3c](RUNBOOK.md#step-3c--pipeline-settings).
 - The DMS task's **name** becomes its config folder, `s3://<bucket>/config/_task/<task name>/`,
   and the middle of its Glue job names, `<project>-<task name>-<role>` (for example
@@ -129,14 +134,20 @@ the order the code runs them:
    and s3transfer are usable, this task's CDC job is built as Spark instead.
 3. **Start DMS** and wait for the full load to finish (`STOPPED_AFTER_CACHED_EVENTS`; polled every
    30 s for up to 24 h, else **`DmsTimedOut`**; a DMS failure is **`DmsFailed`**).
-4. **Create this task's five Glue jobs** from `glue-templates/`.
-5. **Discover, then load and validate each table group** (up to six groups at once). If any group
+4. **Build the table list from the DMS task.** Reads `describe_table_statistics` (every table
+   DMS loaded, including empty ones) and applies the task's table-mapping transformations to get
+   the S3 folder names, then writes `config/_task/<task name>/table_manifest.csv` and
+   `table_list_source.json`. There is nothing to upload. A table that didn't load cleanly, a
+   table-mapping transformation the pipeline can't reproduce, or more than 9 distinct DSQL schemas
+   ends the run at **`BuildTableListFailed`** — before any Glue job is created.
+5. **Create this task's five Glue jobs** from `glue-templates/`.
+6. **Discover, then load and validate each table group** (up to six groups at once). If any group
    fails, the run stops at **`GroupsFailed`** and **DMS stays paused**, so CDC never starts on top
    of an incomplete load.
-6. **Resume DMS into CDC and start the CDC job**, then wait up to 45 min until the CDC job
+7. **Resume DMS into CDC and start the CDC job**, then wait up to 45 min until the CDC job
    confirms it reached its poll loop (**`CdcStartNotConfirmed`** if it never does;
    **`CdcRunFailed`** / **`CdcRunEnded`** if the run fails or stops first).
-7. **Spark fallback, once.** If a Python-shell CDC run fails because Glue couldn't install or
+8. **Spark fallback, once.** If a Python-shell CDC run fails because Glue couldn't install or
    import its drivers (pip/PyPI timeouts, a missing or wrong-Python wheel, `No module named
    'pg8000'`, `Unknown service: 'dsql'`), the CDC job is re-created **with the same name** as
    Spark and started again. Any other error (DSQL, permissions, data) is not retried; a second
@@ -153,7 +164,8 @@ Per-task input keys (set per row in `fleet_tasks.csv`, rarely needed): `task_suf
 different folder and job name than the DMS task's name, and `adopt_existing_folder=true` reuses a
 folder from a run made before the shared state machines existed. The fleet commands are in the
 RUNBOOK's [Step 4](RUNBOOK.md#step-4--create-the-state-machines) (create the state machines)
-and [Step 5b](RUNBOOK.md#5b--upload-each-tasks-table-list) (stage each task's table list).
+and [Step 5](RUNBOOK.md#step-5--run-tasks-with-the-fleet) (run the tasks). Each task's table list
+is built automatically from the DMS task after full load — there is nothing to upload.
 
 ## If a run fails
 

@@ -35,7 +35,8 @@ Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──�
 - **Lambdas** (`lambdas/`, nine `.py` files): `resolve_task`, `driver_discovery`,
   `create_glue_jobs`, `plan_split`, `drain_check`, `stop_cdc_run`, `drop_tags` (the seven core
   functions deployed by RUNBOOK Step 2), `preflight_tasks` (the fleet launcher's own deployed
-  function, with its own IAM role `iam/preflight-tasks-role.*`), and `prepare_cdc_wheels` (not a
+  function, running on the shared `iam/lambda.json` role `<project>-lambda-exec-role`), and
+  `prepare_cdc_wheels` (not a
   deployed function — it ships inside the `driver-discovery` zip and is run automatically by the
   startup workflow).
 - **State machines** (`stepfunctions/`): `startup.asl.json` (full-load→validate→CDC),
@@ -491,19 +492,23 @@ fills dependency gaps and items 1 and 2 stay hidden.
 
 - **Why:** running Step 5/6 by hand for every DMS task doesn't scale. The fleet launcher starts the
   shared `startup` (or `cutover`) for a whole list of tasks from one manual trigger.
-- **What was added:** `lambdas/preflight_tasks.py` (its own deployed function + IAM role
-  `iam/preflight-tasks-role.*`), two state machines `stepfunctions/fleet-startup.asl.json` and
-  `fleet-cutover.asl.json`, the fleet IAM roles (`iam/fleet-startup-role.*`,
-  `iam/fleet-cutover-role.*`), and `config/fleet_tasks.example.csv`.
+- **What was added:** `lambdas/preflight_tasks.py` (its own deployed function, running on the shared
+  `<project>-lambda-exec-role`), two state machines `stepfunctions/fleet-startup.asl.json` and
+  `fleet-cutover.asl.json` (both running on the shared `<project>-sfn-exec-role`), and
+  `config/fleet_tasks.example.csv`. (IAM later consolidated to one combined file per service —
+  `iam/glue.json`, `iam/lambda.json`, `iam/stepfunctions.json` — so the former separate
+  `preflight-tasks`/`fleet-startup`/`fleet-cutover` roles were merged into the lambda and sfn roles.)
 - **How it works:** manual trigger, input `{"bucket","inputPrefix"}`. It reads
   `config/pipeline.json` (the same file every task uses — it does **not** write it) and
   `config/<inputPrefix>/fleet_tasks.csv` (columns `task_arn`, optional `task_suffix`, optional
   `adopt_existing_folder`). The task suffix defaults to the DMS task name. The `Preflight` state
-  (`preflight_tasks`, reusing `resolve_task`'s rules) validates each task's ARN/readiness, the
-  table lists, and that the DSQL database has ≤ 9 of the operator's own schemas (10-schema cap,
-  `cdc_control` is the 10th); it is **fail-closed**. It then starts one per-task execution per task
-  (5 at a time), **asynchronously**, and verifies each reached RUNNING. `FleetStarted` means every
-  task got past its own input checks — **not** that the migrations succeeded.
+  (`preflight_tasks`, reusing `resolve_task`'s rules) validates each task's ARN/readiness and
+  estimates, from each task's selection rules, that the DSQL database stays within ≤ 9 of the
+  operator's own schemas (10-schema cap, `cdc_control` is the 10th; the exact count is enforced
+  per task in `BuildTableList`, before any Glue job); it is **fail-closed**. It then starts one
+  per-task execution per task (5 at a time), **asynchronously**, and verifies each reached
+  RUNNING. `FleetStarted` means every task got past its own input checks — **not** that the
+  migrations succeeded.
 - **Scope note (preflight):** the fleet `Preflight` does **not** inspect Oracle/LogMiner, so it
   does not catch the new-schema CDC-capture gap (`CDC_EDGE_CASE_RESULTS.md` §4).
 - **Single parameters CSV (shipped; offline-tested, real-AWS test pending):** one `params.csv`
@@ -545,6 +550,37 @@ fills dependency gaps and items 1 and 2 stay hidden.
   Python shell (the raw set would need PyPI), and records the choice in `_cdc_engine.json`.
 - **Verified:** workflow simulator 65 checks (4 new cutover cases); CDC optional-API test 12 checks
   on both script copies; switch tool 10 checks; all other suites unchanged.
+
+---
+
+### 2026-10-05 — Table list built from the DMS task; no uploaded table_manifest.csv
+
+- **Before:** every task needed a hand-uploaded `config/_task/<suffix>/table_manifest.csv`
+  (`dms_schema,dms_table`). Preflight refused a task without it, and the operator had to keep each
+  list in sync with the DMS task's selection rules by hand.
+- **Now:** the operator supplies only DMS task ARNs. A new per-task startup state, **`BuildTableList`**
+  (the existing `resolve_task` Lambda, `mode:"build_table_list"`), runs after the full load
+  (`STOPPED_AFTER_CACHED_EVENTS`) and before `CreateGlueJobs`. It reads `describe_table_statistics`
+  (paginated, every loaded table including 0-row ones), applies the task's `TableMappings`
+  transformations (`rename`, `convert-lowercase`/`-uppercase`, `add`/`remove`-`prefix`/`-suffix`,
+  with `%`/`_` object-locator matching) to turn the source names into the S3 folder names, and
+  writes `table_manifest.csv` (same 2-column format discovery already reads) plus
+  `table_list_source.json` (`source=dms`, count, taskArn, timestamp). Any pre-existing
+  `table_manifest.csv` is ignored and overwritten (one log line); there is no operator override.
+  The run fails at **`BuildTableListFailed`** (before any Glue job) if a table is in an
+  error/suspended `TableState`, a transformation can't be reproduced for folder names, or more
+  than 9 distinct DSQL schemas result.
+- Preflight no longer requires a manifest. Its ≤9-schema check became a best-effort estimate from
+  each task's selection rules (fails early only when the explicit, non-wildcard schema names
+  already exceed 9; warns when a wildcard schema makes the count unknowable); the authoritative
+  check moved to `BuildTableList`. The ≤9 cap lives in `resolve_task._MAX_DISTINCT_SCHEMAS`, shared
+  by both. IAM needed no change: `lambda-exec-role` already grants `dms:DescribeTableStatistics`
+  and `s3:PutObject`.
+- **Verified:** offline fake-DMS/S3 suite (23 checks: plain/rename/case/prefix-wildcard/two-rule
+  mappings, unsupported-transform fail, error- and suspended-state fail, 0-row included,
+  pagination, pre-existing manifest ignored+replaced, re-run regenerates, >9 schemas fail before
+  Glue, preflight no longer needs a manifest, wildcard estimate warns); params suite unchanged
+  (53 + 19); py_compile, JSON parse, ASL reachability (46 states), doc `bash -n`, link check.
 
 ---
 

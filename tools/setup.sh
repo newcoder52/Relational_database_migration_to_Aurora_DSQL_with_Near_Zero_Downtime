@@ -7,8 +7,9 @@
 #   tools/setup.sh <local-path-to-params.csv> --bucket <bucket> [--with-drivers] [--dry-run]
 #
 # What it does (create-or-update, safe to re-run), mirroring RUNBOOK Steps 1-4:
-#   1. Fill iam/*.json -> iam/*.filled.json and create/update all 6 roles
-#      (glue, lambda, sfn, preflight-tasks, fleet-startup, fleet-cutover).
+#   1. Fill the 3 combined iam/*.json files and create/update all 3 roles — one per service
+#      (glue-exec, lambda-exec, sfn-exec). The glue VpcPolicy block is applied as a separate
+#      inline policy only when a VPC connection is configured.
 #   1b. Create the Glue network connection, if subnet_id/security_group_id are set.
 #   2. Build fn.zip (every lambdas/*.py + pg8000) and create/update all 8 Lambdas
 #      (resolve-task, driver-discovery, plan-split, create-glue-jobs, stop-cdc-run,
@@ -154,7 +155,6 @@ eval "$EXPORTS"
 GLUE_ROLE_NAME="$P_PROJECT-glue-exec-role"
 LAMBDA_ROLE_ARN="arn:aws:iam::$P_ACCOUNT_ID:role/$P_PROJECT-lambda-exec-role"
 SFN_ROLE_ARN="arn:aws:iam::$P_ACCOUNT_ID:role/$P_PROJECT-sfn-exec-role"
-PREFLIGHT_ROLE_ARN="arn:aws:iam::$P_ACCOUNT_ID:role/$P_PROJECT-preflight-tasks-role"
 LAMBDA_BASE="arn:aws:lambda:$P_REGION:$P_ACCOUNT_ID:function:$P_PROJECT"
 SM_BASE="arn:aws:states:$P_REGION:$P_ACCOUNT_ID:stateMachine"
 HAVE_VPC=0
@@ -163,51 +163,71 @@ HAVE_VPC=0
 echo "=== setup for project=$P_PROJECT region=$P_REGION bucket=$BUCKET (dry-run=$DRY_RUN, with-drivers=$WITH_DRIVERS) ==="
 
 # ---------------------------------------------------------------------------------------------
-# Fill a <<...>> template file into $TMPDIR_SETUP, portably (no sed -i). Echoes the filled path.
+# Fill helpers
 # ---------------------------------------------------------------------------------------------
-fill_file() {
-  src="$1"; out="$2"
-  sed -e "s|<<REGION>>|$P_REGION|g" \
-      -e "s|<<ACCOUNT_ID>>|$P_ACCOUNT_ID|g" \
-      -e "s|<<BUCKET>>|$BUCKET|g" \
-      -e "s|<<DSQL_CLUSTER_ID>>|$P_DSQL_CLUSTER_ID|g" \
-      -e "s|<<PROJECT>>|$P_PROJECT|g" \
-      -e "s|<<GLUE_EXEC_ROLE_NAME>>|$GLUE_ROLE_NAME|g" \
-      "$src" > "$out"
-  if grep -q "<<" "$out"; then
-    echo "ERROR: placeholders left in $out:" >&2
-    grep -n "<<" "$out" >&2
-    exit 1
-  fi
-}
+# IAM templates are filled+split by split_iam() in Step 1 (python3). Glue templates and the
+# state-machine definitions are filled inline in their own steps below. There is no shared
+# fill_file() any more.
 
 # =============================================================================================
-# Step 1 — IAM roles (6)
+# Step 1 — IAM roles (3: one combined file + one role per service)
 # =============================================================================================
 echo "--- Step 1: IAM roles ---"
 mkdir -p "$TMPDIR_SETUP/iam"
 
-# role name : trust file : policy file
-# core three + preflight + the two fleet roles.
-IAM_SPECS="
-glue-exec-role:iam/glue-exec-role.trust.json:iam/glue-exec-role.policy.json
-lambda-exec-role:iam/lambda-exec-role.trust.json:iam/lambda-exec-role.policy.json
-sfn-exec-role:iam/sfn-exec-role.trust.json:iam/sfn-exec-role.policy.json
-preflight-tasks-role:iam/preflight-tasks-role.trust.json:iam/preflight-tasks-role.policy.json
-fleet-startup-role:iam/fleet-startup-role.trust.json:iam/fleet-startup-role.policy.json
-fleet-cutover-role:iam/fleet-cutover-role.trust.json:iam/fleet-cutover-role.policy.json
-"
+# One combined file per service. Each holds {"RoleName","TrustPolicy","Policy"[,"VpcPolicy"]}.
+#   iam/glue.json         -> <project>-glue-exec-role  (all Glue jobs; VpcPolicy only when VPC)
+#   iam/lambda.json       -> <project>-lambda-exec-role (all 8 Lambdas, incl. preflight-tasks)
+#   iam/stepfunctions.json-> <project>-sfn-exec-role   (all 4 state machines, incl. the fleets)
+IAM_FILES="iam/glue.json iam/lambda.json iam/stepfunctions.json"
+
+# split_iam SRC OUTDIR
+#   Fills the <<...>> placeholders in the combined file SRC and writes, into OUTDIR:
+#     <base>.trust.filled.json, <base>.policy.filled.json, and (if a VpcPolicy block exists)
+#     <base>.vpc.filled.json. Prints one line "ROLE=<name> VPC=<0|1>" on stdout so the caller
+#     knows the role name and whether a VpcPolicy was present. Fails (exit 1) if any <<...>>
+#     placeholder is left, matching fill_file's fail-closed behaviour. Portable: python3 only.
+split_iam() {
+  src="$1"; outdir="$2"
+  P_REGION="$P_REGION" P_ACCOUNT_ID="$P_ACCOUNT_ID" P_BUCKET="$BUCKET" \
+  P_DSQL_CLUSTER_ID="$P_DSQL_CLUSTER_ID" P_PROJECT="$P_PROJECT" \
+  P_GLUE_ROLE_NAME="$GLUE_ROLE_NAME" \
+  python3 - "$src" "$outdir" <<'PY'
+import json, os, re, sys
+src, outdir = sys.argv[1], sys.argv[2]
+subs = {
+    "<<REGION>>": os.environ["P_REGION"],
+    "<<ACCOUNT_ID>>": os.environ["P_ACCOUNT_ID"],
+    "<<BUCKET>>": os.environ["P_BUCKET"],
+    "<<DSQL_CLUSTER_ID>>": os.environ["P_DSQL_CLUSTER_ID"],
+    "<<PROJECT>>": os.environ["P_PROJECT"],
+    "<<GLUE_EXEC_ROLE_NAME>>": os.environ["P_GLUE_ROLE_NAME"],
+}
+raw = open(src, encoding="utf-8").read()
+for k, v in subs.items():
+    raw = raw.replace(k, v)
+left = re.findall(r"<<[^>]*>>", raw)
+if left:
+    sys.stderr.write("ERROR: placeholders left in %s: %s\n" % (src, ", ".join(sorted(set(left)))))
+    sys.exit(1)
+doc = json.loads(raw)                       # also validates JSON
+role = doc["RoleName"]
+base = os.path.splitext(os.path.basename(src))[0]
+def dump(obj, suffix):
+    path = os.path.join(outdir, "%s.%s.filled.json" % (base, suffix))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=2) + "\n")
+dump(doc["TrustPolicy"], "trust")
+dump(doc["Policy"], "policy")
+have_vpc = 1 if doc.get("VpcPolicy") else 0
+if have_vpc:
+    dump(doc["VpcPolicy"], "vpc")
+print("ROLE=%s VPC=%d" % (role, have_vpc))
+PY
+}
 
 create_or_update_role() {
-  rname="$1"; trust="$2"; policy="$3"
-  trust_filled="$TMPDIR_SETUP/iam/$(basename "${trust%.json}").filled.json"
-  policy_filled="$TMPDIR_SETUP/iam/$(basename "${policy%.json}").filled.json"
-  fill_file "$trust" "$trust_filled"
-  fill_file "$policy" "$policy_filled"
-  # Also drop filled copies next to the repo files (RUNBOOK convention; .gitignore excludes them)
-  fill_file "$trust" "${trust%.json}.filled.json"
-  fill_file "$policy" "${policy%.json}.filled.json"
-
+  rname="$1"; trust_filled="$2"; policy_filled="$3"
   if [ "$DRY_RUN" -eq 0 ] && aws iam get-role --role-name "$rname" >/dev/null 2>&1; then
     run aws iam update-assume-role-policy --role-name "$rname" \
       --policy-document "file://$trust_filled"
@@ -216,24 +236,42 @@ create_or_update_role() {
       --assume-role-policy-document "file://$trust_filled" \
       --query Role.RoleName --output text
   fi
+  # stable inline policy name per role (same value as before the merge)
   run aws iam put-role-policy --role-name "$rname" --policy-name "$rname" \
     --policy-document "file://$policy_filled"
 }
 
-while IFS=: read -r rname trust policy; do
-  [ -n "$rname" ] || continue
-  create_or_update_role "$P_PROJECT-$rname" "$trust" "$policy"
-done <<EOF
-$IAM_SPECS
-EOF
+for f in $IAM_FILES; do
+  base="$(basename "${f%.json}")"             # glue | lambda | stepfunctions
+  # Fill + split into $TMPDIR_SETUP/iam and, per the RUNBOOK convention, next to the repo file
+  # too (iam/<base>.{trust,policy,vpc}.filled.json; .gitignore excludes *.filled.json).
+  meta="$(split_iam "$f" "$TMPDIR_SETUP/iam")"
+  split_iam "$f" "iam" >/dev/null
+  rname="${meta#ROLE=}"; rname="${rname%% *}"
+  have_vpc_file="${meta##*VPC=}"
+  trust_filled="$TMPDIR_SETUP/iam/$base.trust.filled.json"
+  policy_filled="$TMPDIR_SETUP/iam/$base.policy.filled.json"
+  create_or_update_role "$rname" "$trust_filled" "$policy_filled"
 
-# Glue VPC add-on policy (only when a VPC connection is configured)
-if [ "$HAVE_VPC" -eq 1 ]; then
-  vpc_filled="$TMPDIR_SETUP/iam/glue-exec-role.vpc-addon.policy.filled.json"
-  fill_file "iam/glue-exec-role.vpc-addon.policy.json" "$vpc_filled"
-  fill_file "iam/glue-exec-role.vpc-addon.policy.json" "iam/glue-exec-role.vpc-addon.policy.filled.json"
-  run aws iam put-role-policy --role-name "$GLUE_ROLE_NAME" --policy-name glue-vpc \
-    --policy-document "file://$vpc_filled"
+  # Glue VPC add-on: a separate inline policy (name 'glue-vpc'), applied only when a VPC
+  # connection is configured AND the file actually carries a VpcPolicy block.
+  if [ "$base" = "glue" ] && [ "$HAVE_VPC" -eq 1 ] && [ "$have_vpc_file" = "1" ]; then
+    run aws iam put-role-policy --role-name "$rname" --policy-name glue-vpc \
+      --policy-document "file://$TMPDIR_SETUP/iam/$base.vpc.filled.json"
+  fi
+done
+
+# Upgrade path: the former per-component roles are no longer used. We do NOT delete them (a live
+# e2e run may still reference them); just tell the operator how to remove them once this update
+# is verified.
+if [ "$DRY_RUN" -eq 0 ]; then
+  for old in preflight-tasks-role fleet-startup-role fleet-cutover-role; do
+    if aws iam get-role --role-name "$P_PROJECT-$old" >/dev/null 2>&1; then
+      echo "NOTE: role '$P_PROJECT-$old' is no longer used (its permissions were merged into $P_PROJECT-lambda-exec-role / $P_PROJECT-sfn-exec-role)." >&2
+      echo "      After verifying this update, remove it with:" >&2
+      echo "        aws iam delete-role-policy --role-name $P_PROJECT-$old --policy-name $P_PROJECT-$old 2>/dev/null; aws iam delete-role --role-name $P_PROJECT-$old" >&2
+    fi
+  done
 fi
 
 # =============================================================================================
@@ -286,17 +324,10 @@ drop-tags:drop_tags
 preflight-tasks:preflight_tasks
 "
 
-# preflight-tasks runs on its own role; the other seven on the shared lambda role.
-lambda_role_for() {
-  case "$1" in
-    preflight-tasks) echo "$PREFLIGHT_ROLE_ARN" ;;
-    *)               echo "$LAMBDA_ROLE_ARN" ;;
-  esac
-}
-
+# All 8 Lambdas (incl. preflight-tasks) run on the one shared lambda-exec-role.
 while IFS=: read -r sfx mod; do
   [ -n "$sfx" ] || continue
-  name="$P_PROJECT-$sfx"; handler="$mod.handler"; role="$(lambda_role_for "$sfx")"
+  name="$P_PROJECT-$sfx"; handler="$mod.handler"; role="$LAMBDA_ROLE_ARN"
   if [ "$DRY_RUN" -eq 0 ] && aws lambda get-function --function-name "$name" >/dev/null 2>&1; then
     run aws lambda update-function-code --function-name "$name" --zip-file "fileb://$FN_ZIP" \
       --query FunctionName --output text
@@ -487,8 +518,7 @@ done
 for w in startup cutover; do
   out="$TMPDIR_SETUP/fleet-$w.filled.asl.json"
   fill_fleet_sm "stepfunctions/fleet-$w.asl.json" "$out"
-  create_or_update_sm "$P_PROJECT-fleet-$w" "$out" \
-    "arn:aws:iam::$P_ACCOUNT_ID:role/$P_PROJECT-fleet-$w-role"
+  create_or_update_sm "$P_PROJECT-fleet-$w" "$out" "$SFN_ROLE_ARN"
 done
 
 # =============================================================================================
@@ -499,7 +529,7 @@ echo "=== setup summary ==="
 echo "project         : $P_PROJECT"
 echo "region          : $P_REGION"
 echo "bucket          : $BUCKET"
-echo "roles (6)       : $P_PROJECT-{glue,lambda,sfn}-exec-role, $P_PROJECT-preflight-tasks-role, $P_PROJECT-fleet-{startup,cutover}-role"
+echo "roles (3)       : $P_PROJECT-{glue,lambda,sfn}-exec-role (one per service; lambda runs all 8 Lambdas incl. preflight-tasks, sfn runs all 4 state machines incl. the fleets)"
 echo "lambdas (8)     : $P_PROJECT-{resolve-task,driver-discovery,plan-split,create-glue-jobs,stop-cdc-run,drain-check,drop-tags,preflight-tasks}"
 echo "state machines(4): $P_PROJECT-{startup,cutover,fleet-startup,fleet-cutover}"
 echo "glue scripts    : 4 uploaded to s3://$BUCKET/scripts/"

@@ -55,7 +55,8 @@ collected in `RUNBOOK.md`.
      `s3://<bucket>/config/params.csv`, and run `tools/setup.sh s3://<bucket>/config/params.csv`
      (idempotent; `--dry-run` previews, `--with-drivers` stages the driver wheels). The fleet reads
      the same `params.csv` and safely (re)publishes `config/pipeline.json` from it at startup.
-     (params.csv is offline-tested; real-AWS test pending — run one small live fleet first.)
+     (params.csv, the automatic table list, and the 3-role IAM setup are offline-tested; real-AWS
+     test pending — run one small live fleet first.)
 2. **DMS S3 target endpoint** configured with (these are validated automatically):
    - `AddColumnName = true` (CSVs have header rows),
    - `DatePartitionEnabled = false`,
@@ -79,15 +80,10 @@ collected in `RUNBOOK.md`.
 4. **Target tables exist in DSQL** (created from your clean DDLs) in the lowercased target
    schema, with a single-column PK where possible (multi-column PK tables can't CDC-apply
    cleanly; range-validation needs an integer PK).
-5. **Manifest** staged: `s3://<bucket>/config/_task/<task name>/table_manifest.csv`, naming each
-   table as DMS writes it to S3 (after any schema rename), in any letter case. The DSQL target is
-   the lowercased name. Discovery fails if none of the tables has a DMS folder. Stage one of these
-   per task before a startup fleet ([RUNBOOK Step 5b](RUNBOOK.md#5b--upload-each-tasks-table-list)).
-   ```
-   dms_schema,dms_table
-   target_schema,table_a
-   target_schema,table_b
-   ```
+5. **Table list** — nothing to stage. The pipeline builds each task's table list automatically
+   from the DMS task after its full load (from `describe_table_statistics` plus the task's table
+   mappings), writing `s3://<bucket>/config/_task/<task name>/table_manifest.csv` for you. To load
+   fewer tables, narrow the DMS task's selection rules.
 
 ---
 
@@ -127,11 +123,16 @@ Each per-task startup then performs, in order (matching the `startup` state mach
    on, a problem that only affects Python shell (e.g. a wheel built for 3.10) builds this task's
    CDC job as Spark instead of stopping.
 3. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS` (polled up to ~24 h).
-4. **CreateGlueJobs** → creates this task's 5 Glue jobs (discovery/load/load-big/validate/cdc).
-5. **RunDiscovery** (Job1) → writes `_manifest_index.json` + per-table column mappings.
-6. **PlanSplit** + **GroupFanOut** → runs **Job2 load** then **Job3 validate** per group.
-7. **ResumeDmsToCdc** → resumes DMS from cached-changes stop into ongoing CDC.
-8. **StartCdcJob** → launches the continuous CDC job and confirms it started. A Python-shell run
+4. **BuildTableList** → builds this task's table list from the DMS task (`describe_table_statistics`
+   + the task's table-mapping transformations), writing `table_manifest.csv` and
+   `table_list_source.json` under `config/_task/<task name>/`. Fails at `BuildTableListFailed`
+   (before any Glue job) if a table didn't load cleanly, a transformation can't be reproduced for
+   the S3 folder names, or more than 9 distinct DSQL schemas result.
+5. **CreateGlueJobs** → creates this task's 5 Glue jobs (discovery/load/load-big/validate/cdc).
+6. **RunDiscovery** (Job1) → writes `_manifest_index.json` + per-table column mappings.
+7. **PlanSplit** + **GroupFanOut** → runs **Job2 load** then **Job3 validate** per group.
+8. **ResumeDmsToCdc** → resumes DMS from cached-changes stop into ongoing CDC.
+9. **StartCdcJob** → launches the continuous CDC job and confirms it started. A Python-shell run
    that fails on its drivers is switched to Spark automatically (see below).
 
 After this, each task's full load is in DSQL, validated, and CDC is live.

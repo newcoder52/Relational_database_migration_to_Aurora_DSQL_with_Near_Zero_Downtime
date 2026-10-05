@@ -224,7 +224,7 @@ captured ZERO changes** for these tables.
   caught up, so **cutover can succeed with zero changes applied**. Job 3 validates only the full
   load against S3, and the CDC job's own sampled validation is off by default.
 - **Not covered by the fleet Preflight.** The `preflight_tasks` Lambda (the fleet "Preflight"
-  state) only validates task ARNs, suffixes, table lists and the DSQL schema count — it does
+  state) only validates task ARNs, suffixes and an estimate of the DSQL schema count — it does
   **not** look at Oracle/LogMiner. "Preflight" here is **not** a safeguard for this case.
 - **Fix (DBA-side, outside the pipeline):** before CDC starts, confirm every source schema
   existed before the LogMiner mining dictionary was built, or rebuild it

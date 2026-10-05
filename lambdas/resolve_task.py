@@ -64,6 +64,8 @@ arg value, so the empty case is emitted as the '.' sentinel that derive_table_pr
 normalizes back to "no subfolder".
 """
 
+import csv
+import io
 import json
 import os
 import re
@@ -73,10 +75,17 @@ import boto3
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 
+# DSQL allows 10 schemas per database and cdc_control takes one, so at most 9 task schemas.
+# Single source of truth: preflight_tasks imports this so its pre-start estimate and the
+# authoritative BuildTableList check use the same cap.
+_MAX_DISTINCT_SCHEMAS = 9
+
 
 def handler(event, context):
     if event.get("mode") in ("startup", "cutover"):
         return handler_shared(event, context)
+    if event.get("mode") == "build_table_list":
+        return handler_build_table_list(event, context)
     task_arn = event["taskArn"]
     dms = boto3.client("dms", region_name=REGION)
 
@@ -619,3 +628,314 @@ def handler_shared(event, context):
           f"{out['configPrefix']}; CDC engine {cdc_engine}"
           f"{'' if cdc_engine == 'spark' or not cfg['cdc_spark_fallback'] else ' (Spark fallback on)'}")
     return out
+
+
+# =============================================================================================
+# BUILD-TABLE-LIST MODE (startup workflow, state BuildTableList)
+# =============================================================================================
+#
+# The operator supplies only the DMS task ARN (fleet_tasks.csv). The pipeline builds the task's
+# table list ITSELF from the DMS task, so there is nothing to upload. This mode runs AFTER DMS
+# has finished its full load (the startup SM reaches BuildTableList only when DMS has stopped at
+# STOPPED_AFTER_CACHED_EVENTS) and BEFORE any Glue job is created (BuildTableList -> CreateGlueJobs).
+#
+# It:
+#   1. lists every table DMS loaded, via describe_table_statistics (paginated on Marker),
+#      including empty-at-full-load tables (FullLoadRows == 0, which the pipeline already handles);
+#   2. fails if any table is in an error/suspended state (naming them);
+#   3. turns each SOURCE schema/table (what the stats report) into the S3 FOLDER names (what the
+#      task's TableMappings transformation rules produce) — the names discovery expects;
+#   4. hard-checks the <=9 distinct DSQL-schema cap (before any Glue job exists);
+#   5. writes config/_task/<suffix>/table_manifest.csv (same 2-column format discovery reads) and
+#      table_list_source.json, overwriting any pre-existing manifest (one log line; no override).
+#
+# Event (built by the SM from the carried `resolved` object):
+#   {"mode": "build_table_list",
+#    "taskArn": "...", "bucket": "<pipeline bucket>", "configPrefix": "s3://.../config/_task/<s>/",
+#    "region": "<region>", "taskSuffix": "<suffix>"}
+# Returns: {"ok": true, "count": N, "distinctSchemas": [...], "manifestKey": "...",
+#           "sourceKey": "...", "replacedExisting": bool, "warnings": [...]}
+
+# DMS table-load states we treat as healthy (full load done, or legitimately empty). Compared
+# case-insensitively. Anything else -> the table failed to load and we fail the build naming it.
+_HEALTHY_TABLE_STATES = {"table completed", "table loaded", "fully loaded"}
+# Transformation rule-actions that CAN change a schema/table name and that we can reproduce
+# exactly. Any OTHER transformation on a schema/table target -> fail (we can't predict the folder).
+_NAME_TRANSFORMS = {"rename", "convert-lowercase", "convert-uppercase", "add-prefix",
+                    "add-suffix", "remove-prefix", "remove-suffix"}
+
+
+class TableListError(Exception):
+    pass
+
+
+def _is_error_table_state(state):
+    """True if a DMS TableState means the table did NOT load cleanly (so the build must fail)."""
+    s = str(state or "").strip().lower()
+    if not s:
+        return True
+    if s in _HEALTHY_TABLE_STATES:
+        return False
+    # Explicit error wording, and a fail-closed default for anything else unexpected.
+    return True
+
+
+def _wildcard_to_regex(pat):
+    """A DMS object-locator pattern -> compiled regex. DMS uses '%' (any run) and '_' (one char)
+    like SQL LIKE; '*' is accepted as a synonym for '%'. Matching is case-SENSITIVE on the exact
+    source name DMS reports (DMS matches the source object name)."""
+    out = ["^"]
+    for ch in str(pat or ""):
+        if ch in ("%", "*"):
+            out.append(".*")
+        elif ch == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(ch))
+    out.append("$")
+    return re.compile("".join(out))
+
+
+def _locator_matches(locator, schema, table, is_table_rule):
+    """Does a transformation rule's object-locator match this (schema, table)? For a schema-target
+    rule only the schema is matched; for a table-target rule both schema and table must match."""
+    loc = locator or {}
+    sp = loc.get("schema-name")
+    if sp is not None and not _wildcard_to_regex(sp).match(schema):
+        return False
+    if is_table_rule:
+        tp = loc.get("table-name")
+        if tp is not None and not _wildcard_to_regex(tp).match(table or ""):
+            return False
+    return True
+
+
+def _apply_one_transform(action, value, name):
+    """Apply a single supported name transformation to one name component."""
+    if action == "rename":
+        return str(value if value is not None else name)
+    if action == "convert-lowercase":
+        return name.lower()
+    if action == "convert-uppercase":
+        return name.upper()
+    if action == "add-prefix":
+        return f"{value}{name}"
+    if action == "add-suffix":
+        return f"{name}{value}"
+    if action == "remove-prefix":
+        return name[len(value):] if value and name.startswith(value) else name
+    if action == "remove-suffix":
+        return name[: -len(value)] if value and name.endswith(value) else name
+    return name   # unreachable: callers only pass _NAME_TRANSFORMS actions
+
+
+def _parse_table_mappings(task, task_arn):
+    """Parse the task's TableMappings JSON -> list of rules. Raise TableListError if absent/bad."""
+    tm = task.get("TableMappings")
+    if not tm:
+        raise TableListError(
+            f"DMS task {task_arn} has no TableMappings; cannot derive the table list. The task "
+            f"must have at least one selection rule.")
+    try:
+        doc = json.loads(tm) if isinstance(tm, str) else tm
+    except ValueError as e:
+        raise TableListError(f"DMS task {task_arn} TableMappings is not valid JSON: {e}")
+    rules = (doc or {}).get("rules")
+    if not isinstance(rules, list):
+        raise TableListError(f"DMS task {task_arn} TableMappings has no 'rules' array.")
+    return rules
+
+
+def _transform_names(rules, src_schema, src_table, task_arn):
+    """Apply the task's transformation rules (in rule order) to one SOURCE (schema, table) and
+    return the resulting (schema, table) FOLDER names. Fails on any name-affecting transformation
+    we don't support (so a folder we can't predict never silently produces a wrong manifest)."""
+    schema, table = src_schema, src_table
+    for r in rules:
+        if (r.get("rule-type") or "").lower() != "transformation":
+            continue
+        target = (r.get("rule-target") or "").lower()
+        action = (r.get("rule-action") or "").lower()
+        if target not in ("schema", "table"):
+            continue   # column / table-tablespace / etc. don't affect the folder names
+        if action not in _NAME_TRANSFORMS:
+            raise TableListError(
+                f"DMS task {task_arn} TableMappings uses transformation rule-action {action!r} on "
+                f"{target!r} (rule-id {r.get('rule-id')!r}), which this pipeline can't reproduce "
+                f"when deriving S3 folder names. Supported: {sorted(_NAME_TRANSFORMS)}. Remove the "
+                f"rule or change the task so folder names are predictable.")
+        is_table_rule = target == "table"
+        if not _locator_matches(r.get("object-locator"), schema, table, is_table_rule):
+            continue
+        value = r.get("value")
+        if is_table_rule:
+            table = _apply_one_transform(action, value, table)
+        else:
+            schema = _apply_one_transform(action, value, schema)
+    return schema, table
+
+
+def _describe_table_statistics(dms, task_arn):
+    """Every table DMS reports for this task, paginated on Marker. Returns the raw stat dicts."""
+    stats, marker = [], None
+    while True:
+        kw = {"ReplicationTaskArn": task_arn, "MaxRecords": 500}
+        if marker:
+            kw["Marker"] = marker
+        resp = dms.describe_table_statistics(**kw)
+        stats.extend(resp.get("TableStatistics", []) or [])
+        marker = resp.get("Marker")
+        if not marker:
+            break
+    return stats
+
+
+def _estimate_selection_schemas(rules):
+    """Best-effort distinct DSQL schemas the task's SELECTION rules load into, for preflight's
+    pre-start cap estimate (BuildTableList does the authoritative check from real stats).
+
+    Returns (schemas:set, wildcard:bool). `schemas` is the explicit (non-wildcard) source schema
+    names from 'include' selection rules, with the task's schema-level name transformations
+    applied, lowercased as discovery does. `wildcard` is True if any include selection rule's
+    schema is a wildcard (so the real count can't be known before full load)."""
+    schemas, wildcard = set(), False
+    for r in rules:
+        if (r.get("rule-type") or "").lower() != "selection":
+            continue
+        if (r.get("rule-action") or "include").lower() != "include":
+            continue
+        sp = ((r.get("object-locator") or {}).get("schema-name"))
+        s = str(sp or "").strip()
+        if (not s) or ("%" in s) or ("*" in s) or ("_" in s):
+            wildcard = True
+            continue
+        # Apply schema-target transforms to the explicit name (table left as a wildcard match).
+        try:
+            tschema, _ = _transform_names(rules, s, "", "")
+        except TableListError:
+            # An unsupported transform is a hard error at BuildTableList; for the estimate just
+            # treat this schema as unknown rather than failing preflight here.
+            wildcard = True
+            continue
+        if tschema:
+            schemas.add(tschema.lower())
+    return schemas, wildcard
+
+
+def handler_build_table_list(event, context):
+    task_arn = str(event.get("taskArn") or "").strip()
+    bucket = event.get("bucket")
+    region = event.get("region") or REGION
+    warnings = []
+    if not task_arn:
+        raise TableListError("build_table_list: no taskArn in the event.")
+    if not bucket:
+        raise TableListError("build_table_list: no bucket in the event.")
+
+    # configPrefix is s3://<bucket>/config/_task/<suffix>/ ; derive the key prefix under bucket.
+    config_prefix = str(event.get("configPrefix") or "").strip()
+    if config_prefix.startswith("s3://"):
+        _b, key_prefix = config_prefix[len("s3://"):].split("/", 1)
+    elif config_prefix:
+        key_prefix = config_prefix
+    else:
+        suffix = str(event.get("taskSuffix") or "").strip()
+        if not suffix:
+            raise TableListError("build_table_list: neither configPrefix nor taskSuffix given.")
+        key_prefix = f"config/_task/{suffix}/"
+    if not key_prefix.endswith("/"):
+        key_prefix += "/"
+
+    dms = boto3.client("dms", region_name=region)
+    s3 = boto3.client("s3", region_name=region)
+
+    tasks = dms.describe_replication_tasks(
+        Filters=[{"Name": "replication-task-arn", "Values": [task_arn]}],
+        WithoutSettings=False).get("ReplicationTasks", [])
+    if len(tasks) != 1:
+        raise TableListError(f"DMS task {task_arn} not found (check the ARN and region).")
+    task = tasks[0]
+    rules = _parse_table_mappings(task, task_arn)
+
+    stats = _describe_table_statistics(dms, task_arn)
+    if not stats:
+        raise TableListError(
+            f"DMS task {task_arn} reports no table statistics. The full load must have run (and "
+            f"matched at least one table) before the table list can be built. Check the task's "
+            f"selection rules.")
+
+    errored, rows, seen = [], [], set()
+    for st in stats:
+        src_schema = str(st.get("SchemaName") or "").strip()
+        src_table = str(st.get("TableName") or "").strip()
+        state = st.get("TableState")
+        if not src_schema or not src_table:
+            continue   # DMS sometimes reports aggregate/control rows with no name; skip them
+        if _is_error_table_state(state):
+            errored.append(f"{src_schema}.{src_table} (state={state!r})")
+            continue
+        folder_schema, folder_table = _transform_names(rules, src_schema, src_table, task_arn)
+        if not folder_schema or not folder_table:
+            errored.append(f"{src_schema}.{src_table} (empty name after TableMappings)")
+            continue
+        dedup = (folder_schema, folder_table)
+        if dedup in seen:
+            continue
+        seen.add(dedup)
+        rows.append((folder_schema, folder_table))
+
+    if errored:
+        raise TableListError(
+            f"DMS task {task_arn} has {len(errored)} table(s) that did not load cleanly; the "
+            f"table list was not built and no Glue jobs were created:\n  - "
+            + "\n  - ".join(sorted(errored))
+            + "\nFix the source/DMS problem (or exclude the table in the task's selection rules) "
+              "and start the task again.")
+    if not rows:
+        raise TableListError(
+            f"DMS task {task_arn} loaded no tables with a usable schema/table name. Check the "
+            f"task's selection rules.")
+
+    distinct_schemas = sorted({s.lower() for s, _ in rows})
+    if len(distinct_schemas) > _MAX_DISTINCT_SCHEMAS:
+        raise TableListError(
+            f"DMS task {task_arn} loads into {len(distinct_schemas)} distinct DSQL schemas "
+            f"({distinct_schemas}); DSQL allows 10 per database and cdc_control takes one, so at "
+            f"most {_MAX_DISTINCT_SCHEMAS}. Use fewer schemas (change the task's selection rules). "
+            f"No Glue jobs were created.")
+
+    manifest_key = key_prefix + "table_manifest.csv"
+    source_key = key_prefix + "table_list_source.json"
+
+    replaced = _get_json(s3, bucket, source_key) is not None or _object_exists(s3, bucket, manifest_key)
+    if replaced:
+        print(f"(info) replaced existing table_manifest.csv with the DMS-derived list "
+              f"({len(rows)} tables)")
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["dms_schema", "dms_table"])
+    for schema, table in rows:
+        w.writerow([schema, table])
+    s3.put_object(Bucket=bucket, Key=manifest_key,
+                  Body=buf.getvalue().encode("utf-8"), ContentType="text/csv")
+    _put_json(s3, bucket, source_key, {
+        "source": "dms", "count": len(rows), "taskArn": task_arn, "generatedAt": _now()})
+
+    print(f"(info) build_table_list: task {task_arn} -> {len(rows)} table(s) in "
+          f"{len(distinct_schemas)} schema(s) {distinct_schemas}; wrote s3://{bucket}/{manifest_key}")
+    return {"ok": True, "count": len(rows), "distinctSchemas": distinct_schemas,
+            "manifestKey": manifest_key, "sourceKey": source_key,
+            "replacedExisting": bool(replaced), "warnings": warnings}
+
+
+def _object_exists(s3, bucket, key):
+    """True if s3://bucket/key exists (cheap existence check via get_object)."""
+    try:
+        s3.get_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as e:
+        code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404") or type(e).__name__ == "NoSuchKey":
+            return False
+        raise

@@ -1,0 +1,71 @@
+{
+  "RoleName": "<<PROJECT>>-sfn-exec-role",
+  "_comment": "Shared execution role for ALL 4 state machines (startup, cutover, fleet-startup, fleet-cutover). Union of the former sfn-exec-role, fleet-startup-role and fleet-cutover-role policies, deduped. The former fleet InvokePreflightLambda (lambda:InvokeFunction on function:<<PROJECT>>-preflight-tasks) is a strict subset of InvokeLambdas (function:<<PROJECT>>-*). The two fleet StartExecution/DescribeExecution statements are merged into StartAndVerifyChildren below, scoped to exactly the two child machines the fleets launch (<<PROJECT>>-startup and <<PROJECT>>-cutover) and their executions — no <<PROJECT>>-* wildcard was introduced for states:*. TrustPolicy adds the aws:SourceAccount condition that the former fleet roles carried; the former sfn-exec-role trust had no condition, so this is a tightening (same account only), not a loosening.",
+  "TrustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": { "Service": "states.amazonaws.com" },
+        "Action": "sts:AssumeRole",
+        "Condition": { "StringEquals": { "aws:SourceAccount": "<<ACCOUNT_ID>>" } }
+      }
+    ]
+  },
+  "Policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "InvokeLambdas",
+        "Effect": "Allow",
+        "Action": ["lambda:InvokeFunction"],
+        "Resource": ["arn:aws:lambda:<<REGION>>:<<ACCOUNT_ID>>:function:<<PROJECT>>-*"]
+      },
+      {
+        "Sid": "DmsControl",
+        "Effect": "Allow",
+        "Action": ["dms:StartReplicationTask", "dms:StopReplicationTask",
+                   "dms:DescribeReplicationTasks"],
+        "Resource": ["*"]
+      },
+      {
+        "Sid": "GlueRunJobs",
+        "Effect": "Allow",
+        "Action": ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns",
+                   "glue:BatchStopJobRun"],
+        "Resource": ["*"]
+      },
+      {
+        "Sid": "SyncJobRunEvents",
+        "Effect": "Allow",
+        "Action": ["events:PutTargets", "events:PutRule", "events:DescribeRule"],
+        "Resource": ["arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForGlueJobRule"]
+      },
+      {
+        "Sid": "ConfirmCdcStarted",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket"],
+        "Resource": ["arn:aws:s3:::<<BUCKET>>"],
+        "Condition": {"StringLike": {"s3:prefix": ["config/_task/*"]}}
+      },
+      {
+        "Sid": "StartChildren",
+        "Effect": "Allow",
+        "Action": ["states:StartExecution"],
+        "Resource": [
+          "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-startup",
+          "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-cutover"
+        ]
+      },
+      {
+        "Sid": "VerifyChildren",
+        "Effect": "Allow",
+        "Action": ["states:DescribeExecution"],
+        "Resource": [
+          "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-startup:*",
+          "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-cutover:*"
+        ]
+      }
+    ]
+  }
+}

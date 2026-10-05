@@ -18,7 +18,8 @@ task's migration then runs on its own, exactly as if the per-task workflow had b
 Deploying the fleet (and everything it needs) is part of the one-time setup in
 [`RUNBOOK.md`](../RUNBOOK.md): the `preflight-tasks` Lambda in
 [Step 2](../RUNBOOK.md#step-2--create-the-lambda-functions), the shared settings in
-[Step 3c](../RUNBOOK.md#step-3c--pipeline-settings), and the fleet state machines and roles in
+[Step 3c](../RUNBOOK.md#step-3c--pipeline-settings), and the fleet state machines (on the shared
+Step Functions role) in
 [Step 4](../RUNBOOK.md#step-4--create-the-state-machines). This page is the reference for how
 the fleet behaves once it exists.
 
@@ -38,8 +39,8 @@ the candidate equals the live file nothing is written; if a cutover, or anything
 listing executions fails, it stops at `PreflightFailed` and writes nothing (fail closed). A
 `params.csv` plus a second `<inputPrefix>/pipeline.json` is ambiguous and fails. No `params.csv` →
 exactly today's behaviour. The output reports `paramsPublished` / `backupKey` / `paramsReason`. See
-the [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings). (params.csv is offline-tested;
-real-AWS test pending.)
+the [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings). (params.csv, the automatic table
+list, and the 3-role IAM setup are offline-tested; real-AWS test pending.)
 
 **Task list:** a CSV in the bucket, e.g. `s3://<bucket>/config/fleet_tasks.csv`
 ([example](../config/fleet_tasks.example.csv)):
@@ -50,9 +51,8 @@ real-AWS test pending.)
 | `task_suffix` | optional. Leave blank to use the folder the pipeline would pick anyway: the one recorded for this task (a renamed DMS task keeps its first folder), else the DMS task name. Set it only for a task you also start by hand with a `taskSuffix` |
 | `adopt_existing_folder` | optional, startup only. `true` for a task whose folder holds files from an earlier run but no owner record |
 
-Before a startup fleet, stage each task's table list at
-`config/_task/<task name>/table_manifest.csv`
-([RUNBOOK Step 5b](../RUNBOOK.md#5b--upload-each-tasks-table-list)).
+Each task's table list is built automatically from the DMS task after its full load, so there is
+nothing to upload. To load fewer tables, change the DMS task's selection rules.
 
 **Start input** (both fleets):
 
@@ -76,8 +76,10 @@ The `preflight-tasks` Lambda reuses the per-task workflow's own checks (`resolve
   another task (`_task.json`);
 - startup: the same pre-start checks on each DMS task and S3 endpoint as `resolve_task`
   (`full-load-and-cdc`, `StopTaskCachedChangesApplied=true`, `AddColumnName=true`, the pipeline
-  bucket, not past its full load), the table list staged and not empty, a leftover folder needs
-  `adopt_existing_folder`, and at most 9 distinct DSQL schemas across the fleet's table lists;
+  bucket, not past its full load), a leftover folder needs `adopt_existing_folder`, and an
+  estimate from each task's selection rules that the fleet stays within 9 distinct DSQL schemas
+  (the exact count is only known after full load, so the hard limit is enforced per task in the
+  `BuildTableList` step, before any Glue job);
 - cutover: each task was started by the pipeline (owner record present).
 
 A failed preflight ends at `PreflightFailed`; its cause lists every problem by row. Because

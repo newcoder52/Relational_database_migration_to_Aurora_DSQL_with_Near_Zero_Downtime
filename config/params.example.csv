@@ -20,6 +20,10 @@ account_id,123456789012
 region,us-east-1
 project,dms-dsql
 dsql_endpoint,abcd0efgh1ijkl2mnop3qrstuv.dsql.us-east-1.on.aws
+# ^ public endpoint. Inside a VPC with no internet (glue_connection set), use the DSQL VPC
+#   endpoint's private DNS name instead: <cluster>.dsql-<id>.<region>.on.aws (find it with
+#   `aws ec2 describe-vpc-endpoints` for service com.amazonaws.<region>.dsql-<id>); the public
+#   name times out at discovery.
 
 # ---- optional (shown with their defaults; delete a row to accept the default) ----
 dsql_user,admin

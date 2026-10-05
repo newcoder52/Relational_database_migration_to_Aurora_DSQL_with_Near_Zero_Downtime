@@ -210,7 +210,7 @@
               "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"
             }
           ],
-          "Next": "CreateGlueJobs"
+          "Next": "BuildTableList"
         },
         {
           "Variable": "$.describeResult.ReplicationTasks[0].Status",
@@ -374,6 +374,52 @@
       ],
       "Next": "StartDmsTask",
       "Comment": "Python-shell CDC engine: the Lambda validates the driver-cdc/ wheels for Python 3.9, strips their Requires-Dist (so Glue's pip never contacts PyPI) into driver-cdc-prepared/<fingerprint>/ once per wheel set, and returns that list. If the wheels fail that check and cdc_spark_fallback is on (the default), it checks the three wheels a Spark CDC job needs (boto3, botocore, s3transfer) and returns engine=spark instead, so the CDC job is built as Spark. Only if neither engine can run does it fail here, before DMS starts. Spark engine: plain driver-cdc/ list."
+    },
+    "BuildTableList": {
+      "Type": "Task",
+      "Comment": "Build this task's table list from DMS (describe_table_statistics + TableMappings) after full load and BEFORE any Glue job; writes config/_task/<suffix>/table_manifest.csv and table_list_source.json. Reuses resolve_task (mode build_table_list).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "build_table_list",
+          "bucket": "<<BUCKET>>",
+          "taskArn.$": "$.taskArn",
+          "region.$": "$.resolved.region",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "taskSuffix.$": "$.resolved.taskSuffix"
+        }
+      },
+      "ResultSelector": {
+        "count.$": "$.Payload.count",
+        "distinctSchemas.$": "$.Payload.distinctSchemas",
+        "manifestKey.$": "$.Payload.manifestKey",
+        "replacedExisting.$": "$.Payload.replacedExisting"
+      },
+      "ResultPath": "$.tableList",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "BuildTableListFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CreateGlueJobs"
     },
     "CreateGlueJobs": {
       "Type": "Task",
@@ -815,6 +861,12 @@
       "Type": "Fail",
       "Error": "PipelineFailed",
       "Cause": "A Glue/Lambda step failed. See execution history."
+    },
+    "BuildTableListFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the build-table-list error (a table failed to load, an unsupported TableMappings transformation, or more than 9 distinct DSQL schemas). No Glue jobs were created.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
     },
     "DriversFailed": {
       "Type": "Fail",

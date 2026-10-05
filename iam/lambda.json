@@ -1,0 +1,70 @@
+{
+  "RoleName": "<<PROJECT>>-lambda-exec-role",
+  "_comment": "Shared execution role for ALL 8 Lambdas (resolve-task, driver-discovery, plan-split, create-glue-jobs, stop-cdc-run, drain-check, drop-tags, preflight-tasks). Union of the former lambda-exec-role and preflight-tasks-role policies, deduped. The former preflight statements are strict subsets of the broader lambda statements they merged into: ReadSettingsTaskListsAndFolders (s3:GetObject/ListBucket) and PublishPipelineSettingsFromParamsCsv (s3:PutObject on config/pipeline.json(.*)) are covered by the S3 block below (GetObject/PutObject on <<BUCKET>>/* + ListBucket on the bucket); the preflight DMS describe set is a subset of DmsDescribe; the preflight states List/Describe (the 4 named machines + startup/cutover executions) are subsets of the <<PROJECT>>-* / <<PROJECT>>-*:* blocks below. No new wildcards were introduced. setup.sh attaches AWSLambdaVPCAccessExecutionRole to this role when a VPC is used (as before).",
+  "TrustPolicy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": { "Service": "lambda.amazonaws.com" },
+        "Action": "sts:AssumeRole"
+      }
+    ]
+  },
+  "Policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "Logs",
+        "Effect": "Allow",
+        "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+        "Resource": ["arn:aws:logs:<<REGION>>:<<ACCOUNT_ID>>:*"]
+      },
+      {
+        "Sid": "S3",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+        "Resource": ["arn:aws:s3:::<<BUCKET>>", "arn:aws:s3:::<<BUCKET>>/*"]
+      },
+      {
+        "Sid": "DmsDescribe",
+        "Effect": "Allow",
+        "Action": ["dms:DescribeReplicationTasks", "dms:DescribeEndpoints",
+                   "dms:DescribeTableStatistics"],
+        "Resource": ["*"]
+      },
+      {
+        "Sid": "DsqlConnectForDrainAndDropTags",
+        "Effect": "Allow",
+        "Action": ["dsql:DbConnectAdmin", "dsql:DbConnect"],
+        "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
+      },
+      {
+        "Sid": "GlueManageJobsAtRuntime",
+        "Effect": "Allow",
+        "Action": ["glue:CreateJob", "glue:UpdateJob", "glue:DeleteJob", "glue:GetJob",
+                   "glue:GetJobRuns", "glue:BatchStopJobRun"],
+        "Resource": ["*"]
+      },
+      {
+        "Sid": "PassGlueRoleToCreatedJobs",
+        "Effect": "Allow",
+        "Action": ["iam:PassRole"],
+        "Resource": ["arn:aws:iam::<<ACCOUNT_ID>>:role/<<GLUE_EXEC_ROLE_NAME>>"],
+        "Condition": { "StringEquals": { "iam:PassedToService": "glue.amazonaws.com" } }
+      },
+      {
+        "Sid": "RefuseSecondRunForSameTaskList",
+        "Effect": "Allow",
+        "Action": ["states:ListExecutions"],
+        "Resource": ["arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-*"]
+      },
+      {
+        "Sid": "RefuseSecondRunForSameTaskDescribe",
+        "Effect": "Allow",
+        "Action": ["states:DescribeExecution"],
+        "Resource": ["arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-*:*"]
+      }
+    ]
+  }
+}
