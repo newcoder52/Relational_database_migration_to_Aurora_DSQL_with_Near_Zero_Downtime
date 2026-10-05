@@ -1,0 +1,39 @@
+# config/params.example.csv — the pipeline's "export" values in one file.
+#
+# Copy this to s3://<bucket>/<inputPrefix>/params.csv (next to fleet_tasks.csv) and replace the
+# placeholder values with your own. The fleet reads it, builds config/pipeline.json from it, and
+# (when no run is in progress) publishes it — so nobody retypes an export block. tools/setup.sh
+# reads the same file at one-time setup.
+#
+# Rules:
+#   - header must be exactly:  parameter,value
+#   - one row per key; blank lines and lines starting with '#' are ignored; values are trimmed
+#   - a duplicate key or an unknown key is an error
+#   - the BUCKET is NOT a key here: it is the bucket this CSV lives in (the fleet's "bucket"
+#     input / setup.sh's bucket). That keeps it from disagreeing with where everything is read.
+#   - every value that ends up in pipeline.json must be a real value with no '<' or '>'.
+#   - dsql_cluster_id is DERIVED (first label of dsql_endpoint) and must NOT be listed here.
+parameter,value
+
+# ---- required (no default) ----
+account_id,123456789012
+region,us-east-1
+project,dms-dsql
+dsql_endpoint,abcd0efgh1ijkl2mnop3qrstuv.dsql.us-east-1.on.aws
+
+# ---- optional (shown with their defaults; delete a row to accept the default) ----
+dsql_user,admin
+dsql_database,postgres
+# glue_connection: exact Glue network connection name, or empty for no VPC (leave value blank).
+glue_connection,dms-dsql-vpc
+cdc_engine,pythonshell
+cdc_spark_fallback,true
+control_schema,cdc_control
+# glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
+# Only set it if your Glue role name differs from <project>-glue-exec-role.
+glue_role_arn,arn:aws:iam::123456789012:role/dms-dsql-glue-exec-role
+
+# ---- setup-only: the Glue VPC connection (tools/setup.sh). Set BOTH or NEITHER. ----
+# Not part of pipeline.json. Delete both rows if Glue can reach DSQL without a VPC connection.
+subnet_id,subnet-0abc1234def567890
+security_group_id,sg-0abc1234def567890

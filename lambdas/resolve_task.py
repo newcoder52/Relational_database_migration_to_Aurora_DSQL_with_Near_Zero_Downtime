@@ -298,6 +298,18 @@ def _load_settings(s3, bucket, key, warnings):
     unknown = sorted(set(doc) - SETTINGS_KNOWN)
     if unknown:
         warnings.append(f"pipeline.json has unknown key(s) {unknown} (ignored; check spelling).")
+    return _validate_settings(cfg, warnings)
+
+
+def _validate_settings(cfg, warnings):
+    """Validate and normalise an already-assembled settings dict (defaults already applied,
+    required keys already present). Shared by _load_settings (reading config/pipeline.json)
+    and params_csv.to_pipeline_settings (building the same dict from params.csv), so a CSV can
+    never produce settings the per-task workflow would later reject. Mutates and returns cfg.
+
+    Behaviour is unchanged from when this block lived inline in _load_settings: every message
+    and every normalisation is identical, so existing pipeline.json files resolve exactly as
+    before."""
     if not _NAME_RE.match(str(cfg["project"])):
         raise SettingsError(f"pipeline.json 'project' must be letters, digits and hyphens "
                             f"(got {cfg['project']!r}).")

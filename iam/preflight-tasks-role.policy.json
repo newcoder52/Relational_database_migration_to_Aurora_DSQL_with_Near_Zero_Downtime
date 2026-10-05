@@ -26,6 +26,17 @@
       ]
     },
     {
+      "Sid": "PublishPipelineSettingsFromParamsCsv",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::<<BUCKET>>/config/pipeline.json",
+        "arn:aws:s3:::<<BUCKET>>/config/pipeline.json.*"
+      ]
+    },
+    {
       "Sid": "DescribeDmsTasksAndEndpoints",
       "Effect": "Allow",
       "Action": [
@@ -44,7 +55,9 @@
       ],
       "Resource": [
         "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-startup",
-        "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-cutover"
+        "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-cutover",
+        "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-fleet-startup",
+        "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-fleet-cutover"
       ]
     },
     {

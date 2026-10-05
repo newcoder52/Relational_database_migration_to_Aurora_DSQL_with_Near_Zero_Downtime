@@ -25,9 +25,21 @@ the fleet behaves once it exists.
 ## Inputs
 
 **Settings:** the same `s3://<bucket>/config/pipeline.json` every task already uses
-([RUNBOOK Step 3c](../RUNBOOK.md#step-3c--pipeline-settings)). The fleet never writes it. If you
-keep a `pipeline.json` next to the task list too, it must be identical, or preflight stops (the
-per-task workflows would not use it).
+([RUNBOOK Step 3c](../RUNBOOK.md#step-3c--pipeline-settings)). The fleet never writes it directly.
+If you keep a `pipeline.json` next to the task list too, it must be identical, or preflight stops
+(the per-task workflows would not use it).
+
+**Settings from `params.csv` (optional):** if `s3://<bucket>/<inputPrefix>/params.csv` exists next
+to the task list, preflight validates it (shared parser `lambdas/params_csv.py`), builds the
+`config/pipeline.json` it describes, and — **startup only, and only when no `startup`/`cutover`/fleet
+execution is running (other than this fleet run)** — backs up the old `config/pipeline.json` to a
+dated `config/pipeline.json.<UTC>` key and publishes the new one, then reads it back to verify. If
+the candidate equals the live file nothing is written; if a cutover, or anything is running, or
+listing executions fails, it stops at `PreflightFailed` and writes nothing (fail closed). A
+`params.csv` plus a second `<inputPrefix>/pipeline.json` is ambiguous and fails. No `params.csv` →
+exactly today's behaviour. The output reports `paramsPublished` / `backupKey` / `paramsReason`. See
+the [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings). (params.csv is offline-tested;
+real-AWS test pending.)
 
 **Task list:** a CSV in the bucket, e.g. `s3://<bucket>/config/fleet_tasks.csv`
 ([example](../config/fleet_tasks.example.csv)):
@@ -55,6 +67,9 @@ file name. Missing `bucket` or `inputPrefix` ends at `MissingFleetInput`.
 
 The `preflight-tasks` Lambda reuses the per-task workflow's own checks (`resolve_task`, same zip):
 
+- `params.csv` (if present): parsed and validated; its `project` must match the fleet's per-task
+  state machine; on a startup with nothing running it publishes `config/pipeline.json` (see the
+  [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings)) before the settings check below;
 - the settings file (all of `resolve_task`'s settings checks);
 - every row: a DMS task ARN in the pipeline's region, listed once, that exists; a legal folder
   name short enough for the Glue job names; no two rows on the same folder; a folder not owned by

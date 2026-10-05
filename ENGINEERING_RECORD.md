@@ -506,11 +506,16 @@ fills dependency gaps and items 1 and 2 stay hidden.
   task got past its own input checks — **not** that the migrations succeeded.
 - **Scope note (preflight):** the fleet `Preflight` does **not** inspect Oracle/LogMiner, so it
   does not catch the new-schema CDC-capture gap (`CDC_EDGE_CASE_RESULTS.md` §4).
-- **New requirement not yet built:** a single parameters CSV holding every "export" value (bucket,
-  account, region, project, DSQL endpoint/user/db, subnet, SG, Glue connection, …) alongside
-  `fleet_tasks.csv`, so nobody retypes an export block. On `main` the fleet reads these from
-  `config/pipeline.json`; the two-CSV input is a planned enhancement (see
-  `RUNBOOK.md` → [planned parameters CSV](RUNBOOK.md#values-what-setup-needs-vs-what-running-tasks-needs)).
+- **Single parameters CSV (shipped; offline-tested, real-AWS test pending):** one `params.csv`
+  holding every "export" value (account, region, project, DSQL endpoint/user/db, Glue connection,
+  CDC engine, control schema, and setup-only subnet/SG) alongside `fleet_tasks.csv`, so nobody
+  retypes an export block. The shared parser `lambdas/params_csv.py` turns it into the
+  `config/pipeline.json` dict; `tools/setup.sh` reads it at setup and the fleet's preflight reads it
+  at run time and safely (re)publishes `config/pipeline.json` from it (startup only, nothing
+  running). `account_id`/`subnet_id`/`security_group_id` are setup-only and never land in
+  `pipeline.json`. See `RUNBOOK.md` → [params.csv](RUNBOOK.md#params-csv) and
+  [Step 3c](RUNBOOK.md#step-3c--pipeline-settings). Exercised offline only (fake S3/SFN/DMS); not
+  yet run live on AWS.
 - **Status:** exercised in a state-machine simulator; **not yet run live on AWS** — run one small
   live fleet first. Full operation in `docs/FLEET_LAUNCHER.md` and
   `RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#step-5--run-tasks-with-the-fleet).

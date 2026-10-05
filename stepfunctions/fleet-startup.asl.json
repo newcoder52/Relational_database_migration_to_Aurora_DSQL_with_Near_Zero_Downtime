@@ -45,7 +45,8 @@
           "bucket.$": "$.bucket",
           "inputPrefix.$": "$.inputPrefix",
           "fleetInput.$": "$",
-          "stateMachineArn": "<<STARTUP_STATE_MACHINE_ARN>>"
+          "stateMachineArn": "<<STARTUP_STATE_MACHINE_ARN>>",
+          "fleetExecutionId.$": "$$.Execution.Id"
         }
       },
       "ResultSelector": {

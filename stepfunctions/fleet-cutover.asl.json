@@ -45,7 +45,8 @@
           "bucket.$": "$.bucket",
           "inputPrefix.$": "$.inputPrefix",
           "fleetInput.$": "$",
-          "stateMachineArn": "<<CUTOVER_STATE_MACHINE_ARN>>"
+          "stateMachineArn": "<<CUTOVER_STATE_MACHINE_ARN>>",
+          "fleetExecutionId.$": "$$.Execution.Id"
         }
       },
       "ResultSelector": {

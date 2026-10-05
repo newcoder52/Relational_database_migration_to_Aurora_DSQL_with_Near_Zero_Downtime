@@ -65,11 +65,13 @@ import time
 import boto3
 
 import resolve_task as rt     # same zip: reuse the per-task workflow's exact rules
+import params_csv as pc       # same zip: the one params.csv parser / pipeline.json builder
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 SETTINGS_KEY = rt.SETTINGS_KEY_DEFAULT          # config/pipeline.json
 MAX_DISTINCT_SCHEMAS = 9                        # DSQL: 10 schemas per database, minus cdc_control
 _TRUE = {"true", "1", "yes", "y"}
+_DEFAULT_PARAMS_FILE = "params.csv"
 
 
 class PreflightError(Exception):
@@ -131,6 +133,179 @@ def _running_tasks(state_machine_arn, warnings):
     return found
 
 
+# ---------------------------------------------------------------------------------------------
+# params.csv -> config/pipeline.json  (contract: a single parameters CSV, published once)
+# ---------------------------------------------------------------------------------------------
+def _project_from_state_machine_arn(state_machine_arn):
+    """The project of the per-task state machine the fleet runs, from its ARN. The fleet passes
+    stateMachineArn = arn:aws:states:<region>:<acct>:stateMachine:<project>-startup (or
+    -cutover). Returns (project, name) or (None, None) if it can't be parsed."""
+    name = str(state_machine_arn or "").rsplit(":", 1)[-1]
+    for suffix in ("-startup", "-cutover"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)], name
+    return None, None
+
+
+def _sibling_state_machine_arns(state_machine_arn, project):
+    """ARNs of the four workflows whose RUNNING executions block a settings change, derived from
+    the per-task state machine ARN by swapping its name: <project>-startup, -cutover,
+    -fleet-startup, -fleet-cutover."""
+    head, _, _name = str(state_machine_arn or "").rpartition(":")
+    if not head:
+        return {}
+    return {n: f"{head}:{n}" for n in (f"{project}-startup", f"{project}-cutover",
+                                       f"{project}-fleet-startup", f"{project}-fleet-cutover")}
+
+
+def _running_executions(sfn, state_machine_arn, exclude_execution_id):
+    """Names of RUNNING executions of one state machine, excluding exclude_execution_id (this
+    fleet run). Raises on any API error so the caller can fail closed."""
+    names, token, scanned = [], None, 0
+    while True:
+        kw = {"stateMachineArn": state_machine_arn, "statusFilter": "RUNNING", "maxResults": 100}
+        if token:
+            kw["nextToken"] = token
+        page = sfn.list_executions(**kw)
+        for ex in page.get("executions", []) or []:
+            if exclude_execution_id and ex.get("executionArn") == exclude_execution_id:
+                continue
+            names.append(ex.get("name") or ex.get("executionArn"))
+            scanned += 1
+        token = page.get("nextToken")
+        if not token or scanned >= 2000:
+            break
+    return names
+
+
+def _any_pipeline_running(sfn, sfn_arns, this_execution_id):
+    """{name: [running execution names]} for every sibling workflow with a RUNNING execution
+    (excluding this fleet run). Raises if any listing fails (fail closed)."""
+    busy = {}
+    for name, arn in sfn_arns.items():
+        running = _running_executions(sfn, arn, this_execution_id)
+        if running:
+            busy[name] = running
+    return busy
+
+
+def _handle_params_csv(s3, event, fleet_input, bucket, base, mode, warnings):
+    """If params.csv exists next to the task list, turn it into config/pipeline.json per the
+    contract and (when safe) publish it. Returns a dict merged into the preflight output
+    (paramsPublished / backupKey / paramsReason), or None when there is no params.csv (then the
+    behaviour is exactly as before). Raises PreflightError on any problem (fail closed)."""
+    params_file = str(fleet_input.get("paramsFile") or event.get("paramsFile")
+                      or _DEFAULT_PARAMS_FILE).strip().lstrip("/")
+    params_key = base + params_file
+    text = _get_text(s3, bucket, params_key)
+    if text is None:
+        return None     # D6: no params.csv -> behave exactly as today
+
+    # D1: parse and validate; build the candidate pipeline.json.
+    parsed = pc.parse(text)
+    if parsed["errors"]:
+        raise PreflightError(
+            f"s3://{bucket}/{params_key} has {len(parsed['errors'])} problem(s); nothing was "
+            f"started:\n  - " + "\n  - ".join(parsed["errors"]))
+    for w in parsed["warnings"]:
+        warnings.append(f"{params_key}: {w}")
+    try:
+        candidate = pc.to_pipeline_settings(parsed["params"])
+    except pc.ParamsError as e:
+        raise PreflightError(f"s3://{bucket}/{params_key}: {e}")
+
+    # D1: the params project must match the project of the per-task workflow the fleet runs.
+    sm_project, sm_name = _project_from_state_machine_arn(event.get("stateMachineArn"))
+    if sm_project is None:
+        raise PreflightError(
+            f"could not read the per-task workflow's project from stateMachineArn "
+            f"{event.get('stateMachineArn')!r}; expected a name ending in '-startup' or "
+            f"'-cutover'. Nothing was started.")
+    if candidate["project"] != sm_project:
+        raise PreflightError(
+            f"s3://{bucket}/{params_key} sets project={candidate['project']!r}, but this fleet "
+            f"runs the {sm_name!r} workflow (project {sm_project!r}). They must match. Nothing "
+            f"was started.")
+
+    # D2: a second pipeline.json next to the task list is ambiguous.
+    local_key = base + "pipeline.json"
+    if local_key != SETTINGS_KEY and _get_text(s3, bucket, local_key) is not None:
+        raise PreflightError(
+            f"both s3://{bucket}/{params_key} and s3://{bucket}/{local_key} exist. Use one: "
+            f"the params CSV builds {SETTINGS_KEY} for you, so remove {local_key}. Nothing was "
+            f"started.")
+
+    # D3: compare the candidate with the live canonical pipeline.json.
+    live_text = _get_text(s3, bucket, SETTINGS_KEY)
+    live = None
+    if live_text is not None:
+        try:
+            live = json.loads(live_text)
+        except ValueError as e:
+            raise PreflightError(f"s3://{bucket}/{SETTINGS_KEY} is not valid JSON ({e}); fix or "
+                                 f"remove it. Nothing was started.")
+    if live == candidate:
+        return {"paramsPublished": False, "backupKey": None,
+                "paramsReason": f"{SETTINGS_KEY} already matches {params_key}; nothing written."}
+
+    # D4: candidate differs from (or there is no) live pipeline.json.
+    if mode == "cutover":
+        raise PreflightError(
+            f"s3://{bucket}/{params_key} would change s3://{bucket}/{SETTINGS_KEY}, but settings "
+            f"are never changed at cutover. Publish the new settings with a startup fleet (or by "
+            f"hand) first, then cut over. Nothing was started.")
+
+    # startup: refuse to change settings while any task might be running.
+    sm_arns = _sibling_state_machine_arns(event.get("stateMachineArn"), sm_project)
+    if not sm_arns:
+        raise PreflightError(
+            f"could not derive the pipeline's state machine ARNs from "
+            f"{event.get('stateMachineArn')!r}; cannot safely change settings. Nothing was "
+            f"started.")
+    this_exec = event.get("fleetExecutionId")
+    try:
+        sfn = boto3.client("stepfunctions", region_name=REGION)
+        busy = _any_pipeline_running(sfn, sm_arns, this_exec)
+    except Exception as e:
+        code = str((getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+                   or type(e).__name__)
+        raise PreflightError(
+            f"could not list running executions to safely change s3://{bucket}/{SETTINGS_KEY} "
+            f"({code}). The preflight role needs states:ListExecutions on {sorted(sm_arns)}. "
+            f"Refusing to change settings while this can't be checked. Nothing was started.")
+    if busy:
+        detail = "; ".join(f"{sm}: {', '.join(execs)}" for sm, execs in sorted(busy.items()))
+        raise PreflightError(
+            f"s3://{bucket}/{params_key} would change s3://{bucket}/{SETTINGS_KEY}, but these "
+            f"runs are in progress and read it: {detail}. Settings are not changed while any "
+            f"startup/cutover (or another fleet) is running. Wait for them to finish, then start "
+            f"the fleet again. Nothing was started.")
+
+    # None running: back up the live file (if any), publish, read back and verify.
+    backup_key = None
+    if live_text is not None:
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        backup_key = f"{SETTINGS_KEY}.{stamp}"
+        s3.put_object(Bucket=bucket, Key=backup_key,
+                      Body=live_text.encode("utf-8"), ContentType="application/json")
+    body = (json.dumps(candidate, indent=2) + "\n").encode("utf-8")
+    s3.put_object(Bucket=bucket, Key=SETTINGS_KEY, Body=body, ContentType="application/json")
+    readback = _get_text(s3, bucket, SETTINGS_KEY)
+    try:
+        ok = readback is not None and json.loads(readback) == candidate
+    except ValueError:
+        ok = False
+    if not ok:
+        raise PreflightError(
+            f"wrote s3://{bucket}/{SETTINGS_KEY} from {params_key} but reading it back did not "
+            f"match. Check the bucket and try again. Nothing was started.")
+    reason = (f"published {params_key} to {SETTINGS_KEY}"
+              + (f" (backed up live settings to {backup_key})" if backup_key
+                 else " (no previous settings to back up)"))
+    print(f"(info) {reason}")
+    return {"paramsPublished": True, "backupKey": backup_key, "paramsReason": reason}
+
+
 def handler(event, context):
     fleet_input = event.get("fleetInput") or {}
     bucket = event.get("bucket") or fleet_input.get("bucket")
@@ -146,27 +321,34 @@ def handler(event, context):
     dms = boto3.client("dms", region_name=REGION)
     errors, warnings = [], []
 
+    # --- params.csv (optional): build and, when safe, publish config/pipeline.json from it ---
+    # Done BEFORE the settings are loaded, so the checks below run against the published file.
+    # Returns None when there is no params.csv (then everything behaves exactly as before).
+    params_result = _handle_params_csv(s3, event, fleet_input, bucket, base, mode, warnings)
+
     # --- shared settings: the file every per-task workflow reads, with its full check ---
     try:
         cfg = rt._load_settings(s3, bucket, SETTINGS_KEY, warnings)
     except rt.SettingsError as e:
         raise PreflightError(f"Shared settings problem, nothing was started: {e}")
-    local_key = base + "pipeline.json"
-    if local_key != SETTINGS_KEY:
-        local = _get_text(s3, bucket, local_key)
-        if local is not None:
-            try:
-                same = json.loads(local) == json.loads(_get_text(s3, bucket, SETTINGS_KEY))
-            except ValueError:
-                same = False
-            if not same:
-                raise PreflightError(
-                    f"s3://{bucket}/{local_key} differs from s3://{bucket}/{SETTINGS_KEY}. Every "
-                    f"task's workflow reads {SETTINGS_KEY}, so the fleet won't run with a different "
-                    f"copy next to the task list. Either make {SETTINGS_KEY} the settings you want "
-                    f"(keep a dated copy first: aws s3 cp s3://{bucket}/{SETTINGS_KEY} "
-                    f"s3://{bucket}/{SETTINGS_KEY}.$(date +%Y%m%d%H%M)), or remove {local_key}. "
-                    f"Nothing was started.")
+    if params_result is None:
+        # No params.csv: keep the original local-vs-canonical pipeline.json guard unchanged.
+        local_key = base + "pipeline.json"
+        if local_key != SETTINGS_KEY:
+            local = _get_text(s3, bucket, local_key)
+            if local is not None:
+                try:
+                    same = json.loads(local) == json.loads(_get_text(s3, bucket, SETTINGS_KEY))
+                except ValueError:
+                    same = False
+                if not same:
+                    raise PreflightError(
+                        f"s3://{bucket}/{local_key} differs from s3://{bucket}/{SETTINGS_KEY}. Every "
+                        f"task's workflow reads {SETTINGS_KEY}, so the fleet won't run with a different "
+                        f"copy next to the task list. Either make {SETTINGS_KEY} the settings you want "
+                        f"(keep a dated copy first: aws s3 cp s3://{bucket}/{SETTINGS_KEY} "
+                        f"s3://{bucket}/{SETTINGS_KEY}.$(date +%Y%m%d%H%M)), or remove {local_key}. "
+                        f"Nothing was started.")
     project = cfg["project"]
 
     # --- task list ---
@@ -293,6 +475,10 @@ def handler(event, context):
         print(f"(warn) {w}")
     print(f"preflight ({mode}): {len(out_tasks)} task(s) OK, {to_start} to start, "
           f"{len(out_tasks) - to_start} skipped; schemas {sorted(all_schemas)}.")
-    return {"ok": True, "count": len(out_tasks), "toStart": to_start,
-            "skipped": len(out_tasks) - to_start, "tasks": out_tasks,
-            "distinctSchemas": sorted(all_schemas), "warnings": warnings}
+    out = {"ok": True, "count": len(out_tasks), "toStart": to_start,
+           "skipped": len(out_tasks) - to_start, "tasks": out_tasks,
+           "distinctSchemas": sorted(all_schemas), "warnings": warnings,
+           "paramsPublished": False, "backupKey": None, "paramsReason": None}
+    if params_result:
+        out.update(params_result)
+    return out

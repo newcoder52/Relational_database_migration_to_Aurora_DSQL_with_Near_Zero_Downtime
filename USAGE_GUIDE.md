@@ -50,7 +50,12 @@ collected in `RUNBOOK.md`.
      starts, so the Python shell CDC job installs them without internet.
    - `config/pipeline.json` written ([RUNBOOK Step 3c](RUNBOOK.md#step-3c--pipeline-settings)) and
      the two shared per-task state machines plus the two fleet state machines created
-     ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)).
+     ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)). The quickest way to do all
+     of this is one `params.csv`: copy `config/params.example.csv`, fill it in, upload it as
+     `s3://<bucket>/config/params.csv`, and run `tools/setup.sh s3://<bucket>/config/params.csv`
+     (idempotent; `--dry-run` previews, `--with-drivers` stages the driver wheels). The fleet reads
+     the same `params.csv` and safely (re)publishes `config/pipeline.json` from it at startup.
+     (params.csv is offline-tested; real-AWS test pending — run one small live fleet first.)
 2. **DMS S3 target endpoint** configured with (these are validated automatically):
    - `AddColumnName = true` (CSVs have header rows),
    - `DatePartitionEnabled = false`,

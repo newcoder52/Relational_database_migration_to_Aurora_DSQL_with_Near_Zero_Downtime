@@ -194,14 +194,26 @@ reads that same file; it never writes it.
 > echo "PROJECT=$PROJECT REGION=$REGION"
 > ```
 
-> <a id="params-csv"></a>**Planned change — a single parameters CSV (not built yet).** A planned
-> enhancement lets you keep every "export" value from the setup block above in a `params.csv` (one
-> `key,value` per row) **next to `fleet_tasks.csv`** in S3, so nobody retypes an export block. When
-> it lands, **its one setup change goes exactly here**: replace the hand-edited export block with a
-> single line that reads `params.csv` and exports the same variables, and have the fleet build
-> `config/pipeline.json` from the same file. Nothing else in this runbook changes. **This does not
-> exist today — ignore it until the [Known issues](#known-issues-temporary) note says it has
-> shipped.**
+> <a id="params-csv"></a>**A single parameters CSV (`params.csv`).** Instead of hand-editing the
+> export block above, you can keep every "export" value in one `params.csv` (one `parameter,value`
+> per row) **next to `fleet_tasks.csv`** in S3, so nobody retypes an export block. Copy
+> [`config/params.example.csv`](config/params.example.csv), fill it in, and upload it to
+> `s3://<bucket>/<inputPrefix>/params.csv`. Two things read it, exactly the same way (the shared
+> parser `lambdas/params_csv.py`):
+>
+> - **`tools/setup.sh`** reads it at one-time setup to build everything, including
+>   `config/pipeline.json` ([Step 3c](#step-3c--pipeline-settings)).
+> - **the fleet's preflight** reads it at run time and, when it is safe (startup only, nothing
+>   running), publishes `config/pipeline.json` from it (the [safe-publish rule](#step-3c--pipeline-settings)).
+>
+> The **BUCKET is deliberately not a key** in `params.csv`: it is the bucket the CSV itself lives in
+> (the fleet's `bucket` input / `setup.sh`'s bucket), so it can't disagree with where everything is
+> read from. If you prefer the hand-typed export block, it still works unchanged — `params.csv` is
+> optional.
+>
+> **params.csv is offline-tested; real-AWS test pending.** The parser, the setup-script dry-run and
+> the preflight safe-publish logic all pass an offline test suite (fake S3 / Step Functions / DMS);
+> they have **not** yet been run against live AWS. Run one small live fleet first.
 
 ---
 
@@ -560,8 +572,114 @@ The last command must end with **`PASS`**.
 
 Every per-task `startup` and `cutover` run — and the fleet's preflight — reads
 `s3://$BUCKET/config/pipeline.json`. An edit applies to runs started **after** it, not to runs
-already going. Write it from your variables (don't hand-copy the example file — see the note
-below):
+already going.
+
+> **params.csv is offline-tested; real-AWS test pending.** The `params.csv` → `pipeline.json` flow
+> below (the parser, `tools/setup.sh --dry-run` and the fleet's safe-publish) passes an offline test
+> suite only; it has **not** been run against live AWS yet. Run one small live fleet first.
+
+**The recommended way: one `params.csv`, built by `tools/setup.sh`.** Put every "export" value in a
+single `params.csv` and let setup build `pipeline.json` (and everything else) from it, so nobody
+retypes an export block.
+
+1. Copy the example and fill it in:
+
+   ```bash
+   cp config/params.example.csv params.csv
+   # edit params.csv: set account_id, region, project, dsql_endpoint (and any optional keys)
+   ```
+
+2. Upload it next to `fleet_tasks.csv` in S3:
+
+   ```bash
+   aws s3 cp params.csv "s3://$BUCKET/config/params.csv"
+   ```
+
+3. Run the one-command setup (idempotent — safe to re-run). It can read the CSV straight from S3:
+
+   ```bash
+   tools/setup.sh s3://$BUCKET/config/params.csv [--with-drivers] [--dry-run]
+   ```
+
+   or from a local path (then pass the bucket, because the CSV never names it):
+
+   ```bash
+   tools/setup.sh params.csv --bucket "$BUCKET" [--with-drivers] [--dry-run]
+   ```
+
+`setup.sh` does Steps 1–4 in one pass (create-or-update, so re-running only fixes drift):
+
+- fills `iam/*.json` and creates/updates **all 6 roles** (glue, lambda, sfn, preflight-tasks,
+  fleet-startup, fleet-cutover);
+- creates the Glue network connection when `subnet_id`/`security_group_id` are set (Step 1b);
+- builds `fn.zip` (every `lambdas/*.py` + pg8000) and creates/updates **all 8 Lambdas**;
+- uploads the 4 Glue scripts and the 6 Glue job templates; with `--with-drivers`, also stages the
+  driver wheels (Step 3b);
+- **builds `config/pipeline.json` from `params.csv` and publishes it** under the safe-publish rule
+  below;
+- creates/updates **all 4 state machines** (startup, cutover, fleet-startup, fleet-cutover).
+
+`--dry-run` prints every AWS command without running any (no AWS calls). Note: `--dry-run` with an
+`s3://…/params.csv` path can't read the CSV offline — download it first and pass the local path with
+`--bucket`. A dry-run against a **local** CSV is fully offline.
+
+### What goes in `params.csv`
+
+Header must be exactly `parameter,value`; one row per key; blank lines and lines starting with `#`
+are ignored; values are trimmed; a duplicate or unknown key is an error. `dsql_cluster_id` is
+**derived** (first label of `dsql_endpoint`) and must not be listed. `glue_role_arn` defaults to
+`arn:aws:iam::<account_id>:role/<project>-glue-exec-role` when omitted.
+
+| Parameter | Required? | Default | Meaning |
+|---|---|---|---|
+| `account_id` | **required** | — | 12-digit AWS account id (setup/IAM only; never written to `pipeline.json`) |
+| `region` | **required** | — | AWS region of the DMS tasks and pipeline (must equal the task ARN's region) |
+| `project` | **required** | — | short prefix (letters, digits, hyphens) for role, Lambda and job names |
+| `dsql_endpoint` | **required** | — | Aurora DSQL endpoint, e.g. `<cluster>.dsql.<region>.on.aws` |
+| `dsql_user` | optional | `admin` | DSQL user |
+| `dsql_database` | optional | `postgres` | DSQL database |
+| `glue_connection` | optional | `""` (no VPC) | the Glue network connection's **exact** name; `""` = Glue runs with no VPC connection |
+| `cdc_engine` | optional | `pythonshell` | `pythonshell` (1 DPU) or `spark` (Glue 4.0, 2 × G.1X); `GlueETL`/`pyspark` normalise to `spark` |
+| `cdc_spark_fallback` | optional | `true` | `true`: on a Python-shell CDC driver failure the startup re-creates that task's CDC job as Spark; `false`: stop at `DriversFailed` / `CdcRunFailed` |
+| `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
+| `glue_role_arn` | optional | derived (see above) | the Glue role from Step 1; set only if your Glue role name differs from `<project>-glue-exec-role` |
+| `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection (Step 1b). Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
+| `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
+
+The ten keys that end up in `pipeline.json` are `project`, `region`, `dsql_endpoint`, `dsql_user`,
+`dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
+`control_schema`. `account_id`, `subnet_id` and `security_group_id` are used only by setup and are
+never written into `pipeline.json`.
+
+### The safe-publish rule (how `pipeline.json` is published from `params.csv`)
+
+Both `setup.sh` and the fleet's preflight apply the **same** rule when `params.csv` is present. It
+is deliberately conservative — it never changes settings out from under a run:
+
+- **Preflight validates `params.csv` first.** Any parse/validation problem (missing required key,
+  12-digit `account_id`, both-or-neither VPC pair, an unknown/duplicate key, a value still holding
+  `<`/`>`, the project not matching the fleet's state machine) → `PreflightFailed`, nothing written,
+  nothing started.
+- **If the candidate equals the live `config/pipeline.json`,** nothing is written
+  (`paramsPublished=false`).
+- **If it differs and it's a startup with nothing running,** the live `pipeline.json` is backed up
+  to a dated key `config/pipeline.json.<UTC>` (only when one already exists), the new file is
+  published, then read back and verified (`paramsPublished=true`).
+- **If anything is running — any `startup`, `cutover`, `fleet-startup` or `fleet-cutover` execution
+  (other than this fleet run) — or it's a cutover,** it stops with `PreflightFailed` naming what's
+  running (cutover never publishes). Publish new settings with a startup fleet (or by hand) first,
+  then cut over.
+- **`params.csv` and a second `<inputPrefix>/pipeline.json` together** → `PreflightFailed` (ambiguous
+  — the CSV builds `config/pipeline.json` for you, so remove the local copy).
+- **If executions can't be listed** (e.g. the preflight role lacks `states:ListExecutions`), it
+  **fails closed**: `PreflightFailed`, nothing written.
+- **No `params.csv`** → exactly today's behaviour (the fleet reads the existing `config/pipeline.json`
+  and the old local-vs-canonical guard is unchanged).
+
+### Fallback: write `pipeline.json` by hand
+
+If you prefer not to use `params.csv`, you can still write `pipeline.json` from the export block.
+Don't hand-copy `config/pipeline.example.json` (see the note below):
 
 ```bash
 : "${PROJECT:?}" "${REGION:?}" "${DSQL_ENDPOINT:?}" "${GLUE_ROLE_ARN:?}" "${GLUE_CONNECTION?}"
@@ -585,24 +703,14 @@ EOF
 aws s3 cp pipeline.json "s3://$BUCKET/config/pipeline.json"
 ```
 
-| Key | Meaning |
-|---|---|
-| `project` | prefix of the Lambda and Glue job names; the same `$PROJECT` as Steps 1–2 |
-| `region` | region of the DMS tasks and the pipeline (must equal the task ARN's region) |
-| `dsql_endpoint`, `dsql_user`, `dsql_database` | the Aurora DSQL target |
-| `glue_role_arn` | the Glue role from Step 1 |
-| `glue_connection` | the Glue network connection's **exact** name (a console-made one may read e.g. `Network connection 1`); several, comma-separated; `""` = no VPC |
-| `cdc_engine` | `pythonshell` (default; 1 DPU) or `spark` (Glue 4.0, 2 × G.1X) |
-| `cdc_spark_fallback` | `true` (default): if a Python-shell CDC job's drivers fail, the startup re-creates that task's CDC job as Spark and carries on. `false`: stop at `DriversFailed` / `CdcRunFailed` |
-| `control_schema` | DSQL schema for the CDC control tables (default `cdc_control`) |
-
 > **Don't copy `config/pipeline.example.json` as-is.** Its `description` line contains `<bucket>`,
 > and the pipeline rejects any value with `<` or `>` in it, so a run would fail at `ResolveFailed`
-> ([Known issues](#known-issues-temporary)). The generator above omits `description`, so it is safe.
-> Keep hand-edited values trimmed (no stray spaces) and never set `dsql_user`, `dsql_database` or
-> `control_schema` to an empty string — a blank there is kept, not defaulted, and fails later.
+> ([Known issues](#known-issues-temporary)). The generator above omits `description`, so it is safe
+> (and `params.csv` never emits `description` at all). Keep hand-edited values trimmed (no stray
+> spaces) and never set `dsql_user`, `dsql_database` or `control_schema` to an empty string — a
+> blank there is kept, not defaulted, and fails later.
 
-Before changing a live file, keep a dated copy:
+Before changing a live file by hand, keep a dated copy (setup.sh and the fleet do this for you):
 `aws s3 cp "s3://$BUCKET/config/pipeline.json" "s3://$BUCKET/config/pipeline.json.$(date +%Y%m%d%H%M)"`
 
 ---
@@ -1184,8 +1292,11 @@ can be deleted row by row as the bugs are fixed.
 | 4 | **`config/pipeline.example.json` fails the placeholder check.** Its `description` line contains `<bucket>`, and any value with `<`/`>` is rejected, so a copied-as-is template makes every run (and preflight) fail at `ResolveFailed`. | Generate `pipeline.json` with the Step 3c script (it omits `description`). If you must hand-edit, delete the `description` key, or any value containing `<` or `>`. |
 | 5 | **A console "Run" of the CDC job is not stopped by cutover.** Cutover finds the CDC run by its `--config_prefix` **run** argument; a console run (or a `start-job-run` without that argument) has none, so cutover leaves it running. | Always start the CDC job with `--arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}"` (the block in [If a run fails](#if-a-run-fails-how-to-continue)). Never use the console Run button for the CDC job. If one slips through, stop it with `aws glue batch-stop-job-run` after cutover. |
 
-> The **parameters CSV** ([planned change](#params-csv)) is not a bug — it is a not-yet-built
-> enhancement. Remove its note and wire up the one setup line once it ships.
+> The **parameters CSV** ([`params.csv`](#params-csv)) is not a bug. It has shipped (offline-tested;
+> real-AWS test pending): copy [`config/params.example.csv`](config/params.example.csv), upload it
+> as `s3://$BUCKET/config/params.csv`, and `tools/setup.sh` and the fleet build `config/pipeline.json`
+> from it ([Step 3c](#step-3c--pipeline-settings)). The hand-edited export block still works if you
+> prefer it.
 
 ---
 
@@ -1210,6 +1321,12 @@ Grouped by where the problem shows up. For the next step after a failed run, see
 | `MissingFleetInput` | started without both `bucket` and `inputPrefix` as strings | start with `{"bucket":"...","inputPrefix":"config"}` |
 | `PreflightFailed` | the cause lists one or more problems: a `pipeline.json` problem, a missing/empty task list, a bad or duplicate row, a folder owned by another task, a missing `table_manifest.csv`, or too many DSQL schemas | fix each listed problem (settings in Step 3c, the CSV in [5c](#5c--write-fleet_taskscsv), the table lists in [5b](#5b--upload-each-tasks-table-list)); nothing started, so just trigger the fleet again |
 | `PreflightFailed`: `s3://.../pipeline.json differs from .../config/pipeline.json` | a second `pipeline.json` next to the task list differs from the one every task reads | make `config/pipeline.json` the settings you want (keep a dated copy first), or remove the copy next to the task list |
+| `PreflightFailed`: `params.csv has N problem(s)` | `params.csv` failed parse/validation (missing required key, `account_id` not 12 digits, `subnet_id`/`security_group_id` not both-or-neither, an unknown or duplicate key, or a value still holding `<`/`>`) | fix each listed problem in `params.csv` ([Step 3c](#step-3c--pipeline-settings)), re-upload it, trigger the fleet again |
+| `PreflightFailed`: `sets project=… but this fleet runs the …` | `params.csv`'s `project` ≠ the project of the fleet's per-task state machine | set `project` in `params.csv` to match the fleet you're running, re-upload, trigger again |
+| `PreflightFailed`: `both s3://…/params.csv and s3://…/pipeline.json exist` | a `pipeline.json` next to the task list is ambiguous when `params.csv` builds `config/pipeline.json` | remove the `<inputPrefix>/pipeline.json` copy; keep only `params.csv`, trigger again |
+| `PreflightFailed`: `would change …/pipeline.json, but these runs are in progress` | a startup fleet's `params.csv` differs from live settings while a `startup`/`cutover`/fleet execution is running | wait for the named runs to finish (settings are never changed under a running task), then trigger the fleet again |
+| `PreflightFailed`: `settings are never changed at cutover` | a **cutover** fleet's `params.csv` would change `config/pipeline.json` | publish the new settings with a **startup** fleet (or by hand) first, then cut over |
+| `PreflightFailed`: `could not list running executions to safely change …/pipeline.json` | the preflight role can't `states:ListExecutions` on the four workflows, so the safe-publish fails closed | add `states:ListExecutions` for `$PROJECT-{startup,cutover,fleet-startup,fleet-cutover}` to the preflight role (Step 1), trigger again |
 | `FleetStartIncomplete` | at least one task didn't start | open `results.tasks` in the execution output; fix the `not_started` tasks, re-trigger the fleet (started ones are skipped) |
 | preflight warning: `could not list running executions` | the preflight role can't `states:ListExecutions`/`DescribeExecution` | the fleet still starts every task and the per-task duplicate-run guard still refuses second runs; add the permissions (Step 1) to get the skip-already-running behaviour back |
 
@@ -1366,7 +1483,7 @@ need a separate job ([Rules for the task list](#rules-for-the-task-list)).
 | Step | Runs | Does |
 |---|---|---|
 | `CheckFleetInput` | — | requires `bucket` and `inputPrefix` as strings, else `MissingFleetInput` |
-| `Preflight` | `preflight-tasks` | reads `fleet_tasks.csv` and checks every task (reusing `resolve_task`'s rules); any problem → `PreflightFailed`, nothing started |
+| `Preflight` | `preflight-tasks` | reads `fleet_tasks.csv` and checks every task (reusing `resolve_task`'s rules); any problem → `PreflightFailed`, nothing started. If `params.csv` sits next to the task list, it also builds `config/pipeline.json` from it and (startup only, nothing running) publishes it under the [safe-publish rule](#step-3c--pipeline-settings), reporting `paramsPublished`/`backupKey`/`paramsReason` in its output |
 | `FanOut` (Map, 5 at a time) | `sfn:startExecution`, `sfn:describeExecution` | per row: skip if `already_running` / `past_full_load`; else start the per-task `startup`/`cutover`, wait 30 s, confirm it is RUNNING/SUCCEEDED |
 | `EvalNotStarted` → `FleetStarted` / `FleetStartIncomplete` | — | `FleetStartIncomplete` if any task is `not_started`, else `FleetStarted` |
 

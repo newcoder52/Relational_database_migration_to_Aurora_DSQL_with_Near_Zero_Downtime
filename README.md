@@ -67,6 +67,15 @@ source only at cutover, once CDC has caught up and the target matches the source
   Glue network connection, CDC engine, control schema) live in one file,
   `s3://<bucket>/config/pipeline.json`. The fleet reads it (never writes it), and an edit applies
   to runs started after it.
+- **Quick start — one `params.csv` + `tools/setup.sh`.** Copy `config/params.example.csv`, fill in
+  `account_id`, `region`, `project`, `dsql_endpoint` (plus any optional keys), upload it as
+  `s3://<bucket>/config/params.csv`, and run `tools/setup.sh s3://<bucket>/config/params.csv`
+  (idempotent; add `--dry-run` to preview, `--with-drivers` to stage the Glue driver wheels). Setup
+  builds all 6 roles, 8 Lambdas, 4 state machines and `config/pipeline.json` from that one file. The
+  fleet reads the same `params.csv` and safely (re)publishes `config/pipeline.json` from it at
+  startup. Then run tasks with the fleet. (params.csv is offline-tested; real-AWS test pending —
+  run one small live fleet first. The hand-edited export block still works too.) See
+  [`RUNBOOK.md` Step 3c](RUNBOOK.md#step-3c--pipeline-settings).
 - The DMS task's **name** becomes its config folder, `s3://<bucket>/config/_task/<task name>/`,
   and the middle of its Glue job names, `<project>-<task name>-<role>` (for example
   `<project>-<task name>-load`). Each task runs and cuts over independently.
@@ -276,8 +285,9 @@ stepfunctions/              startup + cutover per-task state machines, plus the
 glue-templates/             The 6 Glue job templates (discovery, load, load-big, validate,
                             cdc, cdc-spark)
 iam/                        Role trust + policy documents (per-task roles, plus the fleet roles)
-config/                     pipeline.example.json, fleet_tasks.example.csv
-tools/                      switch_cdc_engine.py (switch a CDC job Python shell <-> Spark by hand)
+config/                     pipeline.example.json, params.example.csv, fleet_tasks.example.csv
+tools/                      setup.sh (one-command setup from params.csv),
+                            switch_cdc_engine.py (switch a CDC job Python shell <-> Spark by hand)
 RUNBOOK.md                  Step-by-step deploy and operate guide
 USAGE_GUIDE.md              Day-to-day operation, monitoring, manual runs
 ENGINEERING_RECORD.md       Architecture, every bug found and fixed, DDL support matrix
@@ -295,7 +305,8 @@ docs/
 ## Security
 
 No credentials or account-specific values are committed. You supply your own bucket, cluster
-endpoint, schema and role ARNs through `config/pipeline.json` and the RUNBOOK's fill-in steps. The
+endpoint, schema and role ARNs through `config/pipeline.json` (or `config/params.csv`, which builds
+it) and the RUNBOOK's fill-in steps. The
 IAM policies in `iam/` are least-privilege templates scoped to your project prefix and bucket.
 DSQL authentication uses short-lived IAM tokens generated at run time — no stored passwords.
 
