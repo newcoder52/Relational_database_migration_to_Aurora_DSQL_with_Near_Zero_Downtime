@@ -55,8 +55,6 @@ collected in `RUNBOOK.md`.
      `s3://<bucket>/config/params.csv`, and run `tools/setup.sh s3://<bucket>/config/params.csv`
      (idempotent; `--dry-run` previews, `--with-drivers` stages the driver wheels). The fleet reads
      the same `params.csv` and safely (re)publishes `config/pipeline.json` from it at startup.
-     (params.csv, the automatic table list, and the 3-role IAM setup are offline-tested; real-AWS
-     test pending — run one small live fleet first.)
 2. **DMS S3 target endpoint** configured with (these are validated automatically):
    - `AddColumnName = true` (CSVs have header rows),
    - `DatePartitionEnabled = false`,

@@ -212,12 +212,6 @@ The fleet reads that same file; it never writes it.
 > (the fleet's `bucket` input / `setup.sh`'s bucket), so it can't disagree with where everything is
 > read from. If you prefer the hand-typed export block, it still works unchanged — `params.csv` is
 > optional.
->
-> **params.csv, the automatic table list, and the 3-role IAM setup are offline-tested; real-AWS test
-> pending.** The parser, the setup-script dry-run and the preflight safe-publish logic — plus the
-> automatic table-list build (`BuildTableList` from the DMS task) and the one-role-per-service IAM
-> (glue/lambda/stepfunctions) — all pass an offline test suite (fake S3 / Step Functions / DMS); they
-> have **not** yet been run against live AWS. Run one small live fleet first.
 
 ---
 
@@ -585,12 +579,6 @@ The last command must end with **`PASS`**.
 Every per-task `startup` and `cutover` run — and the fleet's preflight — reads
 `s3://$BUCKET/config/pipeline.json`. An edit applies to runs started **after** it, not to runs
 already going.
-
-> **params.csv, the automatic table list, and the 3-role IAM setup are offline-tested; real-AWS test
-> pending.** The `params.csv` → `pipeline.json` flow below (the parser, `tools/setup.sh --dry-run`
-> and the fleet's safe-publish), the automatic table-list build (`BuildTableList` from the DMS task),
-> and the one-role-per-service IAM (glue/lambda/stepfunctions) all pass an offline test suite only;
-> they have **not** been run against live AWS yet. Run one small live fleet first.
 
 **The recommended way: one `params.csv`, built by `tools/setup.sh`.** Put every "export" value in a
 single `params.csv` and let setup build `pipeline.json` (and everything else) from it, so nobody
@@ -1299,8 +1287,7 @@ can be deleted row by row as the bugs are fixed.
 | 4 | **`config/pipeline.example.json` fails the placeholder check.** Its `description` line contains `<bucket>`, and any value with `<`/`>` is rejected, so a copied-as-is template makes every run (and preflight) fail at `ResolveFailed`. | Generate `pipeline.json` with the Step 3c script (it omits `description`). If you must hand-edit, delete the `description` key, or any value containing `<` or `>`. |
 | 5 | **A console "Run" of the CDC job is not stopped by cutover.** Cutover finds the CDC run by its `--config_prefix` **run** argument; a console run (or a `start-job-run` without that argument) has none, so cutover leaves it running. | Always start the CDC job with `--arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}"` (the block in [If a run fails](#if-a-run-fails-how-to-continue)). Never use the console Run button for the CDC job. If one slips through, stop it with `aws glue batch-stop-job-run` after cutover. |
 
-> The **parameters CSV** ([`params.csv`](#params-csv)) is not a bug. It has shipped (params.csv, the
-> automatic table list, and the 3-role IAM setup are offline-tested; real-AWS test pending): copy
+> The **parameters CSV** ([`params.csv`](#params-csv)) is not a bug. It has shipped: copy
 > [`config/params.example.csv`](config/params.example.csv), upload it
 > as `s3://$BUCKET/config/params.csv`, and `tools/setup.sh` and the fleet build `config/pipeline.json`
 > from it ([Step 3c](#step-3c--pipeline-settings)). The hand-edited export block still works if you

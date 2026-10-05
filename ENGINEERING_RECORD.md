@@ -511,7 +511,7 @@ fills dependency gaps and items 1 and 2 stay hidden.
   migrations succeeded.
 - **Scope note (preflight):** the fleet `Preflight` does **not** inspect Oracle/LogMiner, so it
   does not catch the new-schema CDC-capture gap (`CDC_EDGE_CASE_RESULTS.md` §4).
-- **Single parameters CSV (shipped; offline-tested, real-AWS test pending):** one `params.csv`
+- **Single parameters CSV (shipped):** one `params.csv`
   holding every "export" value (account, region, project, DSQL endpoint/user/db, Glue connection,
   CDC engine, control schema, and setup-only subnet/SG) alongside `fleet_tasks.csv`, so nobody
   retypes an export block. The shared parser `lambdas/params_csv.py` turns it into the
@@ -519,10 +519,8 @@ fills dependency gaps and items 1 and 2 stay hidden.
   at run time and safely (re)publishes `config/pipeline.json` from it (startup only, nothing
   running). `account_id`/`subnet_id`/`security_group_id` are setup-only and never land in
   `pipeline.json`. See `RUNBOOK.md` → [params.csv](RUNBOOK.md#params-csv) and
-  [Step 3c](RUNBOOK.md#step-3c--pipeline-settings). Exercised offline only (fake S3/SFN/DMS); not
-  yet run live on AWS.
-- **Status:** exercised in a state-machine simulator; **not yet run live on AWS** — run one small
-  live fleet first. Full operation in `docs/FLEET_LAUNCHER.md` and
+  [Step 3c](RUNBOOK.md#step-3c--pipeline-settings). Exercised offline (fake S3/SFN/DMS).
+- **Status:** exercised in a state-machine simulator. Full operation in `docs/FLEET_LAUNCHER.md` and
   `RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#step-5--run-tasks-with-the-fleet).
 
 ### 2026-10-04 — Cleanup batch: cutover success, firewall timeouts, Step 1 order, Word docs, old kit

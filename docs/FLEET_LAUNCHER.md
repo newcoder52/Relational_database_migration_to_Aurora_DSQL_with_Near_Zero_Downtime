@@ -39,8 +39,7 @@ the candidate equals the live file nothing is written; if a cutover, or anything
 listing executions fails, it stops at `PreflightFailed` and writes nothing (fail closed). A
 `params.csv` plus a second `<inputPrefix>/pipeline.json` is ambiguous and fails. No `params.csv` →
 exactly today's behaviour. The output reports `paramsPublished` / `backupKey` / `paramsReason`. See
-the [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings). (params.csv, the automatic table
-list, and the 3-role IAM setup are offline-tested; real-AWS test pending.)
+the [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings).
 
 **Task list:** a CSV in the bucket, e.g. `s3://<bucket>/config/fleet_tasks.csv`
 ([example](../config/fleet_tasks.example.csv)):

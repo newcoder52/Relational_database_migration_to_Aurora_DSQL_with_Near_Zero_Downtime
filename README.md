@@ -77,9 +77,7 @@ source only at cutover, once CDC has caught up and the target matches the source
   `<cluster>.dsql-<id>.<region>.on.aws` (not the public `<cluster>.dsql.<region>.on.aws`, which
   times out at discovery) — see [RUNBOOK Step 3c](RUNBOOK.md#step-3c--pipeline-settings). The
   fleet reads the same `params.csv` and safely (re)publishes `config/pipeline.json` from it at
-  startup. Then run tasks with the fleet. (params.csv, the automatic table list, and the 3-role IAM
-  setup are offline-tested; real-AWS test pending — run one small live fleet first. The hand-edited
-  export block still works too.) See
+  startup. Then run tasks with the fleet. The hand-edited export block still works too. See
   [`RUNBOOK.md` Step 3c](RUNBOOK.md#step-3c--pipeline-settings).
 - The DMS task's **name** becomes its config folder, `s3://<bucket>/config/_task/<task name>/`,
   and the middle of its Glue job names, `<project>-<task name>-<role>` (for example
