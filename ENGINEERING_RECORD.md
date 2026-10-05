@@ -510,10 +510,10 @@ fills dependency gaps and items 1 and 2 stay hidden.
   account, region, project, DSQL endpoint/user/db, subnet, SG, Glue connection, …) alongside
   `fleet_tasks.csv`, so nobody retypes an export block. On `main` the fleet reads these from
   `config/pipeline.json`; the two-CSV input is a planned enhancement (see
-  `RUNBOOK.md` → [planned parameters CSV](RUNBOOK.md#values-what-setup-needs-vs-what-running-a-task-needs)).
+  `RUNBOOK.md` → [planned parameters CSV](RUNBOOK.md#values-what-setup-needs-vs-what-running-tasks-needs)).
 - **Status:** exercised in a state-machine simulator; **not yet run live on AWS** — run one small
   live fleet first. Full operation in `docs/FLEET_LAUNCHER.md` and
-  `RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#running-many-tasks-with-the-fleet).
+  `RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#step-5--run-tasks-with-the-fleet).
 
 ### 2026-10-04 — Cleanup batch: cutover success, firewall timeouts, Step 1 order, Word docs, old kit
 

@@ -153,7 +153,7 @@ file survives).
 - **Now:** the main CDC job raises `MultiColumnKeyTable` and **never processes** these tables; it
   lists them at startup and leaves their `cdc_control` rows for a **separate composite-key CDC
   job**. That job must write `cdc_control.cdc_file_status` the same way (see
-  `RUNBOOK.md` → [Rules for many tasks](RUNBOOK.md#rules-for-many-tasks)). The drain check still
+  `RUNBOOK.md` → [Rules for many tasks](RUNBOOK.md#rules-for-the-task-list)). The drain check still
   waits for those tables, so **cutover cannot finish until the separate job has caught up**.
 - **Not in the repo:** the separate composite-key CDC job is not shipped here (known gap — see
   `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) and the checklist WP10).
