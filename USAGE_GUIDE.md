@@ -1,21 +1,30 @@
 # End-to-End Usage Guide — DMS → S3 → Glue → Aurora DSQL
 
 _How to operate the pipeline for a migration task: prerequisites, running full load +
-validation + CDC, handling schema changes (DDL), cutover, monitoring, and troubleshooting._
+validation + CDC with the fleet, handling schema changes (DDL), cutover, monitoring, and
+troubleshooting._
 
 Companion docs: `RUNBOOK.md` (one-time deploy of IAM/lambdas/state machines/scripts) and
 `ENGINEERING_RECORD.md` (architecture, fixes, DDL limitations). **Read the DDL limitations in
 the Engineering Record before relying on schema-change replication.** This guide describes the
 code **as it is today, including bugs that aren't fixed yet** — those are called out inline and
-collected in `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary).
+collected in `RUNBOOK.md`.
 
 ---
 
 ## 0. Mental model (read once)
 
-- **Two shared state machines (startup, cutover) serve every DMS task**, started with
-  `{"taskArn": "..."}`. Shared settings live in `s3://<bucket>/config/pipeline.json`; each task's
-  config prefix is `s3://<bucket>/config/_task/<task name>/` (the DMS task's name).
+- **The fleet is how you start and cut over tasks.** You launch the `fleet-startup` (or
+  `fleet-cutover`) state machine once, by hand, with
+  `{"bucket": "<pipeline bucket>", "inputPrefix": "<folder of fleet_tasks.csv>"}`. The fleet reads
+  `fleet_tasks.csv` from `s3://<bucket>/<inputPrefix>/`, checks every task, and starts the per-task
+  **startup** (or **cutover**) for each row. **One DMS task = one row in `fleet_tasks.csv`** — a
+  single task is a one-row list, many tasks are more rows.
+- **Two shared per-task state machines (startup, cutover) do the work for every DMS task**, each
+  started by the fleet with `{"taskArn": "..."}`. Shared settings live in
+  `s3://<bucket>/config/pipeline.json`; each task's config prefix is
+  `s3://<bucket>/config/_task/<task name>/` (the DMS task's name). The fleet reads `pipeline.json`;
+  it never writes it.
 - DMS writes CSVs to `s3://<bucket>/<schema>/<table>/` (full load = `LOAD*.csv`, CDC =
   `<timestamp>.csv` with a leading `Op` column). Glue loads them into DSQL.
 - Flow per task: **full load → (Glue) discover → load → validate → resume DMS to CDC →
@@ -28,19 +37,20 @@ collected in `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary).
 ## 1. Prerequisites (per task)
 
 1. **One-time deploy done** (per `RUNBOOK.md`): IAM roles, the Lambda functions
-   ([RUNBOOK Step 2](RUNBOOK.md#step-2--create-the-lambda-functions) — **seven** core functions,
-   plus the **eighth** `preflight-tasks` if you use the fleet; `lambdas/` holds **nine** `.py`
-   files because `prepare_cdc_wheels.py` ships inside the driver-discovery zip rather than as its
-   own function), scripts staged to
+   ([RUNBOOK Step 2](RUNBOOK.md#step-2--create-the-lambda-functions) — **eight** functions:
+   seven for the per-task workflows plus `preflight-tasks` for the fleet; `lambdas/` holds **nine**
+   `.py` files because `prepare_cdc_wheels.py` ships inside the driver-discovery zip rather than as
+   its own function), scripts staged to
    `s3://<bucket>/scripts/`, glue-templates staged, and the **three driver folders** populated:
    - `driver-fullload/`, `driver-validation/` — DSQL driver wheels only (pg8000, scramp,
      asn1crypto, python-dateutil, six).
    - `driver-cdc/` — the same DSQL drivers **plus** modern `boto3`/`botocore` wheels, downloaded
-     **for Python 3.9** (RUNBOOK Step 3b). The startup workflow checks them and prepares
-     install-safe copies in `driver-cdc-prepared/` before DMS starts, so the Python shell CDC job
-     installs them without internet.
-   - `config/pipeline.json` written (RUNBOOK Step 3c) and the two shared state machines created
-     (RUNBOOK Step 4).
+     **for Python 3.9** ([RUNBOOK Step 3b](RUNBOOK.md#step-3b--driver-wheels)). The startup
+     workflow checks them and prepares install-safe copies in `driver-cdc-prepared/` before DMS
+     starts, so the Python shell CDC job installs them without internet.
+   - `config/pipeline.json` written ([RUNBOOK Step 3c](RUNBOOK.md#step-3c--pipeline-settings)) and
+     the two shared per-task state machines plus the two fleet state machines created
+     ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)).
 2. **DMS S3 target endpoint** configured with (these are validated automatically):
    - `AddColumnName = true` (CSVs have header rows),
    - `DatePartitionEnabled = false`,
@@ -66,7 +76,8 @@ collected in `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary).
    cleanly; range-validation needs an integer PK).
 5. **Manifest** staged: `s3://<bucket>/config/_task/<task name>/table_manifest.csv`, naming each
    table as DMS writes it to S3 (after any schema rename), in any letter case. The DSQL target is
-   the lowercased name. Discovery fails if none of the tables has a DMS folder.
+   the lowercased name. Discovery fails if none of the tables has a DMS folder. Stage one of these
+   per task before a startup fleet ([RUNBOOK Step 5b](RUNBOOK.md#5b--upload-each-tasks-table-list)).
    ```
    dms_schema,dms_table
    target_schema,table_a
@@ -75,26 +86,36 @@ collected in `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary).
 
 ---
 
-## 2. Run the pipeline (the normal path — via the state machine)
+## 2. Run the pipeline (the fleet)
 
-The shared **startup state machine** does everything automatically. Start it with the DMS
-task's ARN (RUNBOOK Step 5):
+Starting a migration — one task or many — always goes through the **fleet-startup** state machine.
+Put one row per DMS task in `fleet_tasks.csv` (columns `task_arn`, optional `task_suffix`, optional
+`adopt_existing_folder`), upload it to the bucket, and launch the fleet once with the bucket and
+the folder that holds it ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)):
 
 ```bash
 aws stepfunctions start-execution \
-  --state-machine-arn <arn-of-$PROJECT-startup> \
-  --name <task-name>-$(date +%Y%m%d%H%M) \
-  --input '{"taskArn":"arn:aws:dms:<region>:<account>:task:<id>"}'
+  --state-machine-arn <arn-of-$PROJECT-fleet-startup> \
+  --name fleet-startup-$(date +%Y%m%d%H%M) \
+  --input '{"bucket":"<pipeline bucket>","inputPrefix":"<folder of fleet_tasks.csv>"}'
 ```
 
-It performs, in order (matching the `startup` state machine; see
-`RUNBOOK.md` → [Step 5c](RUNBOOK.md#5c--start-it) for the per-step detail):
+The fleet's `preflight-tasks` Lambda checks **every** task first (reusing `resolve_task`'s own
+rules); if any row fails, it stops at `PreflightFailed` and **nothing starts**. Otherwise it starts
+one per-task **startup** execution per row (five at a time) with the same input you would pass by
+hand (`{"taskArn": "..."}`, plus `taskSuffix`/`adoptExistingFolder` only if the row sets them), and
+confirms each one got past its own input checks. `FleetStarted` means every task's startup was
+started (or skipped as already started); it does **not** mean the migrations finished — watch each
+per-task execution. See [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for inputs, preflight checks,
+skip rules, results and limits.
+
+Each per-task startup then performs, in order (matching the `startup` state machine):
 1. **ResolveTask** → reads `config/pipeline.json`; derives the task's folder and job names from its
    name; derives `cdcRoot`, `timestampColumnName`, S3 settings from the endpoint; checks the DMS task
    **before starting it** (fails at `ResolveFailed` if `StopTaskCachedChangesApplied` isn't true,
    `AddColumnName` isn't true, the endpoint writes to another bucket, the task is already past its
    full load, `DatePartitionEnabled=true` or `CdcPath` set, or another startup for this task is
-   already running).
+   already running). The fleet's preflight runs these same checks across the whole list first.
 2. **DriverDiscovery** ×3 (fullload / validation / cdc folders) → runs **before DMS starts**, so a
    wrong or missing wheel fails in seconds at `DriversFailed` with **no DMS cost**. For a
    Python-shell CDC job this step also prepares `driver-cdc-prepared/`. With `cdc_spark_fallback`
@@ -108,7 +129,7 @@ It performs, in order (matching the `startup` state machine; see
 8. **StartCdcJob** → launches the continuous CDC job and confirms it started. A Python-shell run
    that fails on its drivers is switched to Spark automatically (see below).
 
-After this, full load is in DSQL, validated, and CDC is live.
+After this, each task's full load is in DSQL, validated, and CDC is live.
 
 **Automatic switch to Spark when the CDC drivers fail** (`cdc_spark_fallback` in
 `config/pipeline.json`, default `true`). Two places:
@@ -129,13 +150,15 @@ the same way and records the choice in `_cdc_engine.json`.
 
 ---
 
-## 3. Run the pipeline manually (for testing / debugging a single step)
+## 3. Driving one step by hand (for testing / debugging)
 
-Useful when iterating. Set once:
+The fleet always starts a task through its per-task **startup** state machine; you do not normally
+start a per-task execution yourself. These are the individual steps the per-task startup runs, for
+when you need to reproduce or debug one of them in isolation. Set once:
 ```bash
-REGION=us-east-1; PROJECT=<project>; SUF=<task name>   # the DMS task's name
-CFG=s3://<bucket>/config/_task/$SUF/
-ARN=<dms-task-arn>
+REGION=us-east-1; PROJECT="<project>"; SUF="<task name>"   # the DMS task's name
+CFG="s3://<bucket>/config/_task/$SUF/"
+ARN="<dms-task-arn>"
 ```
 
 1. **Full load** → wait for cached-events stop:
@@ -185,9 +208,7 @@ ARN=<dms-task-arn>
 > the Glue maximum, set on both `cdc.json` and `cdc-spark.json`. Nothing restarts it
 > automatically. A migration that stays in CDC for more than a week will have its CDC run end on
 > its own (DMS keeps writing change files, so nothing is lost); start the CDC job again by hand to
-> resume. Cut over within 7 days where you can. See
-> `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) #3 and
-> [If a run fails](RUNBOOK.md#if-a-run-fails-how-to-continue).
+> resume. Cut over within 7 days where you can. See `RUNBOOK.md`.
 
 ---
 
@@ -307,34 +328,45 @@ missing row would replay all of them from the start.
 
 ## 6. Cutover
 
-**Before you start — stop writes to the source first.** Cutover's **first** action is to stop the
-DMS task, so any change written to the source **after** that is never captured — silent data loss.
-Put the application into maintenance mode (or make the source read-only), let DMS deliver the last
-changes (CDCLatencySource/Target near zero, and wait past any `CdcMaxBatchInterval`), confirm no
-table is `blocked` and that the CDC run is RUNNING, and only then cut over. The full pre-cutover
-checklist is in `RUNBOOK.md` →
-[Step 6 → Before you start](RUNBOOK.md#before-you-start--checklist); do it for every table of every
-task in a fleet cutover.
+Cutover runs through the **fleet-cutover** state machine, the same way as startup: one launch reads
+`fleet_tasks.csv` and starts the per-task **cutover** for each row (one task is a one-row list).
 
-When CDC has caught up (all tables `idle`, source≈target), start the **cutover state machine**
-with the task's ARN (`{"taskArn": "..."}`, [RUNBOOK Step 6](RUNBOOK.md#step-6--cut-over)). It:
+**Before you start — stop writes to the source first.** Each task's cutover's **first** action is
+to stop its DMS task, so any change written to the source **after** that is never captured — silent
+data loss. For **every** table of **every** task in the list, put the application into maintenance
+mode (or make the source read-only), let DMS deliver the last changes (CDCLatencySource/Target near
+zero, and wait past any `CdcMaxBatchInterval`), confirm no table is `blocked` and that the CDC run
+is RUNNING, and only then launch the fleet. **The fleet checks inputs, not readiness, and cutover
+is irreversible per task** — only list tasks whose CDC has caught up.
+
+When CDC has caught up (all tables `idle`, source≈target), launch the **fleet-cutover** state
+machine ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)):
+
+```bash
+aws stepfunctions start-execution \
+  --state-machine-arn <arn-of-$PROJECT-fleet-cutover> \
+  --name fleet-cutover-$(date +%Y%m%d%H%M) \
+  --input '{"bucket":"<pipeline bucket>","inputPrefix":"<folder of fleet_tasks.csv>"}'
+```
+
+Preflight checks every task (each must have been started by the pipeline); then each per-task
+cutover:
 1. Stops the DMS task.
 2. **Drain-checks** each table (latest CDC file applied) until quiesced.
 3. Stops this task's CDC run, drops the `_cdc_file` tracking column, and deletes the task's Glue
    jobs. If a job can't be deleted it ends at `GlueJobsNotDeleted`, naming it (the data is already
-   cut over; delete the job by hand — **do not re-run the cutover**).
+   cut over; delete the job by hand — **do not re-run that task's cutover**).
 
-**You cannot re-run the cutover once DMS has been stopped (known issue).** Its first step stops
-the DMS task, which the DMS API rejects for an already-stopped task, so a second run just fails at
-`CutoverFailed` within ~2 minutes without finishing. If a cutover fails **after** DMS was stopped
-(`CdcDrainTimedOut`, a later `CutoverFailed`, or `GlueJobsNotDeleted`), **finish the remaining
-steps by hand** using the block in [RUNBOOK Step 6](RUNBOOK.md#step-6--cut-over) and
-[If a run fails → Cutover](RUNBOOK.md#if-a-run-fails-how-to-continue). See also
-`RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) #1.
+**You cannot re-run a task's cutover once its DMS has been stopped (known issue).** The first step
+stops the DMS task, which the DMS API rejects for an already-stopped task, so a second run just
+fails at `CutoverFailed` within ~2 minutes without finishing. Re-launching the **fleet** is safe —
+a task whose cutover is already running is skipped (`already_running`) — but a task that already
+failed **after** DMS was stopped (`CdcDrainTimedOut`, a later `CutoverFailed`, or
+`GlueJobsNotDeleted`) must have its **remaining steps finished by hand** (stop the CDC run, drop the
+`_cdc_file` column on each table, delete the task's five Glue jobs). See `RUNBOOK.md`.
 
-Then repoint the application to DSQL. For many tasks at once, see
-[`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) and
-`RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#running-many-tasks-with-the-fleet).
+Then repoint the application to DSQL. The fleet drives both start and cutover for one task or many;
+see [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for its inputs, skip rules and limits.
 
 ---
 
@@ -345,9 +377,10 @@ Then repoint the application to DSQL. For many tasks at once, see
 | Load run "SUCCEEDED" but **0 rows** | a stale per-group `_load_status.json` marks tables `done` → skipped | delete `s3://<bucket>/config/_task/<task name>/_orchestrator/` (recursive) and re-run |
 | CDC job fails `UnknownServiceError: dsql` | CDC job didn't get modern boto3 | ensure `driver-cdc/` has boto3/botocore wheels and the job's `--extra-py-files` is the **cdc** list (not fullload). In the startup workflow this error switches the CDC job to Spark automatically |
 | CDC log: `another CDC run is applying this table` (cycle summary lists the table as applied by another run) | two different CDC jobs or runs are applying the same table | each change is still applied once; find the extra job (old per-task workflow, hand-made copy, a second DMS task with the same table) and stop it |
-| Startup stops at `ResolveFailed`: `Another startup run is already running` | a startup for this task is still running | wait for it or stop it, then start again |
+| Startup stops at `ResolveFailed`: `Another startup run is already running` | a startup for this task is still running | wait for it or stop it, then launch the fleet again (the task is skipped while running) |
 | CDC startup log: `NOT applied by this job (multi-column primary key)` | the table's primary key has more than one column | expected: run the separate multi-column-key CDC job for it; cutover waits until that job has caught up |
-| Startup stops at `DriversFailed` | a `driver-cdc/` wheel can't work on Python 3.9, or one is missing | the error names the wheel; fix `driver-cdc/` (RUNBOOK Step 3b) and start again (DMS was not started) |
+| Startup stops at `DriversFailed` | a `driver-cdc/` wheel can't work on Python 3.9, or one is missing | the error names the wheel; fix `driver-cdc/` ([RUNBOOK Step 3b](RUNBOOK.md#step-3b--driver-wheels)) and launch the fleet again (DMS was not started) |
+| Fleet stops at `PreflightFailed` | one or more rows failed a per-task check before anything started | the cause lists every problem by row; fix them and launch the fleet again (nothing was started) |
 | CDC job fails installing a `.whl` (`CalledProcessError`, `pypi.org` timeouts), often after ~20 min | the run was given the raw `driver-cdc/` list (older per-task workflow, or a hand-made start with `--extra-py-files`) | start it without `--extra-py-files` so it uses the prepared list saved on the job |
 | Startup ends at `CdcRunFailed`, `CdcRunEnded` or `CdcStartNotConfirmed` | the CDC run failed, stopped, or never reached its poll loop | full load is done and DMS is capturing changes: read the CDC log, fix, restart the CDC job with `--config_prefix` |
 | Startup stops at `ResolveFailed` | a DMS task setting, `pipeline.json`, or folder-owner check failed before DMS started | read the execution's error message; RUNBOOK → Troubleshooting lists each case |
@@ -365,11 +398,11 @@ Then repoint the application to DSQL. For many tasks at once, see
 
 > **A reload needs a DMS task that has not finished its full load.** The shared startup
 > **refuses** a task that is already past its full load (`ResolveFailed` / `past_full_load`), so
-> you **cannot** reload by re-running Section 2 against the same, already-run DMS task. There is no
-> supported in-place reload. After purging the state below, you must **create a new DMS task** (or
-> otherwise reset one so it hasn't completed its full load) and run that. The full, ordered
-> procedure — including the new-task step and archiving a reused folder name — is in
-> `RUNBOOK.md` → [Clean-slate reload](RUNBOOK.md#clean-slate-reload); use it for the DMS part.
+> you **cannot** reload by re-launching the fleet against the same, already-run DMS task. There is
+> no supported in-place reload. After purging the state below, you must **create a new DMS task**
+> (or otherwise reset one so it hasn't completed its full load), add its ARN to `fleet_tasks.csv`,
+> and launch the fleet for it. The full, ordered procedure — including the new-task step and
+> archiving a reused folder name — is in `RUNBOOK.md`; use it for the DMS part.
 
 Stop the task's CDC run (and the DMS task) first. Then purge **all** of these together, or you will
 get stale-state artifacts (see Engineering Record §3). In particular, never delete a table's
@@ -388,5 +421,6 @@ DELETE FROM cdc_control.cdc_apply_exceptions   WHERE table_name='<schema.table>'
 DELETE FROM cdc_control.cdc_validation_failures WHERE table_name='<schema.table>';
 DELETE FROM cdc_control.cdc_skipped_ops        WHERE table_name='<schema.table>';
 ```
-Then start a **new (not-yet-run) DMS task** and run the pipeline from Section 2 (or Section 3 for a
-single-step manual run). Re-running Section 2 on the old task will stop at `ResolveFailed`.
+Then add a **new (not-yet-run) DMS task** to `fleet_tasks.csv` and launch the fleet from Section 2
+(or Section 3 for a single-step manual run). Re-launching the fleet on the old task will stop at
+`ResolveFailed`.

@@ -1,20 +1,33 @@
-# Fleet launcher: start or cut over many DMS tasks with one trigger
+# Fleet launcher: how the fleet starts and cuts over tasks
 
-Two optional state machines on top of the per-task workflows:
+The fleet is the way an operator starts and cuts over migration tasks. Two state machines sit on
+top of the per-task workflows:
 
 - `<project>-fleet-startup` starts `<project>-startup` for every task in a list.
 - `<project>-fleet-cutover` starts `<project>-cutover` for every task in a list.
 
-Each is started once, by hand. It checks every task first, starts one per-task execution per
-task (5 at a time), confirms each one got past its own input checks, and finishes in minutes.
-Each task's migration then runs on its own, exactly as if you had started it by hand with
+**One DMS task is one row in `fleet_tasks.csv`.** Starting a single task is a one-row list;
+starting many is the same list with more rows. There is no separate "start one task by hand" path —
+you always launch the fleet.
+
+Each fleet is started once, by hand. It checks every task first, starts one per-task execution per
+task (5 at a time), confirms each one got past its own input checks, and finishes in minutes. Each
+task's migration then runs on its own, exactly as if the per-task workflow had been started with
 `{"taskArn": "..."}`. Nothing in the per-task workflows changes.
+
+Deploying the fleet (and everything it needs) is part of the one-time setup in
+[`RUNBOOK.md`](../RUNBOOK.md): the `preflight-tasks` Lambda in
+[Step 2](../RUNBOOK.md#step-2--create-the-lambda-functions), the shared settings in
+[Step 3c](../RUNBOOK.md#step-3c--pipeline-settings), and the fleet state machines and roles in
+[Step 4](../RUNBOOK.md#step-4--create-the-state-machines). This page is the reference for how
+the fleet behaves once it exists.
 
 ## Inputs
 
-**Settings:** the same `s3://<bucket>/config/pipeline.json` every task already uses (RUNBOOK
-Step 3c). The fleet never writes it. If you keep a `pipeline.json` next to the task list too, it
-must be identical, or preflight stops (the per-task workflows would not use it).
+**Settings:** the same `s3://<bucket>/config/pipeline.json` every task already uses
+([RUNBOOK Step 3c](../RUNBOOK.md#step-3c--pipeline-settings)). The fleet never writes it. If you
+keep a `pipeline.json` next to the task list too, it must be identical, or preflight stops (the
+per-task workflows would not use it).
 
 **Task list:** a CSV in the bucket, e.g. `s3://<bucket>/config/fleet_tasks.csv`
 ([example](../config/fleet_tasks.example.csv)):
@@ -26,7 +39,8 @@ must be identical, or preflight stops (the per-task workflows would not use it).
 | `adopt_existing_folder` | optional, startup only. `true` for a task whose folder holds files from an earlier run but no owner record |
 
 Before a startup fleet, stage each task's table list at
-`config/_task/<task name>/table_manifest.csv` (RUNBOOK Step 5b).
+`config/_task/<task name>/table_manifest.csv`
+([RUNBOOK Step 5b](../RUNBOOK.md#5b--upload-each-tasks-table-list)).
 
 **Start input** (both fleets):
 
@@ -51,21 +65,23 @@ The `preflight-tasks` Lambda reuses the per-task workflow's own checks (`resolve
   `adopt_existing_folder`, and at most 9 distinct DSQL schemas across the fleet's table lists;
 - cutover: each task was started by the pipeline (owner record present).
 
-A failed preflight ends at `PreflightFailed`; its cause lists every problem by row.
+A failed preflight ends at `PreflightFailed`; its cause lists every problem by row. Because
+preflight runs the per-task rules across the whole list before anything starts, a task that would
+fail its own `ResolveFailed` check is caught here first.
 
 **Schema limit:** DSQL allows 10 schemas per database and `cdc_control` uses one. Preflight counts
 the fleet's own schemas; schemas already in the database from other tasks count too but are not
 visible to it (it prints a warning with the count). Check with
 `SELECT count(*) FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg\_%' AND schema_name <> 'information_schema';`.
 
-## Starting again after a partial failure
+## Skip rules — starting again after a partial failure
 
-Start the fleet again with the same input. Tasks whose per-task execution is already running are
+Launch the fleet again with the same input. Tasks whose per-task execution is already running are
 skipped (`already_running`), and so are startup tasks the pipeline started earlier that are past
 their full load (`past_full_load`). Only the rest are started. Even without the skip (for example
 if the Lambda can't list executions), the per-task workflow refuses a second run of a running task.
 
-## What the result means
+## Results — what the outcome means
 
 - `FleetStarted`: every task was started, or skipped as already started, and each started one
   was still running 30 s later, i.e. past its own input checks. It does **not** mean the
@@ -73,68 +89,10 @@ if the Lambda can't list executions), the per-task workflow refuses a second run
 - `FleetStartIncomplete`: at least one task did not start. The execution output's
   `results.tasks` lists each task with `status` (`started`, `skipped`, `not_started`) and, for
   `not_started`, the error or the child execution's status. The others were started.
-
-## Deploy (once)
-
-Use the variables from the RUNBOOK's "Fill in your values" block (`$PROJECT`, `$REGION`,
-`$ACCOUNT_ID`, `$BUCKET`).
-
-1. **Lambda.** `preflight_tasks.py` is in `lambdas/`, so it is already in `fn.zip` (it needs
-   `resolve_task.py` from the same zip). Create the role and function:
-
-   ```bash
-   export AWS_PAGER=""
-   for f in iam/preflight-tasks-role.policy.json iam/fleet-startup-role.policy.json iam/fleet-cutover-role.policy.json; do
-     sed -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
-         -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<PROJECT>>|$PROJECT|g" "$f" > "${f%.json}.filled.json"
-   done
-   sed -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" iam/fleet-startup-role.trust.json > /tmp/fleet-trust.json
-
-   aws iam create-role --role-name $PROJECT-preflight-tasks-role \
-     --assume-role-policy-document file://iam/preflight-tasks-role.trust.json
-   aws iam put-role-policy --role-name $PROJECT-preflight-tasks-role --policy-name preflight \
-     --policy-document file://iam/preflight-tasks-role.policy.filled.json
-   sleep 10
-   aws lambda create-function --function-name $PROJECT-preflight-tasks --runtime python3.12 \
-     --handler preflight_tasks.handler --zip-file fileb://fn.zip --timeout 300 --memory-size 256 \
-     --role arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-preflight-tasks-role --no-cli-pager
-   ```
-
-2. **Fleet roles** (Step Functions):
-
-   ```bash
-   for w in startup cutover; do
-     aws iam create-role --role-name $PROJECT-fleet-$w-role \
-       --assume-role-policy-document file:///tmp/fleet-trust.json
-     aws iam put-role-policy --role-name $PROJECT-fleet-$w-role --policy-name fleet \
-       --policy-document file://iam/fleet-$w-role.policy.filled.json
-   done
-   ```
-
-3. **State machines:**
-
-   ```bash
-   SM=arn:aws:states:$REGION:$ACCOUNT_ID:stateMachine
-   for w in startup cutover; do
-     sed -e "s|<<PROJECT>>|$PROJECT|g" \
-         -e "s|<<PREFLIGHT_TASKS_LAMBDA_ARN>>|arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT-preflight-tasks|g" \
-         -e "s|<<STARTUP_STATE_MACHINE_ARN>>|$SM:$PROJECT-startup|g" \
-         -e "s|<<CUTOVER_STATE_MACHINE_ARN>>|$SM:$PROJECT-cutover|g" \
-         stepfunctions/fleet-$w.asl.json > fleet-$w.filled.asl.json
-     grep -c '<<' fleet-$w.filled.asl.json    # must print 0
-     aws stepfunctions create-state-machine --name $PROJECT-fleet-$w \
-       --definition file://fleet-$w.filled.asl.json \
-       --role-arn arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-fleet-$w-role --no-cli-pager
-   done
-   ```
-
-4. **Run:**
-
-   ```bash
-   aws s3 cp fleet_tasks.csv s3://$BUCKET/config/fleet_tasks.csv
-   aws stepfunctions start-execution --state-machine-arn $SM:$PROJECT-fleet-startup \
-     --input "{\"bucket\":\"$BUCKET\",\"inputPrefix\":\"config\"}" --no-cli-pager
-   ```
+- `PreflightFailed`: a task failed a check; **nothing was started**. The cause lists every problem
+  by row.
+- `MissingFleetInput`: the start input was missing `bucket` or `inputPrefix`.
+- `FleetFailed`: the fan-out itself failed unexpectedly.
 
 ## Limits
 

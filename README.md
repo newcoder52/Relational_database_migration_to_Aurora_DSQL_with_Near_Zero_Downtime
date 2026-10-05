@@ -52,12 +52,21 @@ source only at cutover, once CDC has caught up and the target matches the source
 
 ## How it works
 
-- **Two shared Step Functions state machines — `startup` and `cutover` — serve every DMS task.**
-  You start either one with just the DMS task's ARN: `{"taskArn": "arn:aws:dms:..."}`. Nothing
-  runs on a schedule.
+- **The fleet is how you start and cut over tasks.** You launch the `fleet-startup` (or
+  `fleet-cutover`) state machine once, by hand, with
+  `{"bucket": "<pipeline bucket>", "inputPrefix": "<folder of fleet_tasks.csv>"}`. It reads
+  `fleet_tasks.csv` from `s3://<bucket>/<inputPrefix>/`, checks every task first, and then starts
+  the per-task **startup** (or **cutover**) state machine for each one. **One DMS task is one row
+  in `fleet_tasks.csv`**, so starting a single task is a one-row list and starting many is the
+  same list with more rows. Nothing runs on a schedule.
+- **Two shared per-task Step Functions state machines — `startup` and `cutover` — do the actual
+  work for every DMS task.** The fleet starts each one with just the DMS task's ARN
+  (`{"taskArn": "arn:aws:dms:..."}`); the per-task startup and cutover state machines described
+  below are exactly what the fleet runs per task.
 - Settings shared by all tasks (project prefix, region, DSQL endpoint/user/database, Glue role,
   Glue network connection, CDC engine, control schema) live in one file,
-  `s3://<bucket>/config/pipeline.json`. An edit applies to runs started after it.
+  `s3://<bucket>/config/pipeline.json`. The fleet reads it (never writes it), and an edit applies
+  to runs started after it.
 - The DMS task's **name** becomes its config folder, `s3://<bucket>/config/_task/<task name>/`,
   and the middle of its Glue job names, `<project>-<task name>-<role>` (for example
   `<project>-<task name>-load`). Each task runs and cuts over independently.
@@ -66,9 +75,9 @@ source only at cutover, once CDC has caught up and the target matches the source
   the case DMS writes them.
 - The S3 layout (`BucketFolder`, the timestamp column, the header row, the NULL marker) is read
   from the DMS endpoint at run time, not typed in.
-- An optional **fleet launcher** starts the shared `startup` (or `cutover`) for a whole list of
-  tasks from one trigger — the normal way to run more than a handful. See
-  [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md).
+
+See [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for the fleet's inputs, preflight checks,
+skip rules, results and limits, and [`RUNBOOK.md`](RUNBOOK.md) for the commands.
 
 ## The Glue jobs and Lambdas
 
@@ -81,15 +90,19 @@ Each task gets its own **five Glue jobs**, created by the startup run and delete
 | **Job 3 — Validate** | `scripts/job3_validate.py` | Per key range: row counts plus a content check of **every column**, chosen by its real DSQL type — integer/numeric: exact sum (after the load's rounding); real/double: sum with a small float tolerance; text/binary: non-null count, length, min, max; boolean: true count; timestamp/date: sum of instants; json: non-null count. A per-value hash is added when DSQL supports `md5()`. Names the column that differs; fails instead of skipping. |
 | **CDC — Continuous** | `scripts/glue_cdc_continuous.py` | Long-running job that applies inserts, updates and deletes to DSQL, multi-table, with crash-proof resume through the DSQL `cdc_control` tables. Runs as a **Python shell** job by default; as a **Spark** job if `cdc_engine` is `spark`, or automatically if the Python-shell drivers fail (see below). |
 
-The state machines call **eight Lambdas** (seven for the core workflows, plus `preflight_tasks`
+The state machines call **eight Lambdas** (seven for the per-task workflows, plus `preflight_tasks`
 for the fleet): `resolve_task`, `driver_discovery`, `plan_split`, `create_glue_jobs`,
 `stop_cdc_run`, `drain_check`, `drop_tags`, and `preflight_tasks`. All ship in one zip;
 `drain_check` and `drop_tags` connect to DSQL (they bundle `pg8000`), and `driver_discovery`
-imports `prepare_cdc_wheels.py` from the same zip. The RUNBOOK's Step 2 covers packaging.
+imports `prepare_cdc_wheels.py` from the same zip. The RUNBOOK's
+[Step 2](RUNBOOK.md#step-2--create-the-lambda-functions) covers packaging.
 
 ## What a startup run does
 
-In the order the code runs them:
+The fleet starts one per-task **startup** execution per `fleet_tasks.csv` row, with the same input
+it would use by hand (`{"taskArn": "..."}`). The `preflight_tasks` Lambda runs every per-task
+check first and refuses to start anything if any row fails. Each per-task startup then runs, in
+the order the code runs them:
 
 1. **Check the task** (seconds). Reads `config/pipeline.json`, works out the folder and job
    names, and checks the DMS task **before starting it**: type `full-load-and-cdc`,
@@ -98,6 +111,7 @@ In the order the code runs them:
    `pipeline.json`, a name of letters/digits/hyphens, and a task not already past its full load.
    A problem ends the run at **`ResolveFailed`**; DMS is untouched. A second startup for the same
    task while one is running also stops here, as does a folder owned by a different task ARN.
+   (The fleet's preflight runs these same checks across the whole list before any task starts.)
 2. **Check the driver files** (seconds; about a minute the first time). Checks the three
    `driver-*` folders and, for a Python-shell CDC job, prepares the `driver-cdc/` wheels into
    `driver-cdc-prepared/<fingerprint>/` so Glue can install them with no internet. A bad or
@@ -122,44 +136,60 @@ In the order the code runs them:
    straight away; delete that file to go back to Python shell. Set `cdc_spark_fallback: false` in
    `pipeline.json` to disable it, or switch a job by hand with `tools/switch_cdc_engine.py`.
 
-When the run succeeds, the full load is in DSQL and validated, and CDC is applying changes.
-Optional input keys (rarely needed): `taskSuffix` uses a different folder and job name than the
-DMS task's name, and `adoptExistingFolder: true` reuses a folder from a run made before the shared
-state machines existed. Commands are in the RUNBOOK's
-[Step 5](RUNBOOK.md#step-5--run-one-task-by-hand).
+When the run succeeds, the full load is in DSQL and validated, and CDC is applying changes. The
+fleet's `FleetStarted` result only means every task's startup was started and still running after
+30 s (past its own input checks) — watch each per-task execution for the outcome.
+
+Per-task input keys (set per row in `fleet_tasks.csv`, rarely needed): `task_suffix` uses a
+different folder and job name than the DMS task's name, and `adopt_existing_folder=true` reuses a
+folder from a run made before the shared state machines existed. The fleet commands are in the
+RUNBOOK's [Step 4](RUNBOOK.md#step-4--create-the-state-machines) (create the state machines)
+and [Step 5b](RUNBOOK.md#5b--upload-each-tasks-table-list) (stage each task's table list).
 
 ## If a run fails
 
-**Where the run stopped decides what to do** — because once DMS has been resumed into CDC it is
-past its full load, and starting the startup again just ends at `ResolveFailed`. The RUNBOOK's
-[If a run fails](RUNBOOK.md#if-a-run-fails-how-to-continue) has the exact command for each state.
+The fleet starts tasks and then returns; each per-task startup runs on its own. **Where a task's
+own run stopped decides what to do** — because once DMS has been resumed into CDC it is past its
+full load, and starting that task's startup again just ends at `ResolveFailed`. Re-launching the
+fleet with the same `fleet_tasks.csv` only starts the tasks that still need it: tasks whose
+per-task execution is already running are skipped (`already_running`), and startup tasks already
+past their full load are skipped (`past_full_load`).
 
-| The run stopped… | What is already done | Then |
+| The task's run stopped… | What is already done | Then |
 |---|---|---|
-| **Before DMS started** — `MissingTaskArn`, `ResolveFailed`, `DriversFailed` | nothing; DMS untouched | Fix the cause in the error and start the startup again with the same input. |
-| **During the full load** — `DmsFailed`, `DmsTimedOut` | DMS was starting/running | Fix it in the DMS console. The startup can only start a task that hasn't finished its full load; a task already past it needs a [clean-slate reload](RUNBOOK.md#clean-slate-reload) with a new DMS task. |
-| **Load/validate** — `GroupsFailed`, or `PipelineFailed` before `ResumeDmsToCdc` | full load is in S3; DMS is paused | Fix the failed group (its Glue log has the cause) and start again with the same input — finished tables are skipped. |
-| **After DMS was resumed into CDC** — `CdcRunFailed`, `CdcRunEnded`, `CdcFallbackFailed`, `CdcStartNotConfirmed`, or `PipelineFailed` at `StartCdcJob` | full load done; **DMS is capturing changes to S3** | **Do not start the startup again.** Nothing is lost while CDC is down. Fix the cause and start the CDC job by hand with its `--config_prefix` argument (RUNBOOK). |
+| **Before DMS started** — `MissingTaskArn`, `ResolveFailed`, `DriversFailed` | nothing; DMS untouched | Fix the cause in the error (or the fleet's `PreflightFailed` row) and launch the fleet again — the fixed task starts, the rest are skipped. |
+| **During the full load** — `DmsFailed`, `DmsTimedOut` | DMS was starting/running | Fix it in the DMS console. The startup can only start a task that hasn't finished its full load; a task already past it needs a clean-slate reload with a new DMS task. |
+| **Load/validate** — `GroupsFailed`, or `PipelineFailed` before `ResumeDmsToCdc` | full load is in S3; DMS is paused | Fix the failed group (its Glue log has the cause) and launch the fleet again — finished tables are skipped, and already-running tasks are skipped too. |
+| **After DMS was resumed into CDC** — `CdcRunFailed`, `CdcRunEnded`, `CdcFallbackFailed`, `CdcStartNotConfirmed`, or `PipelineFailed` at `StartCdcJob` | full load done; **DMS is capturing changes to S3** | **Do not re-launch that task.** Nothing is lost while CDC is down. Fix the cause and start the CDC job by hand with its `--config_prefix` argument (RUNBOOK). |
+
+The exact command for each state is in [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Cutover
 
-When CDC has caught up (every table idle in `cdc_control.cdc_status`), cut over:
+Cutover is driven by the **`fleet-cutover`** state machine, the same way as startup: one launch
+with `{"bucket": "...", "inputPrefix": "..."}` reads `fleet_tasks.csv`, preflight-checks every
+task, and starts the per-task **cutover** for each. **Cut over only tasks whose CDC has caught up**
+(every table idle in `cdc_control.cdc_status`) — the fleet checks inputs, not readiness, and
+**cutover is irreversible per task**.
+
+For each task, in order:
 
 1. **Stop writes to the source** for this task's tables, and let DMS deliver the last changes
-   (its CDC latencies near zero). The cutover's **first step stops DMS**, so any source change
-   made after that is never migrated — getting this order wrong loses data silently.
-2. Start the shared **cutover** state machine with `{"taskArn": "..."}`. It stops the DMS task,
-   waits until each table's latest CDC file is applied (up to ~12 h, else **`CdcDrainTimedOut`**),
-   stops this task's CDC run, drops the internal `_cdc_file` tracking column, and deletes the
-   task's five Glue jobs. It finds the task by its ARN, so a renamed task still cuts over its
-   original folder and jobs. Other tasks are unaffected.
+   (its CDC latencies near zero). The per-task cutover's **first step stops DMS**, so any source
+   change made after that is never migrated — getting this order wrong loses data silently. Do
+   this for every table of every task in the list before you launch the fleet.
+2. The per-task cutover stops the DMS task, waits until each table's latest CDC file is applied
+   (up to ~12 h, else **`CdcDrainTimedOut`**), stops this task's CDC run, drops the internal
+   `_cdc_file` tracking column, and deletes the task's five Glue jobs. It finds the task by its
+   ARN, so a renamed task still cuts over its original folder and jobs. Other tasks are unaffected.
 3. Repoint the application at Aurora DSQL.
 
-End states: `CutoverSucceeded`; `GlueJobsNotDeleted` (data is cut over, a Glue job delete failed —
-delete it by hand); `CdcDrainTimedOut`, or `CutoverFailed` at a later step (DMS is stopped);
-`ResolveFailed` or `CutoverFailed` while DMS is still running (nothing changed). **Once DMS is
-stopped, do not start the cutover again** — its first step would fail on the already-stopped task;
-finish by hand instead ([RUNBOOK Step 6](RUNBOOK.md#step-6--cut-over)).
+End states (per task): `CutoverSucceeded`; `GlueJobsNotDeleted` (data is cut over, a Glue job
+delete failed — delete it by hand); `CdcDrainTimedOut`, or `CutoverFailed` at a later step (DMS is
+stopped); `ResolveFailed` or `CutoverFailed` while DMS is still running (nothing changed). **Once a
+task's DMS is stopped, do not cut it over again** — its first step would fail on the already-stopped
+task; finish that task by hand instead (see [`RUNBOOK.md`](RUNBOOK.md)). Re-launching the fleet is
+safe: a task whose cutover is already running is skipped (`already_running`).
 
 ## Monitoring
 
@@ -222,7 +252,7 @@ Details are in `ENGINEERING_RECORD.md` and `CDC_EDGE_CASE_RESULTS.md`.
   rows of the same range can cancel out. A table whose key can't be split is compared as one
   whole-table range.
 - **DSQL allows at most 10 schemas per database** (not adjustable), and the CDC job adds one
-  (`cdc_control`), so keep ≤ 9 of your own; the fleet preflight enforces it.
+  (`cdc_control`), so keep ≤ 9 of your own; the fleet preflight enforces it across the whole list.
 - **CDC Glue runs stop after 7 days** (the 10080-minute Glue maximum). A long migration's CDC run
   ends on its own — restart it by hand (RUNBOOK), or cut over before 7 days.
 - **A DMS task can be loaded only once:** the startup refuses a task already past its full load, so
@@ -237,15 +267,15 @@ Details are in `ENGINEERING_RECORD.md` and `CDC_EDGE_CASE_RESULTS.md`.
 ```
 scripts/                    The 4 Glue job scripts (job1_discovery, job2_load,
                             job3_validate, glue_cdc_continuous)
-lambdas/                    The 7 orchestration Lambdas (resolve_task, driver_discovery,
+lambdas/                    The 7 per-task orchestration Lambdas (resolve_task, driver_discovery,
                             plan_split, create_glue_jobs, stop_cdc_run, drain_check,
                             drop_tags), prepare_cdc_wheels.py (used by driver_discovery,
-                            same zip), and preflight_tasks.py (fleet launcher only)
-stepfunctions/              startup + cutover state machines, plus the optional
-                            fleet-startup / fleet-cutover launchers
+                            same zip), and preflight_tasks.py (the fleet's preflight)
+stepfunctions/              startup + cutover per-task state machines, plus the
+                            fleet-startup / fleet-cutover launchers that drive them
 glue-templates/             The 6 Glue job templates (discovery, load, load-big, validate,
                             cdc, cdc-spark)
-iam/                        Role trust + policy documents (core roles, plus the fleet roles)
+iam/                        Role trust + policy documents (per-task roles, plus the fleet roles)
 config/                     pipeline.example.json, fleet_tasks.example.csv
 tools/                      switch_cdc_engine.py (switch a CDC job Python shell <-> Spark by hand)
 RUNBOOK.md                  Step-by-step deploy and operate guide
@@ -253,7 +283,7 @@ USAGE_GUIDE.md              Day-to-day operation, monitoring, manual runs
 ENGINEERING_RECORD.md       Architecture, every bug found and fixed, DDL support matrix
 CDC_EDGE_CASE_RESULTS.md    CDC edge cases and data-type limitations
 docs/
-  FLEET_LAUNCHER.md                     Start or cut over many DMS tasks with one trigger
+  FLEET_LAUNCHER.md                     How the fleet works (inputs, preflight, skips, results)
   NO_PK_CDC_UPDATE_TRACKING.md          Design note: CDC for tables without a primary key
   USAGE_GUIDE.docx                      Word version of the usage guide
   CONSIDERATIONS_AND_LIMITATIONS.docx   Considerations and limitations
