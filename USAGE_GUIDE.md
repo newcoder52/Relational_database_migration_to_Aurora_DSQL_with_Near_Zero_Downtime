@@ -36,7 +36,11 @@ collected in `RUNBOOK.md`.
 
 ## 1. Prerequisites (per task)
 
-1. **One-time deploy done** (per `RUNBOOK.md`): IAM roles, the Lambda functions
+1. **One-time deploy done** (per `RUNBOOK.md`): IAM roles (setup creates the three
+   `<project>-{glue,lambda,sfn}-exec-role` roles, or — with `manage_iam=false` — **uses the roles
+   your IAM team already made**, named by `glue_role_arn`/`lambda_role_arn`/`sfn_role_arn`; see
+   [RUNBOOK §4](RUNBOOK.md#using-roles-your-iam-team-already-created-manage_iamfalse)), the Lambda
+   functions
    ([RUNBOOK Step 2](RUNBOOK.md#4-set-up) — **eight** functions:
    seven for the per-task workflows plus `preflight-tasks` for the fleet; `lambdas/` holds **nine**
    `.py` files because `prepare_cdc_wheels.py` ships inside the driver-discovery zip rather than as

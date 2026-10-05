@@ -101,6 +101,9 @@ cp config/params.example.csv params.csv
 | `max_parallel_tables` | optional | `20` | int 1–40. Tables loaded at once on the driver |
 | `per_worker_mem_budget_mb` | optional | `1500` | int ≥ 1. Per-table driver-memory budget (throttle never drops to 1) |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs |
+| `lambda_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-lambda-exec-role` | the role all 8 Lambdas run as; set it to a role your IAM team made. Same idea as `LAMBDA_ROLE_ARN` below |
+| `sfn_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-sfn-exec-role` | the role all 4 state machines run as; same idea as `SFN_ROLE_ARN` below |
+| `manage_iam` | optional (setup-only) | `true` | `true` = create/update the roles (this manual guide, Step 1). `false` = the roles already exist, so **skip Step 1** and just use the three role ARNs below in Steps 2 and 4 |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection; both-or-neither with `security_group_id` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection; both-or-neither with `subnet_id` |
 
@@ -125,12 +128,14 @@ export SUBNET_ID="subnet-0abc1234"            # subnet_id
 export SECURITY_GROUP_ID="sg-0abc1234"        # security_group_id
 export GLUE_CONNECTION="$PROJECT-vpc"         # glue_connection (EXACT name); "" = no VPC
 
-# ---- derived — don't edit ----
+# ---- derived — don't edit (BUT: if your IAM team already made the roles, i.e. manage_iam=false,
+#      set these three to THEIR ARNs instead and SKIP Step 1 — the role NAME is the last ARN
+#      segment, so a role path like .../role/team/your-role is fine) ----
 export AWS_PAGER=""
 export AWS_DEFAULT_REGION="$REGION"
-export SFN_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-sfn-exec-role"
-export LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-lambda-exec-role"
-export GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
+export SFN_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-sfn-exec-role"      # sfn_role_arn
+export LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-lambda-exec-role"  # lambda_role_arn
+export GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"      # glue_role_arn
 ```
 
 ---
@@ -140,6 +145,14 @@ export GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
 *Replaces in setup.sh: Step 1 (`split_iam` + `create_or_update_role`).* **One role per service:**
 `<project>-glue-exec-role`, `<project>-lambda-exec-role`, `<project>-sfn-exec-role`. All 8 Lambdas run
 as the lambda role; all 4 state machines as the sfn role.
+
+> **Already have the roles? (`manage_iam=false`)** If your IAM team created the three roles, **skip
+> this whole step.** Set `GLUE_ROLE_ARN` / `LAMBDA_ROLE_ARN` / `SFN_ROLE_ARN` (above) to their ARNs
+> and go to Step 1b. Make sure each role **trusts** its service (`glue.amazonaws.com`,
+> `lambda.amazonaws.com`, `states.amazonaws.com`) and carries the matching `Policy` block from the
+> `iam/*.json` file (the Lambda policy's `iam:PassRole` must name the Glue role). `tools/setup.sh`
+> with `manage_iam=false` fills those policy files for you under `iam-out/` and checks the trust —
+> this manual step is the `manage_iam=true` (create-them) path.
 
 `iam/` holds three combined files — `iam/glue.json`, `iam/lambda.json`, `iam/stepfunctions.json` —
 each a single JSON `{"RoleName","TrustPolicy","Policy"[,"VpcPolicy"]}` (the Glue file carries a

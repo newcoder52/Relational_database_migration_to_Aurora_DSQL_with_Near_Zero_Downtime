@@ -25,3 +25,5 @@ venv/
 # placeholder-filled copies made by the RUNBOOK commands
 *.filled.json
 *.filled.asl.json
+# per-role policy files setup.sh writes in manage_iam=false mode (customer-facing output)
+iam-out/

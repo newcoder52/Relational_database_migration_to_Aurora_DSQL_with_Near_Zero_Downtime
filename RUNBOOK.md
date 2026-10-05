@@ -218,7 +218,10 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `validate_timeout_minutes` | optional | `2880` | int 1–10080. Validate timeout |
 | `max_parallel_tables` | optional | `20` | int 1–40. How many tables load **at once** on the driver thread pool |
 | `per_worker_mem_budget_mb` | optional | `1500` | int ≥ 1. Per-table driver-memory budget the auto-throttle uses. The throttle **never silently drops to 1** — it holds a floor even if driver memory is unknown/misreported |
-| `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default |
+| `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default. A role **path** is allowed; the role **name** is the last ARN segment |
+| `lambda_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-lambda-exec-role` | the role **all 8 Lambdas** run as. Set it to point the Lambdas at a role your IAM team already made. Must be an IAM role ARN in `account_id`; a path is allowed. Not written to `pipeline.json` |
+| `sfn_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-sfn-exec-role` | the role **all 4 state machines** run as. Same rules as `lambda_role_arn`. Not written to `pipeline.json` |
+| `manage_iam` | optional (setup-only) | `true` | `true`: setup **creates/updates** the three roles as always. `false`: setup only **reads** the three roles you already have (`iam get-role` + trust check + a best-effort `simulate-principal-policy`) and **never** makes an IAM write call — it writes each role's policy JSON to `iam-out/` for your IAM team instead. See [§4 "Using roles your IAM team already created"](#using-roles-your-iam-team-already-created-manage_iamfalse). Not written to `pipeline.json` |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
@@ -231,8 +234,8 @@ Thirty-nine keys end up in `config/pipeline.json`: `project`, `region`, `dsql_en
 `discovery_num_workers`, `discovery_timeout_minutes`, `load_worker_type`, `load_num_workers`,
 `load_timeout_minutes`, `load_big_worker_type`, `load_big_num_workers`, `load_big_timeout_minutes`,
 `validate_worker_type`, `validate_num_workers`, `validate_timeout_minutes`, `max_parallel_tables`,
-`per_worker_mem_budget_mb`. `account_id`, `subnet_id` and
-`security_group_id` are used only by setup.
+`per_worker_mem_budget_mb`. `account_id`, `subnet_id`, `security_group_id`, `lambda_role_arn`,
+`sfn_role_arn` and `manage_iam` are used only by setup.
 
 ---
 
@@ -343,6 +346,62 @@ changed out from under a run:
 > `pipeline.json` by hand. Don't copy `config/pipeline.example.json` as-is: its `description` line
 > contains `<bucket>`, and any value with `<`/`>` is rejected, so a copied-as-is file fails every run
 > at `ResolveFailed`.
+
+### Using roles your IAM team already created (`manage_iam=false`)
+
+By default setup **creates** three roles (`<project>-{glue,lambda,sfn}-exec-role`). If your IAM team
+owns role creation — or you simply aren't allowed to create roles — set `manage_iam=false` and point
+setup at the roles that already exist:
+
+```
+manage_iam,false
+glue_role_arn,arn:aws:iam::ACCOUNT_ID:role/your-glue-role
+lambda_role_arn,arn:aws:iam::ACCOUNT_ID:role/your-lambda-role
+sfn_role_arn,arn:aws:iam::ACCOUNT_ID:role/your-sfn-role
+```
+
+With `manage_iam=false` setup makes **no IAM write call at all** — no `create-role`,
+`update-assume-role-policy`, `put-role-policy`, `attach-role-policy` or any `delete-*`. The only IAM
+calls are reads: `get-role`, `list-role-policies`, `list-attached-role-policies`, and a best-effort
+`simulate-principal-policy`. The Lambdas are created with `--role <lambda_role_arn>` and the state
+machines with `--role-arn <sfn_role_arn>`; everything else (Glue connection, scripts, templates,
+`pipeline.json`, state machines) is done exactly as with `manage_iam=true`.
+
+**What your IAM team must attach.** Each role needs the trust below and the matching permissions:
+
+| Role (`*_role_arn`) | Trust must allow (`sts:AssumeRole`) | Attach |
+|---|---|---|
+| `glue_role_arn` | `glue.amazonaws.com` | the Glue inline policy (S3 bucket, DSQL connect, logs, DMS describe); **plus** the VPC networking statements when a Glue connection is configured |
+| `lambda_role_arn` | `lambda.amazonaws.com` | the Lambda inline policy (S3, DMS/DSQL describe, Glue job management, `states:*` for the pipeline machines) whose `iam:PassRole` **names the Glue role**; **plus** the managed policy `AWSLambdaVPCAccessExecutionRole` when a Glue VPC connection is used |
+| `sfn_role_arn` | `states.amazonaws.com` | the Step Functions inline policy (invoke the pipeline Lambdas, run/stop Glue jobs, DMS start/stop, start/verify the child machines) |
+
+**Where setup writes the policy files.** Setup fills the three policies with your **real** role names
+and ARNs and writes them next to your clone:
+
+```
+iam-out/<glue-role-name>.policy.json      # inline policy JSON to attach to the Glue role
+iam-out/<lambda-role-name>.policy.json     # inline policy JSON for the Lambda role (PassRole -> Glue role)
+iam-out/<sfn-role-name>.policy.json        # inline policy JSON for the Step Functions role
+iam-out/README-IAM.txt                     # per role: the trust it needs and exactly what to attach
+```
+
+Hand `iam-out/` to your IAM team. The path printed at the end of Step 1 tells you where it is.
+
+**Fail-closed checks (nothing is created until these pass).**
+
+- If any of the three roles is **missing**, setup stops before changing anything and names it.
+- If a role's **trust** doesn't allow its service principal, setup stops and prints the exact trust
+  statement to add (e.g. `{"Effect":"Allow","Principal":{"Service":"glue.amazonaws.com"},"Action":"sts:AssumeRole"}`).
+- The best-effort `simulate-principal-policy` check warns if a role is missing a permission its policy
+  needs (or if the simulate call itself is denied). By default setup then **stops**; pass
+  `--skip-permission-check` to continue anyway (e.g. when your account can't call `iam:Simulate*`).
+
+A role given with a **path** works: `arn:aws:iam::<acct>:role/team/sub/your-role` is read and
+created-against as role name `your-role` (the last segment), while the Lambdas/state machines are
+pointed at the full ARN.
+
+> `tools/setup.sh … --dry-run` works in both modes and prints the role each Lambda (`--role`) and each
+> state machine (`--role-arn`) will use, without making any AWS call.
 
 ---
 

@@ -106,6 +106,17 @@ per_worker_mem_budget_mb,1500
 # Only set it if your Glue role name differs from <project>-glue-exec-role.
 glue_role_arn,arn:aws:iam::123456789012:role/dms-dsql-glue-exec-role
 
+# ---- existing-roles: point setup at roles your IAM team already made (setup-only) ----
+# manage_iam: true (default) = setup creates/updates the 3 roles. false = setup only READS the 3
+#   roles you already have and NEVER writes IAM; it writes each role's policy JSON to iam-out/ for
+#   your IAM team to attach. See RUNBOOK §4 "Using roles your IAM team already created".
+manage_iam,true
+# lambda_role_arn: the role all 8 Lambdas run as (defaults to <project>-lambda-exec-role). Set it
+#   to the role your IAM team made. A role path is allowed; the role NAME is the last ARN segment.
+lambda_role_arn,arn:aws:iam::123456789012:role/dms-dsql-lambda-exec-role
+# sfn_role_arn: the role all 4 state machines run as (defaults to <project>-sfn-exec-role).
+sfn_role_arn,arn:aws:iam::123456789012:role/dms-dsql-sfn-exec-role
+
 # ---- setup-only: the Glue VPC connection (tools/setup.sh). Set BOTH or NEITHER. ----
 # Not part of pipeline.json. Delete both rows if Glue can reach DSQL without a VPC connection.
 subnet_id,subnet-0abc1234def567890

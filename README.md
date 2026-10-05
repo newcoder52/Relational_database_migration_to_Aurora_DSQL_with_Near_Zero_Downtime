@@ -49,7 +49,10 @@ results.
 `glue-templates/`, `stepfunctions/`, `tools/`); **one S3 bucket** holds what the pipeline reads at run
 time (scripts, templates, driver wheels, `config/pipeline.json`, `config/params.csv`,
 `config/fleet_tasks.csv`, and the DMS output CSVs); setup creates the **AWS resources** (3 IAM roles,
-8 Lambdas, 4 state machines). The DMS S3 target endpoint must write to that same bucket.
+8 Lambdas, 4 state machines). The DMS S3 target endpoint must write to that same bucket. If your IAM
+team already owns the three roles, set `manage_iam=false` (plus `lambda_role_arn` / `sfn_role_arn` /
+`glue_role_arn`) and setup **uses** those roles instead of creating any — see
+[RUNBOOK §4](RUNBOOK.md#using-roles-your-iam-team-already-created-manage_iamfalse).
 
 1. **Clone the repo** and `cd` into it (run everything from this folder):
    ```bash

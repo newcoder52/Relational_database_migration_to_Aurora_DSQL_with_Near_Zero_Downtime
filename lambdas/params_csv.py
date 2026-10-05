@@ -35,8 +35,17 @@ KEYS
     cdc_validation     = true                (Tier-2 CDC validation on; cutover blocks on failures)
     cdc_validation_sample = 20               (rows re-checked per committed CDC file; 0 = all)
     glue_role_arn      = arn:aws:iam::<account_id>:role/<project>-glue-exec-role
-  Setup-only (used by tools/setup.sh for the Glue network connection; NOT part of pipeline.json):
-    subnet_id, security_group_id            both together, or neither
+  Setup-only (used by tools/setup.sh; NOT part of pipeline.json):
+    subnet_id, security_group_id            both together, or neither (Glue network connection)
+    lambda_role_arn    = arn:aws:iam::<account_id>:role/<project>-lambda-exec-role
+    sfn_role_arn       = arn:aws:iam::<account_id>:role/<project>-sfn-exec-role
+    manage_iam         = true                (true: setup creates/updates the 3 roles as today;
+                                              false: setup only READS the 3 existing roles the
+                                              customer's IAM team made and never writes IAM)
+  Note on the role ARNs: each is validated as an IAM role ARN in account_id. A role PATH is
+  allowed (arn:aws:iam::acct:role/some/path/name); the role NAME used for iam calls is the LAST
+  segment of the ARN (role_name_from_arn). glue_role_arn stays in pipeline.json (create_glue_jobs
+  reads it); lambda_role_arn / sfn_role_arn / manage_iam are setup-only, like subnet_id.
   Derived, never written in the CSV:
     dsql_cluster_id    = the first label of dsql_endpoint
 
@@ -110,14 +119,41 @@ OPTIONAL_DEFAULTS = {
     "max_parallel_tables": "20",
     "per_worker_mem_budget_mb": "1500",
 }
-# Setup-only keys: consumed by tools/setup.sh (Glue network connection), never in pipeline.json.
-SETUP_ONLY = ("subnet_id", "security_group_id")
+# Setup-only keys: consumed by tools/setup.sh, never written to pipeline.json.
+#   subnet_id / security_group_id : Glue network connection (both-or-neither).
+#   manage_iam                    : "true" (default) = setup creates/updates the 3 roles as it
+#                                   always has; "false" = setup only READS the 3 roles the
+#                                   customer already has and never makes an IAM write call.
+# lambda_role_arn / sfn_role_arn are ALSO setup-only but, like glue_role_arn, have a derived
+# default (account_id + project), so they are listed in _DERIVED_ROLE_ARNS below (not here) and
+# get a default filled in at parse time.
+SETUP_ONLY = ("subnet_id", "security_group_id", "manage_iam",
+              "lambda_role_arn", "sfn_role_arn")
+
+# manage_iam's static default (the role ARNs' defaults are derived from account_id/project).
+_SETUP_ONLY_DEFAULTS = {
+    "manage_iam": "true",
+}
 
 # glue_role_arn is optional-with-a-derived-default; list it so it is an allowed (not "unknown")
-# key and so to_pipeline_settings carries it through.
+# key and so to_pipeline_settings carries it through. lambda_role_arn / sfn_role_arn are the same
+# idea but setup-only (not in PIPELINE_KEYS).
 _DERIVED_DEFAULT = ("glue_role_arn",)
 
-ALLOWED = tuple(REQUIRED) + tuple(OPTIONAL_DEFAULTS) + _DERIVED_DEFAULT + SETUP_ONLY
+# The three role ARNs that take a derived default of
+# arn:aws:iam::<account_id>:role/<project>-<suffix>-exec-role when the operator omits them.
+# (key, role-name suffix). glue_role_arn is also in _DERIVED_DEFAULT / PIPELINE_KEYS.
+_DERIVED_ROLE_ARNS = (
+    ("glue_role_arn", "glue"),
+    ("lambda_role_arn", "lambda"),
+    ("sfn_role_arn", "sfn"),
+)
+
+ALLOWED = (tuple(REQUIRED) + tuple(OPTIONAL_DEFAULTS) + _DERIVED_DEFAULT + SETUP_ONLY
+           + ("lambda_role_arn", "sfn_role_arn"))
+# De-duplicate while keeping order deterministic (lambda_role_arn / sfn_role_arn appear in both
+# SETUP_ONLY and the explicit tuple above only for readability).
+ALLOWED = tuple(dict.fromkeys(ALLOWED))
 
 # The subset of params that becomes pipeline.json. Mirrors resolve_task.SETTINGS_KNOWN minus the
 # free-text "description"/"settings_version" (which the CSV never carries). account_id and the
@@ -138,6 +174,28 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "max_parallel_tables", "per_worker_mem_budget_mb")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
+
+# An IAM role ARN: arn:aws[partition]:iam::<12-digit account>:role/<path.../><name>. The capture
+# group is everything after "role/", which may contain a path (segments separated by '/'); the
+# role NAME for iam CLI calls is the LAST '/'-separated segment of that. Matches the same shape
+# resolve_task._validate_settings enforces for glue_role_arn.
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::(\d{12}):role/(.+)$")
+
+
+def role_name_from_arn(arn):
+    """The IAM role NAME (last path segment) from a role ARN, for iam get-role/put-role-policy.
+    arn:aws:iam::123456789012:role/team/path/my-glue-role -> 'my-glue-role'. Returns "" if arn is
+    not a role ARN. Used by tools/setup.sh so a role given with a PATH still resolves to its name."""
+    m = _ROLE_ARN_RE.match(str(arn or "").strip())
+    if not m:
+        return ""
+    return m.group(2).rsplit("/", 1)[-1]
+
+
+def role_arn_account(arn):
+    """The 12-digit account id embedded in a role ARN, or "" if arn is not a role ARN."""
+    m = _ROLE_ARN_RE.match(str(arn or "").strip())
+    return m.group(1) if m else ""
 
 # Integer params with (lower, upper) bounds. upper=None means unbounded above. These mirror the
 # ranges resolve_task._validate_settings enforces, so parse() can collect the same problems the
@@ -281,12 +339,43 @@ def parse(text):
 
     # Assemble the full params dict: defaults first, then the operator's values.
     params = dict(OPTIONAL_DEFAULTS)
+    params.update(_SETUP_ONLY_DEFAULTS)
     params.update(raw)
-    # glue_role_arn default is derived from account_id + project when not given.
-    if not str(params.get("glue_role_arn") or "").strip():
-        proj = str(params.get("project") or "").strip()
-        if acct and _ACCOUNT_RE.match(acct) and proj:
-            params["glue_role_arn"] = f"arn:aws:iam::{acct}:role/{proj}-glue-exec-role"
+    # The three role ARNs default to arn:aws:iam::<account_id>:role/<project>-<svc>-exec-role when
+    # not given (glue stays in pipeline.json; lambda/sfn are setup-only). Only derive when
+    # account_id/project are valid so we never emit a half-filled ARN.
+    proj = str(params.get("project") or "").strip()
+    acct_ok = bool(acct and _ACCOUNT_RE.match(acct))
+    for key, svc in _DERIVED_ROLE_ARNS:
+        if not str(params.get(key) or "").strip():
+            if acct_ok and proj:
+                params[key] = f"arn:aws:iam::{acct}:role/{proj}-{svc}-exec-role"
+
+    # Validate each role ARN the operator SET (an omitted one took the derived default above and
+    # is trusted). Each must be an IAM role ARN whose embedded account matches account_id — a role
+    # in another account can never be assumed by this account's services. A role PATH is allowed;
+    # role_name_from_arn pulls the last segment for the iam calls.
+    for key, _svc in _DERIVED_ROLE_ARNS:
+        if key not in raw:
+            continue
+        val = str(raw[key]).strip()
+        if not _ROLE_ARN_RE.match(val):
+            errors.append(f"{key} must be an IAM role ARN "
+                          f"(arn:aws:iam::<account_id>:role/<name>; got {val!r}).")
+            continue
+        arn_acct = role_arn_account(val)
+        if acct and _ACCOUNT_RE.match(acct) and arn_acct != acct:
+            errors.append(f"{key} is in account {arn_acct} but account_id is {acct}; the role "
+                          f"must be in the same account (got {val!r}).")
+
+    # manage_iam must be a boolean literal ("true"/"false", case-insensitive). It is setup-only;
+    # resolve_task never sees it. Normalise to the lowercase string.
+    mi_raw = str(params.get("manage_iam") or "").strip().lower()
+    if mi_raw not in ("true", "false"):
+        errors.append(f"manage_iam must be true or false (got "
+                      f"{params.get('manage_iam')!r}).")
+    else:
+        params["manage_iam"] = mi_raw
 
     return {"params": params, "errors": errors, "warnings": warnings}
 
