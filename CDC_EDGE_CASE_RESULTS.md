@@ -150,15 +150,21 @@ file survives).
 ### 2.6 Multi-column-PK tables → NOT applied by the main CDC job ✅ CHANGED (2026-10-03)
 - **Was:** a table whose primary key has more than one column was treated as keyless — every
   UPDATE was skipped, DELETEs matched on every column, and a `_cdc_file` column was added.
-- **Now:** the main CDC job raises `MultiColumnKeyTable` and **never processes** these tables; it
-  lists them at startup and leaves their `cdc_control` rows for the **separate composite CDC job**,
-  which writes `cdc_control.cdc_file_status` the same way (see
-  `RUNBOOK.md` → [Rules for the task list](RUNBOOK.md#rules-for-the-task-list)). The drain check still
-  waits for those tables, so **cutover cannot finish until the composite job has caught up**.
-- **Now in the repo:** the composite CDC job is shipped as `scripts/glue_cdc_composite.py` with
-  templates `glue-templates/cdc-composite{,-spark}.json`. Startup creates and starts
-  `<project>-<task>-cdc-composite` automatically after discovery whenever the task has a composite-PK
-  table; cutover stops and deletes it. A task with no composite-PK tables gets no extra job.
+- **Now:** the main CDC job raises `MultiColumnKeyTable` and **never processes** these tables; each
+  composite table is forked out after discovery into its own **`ck` fork** — a dedicated load,
+  validate and CDC job (`<project>-<task>-ck-<slug>-{load,validate,cdc}`, CDC script
+  `scripts/glue_cdc_composite.py`), scoped to that one table via a one-table manifest. The fork
+  writes `cdc_control.cdc_file_status` the same way, so the drain check still waits for those
+  tables; **cutover cannot finish until each fork's CDC has caught up**.
+- **Now in the repo (per-table forks):** composite tables get `ck` forks (above); **big**
+  single-/no-PK tables get a `bg` CDC job (`<project>-<task>-bg-<slug>-cdc`, main CDC script); the
+  main CDC job applies the rest. Ownership is recorded per table in the task registry
+  `config/_task/<task>/_jobs.json` (`cdcOwners` → `main` | `ck-<slug>` | `bg-<slug>`), which every
+  CDC job reads so each table is applied by exactly one job. Startup creates/updates the fork jobs
+  (idempotent, recreates missing, reports stale); cutover stops every CDC run and deletes all the
+  task's jobs, found by exact tags + the registry. Caps: `max_composite_forks` (fail early) and
+  `max_big_cdc_forks` (overflow → main CDC job + warning). A task with no composite and no big
+  tables gets no fork jobs.
 - All CDC results in §1–§2 are for **single-column-PK** tables only.
 
 ### 2.7 Binary (RAW/BLOB → bytea) stored as ASCII of the hex text (silent) ✅ FIXED 2026-10-04 (simulator only)
@@ -200,7 +206,7 @@ file survives).
 | **varchar leading/trailing spaces** | BREAK — stripped, silent | MEDIUM | **FIXED** — CDC 2026-09-23; full load/validation 2026-10-03 (§2.2) |
 | **NULL look-alike text (NA/N/A/NONE/(NULL)/\N/null)** | BREAK — silently NULL | HIGH | **FIXED 2026-10-03** (§2.5) |
 | **binary RAW/BLOB → bytea** | BREAK — ASCII-of-hex, silent | MEDIUM | **FIXED 2026-10-04, simulator only** (§2.7) |
-| multi-column-PK table CDC | not applied by main job | — | **CHANGED 2026-10-03**; applied by the separate composite CDC job, now shipped (§2.6) |
+| multi-column-PK table CDC | not applied by main job | — | **CHANGED**; each composite table is a per-table `ck` fork (own load/validate/cdc); big single/no-PK tables get a `bg` CDC job; owners recorded in `_jobs.json` (§2.6) |
 | smallest-normal double (~2.2e-308) | BREAK — underflow to 0 | LOW | Open; root cause unconfirmed (§2.3) |
 | new-schema LogMiner gap | BREAK — zero CDC captured, silent | HIGH | Open (DBA-side; §4) |
 

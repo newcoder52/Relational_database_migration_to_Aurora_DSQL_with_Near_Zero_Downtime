@@ -246,6 +246,12 @@ SETTINGS_DEFAULTS = {
     # --cdc_validation / --cdc_validation_sample (create_glue_jobs).
     "cdc_validation": True,
     "cdc_validation_sample": 20,
+    # Max composite-PK tables that may be forked out of ONE task (each gets its own always-on
+    # CDC job). plan_split fails early if a task exceeds this. See DESIGN_FORK.md §6.
+    "max_composite_forks": 8,
+    # Max BIG single/no-PK tables that get their own CDC job (bg fork). Overflow stays on the
+    # main CDC job (serial apply) with a warning — NOT a failure. See DESIGN_FORK.md §6.
+    "max_big_cdc_forks": 8,
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
 GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
@@ -292,19 +298,6 @@ def _get_json(s3, bucket, key):
 def _put_json(s3, bucket, key, doc):
     s3.put_object(Bucket=bucket, Key=key, Body=(json.dumps(doc, indent=2) + "\n").encode("utf-8"),
                   ContentType="application/json")
-
-
-def _task_has_composite_tables(s3, bucket, index_key):
-    """True if the task's manifest index has >=1 multi-column-PK table (pk_mode == 'composite',
-    written by job1_discovery). Best-effort: index missing/unreadable -> False (no composite
-    job started). Used to gate the composite CDC job in startup/cutover."""
-    idx = _get_json(s3, bucket, index_key)
-    if not isinstance(idx, dict):
-        return False
-    for t in idx.get("tables", []):
-        if t.get("pk_mode") == "composite" or len(t.get("pk_columns") or []) > 1:
-            return True
-    return False
 
 
 def _load_settings(s3, bucket, key, warnings):
@@ -399,6 +392,24 @@ def _validate_settings(cfg, warnings):
     if ".dsql" not in _ep and not _ep.endswith(".on.aws"):
         warnings.append(f"dsql_endpoint {cfg['dsql_endpoint']!r} does not look like an Aurora "
                         f"DSQL cluster endpoint; using it as given.")
+    mcf = cfg.get("max_composite_forks", 8)
+    try:
+        mcf = int(mcf)
+    except (TypeError, ValueError):
+        raise SettingsError(f"pipeline.json 'max_composite_forks' must be a positive integer "
+                            f"(got {cfg.get('max_composite_forks')!r}).")
+    if mcf < 1:
+        raise SettingsError(f"pipeline.json 'max_composite_forks' must be >= 1 (got {mcf}).")
+    cfg["max_composite_forks"] = mcf
+    mbf = cfg.get("max_big_cdc_forks", 8)
+    try:
+        mbf = int(mbf)
+    except (TypeError, ValueError):
+        raise SettingsError(f"pipeline.json 'max_big_cdc_forks' must be a positive integer "
+                            f"(got {cfg.get('max_big_cdc_forks')!r}).")
+    if mbf < 1:
+        raise SettingsError(f"pipeline.json 'max_big_cdc_forks' must be >= 1 (got {mbf}).")
+    cfg["max_big_cdc_forks"] = mbf
     return cfg
 
 
@@ -507,6 +518,11 @@ def _validate_suffix(suffix, project):
 
 
 def _has_run_artifacts(s3, bucket, prefix):
+    # Prefix MUST end in '/' so a task folder "config/_task/orders" never matches the sibling
+    # "config/_task/orders-eu/..." (list prefix is a raw string match). Callers pass a slashed
+    # prefix today; normalize defensively.
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
     pag = s3.get_paginator("list_objects_v2")
     for page in pag.paginate(Bucket=bucket, Prefix=prefix):
         for o in page.get("Contents", []) or []:
@@ -697,12 +713,6 @@ def handler_shared(event, context):
                         f"Glue jobs ({suffix!r}).")
 
     jobs = {role: f"{cfg['project']}-{suffix}-{role}" for role in GLUE_ROLES}
-    # COMPOSITE CDC job: a second CDC job (<project>-<suffix>-cdc-composite) that applies ONLY
-    # multi-column-PK tables. Its name is always resolvable; hasCompositeTables (read from the
-    # manifest index pk_mode) tells startup/cutover whether to start/stop it for this task.
-    composite_cdc_job = f"{cfg['project']}-{suffix}-cdc-composite"
-    has_composite_tables = _task_has_composite_tables(
-        s3, bucket, f"config/_task/{suffix}/_manifest_index.json")
     # An earlier run of this task switched its CDC job to Spark because the Python-shell
     # drivers failed (create-glue-jobs wrote this file): keep Spark, don't fail the same way again.
     cdc_engine = cfg["cdc_engine"]
@@ -724,6 +734,7 @@ def handler_shared(event, context):
         "ownerRecord": f"s3://{bucket}/{marker_key}",
         "project": cfg["project"],
         "region": cfg["region"],
+        "accountId": ids["account"],
         "dsqlEndpoint": cfg["dsql_endpoint"],
         "dsqlEndpointCandidates": ",".join(_build_dsql_endpoint_candidates(cfg, warnings)),
         "dsqlUser": cfg["dsql_user"],
@@ -737,8 +748,8 @@ def handler_shared(event, context):
         "cdcValidationSample": cfg["cdc_validation_sample"],
         "jobNames": jobs,
         "cdcJobName": jobs["cdc"],
-        "compositeCdcJobName": composite_cdc_job,
-        "hasCompositeTables": has_composite_tables,
+        "maxCompositeForks": cfg["max_composite_forks"],
+        "maxBigCdcForks": cfg["max_big_cdc_forks"],
         "warnings": warnings,
     })
     for w in warnings:

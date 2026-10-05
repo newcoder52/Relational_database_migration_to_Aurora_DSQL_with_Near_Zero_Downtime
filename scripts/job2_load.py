@@ -3366,6 +3366,8 @@ def s3_table_total_bytes(s3_client, dms_s3_path):
     """Sum the sizes of all DMS CSV objects under a table's S3 prefix (paginated).
     Cheap ROUTING GATE — metadata only, no data scanned."""
     bucket, prefix = split_s3(dms_s3_path)
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"   # exact table folder: "SCHEMA/ORDERS" must not match "SCHEMA/ORDERS_HIST/"
     total = 0
     token = None
     while True:
@@ -3892,6 +3894,8 @@ def s3_list_table_files(s3_client, dms_s3_path):
     with sizes. Skips zero-byte keys and any 'directory placeholder' keys (ending in
     '/'). Returns a list of (s3_uri, size_bytes), largest first. Metadata only."""
     bucket, prefix = split_s3(dms_s3_path)
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"   # exact table folder: "SCHEMA/ORDERS" must not match "SCHEMA/ORDERS_HIST/"
     files = []
     token = None
     skipped_cdc = 0

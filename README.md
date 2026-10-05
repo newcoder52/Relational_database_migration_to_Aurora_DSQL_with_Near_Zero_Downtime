@@ -79,12 +79,24 @@ time (scripts, templates, driver wheels, `config/pipeline.json`, `config/params.
 
 - **DSQL schemas:** at most 10 per database (not adjustable); the CDC job adds `cdc_control`, so keep
   ≤ 9 of your own. The fleet preflight enforces it per task.
-- **Multi-column (composite) primary keys:** these tables are loaded and validated, and their
-  ongoing CDC changes are applied by a **separate composite CDC job** (`<project>-<task>-cdc-composite`,
-  script `scripts/glue_cdc_composite.py`). After discovery, startup creates and starts it
-  automatically whenever the task has at least one composite-PK table; the main CDC job applies
-  single- and no-PK tables, the composite job applies the composite ones, and cutover stops and
-  deletes both. A task with no composite-PK tables gets no extra job.
+- **Per-table fork CDC jobs.** After discovery, each table is assigned exactly one CDC owner,
+  recorded in the per-task registry `config/_task/<task>/_jobs.json` (`cdcOwners`):
+  - **Composite (multi-column) primary keys** get their own `ck` fork — a dedicated load, validate
+    and CDC job (`<project>-<task>-ck-<slug>-{load,validate,cdc}`, CDC script
+    `scripts/glue_cdc_composite.py`), scoped to that one table.
+  - **Big single-/no-PK tables** (FullLoadRows ≥ `big_table_row_threshold`, or many part-files) get
+    their own `bg` CDC job (`<project>-<task>-bg-<slug>-cdc`, main CDC script); their load and
+    validate stay on the shared `load-big` + `validate` jobs.
+  - The **main CDC job** applies the remaining small single-/no-PK tables.
+  Every table is loaded, validated and CDC-applied by **exactly one** job. Startup creates/updates
+  the fork jobs (idempotent), recreates any missing one, and reports stale ones; cutover stops every
+  CDC run (main + all forks) and deletes all of the task's jobs. Jobs are always found by their
+  exact tags (`dsql_pipeline_project`/`_task`/`_fork`) + the registry — never by name prefix.
+  Caps (params.csv): `max_composite_forks` (default 8; a task with more composite tables fails early,
+  naming them) and `max_big_cdc_forks` (default 8; big tables past the cap stay on the main CDC job
+  with a warning). Watch the Glue concurrent-job-run quota (~30/account) and DSQL connections
+  (10,000/cluster) as the number of always-on CDC jobs grows. A task with no composite and no big
+  tables gets no fork jobs.
 - **Tables without a primary key:** inserts and deletes are applied; **updates are skipped and
   logged** to `cdc_control.cdc_skipped_ops`, unless you declare a stable logical key.
 - **Schema changes during CDC:** `ADD COLUMN` and `RENAME COLUMN` are handled automatically (rename

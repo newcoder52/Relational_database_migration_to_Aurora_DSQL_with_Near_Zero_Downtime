@@ -65,7 +65,10 @@
         "csvNullValue.$": "$.Payload.csvNullValue",
         "cdcSparkFallback.$": "$.Payload.cdcSparkFallback",
         "cdcValidation.$": "$.Payload.cdcValidation",
-        "cdcValidationSample.$": "$.Payload.cdcValidationSample"
+        "cdcValidationSample.$": "$.Payload.cdcValidationSample",
+        "accountId.$": "$.Payload.accountId",
+        "maxCompositeForks.$": "$.Payload.maxCompositeForks",
+        "maxBigCdcForks.$": "$.Payload.maxBigCdcForks"
       },
       "ResultPath": "$.resolved",
       "Retry": [
@@ -547,7 +550,8 @@
           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
           "cdc_validation.$": "$.resolved.cdcValidation",
-          "cdc_validation_sample.$": "$.resolved.cdcValidationSample"
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+          "account_id.$": "$.resolved.accountId"
         }
       },
       "ResultSelector": {
@@ -608,67 +612,6 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "EnsureCompositeJob"
-    },
-    "EnsureCompositeJob": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "AFTER RunDiscovery (which wrote THIS run's _manifest_index.json with pk_mode): create the composite CDC job if any table has a multi-column PK, and return {hasCompositeTables, compositeCdcJobName} into $.composite. Reuses create-glue-jobs (mode ensure_composite). This is the authoritative composite decision — resolve_task's early hasCompositeTables can be stale/absent before discovery and is NOT used to start the composite job.",
-      "Parameters": {
-        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
-        "Payload": {
-          "mode": "ensure_composite",
-          "bucket": "<<BUCKET>>",
-          "glue_templates_prefix": "glue-templates",
-          "scripts_prefix": "scripts",
-          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
-          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
-          "cdc_root.$": "$.resolved.cdcRoot",
-          "timestampColumnName.$": "$.resolved.timestampColumnName",
-          "project.$": "$.resolved.project",
-          "taskSuffix.$": "$.resolved.taskSuffix",
-          "configPrefix.$": "$.resolved.configPrefix",
-          "glue_role_arn.$": "$.resolved.glueRoleArn",
-          "region.$": "$.resolved.region",
-          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
-          "dsql_user.$": "$.resolved.dsqlUser",
-          "dsql_database.$": "$.resolved.dsqlDatabase",
-          "control_schema.$": "$.resolved.controlSchema",
-          "dms_task_arn.$": "$.taskArn",
-          "glue_connections.$": "$.resolved.glueConnection",
-          "cdc_engine.$": "$.driverCdc.engine",
-          "csv_null_value.$": "$.resolved.csvNullValue",
-          "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
-          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
-          "cdc_validation.$": "$.resolved.cdcValidation",
-          "cdc_validation_sample.$": "$.resolved.cdcValidationSample"
-        }
-      },
-      "ResultSelector": {
-        "hasCompositeTables.$": "$.Payload.hasCompositeTables",
-        "compositeCdcJobName.$": "$.Payload.compositeCdcJobName",
-        "jobs.$": "$.Payload.jobs"
-      },
-      "ResultPath": "$.composite",
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 5,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "EnsureCompositeFailed",
-          "ResultPath": "$.error"
-        }
-      ],
       "Next": "PlanSplit"
     },
     "PlanSplit": {
@@ -686,14 +629,85 @@
           "min_writers_per_loader": 100,
           "max_writers_per_loader": 150,
           "map_max_concurrency": 6,
-          "config_prefix.$": "$.resolved.configPrefix"
+          "config_prefix.$": "$.resolved.configPrefix",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "max_composite_forks.$": "$.resolved.maxCompositeForks",
+          "max_big_cdc_forks.$": "$.resolved.maxBigCdcForks"
         }
       },
       "ResultSelector": {
         "groups.$": "$.Payload.groups",
-        "group_count.$": "$.Payload.group_count"
+        "group_count.$": "$.Payload.group_count",
+        "forks.$": "$.Payload.forks",
+        "fork_count.$": "$.Payload.fork_count"
       },
       "ResultPath": "$.plan",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PlanSplitFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "EnsureForkJobs"
+    },
+    "EnsureForkJobs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "AFTER plan_split: create/update the per-fork load/validate/cdc Glue jobs for every composite-PK table (ck-<slug>-load/-validate/-cdc), scoped to that one table's config_prefix, tagged with task+fork. Idempotent (re-run updates, never duplicates). No forks -> nothing created.",
+      "Parameters": {
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "ensure_fork_jobs",
+          "bucket": "<<BUCKET>>",
+          "glue_templates_prefix": "glue-templates",
+          "scripts_prefix": "scripts",
+          "forks.$": "$.plan.forks",
+          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
+          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "timestampColumnName.$": "$.resolved.timestampColumnName",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "glue_role_arn.$": "$.resolved.glueRoleArn",
+          "region.$": "$.resolved.region",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema",
+          "dms_task_arn.$": "$.taskArn",
+          "glue_connections.$": "$.resolved.glueConnection",
+          "cdc_engine.$": "$.driverCdc.engine",
+          "csv_null_value.$": "$.resolved.csvNullValue",
+          "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+          "account_id.$": "$.resolved.accountId"
+        }
+      },
+      "ResultSelector": {
+        "created.$": "$.Payload.created",
+        "updated.$": "$.Payload.updated"
+      },
+      "ResultPath": "$.forkJobs",
       "Retry": [
         {
           "ErrorEquals": [
@@ -709,7 +723,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "PipelineFailed",
+          "Next": "EnsureForkJobsFailed",
           "ResultPath": "$.error"
         }
       ],
@@ -726,9 +740,9 @@
         "load_args.$": "$$.Map.Item.Value.load_args",
         "extraPyFilesFullload.$": "$.driverFullload.extraPyFiles",
         "extraPyFilesValidation.$": "$.driverValidation.extraPyFiles",
-        "loadJob.$": "$.glue.jobs.load",
-        "loadBigJob.$": "$.glue.jobs['load-big']",
-        "validateJob.$": "$.glue.jobs.validate"
+        "loadJob.$": "$$.Map.Item.Value.loadJobName",
+        "loadBigJob.$": "$$.Map.Item.Value.loadBigJobName",
+        "validateJob.$": "$$.Map.Item.Value.validateJobName"
       },
       "ResultPath": "$.mapResult",
       "Iterator": {
@@ -738,8 +752,16 @@
             "Type": "Choice",
             "Choices": [
               {
-                "Variable": "$.kind",
-                "StringEquals": "big",
+                "Or": [
+                  {
+                    "Variable": "$.kind",
+                    "StringEquals": "big"
+                  },
+                  {
+                    "Variable": "$.kind",
+                    "StringEquals": "composite-big"
+                  }
+                ],
                 "Next": "GroupLoadBig"
               }
             ],
@@ -1027,10 +1049,16 @@
       "ErrorPath": "$.error.Error",
       "CausePath": "$.error.Cause"
     },
-    "EnsureCompositeFailed": {
+    "EnsureForkJobsFailed": {
       "Type": "Fail",
-      "Error": "EnsureCompositeFailed",
-      "Comment": "Creating the composite CDC job after discovery failed (template/engine/role problem). The main CDC job was not started; investigate before cutover.",
+      "Error": "EnsureForkJobsFailed",
+      "Comment": "Creating a composite fork's load/validate/cdc jobs failed (template/engine/role problem). No CDC was started; investigate before retrying.",
+      "CausePath": "$.error.Cause"
+    },
+    "PlanSplitFailed": {
+      "Type": "Fail",
+      "Error": "PlanSplitFailed",
+      "Comment": "plan_split failed \u2014 e.g. the task has more composite-PK tables than max_composite_forks (the cause lists them), or the master index is unreadable. No Glue jobs were created.",
       "CausePath": "$.error.Cause"
     },
     "DriversFailed": {
@@ -1326,148 +1354,182 @@
         {
           "Variable": "$.cdcMarker.keyCount",
           "NumericGreaterThan": 0,
-          "Next": "HasCompositeToStart"
+          "Next": "StartForkCdcMap"
         }
       ],
       "Default": "CountCdcCheck"
     },
-    "HasCompositeToStart": {
-      "Type": "Choice",
-      "Comment": "Start the composite CDC job next to the main one, but only if THIS run's discovery found composite-PK tables (decided by EnsureCompositeJob post-discovery, in $.composite). No composite tables -> skip cleanly to success.",
-      "Choices": [
-        {
-          "Variable": "$.composite.hasCompositeTables",
-          "BooleanEquals": true,
-          "Next": "StartCdcCompositeJob"
-        }
-      ],
-      "Default": "TaskSucceeded"
-    },
-    "StartCdcCompositeJob": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::glue:startJobRun",
-      "Comment": "Start the composite CDC job (applies ONLY multi-column-PK tables). Same per-task --config_prefix; a distinct --startup_execution (<exec>-composite) so its start marker never collides with the main CDC job's.",
+    "StartForkCdcMap": {
+      "Type": "Map",
+      "Comment": "Start EACH composite fork's CDC job (ck-<slug>-cdc) next to the main CDC job, and confirm each wrote its own start marker (_cdc_started/<exec>-ck-<slug>.json). Empty $.plan.forks (no composite tables) -> no iterations, straight to TaskSucceeded. Any fork that does not confirm -> ForkCdcStartNotConfirmed.",
+      "ItemsPath": "$.plan.forks",
+      "MaxConcurrency": 4,
       "Parameters": {
-        "JobName.$": "$.composite.compositeCdcJobName",
-        "Arguments": {
-          "--config_prefix.$": "$.resolved.configPrefix",
-          "--dms_task_arn.$": "$.taskArn",
-          "--cdc_root.$": "$.resolved.cdcRoot",
-          "--timestamp_column.$": "$.resolved.timestampColumnName",
-          "--startup_execution.$": "States.Format('{}-composite', $$.Execution.Name)"
+        "fork_slug.$": "$$.Map.Item.Value.fork_slug",
+        "cdcJobName.$": "$$.Map.Item.Value.cdcJobName",
+        "config_prefix.$": "$$.Map.Item.Value.config_prefix",
+        "taskArn.$": "$.taskArn",
+        "cdcRoot.$": "$.resolved.cdcRoot",
+        "timestampColumnName.$": "$.resolved.timestampColumnName",
+        "taskSuffix.$": "$.resolved.taskSuffix",
+        "execName.$": "$$.Execution.Name"
+      },
+      "Iterator": {
+        "StartAt": "StartForkCdcJob",
+        "States": {
+          "StartForkCdcJob": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun",
+            "Comment": "Start this fork's composite CDC job, scoped to its one-table config_prefix, with a distinct --startup_execution (<exec>-ck-<slug>) so its start marker never collides.",
+            "Parameters": {
+              "JobName.$": "$.cdcJobName",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--dms_task_arn.$": "$.taskArn",
+                "--cdc_root.$": "$.cdcRoot",
+                "--timestamp_column.$": "$.timestampColumnName",
+                "--startup_execution.$": "States.Format('{}-ck-{}', $.execName, $.fork_slug)"
+              }
+            },
+            "ResultPath": "$.forkCdcStart",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ForkCdcNotConfirmed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "InitForkCheck"
+          },
+          "InitForkCheck": {
+            "Type": "Pass",
+            "Parameters": {
+              "checks": 0
+            },
+            "ResultPath": "$.forkCheck",
+            "Next": "WaitForForkStart"
+          },
+          "WaitForForkStart": {
+            "Type": "Wait",
+            "Seconds": 30,
+            "Next": "CheckForkStarted"
+          },
+          "CheckForkStarted": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+            "Comment": "Confirm this fork's CDC run reached its poll loop: config/_task/<task>/_cdc_started/<exec>-ck-<slug>.json.",
+            "Parameters": {
+              "Bucket": "<<BUCKET>>",
+              "Prefix.$": "States.Format('config/_task/{}/_cdc_started/{}-ck-{}.json', $.taskSuffix, $.execName, $.fork_slug)"
+            },
+            "ResultSelector": {
+              "keyCount.$": "$.KeyCount"
+            },
+            "ResultPath": "$.forkMarker",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ThrottlingException",
+                  "Glue.InternalServiceException",
+                  "S3.SdkClientException",
+                  "S3.S3Exception"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ForkCdcNotConfirmed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IsForkStarted"
+          },
+          "IsForkStarted": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.forkMarker.keyCount",
+                "NumericGreaterThan": 0,
+                "Next": "ForkStarted"
+              }
+            ],
+            "Default": "CountForkCheck"
+          },
+          "CountForkCheck": {
+            "Type": "Pass",
+            "Parameters": {
+              "checks.$": "States.MathAdd($.forkCheck.checks, 1)"
+            },
+            "ResultPath": "$.forkCheck",
+            "Next": "ForkCheckBudgetLeft"
+          },
+          "ForkCheckBudgetLeft": {
+            "Type": "Choice",
+            "Comment": "90 checks x 30 s = 45 min, same budget as the main CDC confirmation.",
+            "Choices": [
+              {
+                "Variable": "$.forkCheck.checks",
+                "NumericLessThan": 90,
+                "Next": "WaitForForkStart"
+              }
+            ],
+            "Default": "ForkCdcNotConfirmed"
+          },
+          "ForkStarted": {
+            "Type": "Pass",
+            "Parameters": {
+              "fork_slug.$": "$.fork_slug",
+              "status": "started"
+            },
+            "End": true
+          },
+          "ForkCdcNotConfirmed": {
+            "Type": "Fail",
+            "Error": "ForkCdcStartNotConfirmed",
+            "Cause": "A composite fork's CDC run did not start/confirm within the budget. The main CDC job is running; investigate the fork CDC job before cutover."
+          }
         }
       },
-      "ResultPath": "$.cdcCompositeStart",
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.ServiceException",
-            "States.Timeout",
-            "Glue.ConcurrentRunsExceededException",
-            "Glue.ThrottlingException"
-          ],
-          "IntervalSeconds": 10,
-          "MaxAttempts": 3,
-          "BackoffRate": 2.0
-        }
-      ],
+      "ResultPath": "$.forkStartResult",
       "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "PipelineFailed",
+          "Next": "ForkCdcStartNotConfirmed",
           "ResultPath": "$.error"
         }
       ],
-      "Next": "InitCompositeCheck"
+      "Next": "TaskSucceeded"
     },
-    "InitCompositeCheck": {
-      "Type": "Pass",
-      "Parameters": {
-        "checks": 0
-      },
-      "ResultPath": "$.cdcCompositeCheck",
-      "Next": "WaitForCompositeStart"
-    },
-    "WaitForCompositeStart": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "CheckCompositeStarted"
-    },
-    "CheckCompositeStarted": {
-      "Type": "Task",
-      "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
-      "Comment": "Confirm the composite CDC run reached its poll loop: it writes config/_task/<task>/_cdc_started/<exec>-composite.json.",
-      "Parameters": {
-        "Bucket": "<<BUCKET>>",
-        "Prefix.$": "States.Format('config/_task/{}/_cdc_started/{}-composite.json', $.resolved.taskSuffix, $$.Execution.Name)"
-      },
-      "ResultSelector": {
-        "keyCount.$": "$.KeyCount"
-      },
-      "ResultPath": "$.cdcCompositeMarker",
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.ServiceException",
-            "States.Timeout",
-            "Glue.ThrottlingException",
-            "Glue.InternalServiceException",
-            "S3.SdkClientException",
-            "S3.S3Exception"
-          ],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 5,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "PipelineFailed",
-          "ResultPath": "$.error"
-        }
-      ],
-      "Next": "IsCompositeStarted"
-    },
-    "IsCompositeStarted": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.cdcCompositeMarker.keyCount",
-          "NumericGreaterThan": 0,
-          "Next": "TaskSucceeded"
-        }
-      ],
-      "Default": "CountCompositeCheck"
-    },
-    "CountCompositeCheck": {
-      "Type": "Pass",
-      "Parameters": {
-        "checks.$": "States.MathAdd($.cdcCompositeCheck.checks, 1)"
-      },
-      "ResultPath": "$.cdcCompositeCheck",
-      "Next": "CompositeCheckBudgetLeft"
-    },
-    "CompositeCheckBudgetLeft": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.cdcCompositeCheck.checks",
-          "NumericLessThan": 90,
-          "Next": "WaitForCompositeStart"
-        }
-      ],
-      "Default": "CompositeStartNotConfirmed",
-      "Comment": "90 checks x 30 s = 45 min, same budget as the main CDC confirmation."
-    },
-    "CompositeStartNotConfirmed": {
+    "ForkCdcStartNotConfirmed": {
       "Type": "Fail",
-      "Error": "CompositeStartNotConfirmed",
-      "Cause": "The composite CDC run did not write its start marker within the budget. The main CDC job is running; investigate the composite job's run before cutover."
+      "Error": "ForkCdcStartNotConfirmed",
+      "Comment": "One or more composite fork CDC jobs did not start/confirm. See the StartForkCdcMap iteration that failed.",
+      "CausePath": "$.error.Cause"
     },
     "CountCdcCheck": {
       "Type": "Pass",

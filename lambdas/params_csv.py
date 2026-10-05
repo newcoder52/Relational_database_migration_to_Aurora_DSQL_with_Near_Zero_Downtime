@@ -73,6 +73,8 @@ OPTIONAL_DEFAULTS = {
     "control_schema": "cdc_control",
     "cdc_validation": "true",
     "cdc_validation_sample": "20",
+    "max_composite_forks": "8",
+    "max_big_cdc_forks": "8",
 }
 # Setup-only keys: consumed by tools/setup.sh (Glue network connection), never in pipeline.json.
 SETUP_ONLY = ("subnet_id", "security_group_id")
@@ -88,7 +90,8 @@ ALLOWED = tuple(REQUIRED) + tuple(OPTIONAL_DEFAULTS) + _DERIVED_DEFAULT + SETUP_
 # setup-only keys are intentionally absent.
 PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_database",
                  "glue_role_arn", "glue_connection", "cdc_engine", "cdc_spark_fallback",
-                 "control_schema", "cdc_validation", "cdc_validation_sample")
+                 "control_schema", "cdc_validation", "cdc_validation_sample",
+                 "max_composite_forks", "max_big_cdc_forks")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
 

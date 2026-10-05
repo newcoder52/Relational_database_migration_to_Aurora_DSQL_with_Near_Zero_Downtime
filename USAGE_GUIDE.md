@@ -76,8 +76,8 @@ collected in `RUNBOOK.md`.
    ]}
    ```
 4. **Target tables exist in DSQL** (created from your clean DDLs) in the lowercased target
-   schema, with a single-column PK where possible (multi-column PK tables are applied by the
-   separate composite CDC job; range-validation needs an integer PK).
+   schema, with a single-column PK where possible (multi-column-PK tables are applied by their own
+   per-table composite (`ck`) fork CDC job; range-validation needs an integer PK).
 5. **Table list** — nothing to stage. The pipeline builds each task's table list automatically
    from the DMS task after its full load (from `describe_table_statistics` plus the task's table
    mappings), writing `s3://<bucket>/config/_task/<task name>/table_manifest.csv` for you. To load
@@ -401,7 +401,7 @@ see [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for its inputs, skip rule
 | CDC job fails `UnknownServiceError: dsql` | CDC job didn't get modern boto3 | ensure `driver-cdc/` has boto3/botocore wheels and the job's `--extra-py-files` is the **cdc** list (not fullload). In the startup workflow this error switches the CDC job to Spark automatically |
 | CDC log: `another CDC run is applying this table` (cycle summary lists the table as applied by another run) | two different CDC jobs or runs are applying the same table | each change is still applied once; find the extra job (old per-task workflow, hand-made copy, a second DMS task with the same table) and stop it |
 | Startup stops at `ResolveFailed`: `Another startup run is already running` | a startup for this task is still running | wait for it or stop it, then launch the fleet again (the task is skipped while running) |
-| CDC startup log: `NOT applied by this job (multi-column primary key)` | the table's primary key has more than one column | expected: the main CDC job skips it; the separate `-cdc-composite` job (started automatically for this task) applies it, and cutover waits until that job has caught up |
+| CDC startup log: `NOT applied by this job (multi-column primary key)` | the table's primary key has more than one column | expected: the main CDC job skips it; the table's own per-table composite (`ck`) fork CDC job (`<project>-<task>-ck-<slug>-cdc`, started automatically for this task) applies it, and cutover waits until that fork has caught up |
 | Startup stops at `DriversFailed` | a `driver-cdc/` wheel can't work on Python 3.9, or one is missing | the error names the wheel; fix `driver-cdc/` ([RUNBOOK Step 3b](RUNBOOK.md#4-set-up)) and launch the fleet again (DMS was not started) |
 | Fleet stops at `PreflightFailed` | one or more rows failed a per-task check before anything started | the cause lists every problem by row; fix them and launch the fleet again (nothing was started) |
 | CDC job fails installing a `.whl` (`CalledProcessError`, `pypi.org` timeouts), often after ~20 min | the run was given the raw `driver-cdc/` list (older per-task workflow, or a hand-made start with `--extra-py-files`) | start it without `--extra-py-files` so it uses the prepared list saved on the job |

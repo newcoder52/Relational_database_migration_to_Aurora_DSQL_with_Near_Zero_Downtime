@@ -210,10 +210,10 @@
         <mxCell id="g_cdc_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#5A6B86;" value="applies ongoing I/U/D until cutover" vertex="1">
           <mxGeometry height="20" width="420" x="840" y="727" as="geometry" />
         </mxCell>
-        <mxCell id="g_cdc_comp" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.glue;" value="CDC composite" vertex="1">
+        <mxCell id="g_cdc_comp" parent="1" style="sketch=0;outlineConnect=0;fontColor=#232F3E;fillColor=#8C4FFF;strokeColor=#ffffff;dashed=0;verticalLabelPosition=bottom;verticalAlign=top;align=center;html=1;fontSize=11;aspect=fixed;shape=mxgraph.aws4.resourceIcon;resIcon=mxgraph.aws4.glue;" value="Per-table fork jobs" vertex="1">
           <mxGeometry height="42" width="42" x="730" y="784" as="geometry" />
         </mxCell>
-        <mxCell id="g_cdc_comp_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#5A6B86;" value="composite-key CDC job (only if the task has multi-column-PK tables)" vertex="1">
+        <mxCell id="g_cdc_comp_t" parent="1" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;whiteSpace=wrap;fontSize=11;fontColor=#5A6B86;" value="Per-table forks (EnsureForkJobs, after discovery): ck-&lt;table&gt; load/validate/CDC for composite keys; bg-&lt;table&gt; CDC for big tables. Main CDC applies the rest. StartForkCdcMap starts each fork&#39;s CDC next to main." vertex="1">
           <mxGeometry height="20" width="420" x="840" y="795" as="geometry" />
         </mxCell>
 

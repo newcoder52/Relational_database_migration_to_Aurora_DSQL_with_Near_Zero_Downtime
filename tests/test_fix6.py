@@ -45,12 +45,19 @@ def check(cond, msg):
 def test_asl_m01_m02_m03():
     cut = json.load(open(os.path.join(SF, "cutover.asl.json")))
     S = cut["States"]
-    rs = S["CutoverResolveTask"]["ResultSelector"]
-    check("hasCompositeTables.$" in rs and "compositeCdcJobName.$" in rs,
-          "M01: cutover ResultSelector carries both composite fields")
-    hc = json.dumps(S["HasCompositeToStop"])
-    check('"IsPresent": true' in hc and "hasCompositeTables" in hc,
-          "M01: HasCompositeToStop IsPresent-guards hasCompositeTables")
+    # M01 (fork design): the composite-v1 single-job cutover states were REPLACED by the per-table
+    # fork cleanup. Cutover must find every fork CDC job (ck-*/bg-*) by EXACT TAG + registry
+    # (ListForkCdcJobs, mode list_fork_cdc), stop each run (StopForkCdcRuns), then DropTags; and
+    # delete ALL the task's jobs by tag/registry (DeleteGlueJobs mode delete). The removed
+    # composite-v1 states must be GONE.
+    check("HasCompositeToStop" not in S and "StopCdcCompositeRun" not in S,
+          "M01: composite-v1 cutover states removed (fork design)")
+    check("ListForkCdcJobs" in S and S["ListForkCdcJobs"]["Parameters"]["Payload"].get("mode")
+          == "list_fork_cdc", "M01: ListForkCdcJobs uses mode list_fork_cdc (exact-tag + registry)")
+    check("StopForkCdcRuns" in S and S["StopForkCdcRuns"].get("Next") == "DropTags",
+          "M01: StopForkCdcRuns -> DropTags")
+    check(S.get("DeleteGlueJobs", {}).get("Parameters", {}).get("Payload", {}).get("mode") == "delete",
+          "M01: DeleteGlueJobs deletes the task's jobs (by tag/registry)")
 
     # M02: a describe-before-stop state exists and routes already-stopped -> skip the stop
     check("DescribeBeforeStop" in S and "IsAlreadyStopped" in S,

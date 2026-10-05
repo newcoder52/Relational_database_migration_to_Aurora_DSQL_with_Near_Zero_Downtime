@@ -39,6 +39,14 @@ control_schema,cdc_control
 cdc_validation,true
 # cdc_validation_sample: rows re-checked per committed CDC file (0 = check every change; costly).
 cdc_validation_sample,20
+# max_composite_forks: max composite-PK tables that may be forked out of ONE task. Each composite
+# table runs its own always-on CDC job (plus its own load/validate jobs), so this caps the always-
+# on Glue jobs and DSQL connections per task. Startup fails early (naming the tables) if exceeded.
+max_composite_forks,8
+# max_big_cdc_forks: max BIG single/no-PK tables that get their OWN CDC job (bg fork). A big table
+# keeps its normal load/validate (shared load-big + validate); only CDC is forked. Overflow beyond
+# this cap stays on the MAIN CDC job (serial apply) with a warning — NOT a failure.
+max_big_cdc_forks,8
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
 # Only set it if your Glue role name differs from <project>-glue-exec-role.
 glue_role_arn,arn:aws:iam::123456789012:role/dms-dsql-glue-exec-role

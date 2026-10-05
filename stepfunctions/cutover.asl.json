@@ -57,7 +57,9 @@
         "compositeCdcJobName.$": "$.Payload.compositeCdcJobName",
         "hasCompositeTables.$": "$.Payload.hasCompositeTables",
         "cdcRoot.$": "$.Payload.cdcRoot",
-        "warnings.$": "$.Payload.warnings"
+        "warnings.$": "$.Payload.warnings",
+        "region.$": "$.Payload.region",
+        "accountId.$": "$.Payload.accountId"
       },
       "ResultPath": "$.resolved",
       "Retry": [
@@ -186,7 +188,7 @@
     },
     "CdcValidationFailedPre": {
       "Type": "Pass",
-      "Comment": "Build a Cause naming each table and its unresolved-failure count, then fail. DMS is still running and CDC is still running — nothing was touched.",
+      "Comment": "Build a Cause naming each table and its unresolved-failure count, then fail. DMS is still running and CDC is still running \u2014 nothing was touched.",
       "Parameters": {
         "Error": "CdcValidationFailed",
         "Cause.$": "States.Format('CDC validation found unresolved failures BEFORE DMS was stopped (DMS still running, CDC still running). Investigate cdc_control.cdc_validation_failures and clear with UPDATE ... SET resolved=true after review. Total={}, byTable={}', $.validationPre.failures, States.JsonToString($.validationPre.byTable))"
@@ -512,47 +514,29 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "HasCompositeToStop"
+      "Next": "ListForkCdcJobs"
     },
-    "HasCompositeToStop": {
-      "Type": "Choice",
-      "Comment": "Stop the composite CDC run too, but only if this task has composite-PK tables (so a task with none skips cleanly). IsPresent-guards hasCompositeTables first: if resolve_task did not supply it (older output / missing manifest), treat as no composite job and skip to DropTags rather than raising States.Runtime on a missing path.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.resolved.hasCompositeTables",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.resolved.hasCompositeTables",
-              "BooleanEquals": true
-            }
-          ],
-          "Next": "StopCdcCompositeRun"
-        }
-      ],
-      "Default": "DropTags"
-    },
-    "StopCdcCompositeRun": {
+    "ListForkCdcJobs": {
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
-      "Comment": "Stop the composite CDC job's run for THIS task (same stop-cdc-run Lambda, composite job name, same per-task config prefix).",
+      "Comment": "Find THIS task's fork CDC jobs (ck-* and bg-*) by EXACT TAG (project+task) UNION the per-task registry _jobs.json \u2014 never by name prefix \u2014 so every fork's CDC run can be stopped before the jobs are deleted, and stale ones are caught. Returns [] when the task has no forks.",
       "Parameters": {
-        "FunctionName": "<<STOP_CDC_RUN_LAMBDA_ARN>>",
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
         "Payload": {
-          "cdcJobName.$": "$.resolved.compositeCdcJobName",
+          "mode": "list_fork_cdc",
+          "bucket": "<<BUCKET>>",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "region.$": "$.resolved.region",
+          "account_id.$": "$.resolved.accountId",
           "configPrefix.$": "$.resolved.configPrefix"
         }
       },
-      "ResultPath": "$.stopCompositeRun",
+      "ResultSelector": {
+        "forkCdcJobNames.$": "$.Payload.forkCdcJobNames"
+      },
+      "ResultPath": "$.forkCdc",
       "Retry": [
-        {
-          "ErrorEquals": [
-            "Glue.EntityNotFoundException"
-          ],
-          "MaxAttempts": 0
-        },
         {
           "ErrorEquals": [
             "States.ALL"
@@ -565,12 +549,73 @@
       "Catch": [
         {
           "ErrorEquals": [
-            "Glue.EntityNotFoundException"
+            "States.ALL"
           ],
-          "Comment": "The composite CDC job does not exist for this task (none was created, or it was already deleted). Nothing to stop; DeleteGlueJobs removes it by name anyway. Do not fail cutover.",
-          "Next": "DropTags",
-          "ResultPath": "$.stopCompositeRun"
-        },
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "StopForkCdcRuns"
+    },
+    "StopForkCdcRuns": {
+      "Type": "Map",
+      "Comment": "Stop EACH composite fork's CDC run for this task (same stop-cdc-run Lambda, each fork's own job name + the task's config prefix). Empty list -> no iterations. A fork job already gone is tolerated (EntityNotFound skipped); DeleteGlueJobs removes it by prefix anyway.",
+      "ItemsPath": "$.forkCdc.forkCdcJobNames",
+      "MaxConcurrency": 5,
+      "Parameters": {
+        "forkCdcJobName.$": "$$.Map.Item.Value",
+        "configPrefix.$": "$.resolved.configPrefix"
+      },
+      "Iterator": {
+        "StartAt": "StopOneForkCdcRun",
+        "States": {
+          "StopOneForkCdcRun": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "<<STOP_CDC_RUN_LAMBDA_ARN>>",
+              "Payload": {
+                "cdcJobName.$": "$.forkCdcJobName",
+                "configPrefix.$": "$.configPrefix"
+              }
+            },
+            "ResultPath": "$.stopForkRun",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Glue.EntityNotFoundException"
+                ],
+                "MaxAttempts": 0
+              },
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "Glue.EntityNotFoundException"
+                ],
+                "Comment": "This fork CDC job no longer exists; nothing to stop. DeleteGlueJobs removes it by prefix. Do not fail cutover.",
+                "Next": "ForkStopDone",
+                "ResultPath": "$.stopForkRun"
+              }
+            ],
+            "End": true
+          },
+          "ForkStopDone": {
+            "Type": "Pass",
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.stopForkResult",
+      "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"

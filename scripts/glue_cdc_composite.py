@@ -193,6 +193,14 @@ DMS_TASK_ARN = 'arn:aws:dms:<REGION>:<ACCOUNT>:task:<TASK_ID>'
 # DSQL schema that holds v4's control tables (created if not exists on startup).
 CONTROL_SCHEMA = 'cdc_control'
 
+# CDC ownership (fork design) — see glue_cdc_continuous.py. The composite job applies a table only
+# if its recorded owner (in config/_task/<suffix>/_jobs.json -> cdcOwners) == CDC_OWNER_SELF. For a
+# ck fork this is "ck-<slug>"; its one-table manifest already scopes it, this is defense-in-depth
+# against the ONE ownership record. Absent record -> default owner "main" (so a composite table with
+# no registry is NOT applied by a ck job that expects "ck-<slug>").
+CDC_OWNER_SELF = 'main'
+CDC_OWNERS_KEY = None
+
 # Timing
 POLL_INTERVAL = 30              # seconds between S3 polls when idle
 DDL_WATCH_INTERVAL = 10         # seconds between DMS DDL-count checks
@@ -443,12 +451,14 @@ def _apply_cdc_arg_overrides():
     global MAX_PARALLEL_TABLES, REQUIRE_FULL_LOAD_DONE, POLL_INTERVAL
     global DMS_TIMESTAMP_COLUMN, SINGLE_SWAP_IS_RENAME
     global VALIDATION_ENABLED, VALIDATION_SAMPLE_PER_FILE
+    global CDC_OWNER_SELF, CDC_OWNERS_KEY
     optional = ["config_prefix", "index_s3_key", "load_status_key", "s3_bucket", "cdc_root",
                 "dsql_endpoint", "dsql_database", "dsql_user", "region",
                 "dms_task_arn", "control_schema",
                 "max_parallel_tables", "require_full_load_done", "poll_interval",
                 "timestamp_column", "single_swap_is_rename",
-                "cdc_validation", "cdc_validation_sample"]
+                "cdc_validation", "cdc_validation_sample",
+                "cdc_owner_self", "cdc_owners_key"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -493,6 +503,11 @@ def _apply_cdc_arg_overrides():
         DMS_TASK_ARN = _s("dms_task_arn")
     if _s("control_schema"):
         CONTROL_SCHEMA = _s("control_schema")
+    if _s("cdc_owner_self"):
+        CDC_OWNER_SELF = _s("cdc_owner_self")
+        print(f"  ↪ CDC_OWNER_SELF -> {CDC_OWNER_SELF}")
+    if _s("cdc_owners_key"):
+        CDC_OWNERS_KEY = _s("cdc_owners_key")
     if "max_parallel_tables" in ov:
         try:
             MAX_PARALLEL_TABLES = max(1, int(ov["max_parallel_tables"]))
@@ -1740,6 +1755,30 @@ def load_manifest():
     if not tables:
         raise Exception("Master index has no tables — run Job 1 first.")
     return tables
+
+
+def _load_cdc_owners():
+    """The ONE persisted CDC-ownership record: cdcOwners{label->owner} in the task registry
+    config/_task/<suffix>/_jobs.json. Returns {label: owner} or None (pre-fork task). A ck fork
+    runs with its own config_prefix, so the SM passes the task-level key as --cdc_owners_key."""
+    if CDC_OWNERS_KEY:
+        bucket, key = (BUCKET, CDC_OWNERS_KEY) if not str(CDC_OWNERS_KEY).startswith("s3://") \
+            else split_s3(CDC_OWNERS_KEY)
+    else:
+        bucket, key = split_s3(CONFIG_PREFIX.rstrip('/') + '/_jobs.json')
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound") or type(e).__name__ == "NoSuchKey":
+            print(f"  ℹ️ no job registry at s3://{bucket}/{key}; owner defaults to 'main'.", flush=True)
+            return None
+        raise
+    doc = json.loads(obj['Body'].read().decode('utf-8'))
+    owners = doc.get('cdcOwners') or {}
+    print(f"  ↪ CDC owners loaded ({len(owners)} table(s)); this job applies owner="
+          f"{CDC_OWNER_SELF!r}.", flush=True)
+    return owners
 
 
 def load_table_config(entry):
@@ -4019,9 +4058,16 @@ def main():
     print("  [startup] loading manifest…", flush=True)
     entries = load_manifest()
     print(f"  [startup] manifest loaded: {len(entries)} entries; building contexts…", flush=True)
+    owners = _load_cdc_owners()
     contexts = []
     single_key = []
+    not_owned = []
     for _i, e in enumerate(entries):
+        _label = f"{e.get('dsql_schema')}.{e.get('dsql_table')}"
+        _owner = owners.get(_label, "main") if owners is not None else "main"
+        if _owner != CDC_OWNER_SELF:
+            not_owned.append(f"{_label} (owner={_owner})")
+            continue
         try:
             print(f"    [startup] context {_i+1}/{len(entries)}: {e.get('dsql_schema')}.{e.get('dsql_table')}", flush=True)
             contexts.append(build_table_context(e))

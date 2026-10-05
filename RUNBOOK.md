@@ -112,8 +112,8 @@ Work through this before setup. Each item is something the pipeline assumes.
       pipeline loads into existing tables; it never creates them. If a table that the DMS task
       replicates has no table in DSQL, discovery now **fails fast** and names it (create it, then
       re-trigger the fleet) rather than silently skipping it. A single-column primary key gets full
-      insert/update/delete CDC; a table with a **multi-column** primary key is applied by the
-      composite CDC job (see [Rules for the task list](#rules-for-the-task-list)).
+      insert/update/delete CDC; a table with a **multi-column** primary key is applied by its own
+      per-table composite (`ck`) fork CDC job (see [Rules for the task list](#rules-for-the-task-list)).
 - [ ] **No binary (`bytea`) column in a primary key.** DSQL rejects `bytea` in a key
       (`0A000: datatype bytea is not supported in a key`). Map an Oracle `RAW`/`BLOB` **key** column
       to `uuid` (for 16-byte GUID keys) or `text` in the target DDL — not `bytea`. (The pipeline
@@ -392,13 +392,22 @@ per-task `startup` refuses a second run of a task that is already running.
 - **Reusing a deleted task's name:** the pipeline refuses a folder another task ARN created (its old
   status files would make CDC skip tables this task never loaded). Preflight fails that row with the
   `aws s3 mv` command to archive the old folder to `config/_archive/`.
-- **Tables with a multi-column (composite) primary key** are loaded and validated normally, and
-  their ongoing CDC changes are applied by a **separate composite CDC job**. After discovery, if the
-  task has at least one composite-PK table, startup creates and starts one extra Glue job
-  `$PROJECT-$TASK_NAME-cdc-composite` (script `scripts/glue_cdc_composite.py`) next to the main CDC
-  job and confirms it started; the main CDC job keeps applying single- and no-PK tables, and the
-  composite job applies only the composite-PK ones (no table is applied by both). A task with no
-  composite-PK tables gets no extra job. Cutover drains, stops and deletes both CDC jobs.
+- **Per-table fork CDC jobs.** After discovery, each table is assigned one CDC owner (recorded in
+  `config/_task/<task>/_jobs.json` → `cdcOwners`), and startup creates/updates the matching jobs:
+  - a **composite (multi-column) PK** table gets its own **`ck` fork** — a dedicated load, validate
+    and CDC job `$PROJECT-$TASK_NAME-ck-<slug>-{load,validate,cdc}` (CDC via
+    `scripts/glue_cdc_composite.py`), scoped to that one table;
+  - a **big** single-/no-PK table (FullLoadRows ≥ `big_table_row_threshold`, or many part-files) gets
+    its own **`bg` CDC job** `$PROJECT-$TASK_NAME-bg-<slug>-cdc` (main CDC script) while keeping the
+    shared `load-big` + `validate` jobs;
+  - the **main CDC job** applies the remaining small single-/no-PK tables.
+  No table is applied by two jobs. Startup starts and confirms every fork CDC job next to the main
+  one (each with its own start marker), recreates any missing fork job, and reports stale ones;
+  cutover drains every table, stops every CDC run (main + all forks) and deletes all the task's jobs.
+  Jobs are found by their exact tags + the registry, never by name prefix. Caps (params.csv):
+  `max_composite_forks` (default 8 — a task with more composite tables fails early, naming them) and
+  `max_big_cdc_forks` (default 8 — big tables past the cap stay on the main CDC job with a warning).
+  A task with no composite and no big tables gets no fork jobs.
 - **Schema limit:** a startup task may load into at most **9** distinct DSQL schemas (DSQL allows 10
   per database; `cdc_control` uses one). This is enforced per task while its table list is built
   (before any Glue job); preflight also estimates it from each task's selection rules and fails early
@@ -533,9 +542,9 @@ wrong loses data silently.
       run isn't running, that task's cutover stops DMS and waits the full drain budget (~12 h) before
       failing.
 - [ ] **Composite-key (multi-column-PK) tables:** their ongoing changes are tracked by the separate
-      composite CDC job (`$PROJECT-$TASK_NAME-cdc-composite`), created and started automatically when
-      the task has any (see [Rules for the task list](#rules-for-the-task-list)). Confirm that job's
-      run is RUNNING too before cutover. Only cut
+      per-table composite (`ck`) and big (`bg`) fork CDC jobs, created and started automatically when
+      the task has any (see [Rules for the task list](#rules-for-the-task-list)). Confirm each fork
+      job's run is RUNNING too before cutover. Only cut
       over once you've accounted for that — their full load is in DSQL, but no changes since full
       load were applied.
 
@@ -561,7 +570,7 @@ The result states are the same as a startup fleet ([§5](#5-run-tasks-with-the-f
 `FleetStarted` means each cutover **started**, not that it finished — watch each child. Each
 `$PROJECT-cutover` child, for its one task: stops the DMS task (up to ~1 h), waits until each table's
 last CDC file is applied (`DrainCheck`; up to ~12 h), stops this task's CDC run, drops the internal
-`_cdc_file` column, and deletes this task's Glue jobs (the five `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus `-cdc-composite` when the task has composite-PK tables). It finds the task by its ARN, so a
+`_cdc_file` column, and deletes this task's Glue jobs (the five `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus each per-table fork job `ck-<slug>-{load,validate,cdc}` / `bg-<slug>-cdc`, found by this task's tags). It finds the task by its ARN, so a
 renamed task still cuts over its original folder and jobs.
 
 > **† A cutover fleet re-triggers cutover for EVERY task in the CSV**, including ones already cut
@@ -579,7 +588,7 @@ Each child ends at one of:
 | Ends at | Meaning | What to do |
 |---|---|---|
 | `CutoverSucceeded` | done | point the application at Aurora DSQL |
-| `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed (named in the error; the jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus `-cdc-composite` when the task has composite-PK tables) | delete it by hand: `aws glue delete-job --job-name <name>`, or just re-run cutover for this task (it is idempotent — a job already gone counts as deleted) |
+| `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed (named in the error; the jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus each per-table fork job `ck-<slug>-*` / `bg-<slug>-cdc`, found by this task's tags) | delete it by hand: `aws glue delete-job --job-name <name>`, or just re-run cutover for this task (it is idempotent — a job already gone counts as deleted) |
 | `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed for this task | fix the error shown, re-run cutover for this task via the fleet |
 | `CdcValidationFailed` | unresolved CDC-validation discrepancies blocked cutover (pre-check: nothing touched; final check: DMS stopped, CDC run/`_cdc_file`/Glue jobs all untouched) | review `cdc_control.cdc_validation_failures`, clear each reviewed row with `UPDATE … SET resolved=true` (never `DELETE`), then re-run cutover ([§8](#8-if-something-fails)) |
 | `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`) | DMS is stopped; a table's last file wasn't applied within ~12 h | fix the cause ([§8](#8-if-something-fails)), then **re-run cutover for this task** — it skips the already-stopped DMS and re-drains |
@@ -618,11 +627,12 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Startup** `PipelineFailed` at `ResumeDmsToCdc` | load done and validated; DMS probably still paused | **don't re-trigger the fleet for this task.** If DMS is still stopped, resume it: `aws dms start-replication-task --replication-task-arn "$TASK_ARN" --start-replication-task-type resume-processing`, then **start the CDC job by hand** (below) |
 | **Startup** `CdcRunFailed`/`CdcRunEnded`/`CdcFallbackFailed`, or `PipelineFailed` at `StartCdcJob`/`GetCdcRun`/`CheckCdcStarted` | load done; **DMS is in CDC**, capturing changes to S3 | **don't re-trigger the fleet** (it skips this task). Check whether a CDC run is already RUNNING ([§6](#6-watch-progress)); if not, fix the cause in the CDC log and **start the CDC job by hand** (below). Nothing is lost while it's down — DMS keeps writing change files |
 | **Startup** `CdcStartNotConfirmed` | the CDC run is running but didn't write its start marker in 45 min | check the CDC log ([§6](#6-watch-progress)). If it shows `entering poll loop`, CDC is fine and the marker couldn't be written — check the Glue role can write `config/_task/<task>/_cdc_started/` |
-| **Startup** `EnsureCompositeFailed` | creating the composite CDC job after discovery failed (template/engine/role problem); the main CDC job was not started | fix the cause (the Lambda error names it), re-trigger the fleet for this task — nothing is past full load |
-| **Startup** `CompositeStartNotConfirmed` | the composite CDC run didn't write its start marker in 45 min (the main CDC job is running) | check the `-cdc-composite` run's log ([§6](#6-watch-progress)); if it shows `entering poll loop`, check the Glue role can write `config/_task/<task>/_cdc_started/`. Investigate before cutover |
+| **Startup** `PlanSplitFailed` | planning the forks failed: more composite tables than `max_composite_forks` (the cause lists them), or the master index was unreadable | reduce composite tables in the task's selection rules / split the task / raise `max_composite_forks` in params.csv, then re-trigger the fleet. No Glue jobs were created. (Big tables past `max_big_cdc_forks` do NOT fail — they stay on the main CDC job with a warning) |
+| **Startup** `EnsureForkJobsFailed` | creating a fork's load/validate/cdc jobs after discovery failed (template/engine/role problem), OR a Glue job with that name already exists with different/absent tags (a hand-made or other-task job) and was refused, OR listing/tagging Glue jobs failed | the Lambda error names it; remove/rename the conflicting job or fix the IAM/template, then re-trigger the fleet — nothing is past full load |
+| **Startup** `ForkCdcStartNotConfirmed` | a fork CDC job (ck-* or bg-*) didn't write its start marker in 45 min (the main CDC job is running) | check that fork's run log ([§6](#6-watch-progress)); if it shows `entering poll loop`, check the Glue role can write `config/_task/<task>/_cdc_started/`. Investigate before cutover |
 | **Startup** execution shows `CdcDriverFallback` then succeeds | the Python-shell drivers failed; the job is now Spark | nothing to fix. The reason is in `config/_task/<task name>/_cdc_engine.json`; fix `driver-cdc/` and delete that file to go back to Python shell |
 | **Cutover** `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed | fix the error, re-run cutover for this task via the fleet (keep only this task in the CSV, or remove already-cut-over tasks first) |
-| **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **re-run cutover for this task**. Cutover is now re-runnable: it describes the DMS task first and skips the stop when it is already stopped (`InvalidResourceStateFault` is also tolerated), re-drains, and every later step is idempotent (stop-CDC no-op when nothing runs, `_cdc_file` drop `IF EXISTS`, Glue delete treats an already-gone job as deleted, composite job absent is fine) |
+| **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **re-run cutover for this task**. Cutover is now re-runnable: it describes the DMS task first and skips the stop when it is already stopped (`InvalidResourceStateFault` is also tolerated), re-drains, and every later step is idempotent (stop-CDC no-op when nothing runs, `_cdc_file` drop `IF EXISTS`, Glue delete treats an already-gone job as deleted, a fork job already absent is fine) |
 | **Cutover** `CdcValidationFailed` (from `CdcValidationFailedPre`, **before** DMS is stopped) | nothing touched — DMS still running, CDC still running | investigate the unresolved rows (query below), confirm each is explained/benign, then clear them and re-run cutover: `UPDATE cdc_control.cdc_validation_failures SET resolved = true WHERE table_name = '<schema>.<table>';` (never `DELETE` — keep the audit) |
 | **Cutover** `CdcValidationFailed` (from `CdcValidationFailedFinal`, **after** the drain) | DMS is **stopped**; the CDC run, the `_cdc_file` column and the Glue jobs are **untouched** | same `UPDATE … SET resolved = true` after review, then re-run cutover (it re-stops DMS idempotently, re-drains, re-checks). The query: `SELECT table_name, count(*) FROM cdc_control.cdc_validation_failures WHERE resolved=false GROUP BY table_name;` |
 | **CDC** a table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` ([how to connect](#connect-to-dsql-and-check-progress)) — CDC resumes. **Never delete the row** (applied files stay and would all be replayed) |
@@ -665,9 +675,19 @@ RUN=$(aws glue get-job-runs --job-name "$PROJECT-$TASK_NAME-cdc" \
 [ -n "$RUN" ] && aws glue batch-stop-job-run --job-name "$PROJECT-$TASK_NAME-cdc" --job-run-ids "$RUN"
 # 3. In DSQL, for each of this task's tables (quote the names):
 #      ALTER TABLE "<schema>"."<table>" DROP COLUMN IF EXISTS "_cdc_file";
-# 4. Delete this task's Glue jobs (cdc-composite is a no-op if the task had no composite-PK tables)
-for r in discovery load load-big validate cdc cdc-composite; do
+# 4. Delete this task's Glue jobs: the five shared jobs, plus every per-table fork job
+#    (ck-<slug>-{load,validate,cdc} and bg-<slug>-cdc). Find the forks by this task's tags
+#    (never by name prefix — another task's name may be a prefix of this one):
+for r in discovery load load-big validate cdc; do
   aws glue delete-job --job-name "$PROJECT-$TASK_NAME-$r"
+done
+# fork jobs (tagged dsql_pipeline_project=$PROJECT, dsql_pipeline_task=$TASK_NAME):
+for j in $(aws glue list-jobs --query 'JobNames[]' --output text | tr '\t' '\n'); do
+  tags=$(aws glue get-tags --resource-arn "arn:aws:glue:$REGION:$ACCOUNT:job/$j" --query 'Tags' --output json 2>/dev/null)
+  echo "$tags" | grep -q "\"dsql_pipeline_task\": \"$TASK_NAME\"" \
+    && echo "$tags" | grep -q "\"dsql_pipeline_project\": \"$PROJECT\"" \
+    && echo "$tags" | grep -q "dsql_pipeline_fork" \
+    && aws glue delete-job --job-name "$j"
 done
 ```
 
@@ -769,20 +789,20 @@ The load/discovery/validate templates each allow 10 concurrent runs; the CDC tem
 | `StartDmsTask` → `IsDmsDone` | DMS API | start DMS, poll (30 s × 2880 ≈ 24 h) until `STOPPED_AFTER_CACHED_EVENTS` |
 | `BuildTableList` | `resolve-task` | build the table list from `describe_table_statistics` + the task mappings; enforce ≤ 9 DSQL schemas |
 | `CreateGlueJobs` | `create-glue-jobs` | create `<project>-<task>-<role>` jobs from `glue-templates/` in your Glue connection |
-| `RunDiscovery` | Glue job 1 | writes `_manifest_index.json` |
-| `EnsureCompositeJob` | `create-glue-jobs` | after discovery: if any table has a composite PK, create `<project>-<task>-cdc-composite`; else do nothing |
-| `PlanSplit` | `plan-split` | writes per-group manifests under `_orchestrator/group-<n>/` |
-| `GroupFanOut` | Glue jobs 2 and 3 | load then validate each group (up to 6 groups at once) |
-| `ResumeDmsToCdc`, `StartCdcJob` | DMS API, Glue | resume DMS into CDC; start the CDC job (with `--config_prefix` as a run argument) |
-| `GetCdcRun` / `CheckCdcStarted` | Glue, S3 | wait up to 45 min for the CDC run's start marker |
-| `StartCdcCompositeJob` / `CheckCompositeStarted` | Glue, S3 | if the task has composite-PK tables, start `-cdc-composite` and wait up to 45 min for its start marker |
+| `RunDiscovery` | Glue job 1 | writes `_manifest_index.json` (with each table's `pk_mode`) |
+| `PlanSplit` | `plan-split` | assigns each table a CDC owner (`main`/`ck-<slug>`/`bg-<slug>`), writes per-group + per-fork manifests under `_orchestrator/`, and the plan's fork list |
+| `EnsureForkJobs` | `create-glue-jobs` | after discovery: create/update each fork's jobs (composite → `ck-<slug>-{load,validate,cdc}`; big single/no-PK → `bg-<slug>-cdc`), tag them, write the task registry `_jobs.json`; recreate missing, report stale |
+| `GroupFanOut` | Glue jobs 2 and 3 | load then validate each group AND each `ck` fork (up to 6 at once) |
+| `ResumeDmsToCdc`, `StartCdcJob` | DMS API, Glue | resume DMS into CDC; start the main CDC job (with `--config_prefix` as a run argument) |
+| `GetCdcRun` / `CheckCdcStarted` | Glue, S3 | wait up to 45 min for the main CDC run's start marker |
+| `StartForkCdcMap` | Glue, S3 | start EACH fork CDC job (ck-* and bg-*) and wait up to 45 min for each one's own start marker |
 | `CdcDriverFallback` → `UseSparkCdcJob` | `create-glue-jobs` | on a driver failure, re-create the CDC job as Spark (once) |
 | cutover `StopCdcDmsTask` → `IsCdcTaskStopped` | DMS API | stop the DMS task (poll 15 s × 240 ≈ 1 h) |
 | cutover `DrainCheck` | `drain-check` | wait (10 s × 4320 ≈ 12 h) until each table's latest CDC file is applied |
-| cutover `StopCdcRun` | `stop-cdc-run` | stop this task's CDC run (found by `--config_prefix`) |
-| cutover `StopCdcCompositeRun` | `stop-cdc-run` | stop the composite CDC run too, if the task has composite-PK tables (tolerant if the job is absent) |
+| cutover `StopCdcRun` | `stop-cdc-run` | stop this task's MAIN CDC run (found by `--config_prefix`) |
+| cutover `ListForkCdcJobs` → `StopForkCdcRuns` | `create-glue-jobs`, `stop-cdc-run` | find the task's fork CDC jobs (ck-*/bg-*) by exact tag + registry, stop each run (tolerant if a job is absent) |
 | cutover `DropTags` | `drop-tags` | drop the `_cdc_file` column |
-| cutover `DeleteGlueJobs` → `AllGlueJobsDeleted` | `create-glue-jobs` | delete this task's Glue jobs (the five, plus `-cdc-composite` by name, idempotent); any failure → `GlueJobsNotDeleted` |
+| cutover `DeleteGlueJobs` → `AllGlueJobsDeleted` | `create-glue-jobs` | delete this task's Glue jobs — the five shared jobs plus every per-table fork job (ck-*/bg-*), found by exact tag + the registry (`ListForkCdcJobs` runs first to stop their runs); idempotent; any failure → `GlueJobsNotDeleted` |
 
 **CDC correctness:** a table with a real primary key (or a declared `logical_key`) gets correct
 inserts, updates and deletes. A table without one gets inserts and deletes; updates are skipped and
@@ -811,9 +831,9 @@ itself failed). Success `FleetStarted` means every task started or was skipped a
 not that the migrations finished.
 
 **Per-task startup:** `MissingTaskArn`, `ResolveFailed`, `DriversFailed` (before DMS) · `DmsFailed`
-(`DmsTaskFailed`), `DmsTimedOut` (`DmsPollBudgetExceeded`), `BuildTableListFailed`, `EnsureCompositeFailed`, `GroupsFailed`,
+(`DmsTaskFailed`), `DmsTimedOut` (`DmsPollBudgetExceeded`), `BuildTableListFailed`, `PlanSplitFailed`, `EnsureForkJobsFailed`, `GroupsFailed`,
 `PipelineFailed` (before DMS resumes) · `CdcRunFailed`, `CdcRunEnded`, `CdcStartNotConfirmed`,
-`CompositeStartNotConfirmed`,
+`ForkCdcStartNotConfirmed`,
 `CdcFallbackFailed`, `PipelineFailed` (after DMS is in CDC).
 
 **Per-task cutover:** `MissingTaskArn`, `ResolveFailed` (nothing touched) · `CutoverFailed` (DMS may
@@ -836,8 +856,8 @@ See [§8](#8-if-something-fails) for the recovery keyed to each state, and
 **Worked out per task, from the row's `taskArn`** (plus `taskSuffix` / `adoptExistingFolder`): the
 task name (the DMS task's name, or `task_suffix`; after the first startup, the name recorded in
 `config/_task_index/<task id>.json`), its config folder `config/_task/<task name>/`, its Glue
-job names `<project>-<task name>-{discovery,load,load-big,validate,cdc}` (plus `-cdc-composite` if it
-has composite-PK tables), its owner record
+job names `<project>-<task name>-{discovery,load,load-big,validate,cdc}` (plus per-table fork jobs
+`ck-<slug>-{load,validate,cdc}` / `bg-<slug>-cdc`), its owner record
 `_task.json`, and its S3 layout (from the DMS S3 endpoint's `BucketFolder`, `TimestampColumnName`,
 `CsvNullValue`, …).
 

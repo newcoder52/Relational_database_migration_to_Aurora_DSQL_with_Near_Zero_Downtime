@@ -358,19 +358,22 @@ def reachability(sm_path):
 
 
 def m01_regression():
-    """Explicit guard that the critical cutover composite wiring is correct and stays correct:
-    - CutoverResolveTask.ResultSelector carries hasCompositeTables + compositeCdcJobName
-    - HasCompositeToStop IsPresent-guards hasCompositeTables before the BooleanEquals."""
+    """Guard the cutover fork-cleanup wiring (fork design; replaces the composite-v1 states):
+    - the composite-v1 states (HasCompositeToStop / StopCdcCompositeRun) are GONE
+    - ListForkCdcJobs uses mode list_fork_cdc (find fork CDC jobs by exact tag + registry)
+    - StopForkCdcRuns -> DropTags; DeleteGlueJobs deletes the task's jobs (mode delete)."""
     problems = []
     cut = json.load(open(os.path.join(SF_DIR, "cutover.asl.json")))
-    rs = cut["States"]["CutoverResolveTask"]["ResultSelector"]
-    for want in ("hasCompositeTables.$", "compositeCdcJobName.$"):
-        if want not in rs:
-            problems.append(f"[M01] cutover CutoverResolveTask.ResultSelector missing '{want}'")
-    hc = cut["States"]["HasCompositeToStop"]
-    txt = json.dumps(hc)
-    if '"IsPresent": true' not in txt or "hasCompositeTables" not in txt:
-        problems.append("[M01] HasCompositeToStop no longer IsPresent-guards hasCompositeTables")
+    S = cut["States"]
+    if "HasCompositeToStop" in S or "StopCdcCompositeRun" in S:
+        problems.append("[M01] composite-v1 cutover states still present (should be fork states)")
+    lf = S.get("ListForkCdcJobs", {})
+    if lf.get("Parameters", {}).get("Payload", {}).get("mode") != "list_fork_cdc":
+        problems.append("[M01] ListForkCdcJobs missing / wrong mode (want list_fork_cdc)")
+    if S.get("StopForkCdcRuns", {}).get("Next") != "DropTags":
+        problems.append("[M01] StopForkCdcRuns does not route to DropTags")
+    if S.get("DeleteGlueJobs", {}).get("Parameters", {}).get("Payload", {}).get("mode") != "delete":
+        problems.append("[M01] DeleteGlueJobs does not delete the task's jobs")
     return problems
 
 

@@ -696,3 +696,33 @@ honest about what is **not** fixed:
 5. **Case-folder latent bug.** A table empty at full load whose DMS folder differs only in letter
    case can be mis-matched permanently and reported caught up at cutover
    (`CDC_EDGE_CASE_RESULTS.md` §2.8). Does not affect tables that have data at full load.
+
+## 2026-10-05 — Per-table fork CDC jobs + per-task job registry
+
+- **Composite (`ck`) and big (`bg`) forks.** After discovery, `plan_split` assigns each table one
+  CDC owner. Composite-PK tables are forked into their own load/validate/CDC jobs
+  (`<project>-<task>-ck-<slug>-{load,validate,cdc}`, CDC via `scripts/glue_cdc_composite.py`). Big
+  single-/no-PK tables (≥ `big_table_row_threshold` rows, or many part-files) get their own CDC job
+  (`<project>-<task>-bg-<slug>-cdc`, main CDC script) while keeping the shared `load-big` + `validate`
+  jobs. The main CDC job applies the remaining small single-/no-PK tables. The earlier "one extra
+  `<project>-cdc-composite` job per task" model was removed.
+- **One ownership record / registry.** `config/_task/<task>/_jobs.json` holds `cdcOwners`
+  (`table → main|ck-<slug>|bg-<slug>`) and the job list; `create_glue_jobs` writes it with an
+  ETag read-modify-write. Every CDC job reads `cdcOwners` (`--cdc_owner_self`/`--cdc_owners_key`) and
+  applies only the tables it owns → each table applied by exactly one job. Ownership is **stable**:
+  once recorded, a re-run keeps it (a threshold change only warns), so a change can't double-apply
+  while old CDC jobs exist.
+- **Exact-tag job lookup (never name prefix).** Jobs carry `dsql_pipeline_project`/`_task`/`_fork`
+  tags; selection for list/stop/delete is by exact tag + the registry. Startup recreates a missing
+  expected job and reports stale ones (not in the current plan) without starting them; cutover stops
+  every CDC run and deletes all the task's jobs. A same-named Glue job with absent/other tags is
+  refused, never overwritten. Fails closed if Glue listing/tagging errors.
+- **S3 folder-prefix exactness.** Table/task/group/fork folder prefixes are normalized to end in `/`
+  before listing, so `SCHEMA/ORDERS` never matches `SCHEMA/ORDERS_HIST/` and `config/_task/orders`
+  never matches `config/_task/orders-eu/` (fixes a latent prefix gap in `job2_load`).
+- **params.csv:** `max_composite_forks` (default 8; exceeding it fails startup early, naming the
+  tables) and `max_big_cdc_forks` (default 8; big tables past the cap stay on the main CDC job with a
+  warning). Watch the Glue concurrent-job-run quota (~30/account) and DSQL connections (10,000/cluster)
+  as always-on CDC jobs grow; the DSQL 5-CDC-streams quota is outbound-only and does not bound these
+  inbound CDC writer jobs.
+- **New startup failure states:** `PlanSplitFailed`, `EnsureForkJobsFailed`, `ForkCdcStartNotConfirmed`.

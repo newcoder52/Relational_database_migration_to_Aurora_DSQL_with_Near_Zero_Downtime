@@ -50,7 +50,8 @@
         "Sid": "GlueManageJobsAtRuntime",
         "Effect": "Allow",
         "Action": ["glue:CreateJob", "glue:UpdateJob", "glue:DeleteJob", "glue:GetJob",
-                   "glue:GetJobRuns", "glue:BatchStopJobRun"],
+                   "glue:GetJobs", "glue:ListJobs", "glue:GetJobRuns", "glue:BatchStopJobRun",
+                   "glue:TagResource", "glue:GetTags"],
         "Resource": ["*"]
       },
       {

@@ -101,30 +101,6 @@ _CDC_ROLES = ("cdc", _CDC_COMPOSITE_ROLE)   # roles wired like the CDC job (args
 _ACTIVE_RUN_STATES = {"STARTING", "RUNNING", "STOPPING", "WAITING"}
 
 
-def _task_has_composite_tables(s3_client, bucket, config_prefix):
-    """True if THIS task's manifest index has at least one multi-column-PK table (pk_mode ==
-    'composite', written by job1_discovery). Used to decide whether to create/delete the
-    composite CDC job: no composite tables -> no composite job. Best-effort: if the index can't
-    be read (not written yet), returns False so we never create a composite job for a task that
-    has none. config_prefix is an s3://.../ prefix; the index is <config_prefix>_manifest_index.json."""
-    try:
-        if not str(config_prefix).startswith("s3://"):
-            return False
-        _b, _, _k = config_prefix[len("s3://"):].partition("/")
-        key = _k.rstrip("/") + "/_manifest_index.json" if _k and not _k.endswith("/") \
-            else _k + "_manifest_index.json"
-        obj = s3_client.get_object(Bucket=_b, Key=key)
-        idx = json.loads(obj["Body"].read())
-        for t in idx.get("tables", []):
-            if t.get("pk_mode") == "composite" or len(t.get("pk_columns") or []) > 1:
-                return True
-        return False
-    except Exception as e:
-        print(f"(info) composite-table check: could not read index under {config_prefix} "
-              f"({type(e).__name__}: {e}); assuming NO composite tables.")
-        return False
-
-
 # A Python-shell CDC run that fails with one of these never got as far as the script: Glue could
 # not install or import the drivers. (The CDC script itself never starts a subprocess, so a
 # CalledProcessError can only come from Glue's pip install of the --extra-py-files wheels.)
@@ -185,8 +161,149 @@ def _active_runs(glue, name):
     return [r["Id"] for r in runs if r.get("JobRunState") in _ACTIVE_RUN_STATES]
 
 
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _wait_runs_stopped(glue, name, attempts=30, delay=10):
+    """Before deleting a job, wait for any STARTING/RUNNING/STOPPING run to reach a stopped state
+    (G3). A job that doesn't exist has no runs. Best-effort: after the budget, proceed to delete
+    (Glue stops runs on delete) rather than block cutover forever."""
+    import time
+    for _i in range(attempts):
+        try:
+            act = _active_runs(glue, name)
+        except glue.exceptions.EntityNotFoundException:
+            return
+        except Exception:
+            return
+        if not act:
+            return
+        time.sleep(delay)
+
+
 def _read_json(s3, bucket, key):
     return json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8"))
+
+
+def _job_arn(region, account_id, name):
+    return f"arn:aws:glue:{region}:{account_id}:job/{name}"
+
+
+def _account_id(event):
+    acct = str(event.get("account_id") or "").strip()
+    if not acct:
+        _p = str(event.get("dms_task_arn") or "").split(":")
+        acct = _p[4] if len(_p) > 4 else ""
+    return acct
+
+
+def _get_job_tags(glue, region, account_id, name):
+    """The tag dict on a Glue job, or {} if the job doesn't exist. Raises on access/throttle
+    errors so callers fail closed (never a silent partial view)."""
+    try:
+        return glue.get_tags(ResourceArn=_job_arn(region, account_id, name)).get("Tags", {}) or {}
+    except Exception as e:
+        if type(e).__name__ == "EntityNotFoundException":
+            return {}
+        code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        if code in ("EntityNotFoundException", "EntityNotFound"):
+            return {}
+        raise
+
+
+def _select_task_jobs_by_tag(glue, region, account_id, project, task_suffix, fork_slug=None):
+    """EXACT-TAG job selection (NEVER by name prefix/substring — see G1). Returns the set of job
+    names whose tags match dsql_pipeline_project==project AND dsql_pipeline_task==task_suffix
+    (AND dsql_pipeline_fork==fork_slug when given). Pages list_jobs, reads each job's tags.
+    Raises on any list/get-tags error so the caller fails closed (a silent partial view could
+    leave a CDC run going after cutover)."""
+    selected = set()
+    token = None
+    while True:
+        kw = {"MaxResults": 200}
+        if token:
+            kw["NextToken"] = token
+        resp = glue.list_jobs(**kw)
+        for n in resp.get("JobNames", []) or []:
+            tags = _get_job_tags(glue, region, account_id, n)
+            if tags.get("dsql_pipeline_project") == project and \
+               tags.get("dsql_pipeline_task") == task_suffix and \
+               (fork_slug is None or tags.get("dsql_pipeline_fork") == fork_slug):
+                selected.add(n)
+        token = resp.get("NextToken")
+        if not token:
+            break
+    return selected
+
+
+# ---- per-task job REGISTRY (G2): the ONE source of truth, config/_task/<suffix>/_jobs.json -----
+def _registry_key(config_prefix, task_suffix):
+    """Key of the task registry _jobs.json. config_prefix is the TASK config prefix
+    (s3://.../config/_task/<suffix>/) for create/ensure_fork_jobs; for a fork fallback the
+    task-level prefix is derived from task_suffix."""
+    cp = str(config_prefix or "")
+    if cp.startswith("s3://") and cp.count("/") >= 3:
+        key = cp.split("/", 3)[3]
+    else:
+        key = cp.lstrip("/")
+    key = key.rstrip("/")
+    # If config_prefix is a FORK prefix (.../_orchestrator/ck-<slug>), walk up to the task root.
+    marker = "/_orchestrator/"
+    if marker in ("/" + key + "/"):
+        key = key.split("/_orchestrator/", 1)[0]
+    elif not key:
+        key = f"config/_task/{task_suffix}"
+    return key.rstrip("/") + "/_jobs.json"
+
+
+def _read_registry(s3, bucket, key):
+    """(doc, etag). doc is {} with no 'jobs' when absent. etag None when absent."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        return json.loads(obj["Body"].read().decode("utf-8")), obj.get("ETag")
+    except Exception as e:
+        code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404", "NotFound") or type(e).__name__ == "NoSuchKey":
+            return {}, None
+        raise
+
+
+def _write_registry(s3, bucket, key, doc, etag):
+    """Conditional write: If-Match the ETag we read (If-None-Match '*' when creating), so a
+    concurrent update can't be clobbered. Returns the new ETag. Raises PreconditionFailed on a
+    race (the caller retries the read-modify-write)."""
+    body = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+    kw = {"Bucket": bucket, "Key": key, "Body": body, "ContentType": "application/json"}
+    if etag:
+        kw["IfMatch"] = etag
+    else:
+        kw["IfNoneMatch"] = "*"
+    return s3.put_object(**kw).get("ETag")
+
+
+def _update_registry(s3, bucket, key, mutate, attempts=6):
+    """Read-modify-write the registry safely against concurrent updates (S3 conditional write
+    with ETag, retried on PreconditionFailed/412). `mutate(doc)` edits the doc in place."""
+    import time
+    for i in range(attempts):
+        doc, etag = _read_registry(s3, bucket, key)
+        mutate(doc)
+        try:
+            _write_registry(s3, bucket, key, doc, etag)
+            return doc
+        except Exception as e:
+            code = (getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+            name = type(e).__name__
+            if code in ("PreconditionFailed", "412", "ConditionalRequestConflict") \
+               or name in ("PreconditionFailed",):
+                if i < attempts - 1:
+                    time.sleep(0.2 * (2 ** i))
+                    continue
+            raise
+    raise Exception(f"could not update job registry s3://{bucket}/{key} after {attempts} tries "
+                    f"(concurrent writers?).")
 
 
 def _job_name(project, task_suffix, role):
@@ -291,18 +408,49 @@ def handler(event, context):
     task_suffix = event["taskSuffix"]
 
     glue = boto3.client("glue", region_name=REGION)
+    s3 = boto3.client("s3", region_name=REGION)
+    region = event.get("region", REGION)
+    account_id = _account_id(event)
     names = {role: _job_name(project, task_suffix, role) for role in _ROLES}
-    # The composite CDC job name is always resolvable (delete mode removes it idempotently even
-    # if it was never created; _job_name enforces the 255-char limit). Whether it is CREATED is
-    # decided below from the task's composite-table count.
-    names[_CDC_COMPOSITE_ROLE] = _job_name(project, task_suffix, _CDC_COMPOSITE_ROLE)
+    reg_key = _registry_key(event.get("configPrefix") or f"config/_task/{task_suffix}/", task_suffix)
+
+    if mode == "list_fork_cdc":
+        # Cutover support: return THIS task's FORK CDC job names (ck-* and bg-*), from the UNION of
+        # the registry and the exact-tag selection (so stale jobs are caught too). Fail closed on
+        # a Glue list/tag error. Never selects by name prefix (G1).
+        if not account_id:
+            raise Exception("list_fork_cdc: cannot resolve account id (need account_id or "
+                            "dms_task_arn) to read job tags.")
+        reg_doc, _ = _read_registry(s3, bucket, reg_key)
+        reg_fork_cdc = {j["name"] for j in reg_doc.get("jobs", [])
+                        if j.get("role") in ("ck-cdc", "bg-cdc")}
+        tagged = _select_task_jobs_by_tag(glue, region, account_id, project, task_suffix)
+        tagged_fork_cdc = set()
+        for n in tagged:
+            t = _get_job_tags(glue, region, account_id, n)
+            if t.get("dsql_pipeline_fork") and n.endswith("-cdc"):
+                tagged_fork_cdc.add(n)
+        fork_cdc = sorted(reg_fork_cdc | tagged_fork_cdc)
+        missing = sorted(reg_fork_cdc - tagged)   # in registry but Glue has no tagged job
+        print(f"(info) list_fork_cdc: {len(fork_cdc)} fork CDC job(s): {fork_cdc}"
+              + (f"; missing from Glue: {missing}" if missing else ""))
+        return {"forkCdcJobNames": fork_cdc, "missingForkCdcJobNames": missing, "jobs": names}
 
     if mode == "delete":
-        # A job that is already gone counts as deleted. Any other error is returned under
-        # "failed" (the cutover workflow then ends at GlueJobsNotDeleted instead of succeeding).
+        # Delete the task's jobs = UNION of the registry and the exact-tag selection (so stale
+        # jobs — e.g. a fork whose table was removed — are cleaned up too). NEVER by name prefix.
+        # Fail closed if Glue listing/tagging fails. Wait for any active run to stop first.
+        if not account_id:
+            raise Exception("delete: cannot resolve account id to read job tags.")
+        reg_doc, _ = _read_registry(s3, bucket, reg_key)
+        reg_names = {j["name"] for j in reg_doc.get("jobs", [])}
+        tagged = _select_task_jobs_by_tag(glue, region, account_id, project, task_suffix)
+        found = reg_names | tagged
+        reported_missing = sorted(reg_names - tagged)
         deleted, failed = [], []
-        for role, name in names.items():
+        for name in sorted(found):
             try:
+                _wait_runs_stopped(glue, name)
                 glue.delete_job(JobName=name)
                 deleted.append(name)
             except glue.exceptions.EntityNotFoundException:
@@ -310,15 +458,21 @@ def handler(event, context):
             except Exception as e:
                 print(f"(error) could not delete {name}: {e}")
                 failed.append({"job": name, "error": f"{type(e).__name__}: {e}"[:500]})
-        return {"jobs": names, "deleted": deleted, "failed": failed, "created": [], "updated": []}
+        # Clear the registry (best-effort) so a re-created task starts clean.
+        try:
+            _update_registry(s3, bucket, reg_key, lambda d: d.update(
+                {"jobs": [], "cdcOwners": {}, "deletedAt": _now_iso()}))
+        except Exception as e:
+            print(f"(warn) could not clear registry {reg_key}: {e}")
+        return {"jobs": names, "deleted": deleted, "failed": failed,
+                "reportedMissing": reported_missing, "created": [], "updated": []}
 
-    # mode == create
+    # ---- create / ensure_fork_jobs / cdc_fallback ------------------------------------------
     templates_prefix = event["glue_templates_prefix"].strip("/")
     scripts_prefix = event["scripts_prefix"].strip("/")
     config_prefix = event["configPrefix"]
     extra_py_files = event.get("extraPyFiles", "")
     glue_role_arn = event["glue_role_arn"]
-    region = event.get("region", REGION)
     dsql_endpoint = event["dsql_endpoint"]
     # Ordered PrivateLink/public failover list (CSV) derived by resolve_task. Optional for
     # backward compatibility; the scripts fall back to --dsql_endpoint when it is absent/empty.
@@ -332,67 +486,120 @@ def handler(event, context):
     # task ARN hardcoded). Absent for non-cdc roles.
     dms_task_arn = event.get("dms_task_arn", "")
 
-    s3 = boto3.client("s3", region_name=REGION)
     created, updated, replaced = [], [], []
+    job_records = []
     spark_cdc_drivers = None
-    roles, fallback_reason = _ROLES, ""
-    # ensure_composite result (only meaningful in that mode).
-    has_composite = False
+    fallback_reason = ""
+    cdc_engine = _cdc_engine(event)
+
+    # Base tags on EVERY job so cutover/re-runs can find a task's jobs (and a fork's jobs).
+    base_tags = {"dsql_pipeline_project": project, "dsql_pipeline_task": task_suffix}
+
+    # A "job spec" fully describes one job to upsert: its name, which template stem to read, the
+    # command engine, the config_prefix it is scoped to, whether it is a CDC job (gets cdc args/
+    # drivers), and its tags. This replaces the old role-only loop so forks (own name + own
+    # config_prefix + composite CDC template) and the shared set use ONE code path.
+    job_specs = []
+
     if mode == "cdc_fallback":
         err_msg = str(event.get("error_message") or "")
         why = driver_error_reason(err_msg)
         if not why:
             print(f"(info) CDC run failed for a reason other than its drivers; job left as is: "
                   f"{err_msg[:500]}")
-            return {"jobs": names, "switched": False, "reason": "", "cdcEngine": _cdc_engine(event),
+            return {"jobs": names, "switched": False, "reason": "", "cdcEngine": cdc_engine,
                     "created": [], "updated": [], "replaced": [], "deleted": []}
-        # Which CDC job fell back: the main cdc job (default) or the composite one. The startup
-        # SM passes fallback_role when it is the composite job's Spark fallback.
-        _fb_role = event.get("fallback_role", "cdc")
-        if _fb_role not in _CDC_ROLES:
-            _fb_role = "cdc"
         fallback_reason = (f"Python-shell CDC run {event.get('failed_run_id') or ''} failed: {why} "
                            f"({err_msg[:600]})")
-        print(f"(info) {names[_fb_role]}: {fallback_reason}. Re-creating it as a Spark job.")
-        roles, cdc_engine = [_fb_role], "spark"
-    elif mode == "ensure_composite":
-        # Called by the startup SM AFTER RunDiscovery, when THIS run's _manifest_index.json
-        # (with pk_mode, written by job1_discovery) finally exists. Decide composite ownership
-        # from that fresh index and create ONLY the composite CDC job if any table is composite.
-        # (create mode runs BEFORE discovery and therefore can NOT see pk_mode, so composite
-        # creation was moved here — see MERGE_NOTES.md.) No composite tables -> create nothing
-        # and report hasCompositeTables=false so startup skips the composite start cleanly.
-        cdc_engine = _cdc_engine(event)
-        if cdc_engine == "spark" and event.get("cdc_fallback_reason"):
-            fallback_reason = str(event["cdc_fallback_reason"])
-        has_composite = _task_has_composite_tables(s3, bucket, config_prefix)
-        if has_composite:
-            roles = [_CDC_COMPOSITE_ROLE]
-            print(f"(info) ensure_composite: task has composite-PK table(s); creating/updating "
-                  f"composite CDC job {names[_CDC_COMPOSITE_ROLE]}.")
+        cdc_engine = "spark"
+        # The failing CDC job: the main cdc job, OR a fork CDC job (fork_cdc_job_name + fork_kind).
+        fb_name = event.get("fork_cdc_job_name") or names["cdc"]
+        fb_kind = event.get("fork_kind")   # "ck" | "bg" | None(main)
+        fb_slug = event.get("fork_slug")
+        if fb_kind == "ck":
+            fb_stem = _CDC_COMPOSITE_ENGINES["spark"]      # composite script (ck fork)
+            fb_role, fb_owner = "ck-cdc", f"ck-{fb_slug}"
+        elif fb_kind == "bg":
+            fb_stem = _CDC_ENGINES["spark"]                # MAIN script (bg fork is big single/no-PK)
+            fb_role, fb_owner = "bg-cdc", f"bg-{fb_slug}"
         else:
-            roles = []
-            print("(info) ensure_composite: task has no composite-PK tables; composite CDC job "
-                  "NOT created.")
-    else:
-        # mode == create: the full per-task job set EXCEPT the composite CDC job. The composite
-        # job cannot be decided here because discovery (which writes pk_mode) has not run yet;
-        # it is created later by the ensure_composite call after RunDiscovery.
-        cdc_engine = _cdc_engine(event)
+            fb_stem = _CDC_ENGINES["spark"]
+            fb_role, fb_owner = "cdc", "main"
+        fb_cp = event.get("fork_config_prefix") or config_prefix
+        fb_tags = dict(base_tags)
+        if fb_slug:
+            fb_tags["dsql_pipeline_fork"] = fb_slug
+        print(f"(info) {fb_name}: {fallback_reason}. Re-creating it as a Spark job.")
+        job_specs.append({"name": fb_name, "tmpl_stem": fb_stem, "config_prefix": fb_cp,
+                          "is_cdc": True, "tags": fb_tags, "role": fb_role, "owner_slug": fb_owner,
+                          "table": event.get("fork_table")})
+    elif mode == "ensure_fork_jobs":
+        # Called by the startup SM AFTER plan_split: create/update the per-fork jobs from THIS
+        # run's plan ($.plan.forks). Idempotent. A CK fork (composite key) gets load/validate/cdc
+        # (composite script); a BG fork (big single/no-PK table) gets a CDC job ONLY (its
+        # load/validate stay in the normal "big" group). No forks -> nothing created.
         if cdc_engine == "spark" and event.get("cdc_fallback_reason"):
             fallback_reason = str(event["cdc_fallback_reason"])
+        forks = event.get("forks") or []
+        for f in forks:
+            fcp = f["config_prefix"]
+            slug = f["fork_slug"]
+            kind = f.get("kind", "ck")   # "ck" | "bg"
+            ftags = dict(base_tags, dsql_pipeline_fork=slug)
+            if kind == "bg":
+                # Big single/no-PK CDC fork: one CDC job on the MAIN cdc script (glue_cdc_continuous),
+                # same engine/driver/fallback rules as the main CDC job.
+                cdc_stem = _CDC_ENGINES[cdc_engine]
+                job_specs.append({"name": f["cdcJobName"], "tmpl_stem": cdc_stem,
+                                  "config_prefix": fcp, "is_cdc": True, "tags": ftags,
+                                  "role": "bg-cdc", "owner_slug": f"bg-{slug}",
+                                  "table": f.get("fork_table")})
+            else:
+                # Composite-key fork: load + validate (shared templates) + CDC (composite script).
+                load_stem = "load-big" if f.get("loadRole") == "load-big" else "load"
+                cdc_stem = _CDC_COMPOSITE_ENGINES[cdc_engine]
+                job_specs.append({"name": f["loadJobName"], "tmpl_stem": load_stem,
+                                  "config_prefix": fcp, "is_cdc": False, "tags": ftags,
+                                  "role": "ck-load", "owner_slug": f"ck-{slug}",
+                                  "table": f.get("fork_table")})
+                job_specs.append({"name": f["validateJobName"], "tmpl_stem": "validate",
+                                  "config_prefix": fcp, "is_cdc": False, "tags": ftags,
+                                  "role": "ck-validate", "owner_slug": f"ck-{slug}",
+                                  "table": f.get("fork_table")})
+                job_specs.append({"name": f["cdcJobName"], "tmpl_stem": cdc_stem,
+                                  "config_prefix": fcp, "is_cdc": True, "tags": ftags,
+                                  "role": "ck-cdc", "owner_slug": f"ck-{slug}",
+                                  "table": f.get("fork_table")})
+        n_ck = sum(1 for f in forks if f.get("kind", "ck") == "ck")
+        n_bg = sum(1 for f in forks if f.get("kind") == "bg")
+        print(f"(info) ensure_fork_jobs: {n_ck} composite + {n_bg} big fork(s); "
+              f"{len(job_specs)} fork job(s) to create/update.")
+    else:
+        # mode == create: the shared per-task job set (discovery/load/load-big/validate/cdc).
+        # NO fork job here — forks are created by ensure_fork_jobs from THIS run's discovery.
+        if cdc_engine == "spark" and event.get("cdc_fallback_reason"):
+            fallback_reason = str(event["cdc_fallback_reason"])
+        for role in _ROLES:
+            stem = _CDC_ENGINES[cdc_engine] if role == "cdc" else role
+            job_specs.append({"name": names[role], "tmpl_stem": stem,
+                              "config_prefix": config_prefix, "is_cdc": role == "cdc",
+                              "tags": dict(base_tags), "role": role,
+                              "owner_slug": "main" if role == "cdc" else None})
 
-    for role in roles:
-        tmpl_stem = (_CDC_COMPOSITE_ENGINES[cdc_engine] if role == _CDC_COMPOSITE_ROLE
-                     else _CDC_ENGINES[cdc_engine] if role == "cdc" else role)
+    for spec in job_specs:
+        tmpl_stem = spec["tmpl_stem"]
+        name = spec["name"]
+        is_cdc = spec["is_cdc"]
+        job_config_prefix = spec["config_prefix"]
+        job_tags = spec["tags"]
         tmpl = _read_json(s3, bucket, f"{templates_prefix}/{tmpl_stem}.json")
-        name = names[role]
         command_name = tmpl.get("command_name", "glueetl")
-        if role in _CDC_ROLES and (command_name == "pythonshell") != (cdc_engine == "pythonshell"):
+        if is_cdc and (command_name == "pythonshell") != (cdc_engine == "pythonshell"):
             raise Exception(f"{tmpl_stem}.json has command_name={command_name!r}, which does not "
                             f"match cdc_engine={cdc_engine!r}")
         script_key = tmpl["script"]
         script_location = f"s3://{bucket}/{scripts_prefix}/{script_key}"
+        role = tmpl_stem   # for messages/placeholder error text
 
         # Computed args every job gets; template default_arguments merged on top.
         # NOTE the two bucket args are the SAME bucket under different names because the
@@ -402,7 +609,7 @@ def handler(event, context):
         # both is harmless — each script only reads the flag it asks for; the other is an
         # ignored extra DefaultArgument.
         args = {
-            "--config_prefix": config_prefix,
+            "--config_prefix": job_config_prefix,
             "--dsql_endpoint": dsql_endpoint,
             "--dsql_user": dsql_user,
             "--dsql_database": dsql_database,
@@ -422,11 +629,14 @@ def handler(event, context):
             # The DMS endpoint's BucketFolder ("." = none), so discovery finds each table's
             # folder where DMS really writes it (same root the CDC job and drain check use).
             args["--cdc_root"] = cdc_root
-        if role != "discovery" and event.get("csv_null_value") is not None:
+        if role in ("load", "load-big", "validate", "cdc", "cdc-spark",
+                    _CDC_COMPOSITE_ROLE, "cdc-composite-spark") and \
+                event.get("csv_null_value") is not None:
             # Glue can't pass an empty argument value, so an empty marker travels as __EMPTY__.
+            # (Everything except discovery takes --csv_null_value.)
             _nv = str(event["csv_null_value"])
             args["--csv_null_value"] = _nv if _nv != "" else "__EMPTY__"
-        if role in _CDC_ROLES:
+        if is_cdc:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema
             # CDC validation (Tier-2 deferred by-PK net-state check). ON by default; the two
@@ -441,6 +651,9 @@ def handler(event, context):
             _cvs = event.get("cdc_validation_sample")
             if _cvs is not None:
                 args["--cdc_validation_sample"] = str(_cvs)
+            # OWNERSHIP: this CDC job applies a table only if _jobs.json cdcOwners[table] matches.
+            args["--cdc_owner_self"] = spec.get("owner_slug") or "main"
+            args["--cdc_owners_key"] = reg_key
             _ts_col = event.get("timestampColumnName")
             if _ts_col:
                 # The DMS TimestampColumnName (CDC watermark), derived from the endpoint by
@@ -548,6 +761,32 @@ def handler(event, context):
         _conns = _connections_for(tmpl, event)
         if _conns:
             job_kwargs["Connections"] = {"Connections": _conns}
+        if job_tags:
+            job_kwargs["Tags"] = dict(job_tags)   # task/fork tags for find-by-tag at cutover
+
+        # G5 TAG-SAFETY: if a job with this exact name already exists, it MUST carry this task's
+        # tags (and the fork tag when applicable). A hand-made job (no tags), or one owned by a
+        # DIFFERENT task that shares the name, is REFUSED — never overwritten/updated/deleted.
+        if account_id:
+            try:
+                glue.get_job(JobName=name)
+                _exists = True
+            except glue.exceptions.EntityNotFoundException:
+                _exists = False
+            except Exception:
+                _exists = False
+            if _exists:
+                _ex_tags = _get_job_tags(glue, region, account_id, name)
+                _mismatch = (_ex_tags.get("dsql_pipeline_project") != project or
+                             _ex_tags.get("dsql_pipeline_task") != task_suffix or
+                             _ex_tags.get("dsql_pipeline_fork") != job_tags.get("dsql_pipeline_fork"))
+                if _mismatch:
+                    raise Exception(
+                        f"Refusing to modify Glue job {name!r}: it exists with tags {_ex_tags or '{}'} "
+                        f"that do not match this task (project={project!r}, task={task_suffix!r}, "
+                        f"fork={job_tags.get('dsql_pipeline_fork')!r}). A different task or a "
+                        f"hand-made job owns this name. Rename/remove it, or use a different "
+                        f"project/task name. No job was changed.")
 
         try:
             glue.create_job(**job_kwargs)
@@ -561,7 +800,7 @@ def handler(event, context):
             if _n in ("AlreadyExistsException", "IdempotentParameterMismatchException") \
                or "already exists" in str(_ce).lower() \
                or "already submitted" in str(_ce).lower():
-                upd = {k: v for k, v in job_kwargs.items() if k != "Name"}
+                upd = {k: v for k, v in job_kwargs.items() if k not in ("Name", "Tags")}
                 try:
                     _existing_job = glue.get_job(JobName=name).get("Job", {})
                 except Exception as _ge:
@@ -601,31 +840,99 @@ def handler(event, context):
             else:
                 raise
 
+        # Ensure task/fork tags on the job whether it was created, updated or replaced. CreateJob
+        # applies Tags inline; UpdateJob cannot, so (re)apply them here via tag_resource (no-op
+        # if already present). Best-effort — a tagging hiccup must not fail job creation.
+        if job_tags:
+            try:
+                acct = (event.get("account_id") or "").strip()
+                if not acct and dms_task_arn:
+                    _p = str(dms_task_arn).split(":")
+                    acct = _p[4] if len(_p) > 4 else ""
+                if acct:
+                    arn = f"arn:aws:glue:{region}:{acct}:job/{name}"
+                    glue.tag_resource(ResourceArn=arn, TagsToAdd=dict(job_tags))
+            except Exception as _te:
+                print(f"(warn) could not tag {name}: {type(_te).__name__}: {_te}")
+
+        # Collect this job's registry record (G2). cdcOwners is filled from CDC specs below.
+        job_records.append({
+            "name": name,
+            "role": spec.get("role", tmpl_stem),
+            "table": spec.get("table"),
+            "ownerSlug": spec.get("owner_slug"),
+            "engine": "spark" if command_name != "pythonshell" else "pythonshell",
+            "configPrefix": job_config_prefix,
+            "createdByExecution": event.get("startupExecution") or event.get("executionName"),
+            "updatedAt": _now_iso(),
+        })
+
     out = {"jobs": names, "created": created, "updated": updated, "replaced": replaced,
            "deleted": [], "cdcEngine": cdc_engine}
-    if mode == "ensure_composite":
-        # The startup SM reads these into $.composite to decide whether to start the composite
-        # CDC job (and with what job name). Computed from THIS run's discovery index.
-        out["hasCompositeTables"] = has_composite
-        out["compositeCdcJobName"] = names[_CDC_COMPOSITE_ROLE]
+
+    # ---- REGISTRY (G2) + RECONCILE (G3) ----------------------------------------------------
+    # Merge this run's job records into the ONE source of truth _jobs.json (read-modify-write
+    # with ETag). cdcOwners maps each forked table -> its CDC owner slug (ck-/bg-); tables not
+    # listed default to owner 'main'. create mode seeds the shared jobs (cdc owner 'main');
+    # ensure_fork_jobs adds the fork jobs + their table owners.
+    if mode in ("create", "ensure_fork_jobs", "cdc_fallback") and account_id:
+        def _mutate(doc):
+            doc.setdefault("project", project)
+            doc.setdefault("taskSuffix", task_suffix)
+            doc.setdefault("jobs", [])
+            doc.setdefault("cdcOwners", {})
+            by_name = {j["name"]: j for j in doc["jobs"]}
+            for rec in job_records:
+                existing = by_name.get(rec["name"], {})
+                merged = dict(existing, **{k: v for k, v in rec.items() if v is not None})
+                merged.setdefault("createdAt", existing.get("createdAt") or rec["updatedAt"])
+                by_name[rec["name"]] = merged
+                # Record the per-table CDC owner (only for CDC specs that carry a table).
+                if rec.get("table") and rec.get("role") in ("ck-cdc", "bg-cdc"):
+                    doc["cdcOwners"][rec["table"]] = rec["ownerSlug"]
+            doc["jobs"] = sorted(by_name.values(), key=lambda j: j["name"])
+            doc["updatedAt"] = _now_iso()
+        try:
+            _update_registry(s3, bucket, reg_key, _mutate)
+            out["registryKey"] = reg_key
+        except Exception as e:
+            raise Exception(f"could not update job registry s3://{bucket}/{reg_key}: "
+                            f"{type(e).__name__}: {e}")
+
+    if mode == "ensure_fork_jobs" and account_id:
+        # RECONCILE (G3): a tagged fork job in Glue that is NOT in THIS run's plan is stale (e.g.
+        # its table was dropped from the DMS selection). Report it (staleJobs); DO NOT start it.
+        # Startup does not delete it (cutover's delete-by-tag cleans it up).
+        planned = {s["name"] for s in job_specs} | set(names.values())
+        tagged = _select_task_jobs_by_tag(glue, region, account_id, project, task_suffix)
+        stale = sorted(n for n in tagged if n not in planned
+                       and _get_job_tags(glue, region, account_id, n).get("dsql_pipeline_fork"))
+        if stale:
+            print(f"(info) ensure_fork_jobs: {len(stale)} stale fork job(s) not in this run's "
+                  f"plan (left in place, NOT started): {stale}")
+        out["staleJobs"] = stale
+        out["forkJobsCreated"] = created
+        out["forkJobsUpdated"] = updated
     if spark_cdc_drivers:
         out["sparkCdcDrivers"] = spark_cdc_drivers
-    if fallback_reason and mode != "ensure_composite":
+    if fallback_reason and mode == "cdc_fallback":
         # Record the switch so the next startup of this task builds the Spark job straight away
-        # (resolve-task reads this file). Delete the file to go back to Python shell.
+        # (resolve-task reads this file). For a FORK CDC job, the engine marker is keyed to the
+        # fork's config_prefix so each fork tracks its own engine independently.
         from datetime import datetime, timezone
-        key = _engine_file_key(config_prefix)
-        doc = {"engine": "spark", "reason": fallback_reason,
-               "stage": "after start" if mode == "cdc_fallback" else "driver check",
+        _spec = job_specs[0] if job_specs else {}
+        _cp = _spec.get("config_prefix", config_prefix)
+        key = _engine_file_key(_cp)
+        doc = {"engine": "spark", "reason": fallback_reason, "stage": "after start",
                "failedRunId": event.get("failed_run_id") or None,
                "errorMessage": str(event.get("error_message") or "")[:2000] or None,
-               "job": names[_fb_role] if mode == "cdc_fallback" else names["cdc"],
+               "job": _spec.get("name", names["cdc"]),
                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "undo": f"delete s3://{bucket}/{key} to build the Python-shell CDC job again"}
         s3.put_object(Bucket=bucket, Key=key, Body=(json.dumps(doc, indent=2) + "\n").encode("utf-8"),
                       ContentType="application/json")
         out["engineFile"] = f"s3://{bucket}/{key}"
-        print(f"(info) CDC engine for this task is now spark; recorded in s3://{bucket}/{key}")
+        print(f"(info) CDC engine is now spark; recorded in s3://{bucket}/{key}")
     if mode == "cdc_fallback":
         out.update(switched=True, reason=fallback_reason)
     return out
