@@ -259,13 +259,6 @@ role, and the Step Functions role. All 8 Lambdas (including the fleet's `preflig
 one Lambda role, and all 4 state machines (per-task `startup`/`cutover` **and** `fleet-startup`/
 `fleet-cutover`) run as the one Step Functions role.
 
-> **Upgrade note:** earlier versions created six roles (adding separate `preflight-tasks-role`,
-> `fleet-startup-role`, `fleet-cutover-role`). Those three extra roles are gone — their permissions
-> are merged into the Lambda role and the Step Functions role. If you deployed an earlier version,
-> the old roles are **left in place** (a live run may still reference them) and can be removed once
-> this update is verified:
-> `for r in preflight-tasks-role fleet-startup-role fleet-cutover-role; do aws iam delete-role-policy --role-name "$PROJECT-$r" --policy-name "$PROJECT-$r" 2>/dev/null; aws iam delete-role --role-name "$PROJECT-$r" 2>/dev/null; done`
-
 `iam/` now holds **three** combined files — `iam/glue.json`, `iam/lambda.json`,
 `iam/stepfunctions.json` — each a single JSON document `{"RoleName","TrustPolicy","Policy"[,"VpcPolicy"]}`
 (the Glue file carries a `VpcPolicy`). They contain blanks (`<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`,
