@@ -4,8 +4,12 @@ _Comprehensive record of the pipeline architecture, every bug found and fixed, a
 empirically-tested DDL support/limitations. Companion to `RUNBOOK.md` (deploy steps) and
 `USAGE_GUIDE.md` (end-to-end operation)._
 
-Last validated: 2026-09-22 (a test account in us-east-1,
-a DSQL cluster).
+Last validated: 2026-10-04 (state-machine / script simulations against the real Lambda and Glue
+code; see the dated entries in §6). The last **real-AWS** end-to-end run was earlier (a test
+account in `us-east-1`, a DSQL cluster) and is captured in §5 as a historical snapshot — the
+post-2026-10-01 features (shared workflows, fleet launcher, runtime Spark CDC fallback,
+every-column validation, binary guard, NULL-marker rule, 7-day CDC timeout) have **not** yet been
+run together on real AWS.
 
 ---
 
@@ -28,8 +32,12 @@ Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──�
 ### Components
 - **Glue scripts** (`scripts/`): `job1_discovery.py`, `job2_load.py`,
   `job3_validate.py`, `glue_cdc_continuous.py`. Staged to `s3://<bucket>/scripts/`.
-- **Lambdas** (`lambdas/`): `resolve_task`, `driver_discovery`, `create_glue_jobs`,
-  `plan_split`, `drain_check`, `stop_cdc_run`, `drop_tags`.
+- **Lambdas** (`lambdas/`, nine `.py` files): `resolve_task`, `driver_discovery`,
+  `create_glue_jobs`, `plan_split`, `drain_check`, `stop_cdc_run`, `drop_tags` (the seven core
+  functions deployed by RUNBOOK Step 2), `preflight_tasks` (the fleet launcher's own deployed
+  function, with its own IAM role `iam/preflight-tasks-role.*`), and `prepare_cdc_wheels` (not a
+  deployed function — it ships inside the `driver-discovery` zip and is run automatically by the
+  startup workflow).
 - **State machines** (`stepfunctions/`): `startup.asl.json` (full-load→validate→CDC),
   `cutover.asl.json` (drain + finalize), shared by every DMS task (started with `{"taskArn"}`);
   optional `fleet-startup` / `fleet-cutover` launchers start them for a list of tasks.
@@ -72,7 +80,7 @@ Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──�
 ## 3. Bugs found and fixed (chronological, with root cause + fix + verification)
 
 ### BUG 1 — 3-table full-load column corruption
-- **Symptom**: `nfl_data`, `nfl_stadium_data`, `sport_location` loaded with shifted columns.
+- **Symptom**: three tables (`table_a`, `table_b`, `table_c`) loaded with shifted columns.
 - **Root cause**: the loader's `recursiveFileLookup=true` read stale `processed/` CDC files
   (16-col, leading `Op`) alongside 15-col `LOAD*` files → column shift. NOT a parser bug.
 - **Fix**: defense-in-depth — `job2 _is_full_load_key()` (per-file, requires `LOAD*.csv`,
@@ -205,9 +213,17 @@ changes (same name = no diff → silent corruption), and **conservatively blocks
 
 ---
 
-## 5. Current deployed state (as of last validation)
+## 5. Deployed state at the last real-AWS validation (historical snapshot)
 
-- **Staged CDC script** `s3://oragluedsql/scripts/glue_cdc_continuous.py` contains all fixes
+> **This section is a snapshot of the earlier real-AWS run, kept for history.** It predates the
+> post-2026-10-01 features. For what the pipeline does **now**, read §6 (the dated change log) and
+> the current `RUNBOOK.md` / `USAGE_GUIDE.md`. The current feature set adds: shared startup/cutover
+> state machines, the fleet launcher, runtime Spark CDC fallback, every-column validation, the
+> `bytea` BINARY GUARD, the NULL-marker rule, case-insensitive folder discovery, and the hard
+> 7-day (10080-minute) CDC Glue run timeout. The counts and figures below are from that one test
+> run and are **not** kept current.
+
+- **Staged CDC script** `s3://<test-bucket>/scripts/glue_cdc_continuous.py` contained all fixes
   (positional rename, `SINGLE_SWAP_IS_RENAME`, `_rebuild_ignore_columns`, uppercase
   `consume_ddl_event`, endpoint-derived `DMS_TIMESTAMP_COLUMN`).
 - **Driver folders**: `driver-fullload/` (5), `driver-validation/` (5), `driver-cdc/` (10, incl
@@ -471,6 +487,34 @@ fills dependency gaps and items 1 and 2 stay hidden.
   36 checks (11 new). Error classifier: 12 real driver messages caught, 13 non-driver messages
   (DSQL 54000, connection, broken pipe, permissions, script errors) not. Not yet run on real AWS.
 
+### 2026-10-04 — Fleet launcher: start/cut over a list of tasks from one trigger (commit `41eaa88`)
+
+- **Why:** running Step 5/6 by hand for every DMS task doesn't scale. The fleet launcher starts the
+  shared `startup` (or `cutover`) for a whole list of tasks from one manual trigger.
+- **What was added:** `lambdas/preflight_tasks.py` (its own deployed function + IAM role
+  `iam/preflight-tasks-role.*`), two state machines `stepfunctions/fleet-startup.asl.json` and
+  `fleet-cutover.asl.json`, the fleet IAM roles (`iam/fleet-startup-role.*`,
+  `iam/fleet-cutover-role.*`), and `config/fleet_tasks.example.csv`.
+- **How it works:** manual trigger, input `{"bucket","inputPrefix"}`. It reads
+  `config/pipeline.json` (the same file every task uses — it does **not** write it) and
+  `config/<inputPrefix>/fleet_tasks.csv` (columns `task_arn`, optional `task_suffix`, optional
+  `adopt_existing_folder`). The task suffix defaults to the DMS task name. The `Preflight` state
+  (`preflight_tasks`, reusing `resolve_task`'s rules) validates each task's ARN/readiness, the
+  table lists, and that the DSQL database has ≤ 9 of the operator's own schemas (10-schema cap,
+  `cdc_control` is the 10th); it is **fail-closed**. It then starts one per-task execution per task
+  (5 at a time), **asynchronously**, and verifies each reached RUNNING. `FleetStarted` means every
+  task got past its own input checks — **not** that the migrations succeeded.
+- **Scope note (preflight):** the fleet `Preflight` does **not** inspect Oracle/LogMiner, so it
+  does not catch the new-schema CDC-capture gap (`CDC_EDGE_CASE_RESULTS.md` §4).
+- **New requirement not yet built:** a single parameters CSV holding every "export" value (bucket,
+  account, region, project, DSQL endpoint/user/db, subnet, SG, Glue connection, …) alongside
+  `fleet_tasks.csv`, so nobody retypes an export block. On `main` the fleet reads these from
+  `config/pipeline.json`; the two-CSV input is a planned enhancement (see
+  `RUNBOOK.md` → [planned parameters CSV](RUNBOOK.md#values-what-setup-needs-vs-what-running-a-task-needs)).
+- **Status:** exercised in a state-machine simulator; **not yet run live on AWS** — run one small
+  live fleet first. Full operation in `docs/FLEET_LAUNCHER.md` and
+  `RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#running-many-tasks-with-the-fleet).
+
 ### 2026-10-04 — Cleanup batch: cutover success, firewall timeouts, Step 1 order, Word docs, old kit
 
 - **Cutover reported success when Glue jobs weren't deleted.** `DeleteGlueJobs` caught every error
@@ -496,3 +540,31 @@ fills dependency gaps and items 1 and 2 stay hidden.
   Python shell (the raw set would need PyPI), and records the choice in `_cdc_engine.json`.
 - **Verified:** workflow simulator 65 checks (4 new cutover cases); CDC optional-API test 12 checks
   on both script copies; switch tool 10 checks; all other suites unchanged.
+
+---
+
+## 7. Known issues still open (not yet fixed in this release)
+
+These are real bugs in the code at this HEAD; they are documented, with workarounds, in
+`RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary). Listed here so the record is
+honest about what is **not** fixed:
+
+1. **CDC Glue run 7-day timeout.** Both `glue-templates/cdc.json` and `cdc-spark.json` set
+   `timeout_minutes = 10080` — the Glue maximum (7 days). The CDC job is a continuous poller;
+   after 7 days Glue stops the run and nothing restarts or monitors it (DMS keeps writing change
+   files, so no data is lost — but changes stop being applied until the job is restarted by hand).
+   `10080` is deliberately the Glue max; a self-restarting watchdog is a recommended follow-up.
+2. **Cutover is not idempotent once DMS is stopped.** The first step stops the DMS task; a re-run
+   on an already-stopped task is rejected by the DMS API, so the remaining drain/stop-CDC/drop/
+   delete steps must be finished by hand.
+3. **A real DMS start failure is hidden for 24 h.** The start error is swallowed into the poll
+   loop and surfaces as `DmsTimedOut` a day later.
+4. **`config/pipeline.example.json` fails the placeholder scan.** Its `description` contains
+   `<bucket>`/`<...>`, which `resolve_task` rejects (`<`/`>` in any value) → `ResolveFailed`.
+   Generate `pipeline.json` from the RUNBOOK Step 3c script instead of copying the example.
+5. **Case-folder latent bug.** A table empty at full load whose DMS folder differs only in letter
+   case can be mis-matched permanently and reported caught up at cutover
+   (`CDC_EDGE_CASE_RESULTS.md` §2.8). Does not affect tables that have data at full load.
+6. **Composite-key CDC job not in the repo.** Multi-column-PK tables are skipped by the main CDC
+   job (2026-10-03 entry); the separate job they require is not shipped here, so cutover waits for
+   them indefinitely until it exists.

@@ -1,225 +1,284 @@
-# RUNBOOK — Deploy & Run the Oracle → Aurora DSQL Migration Pipeline
+# RUNBOOK — deploy and run the Oracle → Aurora DSQL migration pipeline
 
-A step-by-step deploy guide you can follow top to bottom. No CDK, no CloudFormation —
-just AWS CLI commands you paste in order. Plan for **~1–2 hours** for the first-time
-one-time setup (Steps 1–4), then a few minutes per migration task after that.
+Follow this top to bottom. It is plain AWS CLI you paste in order — no CDK, no CloudFormation.
+Every command is written to work the same on **macOS, Linux and AWS CloudShell**.
 
-> **New here?** Read [`README.md`](README.md) first for the big picture, and
-> [`USAGE_GUIDE.md`](USAGE_GUIDE.md) for day-to-day operation. This file is the deploy
-> checklist.
+- One-time setup (Steps 1–4): about **1–2 hours**.
+- Each migration task after that (Steps 5–6): a few minutes of your time, plus the load and CDC
+  that run on their own.
 
----
+> **New here?** Read [`README.md`](README.md) for the big picture first.
+> [`USAGE_GUIDE.md`](USAGE_GUIDE.md) covers day-to-day monitoring once a task is running.
 
-## What you're building (read once — 2 minutes)
+**Contents**
 
-You're standing up an automated pipeline that copies data from an Oracle database into
-**Amazon Aurora DSQL**, keeps it in sync while the app keeps running, and lets you cut over
-with almost no downtime.
-
-The moving parts:
-
-- **AWS DMS** reads Oracle and writes the data to **Amazon S3** as CSV files.
-- **AWS Glue** jobs read those CSVs and load / validate / continuously apply them into Aurora DSQL.
-- **AWS Step Functions** is the conductor — it runs the whole sequence for you. There are **two
-  state machines shared by all tasks** (startup and cutover); you start them with a DMS task's ARN.
-  Each run creates that task's Glue jobs and deletes them at cutover. Nothing runs on a schedule;
-  you start it by hand.
-- **One S3 bucket** holds everything the pipeline needs (scripts, templates, driver files,
-  manifests). It's the single source of truth.
-
-**Mental model:** `Oracle → DMS → S3 (CSV) → Glue → Aurora DSQL`, orchestrated by Step Functions.
-
-**The one-time vs. per-task split:**
-- **Steps 1–4 (one-time):** create IAM roles, Lambdas, stage files and settings to S3, and create
-  the two state machines. Do this once.
-- **Steps 5–6 (per migration task):** upload the task's table list and start the startup state
-  machine with the task's ARN; later, the same for cutover. Repeat for each DMS task.
-
-**A few terms you'll see** (so nothing below is a surprise):
-- **full load** = the one-time bulk copy of all existing rows. **CDC** (change data capture) = the
-  ongoing stream of inserts/updates/deletes that happen *after* the full load, kept flowing until cutover.
-- **`STOPPED_AFTER_CACHED_EVENTS`** = the DMS status meaning "full load done, changes captured and paused" — the pipeline waits for this before loading into DSQL.
-- **cutover** = the final switch: CDC has caught up, so you point your app at Aurora DSQL and stop the old flow.
-- **idle** (in the CDC control tables) = that table is fully caught up, nothing pending.
-- **state machine** = an AWS Step Functions workflow — the "conductor" that runs the steps for you.
+- [What you're building](#what-youre-building)
+- [Prerequisites checklist](#prerequisites-checklist)
+- [Values: what setup needs vs. what running a task needs](#values-what-setup-needs-vs-what-running-a-task-needs)
+- [The S3 layout](#the-s3-layout)
+- **One-time setup:**
+  [Step 1 — IAM roles](#step-1--create-the-iam-roles) ·
+  [Step 1b — Glue network connection](#step-1b--create-the-glue-network-connection-vpc-only) ·
+  [Step 2 — Lambda functions](#step-2--create-the-lambda-functions) ·
+  [Step 3a — scripts & templates](#step-3a--scripts-and-job-templates) ·
+  [Step 3b — driver wheels](#step-3b--driver-wheels) ·
+  [Step 3c — pipeline settings](#step-3c--pipeline-settings) ·
+  [Step 4 — state machines](#step-4--create-the-two-state-machines)
+- **Per task:**
+  [Step 5 — run one task by hand](#step-5--run-one-task-by-hand) ·
+  [Step 6 — cut over](#step-6--cut-over) ·
+  [Running many tasks with the fleet](#running-many-tasks-with-the-fleet)
+- [If a run fails: how to continue](#if-a-run-fails-how-to-continue)
+- [Clean-slate reload](#clean-slate-reload)
+- [Upgrading an existing deployment](#upgrading-an-existing-deployment)
+- [Known issues (temporary)](#known-issues-temporary)
+- [Troubleshooting](#troubleshooting)
+- [Reference](#reference)
 
 ---
 
-## Before you start — prerequisites checklist
+## What you're building
 
-Tick all of these before Step 1. The pipeline **loads data into tables that already exist** —
-it never creates target tables.
+An automated pipeline that copies an Oracle database into **Amazon Aurora DSQL**, keeps it in
+sync while the application keeps running, and lets you cut over with almost no downtime.
 
-- [ ] **AWS CLI installed and configured** (`aws sts get-caller-identity` returns your account).
-- [ ] **An Aurora DSQL cluster** exists, and you know its endpoint (e.g. `abcd.dsql.us-east-1.on.aws`).
-- [ ] **A network path from Glue to DSQL**, if your account is locked down (Glue's default network
-      can't reach your DSQL cluster). You need a **private subnet** and a **security group** that can
-      reach DSQL (through a DSQL VPC endpoint with private DNS on, or a NAT gateway), and the subnet's
-      route table needs an **S3 gateway endpoint**. You'll put their IDs in `SUBNET_ID` and
-      `SECURITY_GROUP_ID` below, and Step 1b turns them into a Glue network connection. If Glue can
-      already reach DSQL, skip this.
-- [ ] **Target tables already created in DSQL** — every table you plan to migrate must exist in
-      the target schema, with a single-column primary key where possible (best for CDC + validation).
-      Tables with a multi-column primary key are left to a separate CDC job (see "Running many tasks").
-- [ ] **No more than 9 schemas of your own in the DSQL database.** DSQL allows at most 10 schemas per
-      database (not configurable), and the CDC job adds one, `cdc_control`. Over the limit, CDC fails
-      at startup with `54000` and the startup run ends at `CdcRunFailed`. Count them with
-      `SELECT count(*) FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog','information_schema') AND schema_name NOT LIKE 'pg_%';`
-- [ ] **A DMS task** of type **`full-load-and-cdc`** (the startup checks the settings marked ✔ before
-      starting DMS, so a mistake fails in seconds) with:
-  - `StopTaskCachedChangesApplied = true` ✔
-  - A short **task name** (letters, digits, hyphens, under ~50 characters): it becomes the task's
-    folder and Glue job names.
-  - An **S3 target endpoint** writing to **your pipeline bucket** ✔ with: `AddColumnName=true` ✔, `TimestampColumnName=dms_timestamp`,
-    `Rfc4180=true`, `DatePartitionEnabled=false`, and **no** custom `CdcPath`.
-  - A table mapping that **lowercases** column names. Schema and table names can be in any case:
-    the pipeline finds DMS's folders whatever their case. If the mapping **renames** a schema, the
-    DSQL schema must be the new name, in lowercase.
-  - For any **table without a primary key**: configure DMS to emit **insert/delete only**
-    (updates are skipped and logged, not applied).
-- [ ] **`pip` and Python 3** available locally (to download the driver files in Step 3).
-- [ ] This repo cloned locally (you'll run `aws` commands from its root, referencing `iam/`,
-      `lambdas/`, `glue-templates/`, `stepfunctions/`, `scripts/`).
+- **AWS DMS** reads Oracle and writes the rows to **Amazon S3** as CSV files.
+- **AWS Glue** jobs discover, load, validate and then continuously apply those files into
+  Aurora DSQL.
+- **AWS Step Functions** runs the sequence. **Two state machines — a `startup` and a `cutover` —
+  are shared by every task.** You start them with a single DMS task's ARN. Nothing runs on a
+  schedule.
+- An optional **fleet launcher** (two more state machines) starts the `startup` or `cutover` for
+  a whole list of tasks from one trigger. If you have more than a handful of tasks, this is the
+  normal way to run them (see [Running many tasks](#running-many-tasks-with-the-fleet)).
+- **One S3 bucket** holds everything the pipeline needs: scripts, templates, driver wheels,
+  settings and per-task state.
+
+**One-time vs. per task:**
+
+| | What | Steps |
+|---|---|---|
+| **Once** | IAM roles, Lambda functions, files and settings in S3, the two state machines (and the fleet, if you want it) | 1–4 |
+| **Per DMS task** | upload the task's table list, start the `startup`; later, start the `cutover` | 5–6 |
+
+**Terms used below:**
+
+- **full load** — the one-time bulk copy of the rows that already exist. **CDC** (change data
+  capture) — the stream of inserts, updates and deletes made after that, applied until you cut
+  over.
+- **`STOPPED_AFTER_CACHED_EVENTS`** — the DMS status that means "full load done, later changes
+  captured and paused." The startup waits for it before loading into DSQL.
+- **cutover** — the final switch of the application to Aurora DSQL.
+- A table is **caught up** when its row in `cdc_control.cdc_status` shows no pending work.
+
+The pipeline **loads into tables that already exist** in DSQL; it never creates your target
+tables.
 
 ---
 
-## Fill in your values ONCE (then copy-paste the rest)
+## Prerequisites checklist
 
-Set these environment variables in your terminal. **Every command below uses them**, so you
-never hand-edit commands — you just paste. (These persist only for your current terminal
-session; re-run this block if you open a new terminal.)
+Work through this before Step 1. Each box is a thing the pipeline assumes.
+
+- [ ] **AWS CLI** installed and configured (`aws sts get-caller-identity` prints your account),
+      and **Python 3 with pip**. The simplest option is **AWS CloudShell**, which already has the
+      CLI, Python 3, pip, `git` and `zip`.
+- [ ] **This repo on your machine**, and your terminal in its root folder. In CloudShell:
+      `git clone <this repo>` then `cd` into it. (No GitHub access from CloudShell? Zip the repo,
+      upload it with **Actions → Upload file**, and unzip it.)
+- [ ] **An Aurora DSQL cluster**, and its endpoint (looks like `abcd.dsql.us-east-1.on.aws`).
+- [ ] **Target tables already created** in the target schema, each ideally with a **single-column
+      primary key**. Tables with a **multi-column** primary key are skipped by the main CDC job and
+      need a separate CDC job ([see below](#running-many-tasks-with-the-fleet)).
+- [ ] **At most 9 schemas of your own** in the DSQL database. DSQL allows 10 schemas per database
+      (not adjustable) and the pipeline adds `cdc_control`. Count yours:
+      `SELECT count(*) FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg\_%' AND schema_name <> 'information_schema';`
+- [ ] **A network path from Glue (and two Lambdas) to DSQL**, if your account is locked down: a
+      **private subnet** and a **security group** that can reach DSQL, plus an **S3 gateway
+      endpoint** in that subnet's route table. Step 1b uses them. Skip the VPC steps if Glue can
+      already reach DSQL.
+- [ ] **A DMS task** of type **`full-load-and-cdc`**. The boxes marked ✔ are checked by the startup
+      *before* it starts DMS, so a mistake fails in seconds instead of hours:
+  - [ ] ✔ `FullLoadSettings.StopTaskCachedChangesApplied = true`
+        (and `StopTaskCachedChangesNotApplied` **not** true)
+  - [ ] a **short task name** — letters, digits and hyphens, no leading/trailing hyphen, roughly
+        under 50 characters. It becomes the task's S3 folder and the Glue job names.
+  - [ ] ✔ an **S3 target endpoint** that writes to **your pipeline bucket**, with ✔ `AddColumnName
+        = true`, `TimestampColumnName = dms_timestamp`, `Rfc4180 = true`, and **no** `CompressionType`
+        (plain CSV). `DatePartitionEnabled` is not required.
+  - [ ] a table mapping with a **convert-lowercase rule for columns**. Schema and table names may
+        be any case; column names must be lowercase in DSQL. (A missing lowercase rule is only a
+        warning, but get it right.) The DSQL schema name must match the DMS target schema in
+        lowercase.
+  - [ ] the DMS task is in the **same region** as the pipeline (`region` in Step 3c).
+  - [ ] for tables **without a primary key**: DMS set to emit inserts and deletes only (updates
+        are skipped and logged).
+  - [ ] **NULLs:** the pipeline stores a value as NULL only when the field is empty **or** equals
+        the endpoint's `CsvNullValue` (DMS writes the literal text `NULL` when you leave
+        `CsvNullValue` unset). Every other text, including `NA`, `NONE` and `N/A`, is stored as
+        text. Don't change `CsvNullValue` partway through a migration.
+
+---
+
+## Values: what setup needs vs. what running a task needs
+
+The pipeline deliberately splits its values into two groups.
+
+**Setup (Steps 1–4) needs the "export" values below.** They name your account, bucket, region,
+DSQL cluster and (if used) your VPC. You set them once per terminal session. CloudShell forgets
+them when it reconnects, so re-run the block in a new shell.
 
 ```bash
-# ---- edit these to your values ----
-export BUCKET="my-migration-bucket"          # your ONE source-of-truth S3 bucket (no s3://, no slash)
-export ACCOUNT_ID="123456789012"             # your 12-digit AWS account id
-export REGION="us-east-1"                     # your AWS region
-export PROJECT="dms-dsql"                     # short prefix for role/job names — pick anything; USE THE SAME VALUE EVERYWHERE
-export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"   # your Aurora DSQL endpoint host
-export DSQL_CLUSTER_ID="abcd"                 # first label of the endpoint (before ".dsql")
+# ---- edit these ----
+export BUCKET="my-migration-bucket"          # pipeline bucket (no s3://, no trailing slash)
+export ACCOUNT_ID="123456789012"             # 12-digit AWS account id
+export REGION="us-east-1"                     # AWS region
+export PROJECT="dms-dsql"                     # short prefix for role, Lambda and job names
+export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"
+export DSQL_CLUSTER_ID="abcd"                 # first label of the endpoint
 export DSQL_USER="admin"
 export DSQL_DATABASE="postgres"
-export AWS_PAGER=""                            # stops the AWS CLI pager from making commands appear to "hang"
 
-# ---- network: only if Glue must run inside your VPC to reach DSQL (see prerequisites) ----
-export SUBNET_ID="subnet-0abc1234"            # private subnet with a route to DSQL + an S3 gateway endpoint
-export SECURITY_GROUP_ID="sg-0abc1234"        # must allow all TCP from itself; outbound 443 and 5432
-export GLUE_CONNECTION="$PROJECT-vpc"         # EXACT name of your Glue network connection (Step 1b, or one made
-                                              # in the console, e.g. "Network connection 1"). "" = no VPC
+# ---- VPC: only if Glue must run inside your VPC to reach DSQL ----
+export SUBNET_ID="subnet-0abc1234"            # private subnet: route to DSQL + an S3 gateway endpoint
+export SECURITY_GROUP_ID="sg-0abc1234"        # allows all TCP from itself; outbound 443 and 5432
+export GLUE_CONNECTION="$PROJECT-vpc"         # EXACT name of the Glue network connection
+                                              # (Step 1b, or one made in the console); "" = no VPC
 
-# ---- derived (do not edit) ----
+# ---- derived — don't edit ----
+export AWS_PAGER=""                           # stops the CLI pager from looking like a "hang"
+export AWS_DEFAULT_REGION="$REGION"
 export SFN_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-sfn-exec-role"
 export LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-lambda-exec-role"
 export GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-glue-exec-role"
-echo "Glue role: $GLUE_ROLE_ARN"
 ```
 
-Per-task values (the DMS task ARN and name) are set later, in Step 5.
+> <a id="load-values"></a>**Coming back in a new shell to run or cut over a task?** You do **not**
+> need the whole block. Running a task needs only `BUCKET`, `PROJECT` and the DMS **task ARN** —
+> and `BUCKET` / `PROJECT` are already in `config/pipeline.json`. Paste this to load them (edit only
+> the bucket):
+>
+> ```bash
+> export AWS_PAGER="" BUCKET="my-migration-bucket"
+> eval "$(aws s3 cp s3://$BUCKET/config/pipeline.json - | python3 -c '
+> import json, sys
+> c = json.load(sys.stdin)
+> print("export PROJECT=" + c["project"])
+> print("export REGION=" + c["region"])
+> print("export AWS_DEFAULT_REGION=" + c["region"])')"
+> echo "PROJECT=$PROJECT REGION=$REGION"
+> ```
+>
+> That is all Steps 5 and 6 need, on top of the task ARN you set in 5a.
 
-> **Why so few values?** The S3 folder names (`scripts/`, `glue-templates/`, `driver-*`,
-> `config/`) are **fixed** and already baked into the templates. Per task you only give the DMS
-> task's ARN; its name becomes its folder and job names.
+**Running a task (Steps 5–6) needs only the DMS task ARN** (plus `BUCKET` and `PROJECT`, loaded
+above). Everything else — region, DSQL endpoint/user/database, Glue role, Glue connection, CDC
+engine — is read at run time from `config/pipeline.json`. The **fleet** needs even less to start:
+`{"bucket", "inputPrefix"}`.
+
+> <a id="params-csv"></a>**Planned change — a single parameters CSV (not built yet).** A planned
+> enhancement lets you keep every "export" value above in a `params.csv` (one `key,value` per row)
+> next to `fleet_tasks.csv` in S3, so nobody retypes an export block. When it lands, **its one
+> setup change goes exactly here**: replace the hand-edited export block with a single line that
+> reads `params.csv` and exports the same variables, and have the fleet build `config/pipeline.json`
+> from the same file. Nothing else in this runbook changes. **This does not exist today — ignore it
+> until the [Known issues](#known-issues-temporary) note says it has shipped.**
 
 ---
 
-## The S3 layout (what you're creating in Step 3)
+## The S3 layout
 
-One bucket, fixed folders. You don't invent any prefixes:
+One bucket, fixed folder names (already baked into the templates):
 
 ```
 s3://$BUCKET/
-├── scripts/                  # the 4 Glue scripts
-├── glue-templates/           # the 6 Glue job templates (CDC has a Python shell and a Spark one)
-├── driver-fullload/          # DSQL driver wheels only        (Spark: discovery + load)
-├── driver-validation/        # DSQL driver wheels only        (Spark: validate)
-├── driver-cdc/               # DSQL wheels + boto3/botocore, Python 3.9 (CDC), as downloaded
-├── driver-cdc-prepared/      # written by the startup workflow: install-ready copies of driver-cdc/
-├── <schema>/<table>/         # DMS writes its CSVs here (under the endpoint's BucketFolder, if set)
+├── scripts/                  # the 4 Glue scripts                              (Step 3a)
+├── glue-templates/           # the 6 Glue job templates                        (Step 3a)
+├── driver-fullload/          # pg8000 stack only — Spark discovery + load      (Step 3b)
+├── driver-validation/        # pg8000 stack only — Spark validate              (Step 3b)
+├── driver-cdc/               # pg8000 stack + boto3 set for Python 3.9 (CDC)   (Step 3b)
+├── driver-cdc-prepared/      # written by the startup: install-ready copies of driver-cdc/
+├── <schema>/<table>/         # written by DMS (under the endpoint's BucketFolder, if any)
 └── config/
-    ├── pipeline.json         # settings for every task (Step 3c)
-    ├── _task_index/          # written at runtime: task ARN -> folder name
-    └── _task/<task name>/    # one folder per DMS task (the DMS task's name)
-        ├── table_manifest.csv    # you stage this (Step 5b)
-        ├── _task.json            # written at first startup: which task ARN owns the folder
-        └── _manifest_index.json  # Job 1 writes this at runtime
+    ├── pipeline.json         # settings read by every run                      (Step 3c)
+    ├── fleet_tasks.csv       # the task list, if you use the fleet             (fleet)
+    ├── _task_index/          # written by the startup: task ARN -> folder name
+    └── _task/<task name>/    # one folder per DMS task
+        ├── table_manifest.csv        # you upload this                         (Step 5b)
+        ├── _task.json                # written by the startup: which task ARN owns the folder
+        ├── _manifest_index.json      # written by discovery
+        ├── _orchestrator/group-<n>/  # per-group load status and validation report
+        ├── _cdc_started/             # written by the CDC job when it reaches its poll loop
+        └── _cdc_engine.json          # only if this task's CDC job was switched to Spark
 ```
 
 ---
 
-## Step 1 — Create the IAM roles (one-time, ~10 min)
+## Step 1 — create the IAM roles
 
-**Goal:** create the three roles the pipeline runs as — one for Glue, one for the Lambdas,
-one for Step Functions.
+*One-time, about 10 minutes. Needs the export block.*
 
-**Do this** (from the repo root). First fill in the placeholders, **then** create the roles: the
-trust and policy files contain `<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`, `<<DSQL_CLUSTER_ID>>`,
-`<<PROJECT>>` and `<<GLUE_EXEC_ROLE_NAME>>`, and a role created from an unfilled file trusts or
-allows a literal `<<...>>` name. The commands write filled copies (`*.filled.json`) and leave the
-originals untouched, and work the same on macOS, Linux and CloudShell:
+**Goal:** the three roles the pipeline runs as — Glue, Lambda and Step Functions.
+
+The files in `iam/` contain blanks (`<<REGION>>`, `<<ACCOUNT_ID>>`, `<<BUCKET>>`,
+`<<DSQL_CLUSTER_ID>>`, `<<PROJECT>>`, `<<GLUE_EXEC_ROLE_NAME>>`). **Fill them in first:** a role
+created from an unfilled file would trust or allow a literal `<<...>>` string. The loop writes
+filled copies (`iam/*.filled.json`) and leaves the originals untouched, so a later `git pull`
+never conflicts.
 
 ```bash
-# 1. Fill in the placeholders (writes iam/*.filled.json)
+# 1. Fill in the blanks (portable: no sed -i)
 for f in iam/*.json; do
-  case "$f" in *.filled.json) continue;; esac
+  case "$f" in *.filled.json) continue ;; esac
   sed -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
       -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<DSQL_CLUSTER_ID>>|$DSQL_CLUSTER_ID|g" \
       -e "s|<<PROJECT>>|$PROJECT|g" \
       -e "s|<<GLUE_EXEC_ROLE_NAME>>|$PROJECT-glue-exec-role|g" "$f" > "${f%.json}.filled.json"
 done
-grep -l "<<" iam/*.filled.json    # must print nothing
+grep -l "<<" iam/glue-exec-role.*.filled.json iam/lambda-exec-role.*.filled.json \
+            iam/sfn-exec-role.*.filled.json || echo "no placeholders left in the 3 core roles"
 
-# 2. Glue execution role
-aws iam create-role --role-name $PROJECT-glue-exec-role \
-  --assume-role-policy-document file://iam/glue-exec-role.trust.filled.json
-aws iam put-role-policy --role-name $PROJECT-glue-exec-role \
-  --policy-name glue --policy-document file://iam/glue-exec-role.policy.filled.json
-# Only if you use a VPC (GLUE_CONNECTION is set): lets Glue create network interfaces in your subnet
-aws iam put-role-policy --role-name $PROJECT-glue-exec-role \
+# 2. Create the three roles and attach their policies
+for r in glue lambda sfn; do
+  aws iam create-role --role-name "$PROJECT-$r-exec-role" \
+    --assume-role-policy-document "file://iam/$r-exec-role.trust.filled.json" \
+    --query Role.RoleName --output text
+  aws iam put-role-policy --role-name "$PROJECT-$r-exec-role" \
+    --policy-name "$r" --policy-document "file://iam/$r-exec-role.policy.filled.json"
+done
+
+# 3. VPC only (GLUE_CONNECTION is not ""): let Glue make network interfaces in your subnet
+aws iam put-role-policy --role-name "$PROJECT-glue-exec-role" \
   --policy-name glue-vpc --policy-document file://iam/glue-exec-role.vpc-addon.policy.filled.json
-
-# 3. Lambda execution role
-aws iam create-role --role-name $PROJECT-lambda-exec-role \
-  --assume-role-policy-document file://iam/lambda-exec-role.trust.filled.json
-aws iam put-role-policy --role-name $PROJECT-lambda-exec-role \
-  --policy-name lambda --policy-document file://iam/lambda-exec-role.policy.filled.json
-
-# 4. Step Functions execution role
-aws iam create-role --role-name $PROJECT-sfn-exec-role \
-  --assume-role-policy-document file://iam/sfn-exec-role.trust.filled.json
-aws iam put-role-policy --role-name $PROJECT-sfn-exec-role \
-  --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.filled.json
 ```
 
-> **Created the roles from unfilled files earlier?** Re-run step 1, then fix the trust with
-> `aws iam update-assume-role-policy --role-name $PROJECT-glue-exec-role --policy-document file://iam/glue-exec-role.trust.filled.json`
-> and re-run the `put-role-policy` commands (they overwrite).
+**Verify:** `aws iam get-role --role-name "$PROJECT-glue-exec-role" --query Role.Arn --output text`
+prints the role ARN.
 
-**Verify:** `aws iam get-role --role-name $PROJECT-glue-exec-role` returns the role.
+> **Already created a role from an unfilled file?** Run part 1 again, then
+> `aws iam update-assume-role-policy --role-name "$PROJECT-glue-exec-role" --policy-document file://iam/glue-exec-role.trust.filled.json`
+> (and the same for `lambda` and `sfn`), and run the `put-role-policy` commands again — they
+> overwrite.
 
 ---
 
-## Step 1b — Create the Glue network connection (one-time, only if you use a VPC)
+## Step 1b — create the Glue network connection (VPC only)
 
-**Skip this step if `GLUE_CONNECTION` is `""`.**
+*Skip this step entirely if `GLUE_CONNECTION` is `""`.*
 
-**Goal:** let the Glue jobs run inside your VPC so they can reach DSQL. Glue jobs don't take a
-subnet or security group directly; they join a VPC through a **Glue network connection**. The
-pipeline attaches this connection to every job it creates.
-
-> Don't add the connection to the jobs in the Glue console. The pipeline rewrites each job's
-> definition on every run, so a manual change is lost.
-
-**Do this:**
+**Goal:** let the Glue jobs run inside your VPC so they can reach DSQL. A Glue job joins a VPC
+through a **Glue network connection**; the pipeline attaches the one you name here to every job it
+creates.
 
 ```bash
-# Glue requires the security group to allow all TCP from itself (Spark workers talk to each other)
-aws ec2 authorize-security-group-ingress --group-id $SECURITY_GROUP_ID --protocol tcp --port 0-65535 \
-  --source-group $SECURITY_GROUP_ID --region $REGION --no-cli-pager 2>/dev/null || echo "rule already exists"
+# Glue needs the security group to allow all TCP from itself (Spark workers talk to each other)
+aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_ID" --protocol tcp \
+  --port 0-65535 --source-group "$SECURITY_GROUP_ID" 2>/dev/null || echo "self-ingress rule already present"
 
-AZ=$(aws ec2 describe-subnets --subnet-ids $SUBNET_ID --region $REGION --no-cli-pager \
+AZ=$(aws ec2 describe-subnets --subnet-ids "$SUBNET_ID" \
   --query "Subnets[0].AvailabilityZone" --output text)
 
-aws glue create-connection --region $REGION --no-cli-pager --connection-input "{
+aws glue create-connection --connection-input "{
   \"Name\": \"$GLUE_CONNECTION\",
   \"ConnectionType\": \"NETWORK\",
   \"ConnectionProperties\": {},
@@ -232,426 +291,218 @@ aws glue create-connection --region $REGION --no-cli-pager --connection-input "{
 ```
 
 **Verify:**
-```bash
-aws glue get-connection --name $GLUE_CONNECTION --region $REGION --no-cli-pager \
-  --query "Connection.PhysicalConnectionRequirements"
-```
+`aws glue get-connection --name "$GLUE_CONNECTION" --query Connection.PhysicalConnectionRequirements`
+shows your subnet and security group.
 
 **The subnet also needs:**
-- an **S3 gateway endpoint** in its route table (the jobs load their scripts, wheels and CSVs from S3)
-- a route to DSQL: a DSQL VPC endpoint with **private DNS on**, or NAT. If you use an endpoint, its
-  security group must allow inbound 5432 from `$SECURITY_GROUP_ID`
-- optional, for the CDC job: the DMS API (column-rename detection) and CloudWatch (one metric for
-  tables without a primary key), through VPC endpoints or NAT. Without them CDC still applies every
-  change: each call gives up after a few seconds and the log says once what is turned off
 
-> **The two cutover Lambdas connect to DSQL too.** `drain-check` and `drop-tags` need the same
-> network path. After Step 2, put them in the VPC:
-> ```bash
-> aws iam attach-role-policy --role-name $PROJECT-lambda-exec-role \
->   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-> for n in drain-check drop-tags; do
->   aws lambda update-function-configuration --function-name $PROJECT-$n --region $REGION --no-cli-pager \
->     --vpc-config SubnetIds=$SUBNET_ID,SecurityGroupIds=$SECURITY_GROUP_ID --query FunctionName
-> done
-> ```
+- an **S3 gateway endpoint** in its route table (jobs read scripts, wheels and CSVs from S3);
+- a route to DSQL: a DSQL VPC endpoint with **private DNS on** (its security group allowing inbound
+  5432 from `$SECURITY_GROUP_ID`), or NAT;
+- optional, for the CDC job only: reach to the **DMS API** (so a renamed column is detected) and
+  **CloudWatch** (one metric), via VPC endpoints or NAT. Without them CDC still applies every
+  change — each call just gives up after a few seconds and the log says once what is turned off.
+
+Don't add the connection to a job in the Glue console: the pipeline rewrites each job's whole
+definition on every run, so there is nothing to edit there by hand. Put the name in
+`pipeline.json` instead (Step 3c).
 
 ---
 
-## Step 2 — Create the 7 Lambda functions (one-time, ~15 min)
+## Step 2 — create the Lambda functions
 
-**Goal:** deploy the small orchestration Lambdas the state machine calls.
+*One-time, about 10 minutes. Re-run it whenever `lambdas/` changes.*
 
-All 7 use the **same zip** (all the `.py` files from `lambdas/`) and the **same execution role**
-(`$LAMBDA_ROLE_ARN` from Step 1); they differ only by **handler** (which `.py` file's `handler`
-function runs) and by **name**. Here's the full set:
+**Goal:** the seven small functions the two state machines call. They all use **one zip** and the
+**Lambda role** from Step 1; they differ only by name and handler.
 
-| Function name | Handler | What it does |
+| Function | Handler | What it does |
 |---|---|---|
-| `$PROJECT-resolve-task` | `resolve_task.handler` | reads the DMS S3 target endpoint settings |
-| `$PROJECT-driver-discovery` | `driver_discovery.handler` | lists the driver wheels in each `driver-*` folder; for the CDC job it checks and prepares `driver-cdc/` (needs 1024 MB, 300 s) |
-| `$PROJECT-plan-split` | `plan_split.handler` | splits the table list into balanced load groups |
-| `$PROJECT-create-glue-jobs` | `create_glue_jobs.handler` | creates the task's Glue jobs from the templates |
-| `$PROJECT-stop-cdc-run` | `stop_cdc_run.handler` | stops the CDC Glue run at cutover |
-| `$PROJECT-drain-check` | `drain_check.handler` | **(talks to DSQL)** waits until the last CDC file is applied |
-| `$PROJECT-drop-tags` | `drop_tags.handler` | **(talks to DSQL)** drops the `_cdc_file` column at cutover |
+| `$PROJECT-resolve-task` | `resolve_task.handler` | reads `config/pipeline.json` and the DMS task; works out the task's folder, job names and S3 layout; checks the task before DMS starts; records the folder owner |
+| `$PROJECT-driver-discovery` | `driver_discovery.handler` | checks the `driver-*` folders; prepares the `driver-cdc/` wheels for a Python-shell CDC job |
+| `$PROJECT-plan-split` | `plan_split.handler` | splits the task's tables into balanced load groups |
+| `$PROJECT-create-glue-jobs` | `create_glue_jobs.handler` | creates (and at cutover deletes) the task's Glue jobs; re-creates the CDC job as Spark on a driver failure |
+| `$PROJECT-stop-cdc-run` | `stop_cdc_run.handler` | stops this task's CDC run at cutover |
+| `$PROJECT-drain-check` | `drain_check.handler` | **connects to DSQL:** waits until the last CDC file is applied |
+| `$PROJECT-drop-tags` | `drop_tags.handler` | **connects to DSQL:** drops the internal `_cdc_file` tracking column at cutover |
 
-Do it **either** with the CLI loop (fast) **or** in the Console (click-through). Both produce the
-same 7 functions.
-
-### Option A — CLI (fast, recommended)
+**1. Build the zip.** It holds every `.py` from `lambdas/` plus the **`pg8000`** library, which
+`drain-check` and `drop-tags` import to connect to DSQL. pg8000 is pure Python, so building it on
+any machine is fine. It is installed into a separate build folder so the repo's `lambdas/` is never
+touched.
 
 ```bash
-# Zip all lambda code (all .py at the zip root)
-cd lambdas && zip -r ../fn.zip . && cd ..
+rm -rf _lambda_build fn.zip && mkdir _lambda_build
+cp lambdas/*.py _lambda_build/
+python3 -m pip install pg8000 -t _lambda_build/ --quiet
+(cd _lambda_build && zip -qr ../fn.zip .)
+unzip -l fn.zip | grep -cE ' (resolve_task\.py|prepare_cdc_wheels\.py|pg8000/__init__\.py)$'   # must print 3
+```
 
-# Create the 7 functions (same zip, different handler each)
-for spec in \
-  "resolve-task:resolve_task.handler" \
-  "driver-discovery:driver_discovery.handler" \
-  "plan-split:plan_split.handler" \
-  "create-glue-jobs:create_glue_jobs.handler" \
-  "stop-cdc-run:stop_cdc_run.handler" \
-  "drain-check:drain_check.handler" \
-  "drop-tags:drop_tags.handler" ; do
-    NAME="${spec%%:*}"; HANDLER="${spec##*:}"
-    aws lambda create-function --function-name "$PROJECT-$NAME" \
-      --runtime python3.12 --handler "$HANDLER" --memory-size 1024 --timeout 300 \
-      --role "$LAMBDA_ROLE_ARN" --zip-file fileb://fn.zip --no-cli-pager
+The count must be **3** (both key scripts and pg8000 are in the zip). If it is not, don't deploy.
+
+**2. Create the functions, or update them if they already exist** (safe to re-run):
+
+```bash
+for spec in resolve-task:resolve_task driver-discovery:driver_discovery plan-split:plan_split \
+            create-glue-jobs:create_glue_jobs stop-cdc-run:stop_cdc_run \
+            drain-check:drain_check drop-tags:drop_tags; do
+  NAME="$PROJECT-${spec%%:*}"; HANDLER="${spec##*:}.handler"
+  if aws lambda get-function --function-name "$NAME" >/dev/null 2>&1; then
+    aws lambda update-function-code --function-name "$NAME" --zip-file fileb://fn.zip \
+      --query FunctionName --output text
+    aws lambda wait function-updated --function-name "$NAME"
+    aws lambda update-function-configuration --function-name "$NAME" --handler "$HANDLER" \
+      --runtime python3.12 --memory-size 1024 --timeout 300 --query FunctionName --output text
+    aws lambda wait function-updated --function-name "$NAME"
+  else
+    aws lambda create-function --function-name "$NAME" --zip-file fileb://fn.zip \
+      --handler "$HANDLER" --runtime python3.12 --memory-size 1024 --timeout 300 \
+      --role "$LAMBDA_ROLE_ARN" --query FunctionName --output text
+    aws lambda wait function-active-v2 --function-name "$NAME"
+  fi
 done
 ```
 
-### Option B — AWS Console (manual, click-through)
+The update branch does **not** change `--role`, so it is safe to run even if you later add other
+`$PROJECT-*` functions (such as the fleet's `preflight-tasks`) on their own roles. If
+`create-function` says *"The role defined for the function cannot be assumed by Lambda"*, the role
+from Step 1 is a few seconds old — wait 10 seconds and run the loop again.
 
----
+**3. VPC only:** `drain-check` and `drop-tags` need the same network path as Glue:
 
-Do this once **per function** in the table above (7 times), changing only the **name** and
-**handler** each time:
-
-1. Go to **AWS Console → Lambda → Create function**.
-2. Choose **Author from scratch**.
-3. **Function name:** the name from the table (e.g. `dms-dsql-resolve-task`).
-4. **Runtime:** **Python 3.12**.
-5. **Architecture:** `x86_64` (default).
-6. Expand **Change default execution role → Use an existing role**, and pick your
-   **`<PROJECT>-lambda-exec-role`** (created in Step 1). *(Not "Create a new role" — you want the
-   role that already has the S3/DMS/DSQL/Glue permissions.)*
-7. Click **Create function**.
-8. On the function page: **Code** tab → **Upload from → .zip file** → upload the `fn.zip` you
-   built above (or drag the `lambdas/` files in). **Runtime settings → Edit → Handler:** set it to
-   the handler from the table (e.g. `resolve_task.handler`).
-9. **Configuration → General configuration → Edit:** set **Memory** to **1024 MB** and **Timeout** to
-   **5 min** (300 s). (The driver-discovery function needs this the first time it prepares the CDC
-   drivers; the same values are fine for all seven.)
-10. **Save.** Repeat for the remaining functions.
-
-### Option C — AWS CloudShell (build in the browser, deploy from S3)
-
-Use this if you're working entirely in the browser (no local machine) — AWS **CloudShell**
-already has `aws`, `python`, `pip`, `zip`, and `git` installed. The trick for CloudShell is that
-function code over ~50 MB (or when you'd rather not keep it in the shell) is deployed **from an S3
-object** with `--code S3Bucket=...,S3Key=...` instead of `--zip-file`.
-
-> **⭐ Already built `fn.zip` on your PC (with `pg8000` inside) and uploaded it to S3? Start here.**
-> You do NOT need to clone, `pip install`, or zip anything — the code is already in S3. Just open
-> CloudShell and run this one block. It assumes your zip is at
-> `s3://<your-bucket>/lambda-code/fn.zip` — change `ZIP_KEY` if you used a different path.
->
-> ```bash
-> # 1) Set your values (a fresh CloudShell has none of these)
-> export BUCKET="my-migration-bucket"                 # the bucket where fn.zip already lives
-> export PROJECT="dms-dsql"                            # YOUR project prefix (same one used in Steps 1-2)
-> export ACCOUNT_ID="123456789012"
-> export LAMBDA_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-lambda-exec-role"
-> export ZIP_KEY="lambda-code/fn.zip"                  # the S3 key where YOUR fn.zip lives
-> export AWS_PAGER=""                                  # stops the CLI pager from making each command "hang"
->
-> # 2) Confirm the zip is actually there
-> aws s3 ls "s3://$BUCKET/$ZIP_KEY"
->
-> # 3) Create all 7 functions FROM the S3 zip (no local files needed)
-> for spec in \
->   "resolve-task:resolve_task.handler" \
->   "driver-discovery:driver_discovery.handler" \
->   "plan-split:plan_split.handler" \
->   "create-glue-jobs:create_glue_jobs.handler" \
->   "stop-cdc-run:stop_cdc_run.handler" \
->   "drain-check:drain_check.handler" \
->   "drop-tags:drop_tags.handler" ; do
->     NAME="${spec%%:*}"; HANDLER="${spec##*:}"
->     aws lambda create-function --function-name "$PROJECT-$NAME" \
->       --runtime python3.12 --handler "$HANDLER" --memory-size 1024 --timeout 300 \
->       --role "$LAMBDA_ROLE_ARN" \
->       --code S3Bucket="$BUCKET",S3Key="$ZIP_KEY" --no-cli-pager
-> done
->
-> # 4) Verify all 7 exist
-> aws lambda list-functions \
->   --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName" --output table
-> ```
-> That's the whole thing for your case. Because `pg8000` is already inside your `fn.zip`, the two
-> DSQL functions (`drain-check`, `drop-tags`) are covered — no layer needed. Skip the numbered
-> steps below (they're for building the zip from scratch). Next stop: **Step 3 — stage files to S3**
-> (if not done) and **Step 4 — create the state machines**.
-
----
-
-If instead you're starting from nothing in CloudShell, follow the numbered steps:
-
-1. **Open CloudShell** (icon in the AWS Console top bar), then get the code and build the zip:
-   ```bash
-   # set the same variables you used elsewhere
-   export BUCKET="my-migration-bucket"; export PROJECT="dms-dsql"
-   export LAMBDA_ROLE_ARN="arn:aws:iam::123456789012:role/dms-dsql-lambda-exec-role"
-
-   # get the lambda code (clone the repo, or upload lambdas/ via CloudShell "Actions -> Upload file")
-   git clone https://github.com/newcoder52/Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime.git
-   cd Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime/lambdas
-
-   # (the two DSQL functions need pg8000 — bundle it in so all functions share one zip)
-   pip install pg8000 -t .
-   zip -r ../fn.zip .
-   cd ..
-   ```
-
-   **Already have the repo downloaded on your PC?** You don't need to `git clone` again — get your
-   local copy into CloudShell one of two ways:
-
-   - **Upload the folder into CloudShell**, then build the zip there: in CloudShell click
-     **Actions → Upload file** and upload your local `fn.zip` (if you already zipped it on the PC),
-     or a zip of the `lambdas/` folder; then unzip/`cd` into it and run the `pip install pg8000 -t .`
-     + `zip -r ../fn.zip .` steps above. *(CloudShell's Upload file takes a single file, so zip the
-     folder on your PC first.)*
-   - **Upload straight to S3 from your PC** (skip building in CloudShell entirely): on your PC, in
-     the repo's `lambdas/` folder, run `pip install pg8000 -t .` then zip it, and upload:
-     ```bash
-     # aws s3 cp  <SOURCE: local file on your PC>  <DESTINATION: S3 path>
-     aws s3 cp ~/Downloads/dms-s3-glue-dsql-migration/lambdas/fn.zip s3://$BUCKET/lambda-code/fn.zip
-     ```
-     Then open CloudShell and jump straight to **step 3** below (create the functions from S3) —
-     the zip is already in the bucket, so step 2 is done.
-2. **Upload the zip to S3** (CloudShell has no persistent local storage you can point Lambda at,
-   so stage it in your bucket):
-   ```bash
-   # aws s3 cp  <SOURCE: the fn.zip you just built>  <DESTINATION: S3 path>
-   aws s3 cp fn.zip s3://$BUCKET/lambda-code/fn.zip
-   ```
-   > **What is `lambda-code/`?** It's just an arbitrary **staging folder (prefix)** for the zip —
-   > **not** one of the pipeline's fixed folders, and **not** read at runtime. You don't need to
-   > create it first (`aws s3 cp` makes it), and you can name it anything (`deploy/`, `lambda-zip/`,
-   > …) as long as the same key is used in the `--code S3Key=...` below. Safe to delete after the
-   > functions are created.
-3. **Create the 7 functions from the S3 object** (note `--code` instead of `--zip-file`):
-   ```bash
-   # If you came straight here (uploaded the zip to S3 from your PC) and this is a FRESH
-   # CloudShell, set these three variables first — the loop below uses them:
-   export BUCKET="my-migration-bucket"
-   export PROJECT="dms-dsql"
-   export LAMBDA_ROLE_ARN="arn:aws:iam::123456789012:role/dms-dsql-lambda-exec-role"
-   export AWS_PAGER=""     # stops the CLI pager from making each create-function "hang"
-
-   for spec in \
-     "resolve-task:resolve_task.handler" \
-     "driver-discovery:driver_discovery.handler" \
-     "plan-split:plan_split.handler" \
-     "create-glue-jobs:create_glue_jobs.handler" \
-     "stop-cdc-run:stop_cdc_run.handler" \
-     "drain-check:drain_check.handler" \
-     "drop-tags:drop_tags.handler" ; do
-       NAME="${spec%%:*}"; HANDLER="${spec##*:}"
-       aws lambda create-function --function-name "$PROJECT-$NAME" \
-         --runtime python3.12 --handler "$HANDLER" --memory-size 1024 --timeout 300 \
-         --role "$LAMBDA_ROLE_ARN" \
-         --code S3Bucket=$BUCKET,S3Key=lambda-code/fn.zip --no-cli-pager
-   done
-   ```
-   > Make sure the `S3Key` here (`lambda-code/fn.zip`) matches the path you uploaded the zip to
-   > (Step 2, or your PC upload). If you used a different prefix/name, change it in both places.
-   > To **update** a function's code later after re-uploading the zip:
-   > `aws lambda update-function-code --function-name "$PROJECT-<name>" --s3-bucket $BUCKET --s3-key lambda-code/fn.zip`
-
-Because `pg8000` is bundled into `fn.zip` here, the two DSQL functions (`drain-check`, `drop-tags`)
-are already covered — no separate layer needed. The `lambda-code/` prefix is just a staging spot;
-it's not read at runtime (only at create/update time), so you can delete it afterward if you like.
-
----
-
-### The two DSQL functions need the `pg8000` library
-
-`drain-check` and `drop-tags` connect to Aurora DSQL, so they need the `pg8000` Python package.
-The other 5 functions do **not**. If you skip this, those two fail at **cutover (Step 6)** with
-`No module named 'pg8000'`. Two ways to provide it:
-
-**Option 1 — bundle pg8000 into the zip (simplest):** install it alongside the code before zipping,
-so it's inside `fn.zip` for all functions.
 ```bash
-cd lambdas
-pip install pg8000 -t .        # installs pg8000 (+scramp, asn1crypto) into this folder
-zip -r ../fn.zip .             # now the zip contains the lambda code AND pg8000
-cd ..
+aws iam attach-role-policy --role-name "$PROJECT-lambda-exec-role" \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+for n in drain-check drop-tags; do
+  aws lambda update-function-configuration --function-name "$PROJECT-$n" \
+    --vpc-config "SubnetIds=$SUBNET_ID,SecurityGroupIds=$SECURITY_GROUP_ID" --query FunctionName --output text
+  aws lambda wait function-updated --function-name "$PROJECT-$n"
+done
 ```
 
-**Option 2 — a Lambda layer (cleaner; keeps function zips small):** build a `pg8000` layer once and
-attach it to just the two DSQL functions.
-```bash
-# Build the layer zip (Lambda expects libs under python/)
-mkdir -p layer/python
-pip install pg8000 -t layer/python/
-cd layer && zip -r ../pg8000-layer.zip python && cd ..
+**Verify:** all seven are listed (eight once you add the fleet's `preflight-tasks`):
+`aws lambda list-functions --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName" --output table`
 
-# Publish the layer
-LAYER_ARN=$(aws lambda publish-layer-version --layer-name pg8000 \
-  --zip-file fileb://pg8000-layer.zip \
-  --compatible-runtimes python3.12 \
-  --query LayerVersionArn --output text)
-
-# Attach it to the two DSQL functions
-aws lambda update-function-configuration --function-name "$PROJECT-drain-check" --layers "$LAYER_ARN"
-aws lambda update-function-configuration --function-name "$PROJECT-drop-tags"  --layers "$LAYER_ARN"
-```
-> In the Console, the layer equivalent is: function page → scroll to **Layers → Add a layer →
-> Custom layers →** pick `pg8000` → the version → **Add**. Do it for `drain-check` and `drop-tags`.
-
-**Verify:** `aws lambda list-functions --query "Functions[?starts_with(FunctionName,'$PROJECT-')].FunctionName"`
-lists all 7.
+> **Using the console instead?** For each function: **Author from scratch**, runtime **Python
+> 3.12**, **Use an existing role** → `$PROJECT-lambda-exec-role`; upload the same `fn.zip`; set the
+> handler from the table; set **Memory 1024 MB** and **Timeout 5 min**. The 1024 MB / 300 s matters
+> for `driver-discovery` (preparing the CDC wheels) — the error message points back to this step.
 
 ---
 
-## Step 3 — Stage files to S3 (one-time, ~20 min)
+## Step 3a — scripts and job templates
 
-**Goal:** put the scripts, templates, and driver files in the bucket. This is where the
-driver-folder rules matter most — read the callout.
-
-### 3a — Scripts and templates
+*One-time, about 5 minutes. Re-run it whenever `scripts/` or `glue-templates/` changes — the Glue
+scripts in S3 are what the jobs actually run.*
 
 ```bash
 # The 4 Glue scripts
-aws s3 cp scripts/ s3://$BUCKET/scripts/ --recursive \
-  --exclude "*" --include "job1_discovery.py" --include "job2_load.py" \
-  --include "job3_validate.py" --include "glue_cdc_continuous.py"
+for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py; do
+  aws s3 cp "scripts/$f" "s3://$BUCKET/scripts/$f"
+done
 
-# The 6 job templates (substitute <<BUCKET>> inside them first)
-sed -i '' "s/<<BUCKET>>/$BUCKET/g" glue-templates/*.json      # Linux/CloudShell: drop the ''
-aws s3 cp glue-templates/ s3://$BUCKET/glue-templates/ --recursive --exclude "*" --include "*.json"
+# The 6 job templates, with <<BUCKET>> filled in. Filled copies go to _filled/; the repo files
+# are left alone (create-glue-jobs also fills <<BUCKET>> at run time, so this is belt-and-braces).
+mkdir -p _filled/glue-templates
+for f in glue-templates/*.json; do sed -e "s|<<BUCKET>>|$BUCKET|g" "$f" > "_filled/$f"; done
+grep -l "<<" _filled/glue-templates/*.json || echo "no placeholders left in templates"
+aws s3 cp _filled/glue-templates/ "s3://$BUCKET/glue-templates/" --recursive \
+  --exclude "*" --include "*.json"
 ```
 
-> **Upgrading an existing deployment? Upload the scripts too.** The Glue scripts in
-> `s3://$BUCKET/scripts/` are a separate upload from the Lambdas and state machines. If you
-> redeploy the Lambdas and workflows but not the scripts, the jobs keep running the OLD scripts
-> (a real test run hit an old `job2_load.py` this way and failed at its summary with
-> `KeyError: 'table'`). On every upgrade, redo 3a, then check that S3 matches your copy of the repo:
->
-> ```bash
-> for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py; do
->   L=$(sha256sum < scripts/$f | cut -c1-16)
->   S=$(aws s3 cp s3://$BUCKET/scripts/$f - | sha256sum | cut -c1-16)
->   [ "$L" = "$S" ] && echo "OK    $f" || echo "STALE $f  (repo $L, S3 $S)"
-> done
-> ```
->
-> Every line must say `OK`. Glue reads a script only when a run starts, so a CDC run that is
-> already running keeps the old script: stop it, wait for `STOPPED`, and start a new run
-> (with `--config_prefix`).
->
-> Also check that the two cutover Lambdas have `pg8000`, either in a layer or inside the zip
-> (Step 2). Without it, cutover fails at `DrainCheck` with `No module named 'pg8000'`:
->
-> ```bash
-> for f in drain-check drop-tags; do
->   LAYERS=$(aws lambda get-function-configuration --function-name $PROJECT-$f \
->     --query 'Layers[].Arn' --output text --no-cli-pager)
->   curl -s -o /tmp/$f.zip "$(aws lambda get-function --function-name $PROJECT-$f \
->     --query Code.Location --output text --no-cli-pager)"
->   N=$(unzip -l /tmp/$f.zip | grep -c 'pg8000/')
->   echo "$f: pg8000 files in zip=$N, layers=[$LAYERS]"
-> done
-> ```
->
-> Each function needs either `pg8000 files in zip` above 0 or a `pg8000` layer listed.
->
-> Upgrading to the version that prepares the CDC drivers automatically also needs, once:
->
-> ```bash
-> aws lambda update-function-configuration --function-name $PROJECT-driver-discovery \
->   --memory-size 1024 --timeout 300 --no-cli-pager
-> # the startup workflow now checks that the CDC run started (needs s3:ListBucket on config/_task/*)
-> aws iam put-role-policy --role-name $PROJECT-sfn-exec-role \
->   --policy-name sfn --policy-document file://iam/sfn-exec-role.policy.filled.json   # filled in as in Step 1
-> # resolve-task now refuses a second run for the same task (needs states:ListExecutions/DescribeExecution)
-> aws iam put-role-policy --role-name $PROJECT-lambda-exec-role \
->   --policy-name lambda --policy-document file://iam/lambda-exec-role.policy.filled.json   # filled in as in Step 1
-> ```
+**Verify** that S3 holds the same scripts as your repo (any mismatch means a job would run an old
+script):
 
-### 3b — Driver files (the part people get wrong)
+```bash
+for f in job1_discovery.py job2_load.py job3_validate.py glue_cdc_continuous.py; do
+  if command -v sha256sum >/dev/null 2>&1; then H="sha256sum"; else H="shasum -a 256"; fi
+  L=$($H < "scripts/$f" | cut -c1-16)
+  S=$(aws s3 cp "s3://$BUCKET/scripts/$f" - | $H | cut -c1-16)
+  [ "$L" = "$S" ] && echo "OK    $f" || echo "STALE $f  (repo $L, S3 $S)"
+done
+```
 
-The Glue jobs can't reach PyPI, so their Python dependencies are staged in S3 as `.whl`
-files. There are **three** driver folders because each job type needs a different set:
+Every line must say `OK`. (`sha256sum` is on Linux and CloudShell; macOS uses `shasum -a 256` — the
+line above picks whichever exists.)
 
-| Folder | Used by | Put in it | Do NOT put in it |
+---
+
+## Step 3b — driver wheels
+
+*One-time, about 10 minutes.*
+
+The Glue jobs can't reach PyPI (a locked-down VPC blocks it), so their Python libraries are staged
+in S3 as `.whl` files, in **three** folders:
+
+| Folder | Used by | Put in it | Never put in it |
 |---|---|---|---|
-| `driver-fullload/` | discovery + load (Spark, Python 3.10) | **pg8000 stack only** (5 wheels) | ❌ boto3 / botocore |
-| `driver-validation/` | validate (Spark, Python 3.10) | **pg8000 stack only** (5 wheels) | ❌ boto3 / botocore |
-| `driver-cdc/` | CDC (Python shell, **Python 3.9**) | pg8000 stack **+** boto3 set, downloaded for Python 3.9 and **prepared** (below) | — |
+| `driver-fullload/` | discovery + load (Spark, Python 3.10) | the **pg8000 stack** (5 wheels) | boto3 / botocore |
+| `driver-validation/` | validate (Spark, Python 3.10) | the **pg8000 stack** (5 wheels) | boto3 / botocore |
+| `driver-cdc/` | CDC (Python **shell**, Python 3.9) | the pg8000 stack **and** the boto3 set, built for Python 3.9 (10 wheels) | two versions of any package |
 
-- **pg8000 stack (5 wheels):** `pg8000`, `scramp`, `asn1crypto`, `python_dateutil`, `six`
-- **boto3 set (cdc only):** `boto3`, `botocore`, `jmespath`, `s3transfer`, `urllib3`
+- **pg8000 stack (5):** `pg8000`, `scramp`, `asn1crypto`, `python_dateutil`, `six`
+- **boto3 set (5):** `boto3`, `botocore`, `jmespath`, `s3transfer`, `urllib3`
 
-> ⚠️ **Why the split matters:** the pipeline loads **every** wheel it finds in a folder. If a
-> `boto3`/`botocore` wheel ends up in `driver-fullload/` or `driver-validation/`, it breaks the
-> Spark jobs with `DataNotFoundError: endpoints`. Keep those two folders to the 5 pg8000 wheels
-> only. (The Spark jobs get their boto3 from `driver-cdc/` a different way; the CDC job needs it
-> bundled because Glue's built-in boto3 is too old to know Aurora DSQL.)
+Why the split matters:
 
-> ⚠️ **`driver-cdc/` must be the Python 3.9 set.** Glue Python shell jobs run Python 3.6 or 3.9
-> only. boto3/botocore dropped Python 3.9 at 1.43, scramp at 1.4.7, and on Python 3.9 botocore needs
-> urllib3 below 1.27. The `pip download` below pins those.
+- A boto3/botocore wheel in `driver-fullload/` or `driver-validation/` breaks the Spark jobs with
+  `DataNotFoundError: endpoints`. The Spark jobs get boto3 a different way, from `driver-cdc/`.
+- Glue Python shell runs **Python 3.9**. boto3/botocore 1.43+ and scramp 1.4.7+ need 3.10, and on
+  3.9 botocore needs urllib3 below 1.27. The download below pins those.
+- You **don't** prepare the CDC wheels by hand. Before DMS starts, the startup checks `driver-cdc/`
+  for Python 3.9, then writes install-ready copies to `driver-cdc-prepared/<fingerprint>/` (with a
+  `MANIFEST.txt` of every change, for your security team), once per wheel set. Your files in
+  `driver-cdc/` are never changed.
 
-**You don't prepare the CDC wheels by hand.** Glue's pip installs the CDC job's wheels one at a
-time, and a wheel that lists a dependency not installed yet makes pip ask pypi.org, which a firewall
-blocks (~20 min, then `CalledProcessError`). The startup workflow handles this for every task, before
-DMS starts:
-- the `driver-discovery` Lambda checks the `driver-cdc/` set for Python 3.9 (one version per package,
-  each wheel allows Python 3.9, dependency versions in range, all 10 packages present, botocore
-  knows `dsql`). A wrong or missing wheel stops the run at **`DriversFailed`**, naming the wheel and
-  what to download instead. DMS is not started;
-- it then writes install-safe copies (dependency lists removed, everything else unchanged) to
-  `driver-cdc-prepared/<fingerprint>/`, with `MANIFEST.txt` (original and new checksum of each wheel
-  and every line removed, for your security team). This happens **once per wheel set**; later tasks
-  reuse it in seconds. Your files in `driver-cdc/` are never changed;
-- every CDC job is created with the prepared list, so a console **Run** uses it too.
-
-Wheels you already prepared by hand are fine: they pass through unchanged. The Spark jobs don't
-need any of this (Glue puts their wheels on the Python path without pip).
-
-**Download the wheels** on a machine that can reach PyPI (your laptop, or CloudShell). They're
-pinned to Glue's platform, not your laptop's:
+**Download** on a machine that can reach PyPI (your laptop or CloudShell). The flags pin **Glue's**
+platform and Python, not your machine's:
 
 ```bash
 rm -rf _drv _cdc
 PLAT310="--platform manylinux2014_x86_64 --python-version 310 --only-binary=:all:"
 PLAT39="--platform manylinux2014_x86_64 --python-version 39 --only-binary=:all:"
 
-# Spark jobs (Python 3.10): the 5 pg8000-stack wheels
-pip download pg8000 $PLAT310 -d _drv/
+# Spark jobs (Python 3.10): the pg8000 stack
+python3 -m pip download pg8000 $PLAT310 -d _drv/
 
-# CDC job (Python 3.9): pg8000 stack + boto3 set, capped to releases that support 3.9
-pip download "pg8000>=1.31,<1.32" "scramp>=1.4.5,<1.4.7" \
+# CDC job (Python 3.9): pg8000 stack + boto3 set, capped to releases that still support 3.9
+python3 -m pip download "pg8000>=1.31,<1.32" "scramp>=1.4.5,<1.4.7" \
   "boto3>=1.35,<1.43" "botocore>=1.35,<1.43" "urllib3>=1.25.4,<1.27" $PLAT39 -d _cdc/
 ```
 
-**Upload to the three folders.** Clear `driver-cdc/` first: two versions of one package in that
-folder is an error.
+**Upload.** `driver-cdc/` is cleared first, because two versions of one package there is an error:
 
 ```bash
-# Spark folders = pg8000 stack ONLY
-aws s3 cp _drv/ s3://$BUCKET/driver-fullload/   --recursive --exclude "*" --include "*.whl"
-aws s3 cp _drv/ s3://$BUCKET/driver-validation/ --recursive --exclude "*" --include "*.whl"
-# CDC folder = the Python 3.9 set, as downloaded
-aws s3 rm s3://$BUCKET/driver-cdc/ --recursive --exclude "*" --include "*.whl"
-aws s3 cp _cdc/ s3://$BUCKET/driver-cdc/ --recursive --exclude "*" --include "*.whl"
+aws s3 cp _drv/ "s3://$BUCKET/driver-fullload/"   --recursive --exclude "*" --include "*.whl"
+aws s3 cp _drv/ "s3://$BUCKET/driver-validation/" --recursive --exclude "*" --include "*.whl"
+aws s3 rm "s3://$BUCKET/driver-cdc/" --recursive --exclude "*" --include "*.whl"
+aws s3 cp _cdc/ "s3://$BUCKET/driver-cdc/" --recursive --exclude "*" --include "*.whl"
 ```
 
-**Verify:**
+**Verify** (and run the same check the startup runs, locally — standard Python only, no AWS):
 
 ```bash
-aws s3 ls s3://$BUCKET/driver-fullload/     # expect 5 wheels, ZERO boto3/botocore
-aws s3 ls s3://$BUCKET/driver-validation/   # expect 5 wheels, ZERO boto3/botocore
-aws s3 ls s3://$BUCKET/driver-cdc/          # expect 10 wheels, one per package:
-#   asn1crypto boto3 botocore jmespath pg8000 python_dateutil s3transfer scramp six urllib3
+aws s3 ls "s3://$BUCKET/driver-fullload/"     # 5 wheels, no boto3/botocore
+aws s3 ls "s3://$BUCKET/driver-validation/"   # 5 wheels, no boto3/botocore
+aws s3 ls "s3://$BUCKET/driver-cdc/"          # 10 wheels, one version per package
+rm -rf /tmp/_cdc_check && python3 lambdas/prepare_cdc_wheels.py _cdc/ /tmp/_cdc_check/ --python 3.9
 ```
 
-> **Optional: check the CDC set before uploading.** The Lambda runs the same code as
-> `lambdas/prepare_cdc_wheels.py`, which you can run locally (standard Python only, no AWS access):
-> `python3 lambdas/prepare_cdc_wheels.py _cdc/ /tmp/_cdc_check/ --python 3.9` must end with `PASS`.
+The last command must end with **`PASS`**.
 
-### 3c — Pipeline settings (`config/pipeline.json`, once for all tasks)
+---
 
-Every startup and cutover run reads this one file, so these values are set once for every task.
-An edit applies to runs started afterwards, not to runs already going. This writes the file from
-the variables you set at the top:
+## Step 3c — pipeline settings
+
+*One-time, about 5 minutes.*
+
+Every `startup` and `cutover` run reads `s3://$BUCKET/config/pipeline.json`. An edit applies to
+runs started **after** it, not to runs already going. Write it from your variables (don't hand-copy
+the example file — see the note below):
 
 ```bash
-: "${PROJECT:?}" "${REGION:?}" "${BUCKET:?}" "${DSQL_ENDPOINT:?}" "${GLUE_ROLE_ARN:?}" "${GLUE_CONNECTION?}"
+: "${PROJECT:?}" "${REGION:?}" "${DSQL_ENDPOINT:?}" "${GLUE_ROLE_ARN:?}" "${GLUE_CONNECTION?}"
 python3 - <<'EOF'
 import json, os
 cfg = {
@@ -669,72 +520,49 @@ cfg = {
 open("pipeline.json", "w").write(json.dumps(cfg, indent=2) + "\n")
 print(json.dumps(cfg, indent=2))
 EOF
-aws s3 cp pipeline.json s3://$BUCKET/config/pipeline.json
+aws s3 cp pipeline.json "s3://$BUCKET/config/pipeline.json"
 ```
 
-| Key | What it is |
+| Key | Meaning |
 |---|---|
-| `project` | prefix of your Lambda and Glue job names; must be the same `$PROJECT` as Steps 1–2 |
-| `region` | AWS region of the DMS tasks and the pipeline |
+| `project` | prefix of the Lambda and Glue job names; the same `$PROJECT` as Steps 1–2 |
+| `region` | region of the DMS tasks and the pipeline (must equal the task ARN's region) |
 | `dsql_endpoint`, `dsql_user`, `dsql_database` | the Aurora DSQL target |
-| `glue_role_arn` | the Glue execution role from Step 1 |
-| `glue_connection` | the Glue network connection the jobs run in, by its **exact** name (one made in the console may be called e.g. `Network connection 1`). Several: comma-separated. `""` = no VPC |
-| `cdc_engine` | `pythonshell` (default; 1 DPU, ~$0.44/h per task) or `spark` (Glue 4.0, 2 × G.1X, ~$0.88/h per task; loads its drivers the same way as the full-load jobs) |
-| `cdc_spark_fallback` | `true` (default): if a Python-shell CDC job's drivers fail, the startup re-creates that task's CDC job as Spark (same name) and carries on (see Step 5c). `false`: stop at `DriversFailed` / `CdcRunFailed` instead |
+| `glue_role_arn` | the Glue role from Step 1 |
+| `glue_connection` | the Glue network connection's **exact** name (a console-made one may read e.g. `Network connection 1`); several, comma-separated; `""` = no VPC |
+| `cdc_engine` | `pythonshell` (default; 1 DPU) or `spark` (Glue 4.0, 2 × G.1X) |
+| `cdc_spark_fallback` | `true` (default): if a Python-shell CDC job's drivers fail, the startup re-creates that task's CDC job as Spark and carries on. `false`: stop at `DriversFailed` / `CdcRunFailed` |
 | `control_schema` | DSQL schema for the CDC control tables (default `cdc_control`) |
 
-A template with every key is in [`config/pipeline.example.json`](config/pipeline.example.json).
-Before editing the live file later, keep a dated copy:
-`aws s3 cp s3://$BUCKET/config/pipeline.json s3://$BUCKET/config/pipeline.json.$(date +%Y%m%d%H%M)`.
+> **Don't copy `config/pipeline.example.json` as-is.** Its `description` line contains `<bucket>`,
+> and the pipeline rejects any value with `<` or `>` in it, so a run would fail at `ResolveFailed`
+> ([Known issues](#known-issues-temporary)). The generator above omits `description`, so it is safe.
+> Keep hand-edited values trimmed (no stray spaces) and never set `dsql_user`, `dsql_database` or
+> `control_schema` to an empty string — a blank there is kept, not defaulted, and fails later.
 
-> You do **not** upload the table folders DMS writes (`<schema>/<table>/`, under the endpoint's
-> BucketFolder if it has one). Each task's table list is uploaded per task, in Step 5.
+Before changing a live file, keep a dated copy:
+`aws s3 cp "s3://$BUCKET/config/pipeline.json" "s3://$BUCKET/config/pipeline.json.$(date +%Y%m%d%H%M)"`
 
 ---
 
-## Step 4 — Create the two state machines (one-time, ~5 min)
+## Step 4 — create the two state machines
 
-**Goal:** set up the two "conductors" that run every migration task:
+*One-time, about 5 minutes. Re-run it whenever `stepfunctions/` changes.*
 
-- **startup** — runs the whole migration: full load → validate → switch DMS to CDC → start the continuous CDC job.
-- **cutover** — run later, when you're ready to switch over: drains the last changes and cleans up.
+**Goal:** the **startup** state machine (full load → validate → start CDC) and the **cutover**
+state machine (drain the last changes and clean up), both shared by every task. Their definition
+files have only two kinds of blanks — `<<BUCKET>>` and the seven Lambda ARNs. Everything else is
+read at run time from `pipeline.json` and the DMS task.
 
-**Both are shared by all tasks.** You start them with just a task's ARN (Step 5). At runtime they
-read everything else from `config/pipeline.json` (Step 3c) and from the DMS task itself — including
-the task's **name**, which becomes its folder (`config/_task/<task name>/`) and the middle of its
-Glue job names (`$PROJECT-<task name>-load`, …). So the definition files in `stepfunctions/` have
-only two kinds of blanks: `<<BUCKET>>` and the Lambda ARNs. You fill them in once.
+> **Did Steps 1–3 in the console?** Set `PROJECT`, `REGION`, `ACCOUNT_ID`, `BUCKET` and
+> `SFN_ROLE_ARN` to match what you created, then confirm every Lambda exists:
+> `for n in resolve-task driver-discovery plan-split create-glue-jobs stop-cdc-run drain-check drop-tags; do aws lambda get-function --function-name "$PROJECT-$n" --query Configuration.FunctionName --output text 2>/dev/null || echo "MISSING: $PROJECT-$n"; done`
 
-> **Updating an existing deployment?** Redeploy the Lambda code first (Step 2: same zip, all 7
-> functions), because the shared state machines need the current `resolve-task` and
-> `create-glue-jobs`. Tasks already running on older **per-task** state machines
-> (`$PROJECT-startup-<suffix>`) keep working with the new Lambdas, including their cutover — leave
-> them as they are and use the shared pair for new tasks.
-
-> **Coming in cold (did Steps 1–3 in the console)?** Set just these, matching the names you
-> actually created, then run the name check:
->
-> ```bash
-> export PROJECT="dms-dsql" REGION="us-east-1" ACCOUNT_ID="123456789012" BUCKET="my-migration-bucket"
-> export SFN_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-sfn-exec-role" AWS_PAGER=""
-> for n in resolve-task driver-discovery plan-split create-glue-jobs stop-cdc-run drain-check drop-tags; do
->   printf "%-42s " "$PROJECT-$n"
->   aws lambda get-function --function-name "$PROJECT-$n" \
->     --query "Configuration.FunctionName" --output text --no-cli-pager 2>/dev/null \
->     || echo "❌ NOT FOUND"
-> done
-> aws s3 cp s3://$BUCKET/config/pipeline.json - | head -20      # Step 3c must be done
-> ```
->
-> Every Lambda line should echo its own name. A **`❌ NOT FOUND`** means `$PROJECT` doesn't match
-> what you named the functions: fix `$PROJECT` (or the function names) before 4a.
-
-### 4a — Fill in the blanks
+**1. Fill in the blanks** (writes `startup.filled.asl.json` and `cutover.filled.asl.json`):
 
 ```bash
-: "${PROJECT:?set PROJECT}" "${REGION:?set REGION}" "${ACCOUNT_ID:?set ACCOUNT_ID}" "${BUCKET:?set BUCKET}"
+: "${PROJECT:?}" "${REGION:?}" "${ACCOUNT_ID:?}" "${BUCKET:?}"
 LAMBDA_BASE="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT"
-
 for f in startup cutover; do
   sed -e "s|<<BUCKET>>|$BUCKET|g" \
       -e "s|<<RESOLVE_TASK_LAMBDA_ARN>>|$LAMBDA_BASE-resolve-task|g" \
@@ -746,64 +574,64 @@ for f in startup cutover; do
       -e "s|<<DROP_TAGS_LAMBDA_ARN>>|$LAMBDA_BASE-drop-tags|g" \
       "stepfunctions/$f.asl.json" > "$f.filled.asl.json"
 done
-grep '<<' startup.filled.asl.json cutover.filled.asl.json      # must print nothing
+grep "<<" startup.filled.asl.json cutover.filled.asl.json || echo "no placeholders left"
 ```
 
-> **How the Lambda ARNs are built:** `arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT-<name>`,
-> e.g. `arn:aws:lambda:us-east-1:123456789012:function:dms-dsql-resolve-task`. This works because
-> you created the functions as `$PROJECT-<name>` in Step 2. If an ARN points at a name that doesn't
-> exist, the run fails with `Lambda function not found`.
-
-### 4b — Register them (creates them, or updates them if they already exist)
+**2. Create them, or update them if they exist** (safe to re-run):
 
 ```bash
 for f in startup cutover; do
   ARN=$(aws stepfunctions list-state-machines \
-    --query "stateMachines[?name=='$PROJECT-$f'].stateMachineArn" --output text --no-cli-pager)
+    --query "stateMachines[?name=='$PROJECT-$f'].stateMachineArn" --output text)
   if [ -n "$ARN" ]; then
     aws stepfunctions update-state-machine --state-machine-arn "$ARN" \
-      --definition file://$f.filled.asl.json --no-cli-pager
+      --definition "file://$f.filled.asl.json" --role-arn "$SFN_ROLE_ARN"
   else
     aws stepfunctions create-state-machine --name "$PROJECT-$f" \
-      --definition file://$f.filled.asl.json --role-arn "$SFN_ROLE_ARN" --no-cli-pager
+      --definition "file://$f.filled.asl.json" --role-arn "$SFN_ROLE_ARN"
   fi
 done
-
-aws stepfunctions list-state-machines \
-  --query "stateMachines[?name=='$PROJECT-startup' || name=='$PROJECT-cutover'].name" \
-  --output table --no-cli-pager                                  # expect both names
 ```
+
+**Verify:** both names are listed:
+`aws stepfunctions list-state-machines --query "stateMachines[?starts_with(name,'$PROJECT-')].name" --output table`
+
+> **Going to run many tasks?** Deploy the fleet launcher now
+> ([Running many tasks](#running-many-tasks-with-the-fleet)). It adds an eighth Lambda, three
+> roles and two more state machines, and is the normal way to start more than a few tasks.
 
 ---
 
-## Step 5 — Run a migration task (per task)
+## Step 5 — run one task by hand
 
-**Goal:** migrate one DMS task. Repeat this step for every task; nothing from Steps 1–4 changes.
+*Per DMS task. Steps 1–4 don't change. To start many tasks at once, use the
+[fleet](#running-many-tasks-with-the-fleet) instead.*
 
-### 5a — Pick the task
+In a fresh shell, load your values first ([Coming back in a new shell](#load-values)) — you need
+`BUCKET`, `PROJECT`, `REGION` and `AWS_PAGER=""`.
+
+### 5a — pick the task
 
 ```bash
-export TASK_ARN="arn:aws:dms:us-east-1:123456789012:task:XXXX"     # the DMS task to migrate
+export TASK_ARN="arn:aws:dms:us-east-1:123456789012:task:XXXXXXXXXXXXXXXX"   # the DMS task
 export TASK_NAME=$(aws dms describe-replication-tasks \
-  --filters Name=replication-task-arn,Values=$TASK_ARN \
-  --query 'ReplicationTasks[0].ReplicationTaskIdentifier' --output text --no-cli-pager)
+  --filters "Name=replication-task-arn,Values=$TASK_ARN" \
+  --query 'ReplicationTasks[0].ReplicationTaskIdentifier' --output text)
 export CONFIG_PREFIX="s3://$BUCKET/config/_task/$TASK_NAME/"
 echo "task=$TASK_NAME  folder=$CONFIG_PREFIX  jobs=$PROJECT-$TASK_NAME-*"
 ```
 
-The DMS task's **name** is its folder and its Glue job names. Keep names short (under ~50
-characters) and use letters, digits and hyphens — DMS allows nothing else. Don't rename a task
-while it's being migrated (if you do, the pipeline keeps using the name it started with).
+The task's **name** is its folder and the stem of its Glue job names. Don't rename a DMS task while
+it is being migrated. (If a task has already been through its first startup under a different name
+or a `taskSuffix`, the pipeline keeps the name it recorded for the ARN in
+`config/_task_index/`; `TASK_NAME` above shows the *current* DMS name, which only differs if you
+renamed it — in that case use the recorded name for the folder and job names.)
 
-### 5b — Stage the task's table list
+### 5b — upload the task's table list
 
-Create a CSV listing the tables this task migrates, then upload it. Header row required, two
-columns (`dms_schema,dms_table`): each table's schema and name **as DMS writes them to S3**,
-meaning after any rename in the DMS table mapping. Letter case doesn't matter:
-
-- discovery finds the folder DMS wrote in any case (`MY_TABLE`, `my_table`, `My_Table`), under
-  the endpoint's BucketFolder if it has one, and every later job uses that folder;
-- the DSQL target is the same names in lowercase (`target_schema.my_table`).
+A CSV with a header row and two columns, `dms_schema,dms_table` — each table **as DMS writes it to
+S3** (i.e. after any rename in the DMS table mapping). Letter case doesn't matter: discovery finds
+DMS's folder in any case, and the DSQL target is the same names in lowercase.
 
 ```csv
 dms_schema,dms_table
@@ -811,271 +639,558 @@ TARGET_SCHEMA,MY_TABLE
 target_schema,another_table
 ```
 
-A table with no folder yet (empty at full load) is loaded as empty, with a warning in the
-discovery log; the CDC job picks up its folder when DMS creates it. If **none** of the tables has a
-folder, discovery fails and lists the folders it did find, so a wrong name can't load nothing
-quietly.
-
 ```bash
 aws s3 cp table_manifest.csv "${CONFIG_PREFIX}table_manifest.csv"
 ```
 
-### 5c — Start it
+A table with no folder yet (no rows at full load) is loaded empty, with a warning; the CDC job
+picks it up when DMS creates the folder. If **none** of the tables has a folder, discovery fails
+and lists the folders it did find, so a wrong name can't quietly load nothing.
+
+### 5c — start it
 
 ```bash
 STARTUP_ARN=$(aws stepfunctions list-state-machines \
-  --query "stateMachines[?name=='$PROJECT-startup'].stateMachineArn" --output text --no-cli-pager)
-
+  --query "stateMachines[?name=='$PROJECT-startup'].stateMachineArn" --output text)
 aws stepfunctions start-execution --state-machine-arn "$STARTUP_ARN" \
-  --name "${TASK_NAME:0:60}-$(date +%Y%m%d%H%M)" \
-  --input "{\"taskArn\":\"$TASK_ARN\"}" --no-cli-pager
+  --name "$(printf '%.60s' "$TASK_NAME")-$(date +%Y%m%d%H%M)" \
+  --input "{\"taskArn\":\"$TASK_ARN\"}"
 ```
 
-The run name starts with the task name, so you can find each task's runs in the Step Functions
-console.
+Watch it in the Step Functions console (the run name starts with the task name). In order:
 
-**What happens (in order), so you can follow along in the console:**
-1. **Check the task (seconds).** Reads `config/pipeline.json`, works out the folder and Glue job
-   names from the task name, and checks the DMS task **before starting it**: `full-load-and-cdc`,
-   `StopTaskCachedChangesApplied=true`, `AddColumnName=true`, writing to the pipeline bucket, and not
-   already past its full load. It also records which task owns the folder
-   (`config/_task/<task name>/_task.json`). Any problem stops the run at **`ResolveFailed`** with the
-   reason, and DMS is never started.
-2. **Check the driver files (seconds; about a minute the first time).** Lists the three driver
-   folders; for a Python-shell CDC job, checks `driver-cdc/` for Python 3.9 and prepares it (Step 3b).
-   A wrong or missing wheel stops the run at **`DriversFailed`** with the wheel named, and DMS is
-   never started. **With `cdc_spark_fallback` on (the default)** the run doesn't stop for a
-   Python-shell-only problem (e.g. a wheel that needs Python 3.10, urllib3 2.x, a missing `six`):
-   it checks the three wheels a Spark CDC job takes from `driver-cdc/` (boto3, botocore,
-   s3transfer) and, if they're fine, builds this task's CDC job as Spark. It stops at
-   `DriversFailed` only if neither engine can run.
-3. Start the DMS task → wait for full load to finish (`STOPPED_AFTER_CACHED_EVENTS`), then create
-   this task's Glue jobs from the templates (the CDC job as Python shell or Spark, per `cdc_engine`).
-4. Run **Job 1** (discovery) → **Job 2** (load) → **Job 3** (validate), per table group.
-   **If any group's load or validation fails, the run stops here (`GroupsFailed`) and DMS stays
-   paused**, so CDC never starts on top of an incomplete load.
-5. Resume DMS into ongoing CDC and start the **continuous CDC job**. It applies changes to each
-   table only once that table's load is marked `done` in its group's status file
-   (`${CONFIG_PREFIX}_orchestrator/group-<n>/_load_status.json`).
-6. **Confirm CDC really started.** Every 30 s the run checks the CDC job: it succeeds only once the
-   job writes `config/_task/<task name>/_cdc_started/<execution name>.json`, which it does on
-   reaching its poll loop (drivers installed, DSQL reachable, manifest loaded). If the CDC run fails
-   or stops first, the run ends at **`CdcRunFailed`** (with Glue's error) or **`CdcRunEnded`**; if
-   it never confirms within 45 minutes, **`CdcStartNotConfirmed`**. The full load is done and DMS
-   is capturing changes in all three cases, so you only need to fix and restart the CDC job.
-7. **Driver failure → Spark, automatically** (`cdc_spark_fallback` on, Python-shell CDC job). If
-   the CDC run fails because Glue couldn't install or import its drivers (pip/`pypi.org` timeouts,
-   `CalledProcessError`, a `.whl` that failed to install or is missing, a wheel for the wrong
-   Python, `No module named 'pg8000'`/`'boto3'`…, `Unknown service: 'dsql'`), the run deletes the
-   CDC job, re-creates it **with the same name** as a Spark job (drivers on the Python path, no
-   pip), starts it with the same arguments and confirms it as in 6. The Spark CDC job takes only
-   the pg8000 stack (pg8000, scramp, asn1crypto, plus python_dateutil/six) **by name** from
-   `driver-fullload/`, or from `driver-validation/` if `driver-fullload/` doesn't have exactly one
-   of each (never mixed; other wheels in the folder are left out). boto3/botocore/s3transfer come
-   from `driver-cdc/`, exactly as for the full-load jobs. This happens once: if the
-   Spark run fails too, the run ends at `CdcRunFailed`. Any other error (DSQL, permissions, data)
-   is left alone and ends at `CdcRunFailed` as before.
-   The switch is recorded in `config/_task/<task name>/_cdc_engine.json` (reason, failed run, Glue's
-   error), so a later startup of this task builds the Spark job straight away. To go back to
-   Python shell for that task, delete that file.
+1. **Check the task** (seconds): reads `pipeline.json` and checks the DMS task **before starting
+   it** — `full-load-and-cdc`, `StopTaskCachedChangesApplied=true`, `AddColumnName=true`, writes to
+   the pipeline bucket, same region, not already past its full load. Any problem → **`ResolveFailed`**
+   with the reason; DMS is untouched. A second startup for the same task while one is running also
+   stops here.
+2. **Check the driver wheels** (seconds; about a minute the first time): for a Python-shell CDC
+   job, checks and prepares `driver-cdc/` (Step 3b). A wrong or missing wheel → **`DriversFailed`**,
+   naming it; DMS is untouched. With `cdc_spark_fallback` on, a problem that only affects Python
+   shell (e.g. a wheel built for 3.10) doesn't stop the run: if boto3, botocore and s3transfer are
+   usable, this task's CDC job is built as Spark instead.
+3. **Start DMS and wait for the full load** (`STOPPED_AFTER_CACHED_EVENTS`; polled every 30 s for up
+   to **24 h**). Then create this task's Glue jobs.
+4. **Discovery, then load and validate** each table group. If any group fails → **`GroupsFailed`**,
+   and DMS stays paused, so CDC never starts on an incomplete load.
+5. **Resume DMS into CDC and start the CDC job.** It applies changes to a table only once that
+   table's load is marked `done` (`${CONFIG_PREFIX}_orchestrator/group-<n>/_load_status.json`).
+6. **Confirm CDC started** (polled every 30 s for up to **45 min**): the run succeeds when the CDC
+   job writes `_cdc_started/<startup execution name>.json` (the Step Functions run name from 5c) on
+   reaching its poll loop. If the CDC run fails first →
+   **`CdcRunFailed`** (with Glue's error); if it stops → **`CdcRunEnded`**; if it never confirms →
+   **`CdcStartNotConfirmed`**.
+7. **Spark fallback, once** (`cdc_spark_fallback` on, Python-shell CDC job): if the CDC run failed
+   because Glue couldn't install or import its drivers (pip/`pypi.org` timeouts,
+   `CalledProcessError`, a missing or wrong-Python wheel, `No module named 'pg8000'`,
+   `Unknown service: 'dsql'`), the CDC job is re-created **with the same name** as Spark, started
+   with the same arguments, and confirmed as in step 6. Any other error (DSQL, permissions, data)
+   is not retried. The switch is recorded in `${CONFIG_PREFIX}_cdc_engine.json`; later startups of
+   this task build Spark straight away. Delete that file to go back to Python shell.
 
-> **If a step fails:** fix the cause, then **start a new execution with the same input.** Each
-> stage skips already-completed work (via S3 status files), and job creation is idempotent — so a
-> re-run safely resumes from where it stopped. A second startup for a task whose startup is
-> still running stops at **`ResolveFailed`** ("Another startup run is already running"), so a
-> task can't be loaded twice.
+If the run stops at any Fail state, go to
+[If a run fails](#if-a-run-fails-how-to-continue) — what to do depends on **where** it stopped.
 
-> **Optional input keys** (rarely needed): `"taskSuffix": "<name>"` uses a different folder/job name
-> than the DMS task name; `"adoptExistingFolder": true` lets a task use a folder that already holds
-> files from a run made before the shared state machines (only if those files are this task's).
+> **Optional input keys** (rarely needed): `"taskSuffix": "<name>"` uses a different folder and job
+> name than the DMS task's name; `"adoptExistingFolder": true` lets the task reuse a folder that
+> already holds this task's files from a run made before the shared state machines existed.
 
-### 5d — Check that CDC is applying
-
-The run shows **Succeed** once the CDC job has reached its poll loop (step 6 above). To see it
-applying changes, check the CDC job's log:
+### 5d — check that CDC is applying
 
 ```bash
-JOB=$PROJECT-$TASK_NAME-cdc
-RUN=$(aws glue get-job-runs --job-name $JOB --max-items 1 --query 'JobRuns[0].Id' --output text --no-cli-pager)
-aws glue get-job-run --job-name $JOB --run-id $RUN --query 'JobRun.JobRunState' --no-cli-pager
-LG=$([ "$(aws glue get-job --job-name $JOB --query Job.Command.Name --output text --no-cli-pager)" = pythonshell ] \
-  && echo /aws-glue/python-jobs/output || echo /aws-glue/jobs/output)
-aws logs tail $LG --log-stream-names $RUN --since 1h | grep -E "Full-load gate|poll loop|CANNOT" | tail -5
+JOB="$PROJECT-$TASK_NAME-cdc"
+RUN=$(aws glue get-job-runs --job-name "$JOB" --max-items 1 --query 'JobRuns[0].Id' --output text)
+aws glue get-job-run --job-name "$JOB" --run-id "$RUN" --query 'JobRun.JobRunState'
+if [ "$(aws glue get-job --job-name "$JOB" --query Job.Command.Name --output text)" = pythonshell ]; then
+  LG="/aws-glue/python-jobs/output"; else LG="/aws-glue/jobs/output"; fi
+aws logs tail "$LG" --log-stream-names "$RUN" --since 1h | grep -E "Full-load gate|poll loop|CANNOT" | tail -5
 ```
 
 Healthy: `RUNNING`, then `Full-load gate: N/N table(s) marked 'done'` and `entering poll loop`.
-(See `USAGE_GUIDE.md` → Monitoring for the `cdc_control` queries to watch CDC progress.)
+To watch per table: `SELECT table_name, status, error FROM cdc_control.cdc_status;` (more queries
+in `USAGE_GUIDE.md`).
 
 ---
 
-## Step 6 — Cut over (per task, when you're ready to switch the app)
+## Step 6 — cut over
 
-**Goal:** once CDC has caught up (all tables idle, source ≈ target row counts), finalize and
-switch the application to Aurora DSQL.
+*Per task, when you're ready to switch the application to Aurora DSQL.*
 
-**Do this** (with `TASK_ARN` and `TASK_NAME` set as in 5a):
+### Before you start — checklist
+
+Do these **in order**. Cutover stops DMS first, so any change made on the source after that is
+never migrated — getting this order wrong loses data silently.
+
+- [ ] **Stop writes to the source** for this task's tables (put the application in maintenance
+      mode or make the source read-only). For a fleet cutover, stop writes for **every** table of
+      **every** task in the list.
+- [ ] **Let DMS deliver the last changes.** In the DMS console, the task's **CDCLatencySource** and
+      **CDCLatencyTarget** are near zero, and (if the endpoint batches) you have waited past its
+      `CdcMaxBatchInterval` so the last change file has landed in S3.
+- [ ] **No table is blocked.** `SELECT table_name FROM cdc_control.cdc_status WHERE status='blocked';`
+      returns nothing. If it doesn't, fix the cause and unblock
+      ([Troubleshooting → CDC](#cdc)) before cutting over.
+- [ ] **The CDC run is RUNNING** (check as in 5d). Cutover does not verify this; if the run is not
+      running, cutover stops DMS and then waits the full drain budget (~12 h) before failing.
+- [ ] **Multi-column-PK tables:** their separate CDC job is running and has caught up (it must mark
+      their latest change files `done` in `cdc_control.cdc_file_status`).
+
+### Start it
+
+With `TASK_ARN` and `TASK_NAME` set as in 5a:
 
 ```bash
 CUTOVER_ARN=$(aws stepfunctions list-state-machines \
-  --query "stateMachines[?name=='$PROJECT-cutover'].stateMachineArn" --output text --no-cli-pager)
-
+  --query "stateMachines[?name=='$PROJECT-cutover'].stateMachineArn" --output text)
 aws stepfunctions start-execution --state-machine-arn "$CUTOVER_ARN" \
-  --name "cutover-${TASK_NAME:0:50}-$(date +%Y%m%d%H%M)" \
-  --input "{\"taskArn\":\"$TASK_ARN\"}" --no-cli-pager
+  --name "cutover-$(printf '%.50s' "$TASK_NAME")-$(date +%Y%m%d%H%M)" \
+  --input "{\"taskArn\":\"$TASK_ARN\"}"
 ```
 
-It stops the DMS task, drain-checks that the last CDC file was applied, stops this task's CDC
-run, removes the pipeline's internal `_cdc_file` tracking column, and deletes this task's Glue
-jobs. It finds the task's folder and jobs by its ARN, so it works even if the DMS task was renamed.
-If a Glue job can't be deleted, the run ends at `GlueJobsNotDeleted` naming it: the migration is
-already cut over, so delete the job by hand or start the cutover again.
-**Then you** repoint your application to Aurora DSQL. Other tasks are unaffected.
+It stops the DMS task (up to ~1 h to reach `stopped`), waits until each table's last CDC file is
+applied (`DrainCheck`; up to ~12 h), stops this task's CDC run, drops the internal `_cdc_file`
+column, and deletes this task's five Glue jobs. It finds the task by its ARN, so a renamed task
+still cuts over its original folder and jobs. Other tasks are not affected.
+
+| Ends at | Meaning | What to do |
+|---|---|---|
+| `CutoverSucceeded` | done | point the application at Aurora DSQL |
+| `GlueJobsNotDeleted` | the data is cut over; only deleting a Glue job failed (named in the error, or the Lambda's error if the delete step itself failed; the five jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`) | delete it by hand: `aws glue delete-job --job-name <name>`. **Do not re-run the cutover** |
+| `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing has changed yet | fix the error shown in the execution, start the cutover again |
+| `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`) | DMS is stopped; a table's last file wasn't applied within ~12 h | fix the cause ([Troubleshooting → Cutover](#cutover)), then **finish by hand** (below) |
+| `CutoverFailed` at a step **after DMS was stopped** | DMS is stopped | the Cause says "see execution history"; open the failed state to find the step. Fix it, then **finish by hand** (below) |
+
+**Important: once DMS is stopped, do not start the cutover again.** Its first step stops the DMS
+task, which the DMS API rejects for a task that is already stopped, so a re-run just ends at
+`CutoverFailed` within a couple of minutes without doing anything
+([Known issues](#known-issues-temporary)). Finish the remaining steps by hand instead:
+
+```bash
+# 1. Confirm every table of this task is caught up:
+#      SELECT table_name, status FROM cdc_control.cdc_status;   -- none should be 'blocked'
+# 2. Stop this task's CDC run (if still running)
+RUN=$(aws glue get-job-runs --job-name "$PROJECT-$TASK_NAME-cdc" \
+  --query "JobRuns[?JobRunState=='RUNNING'].Id" --output text)
+[ -n "$RUN" ] && aws glue batch-stop-job-run --job-name "$PROJECT-$TASK_NAME-cdc" --job-run-ids "$RUN"
+# 3. In DSQL, for each of this task's tables (quote the names):
+#      ALTER TABLE "<schema>"."<table>" DROP COLUMN IF EXISTS "_cdc_file";
+# 4. Delete this task's five Glue jobs
+for r in discovery load load-big validate cdc; do
+  aws glue delete-job --job-name "$PROJECT-$TASK_NAME-$r"
+done
+```
+
+**After a successful cutover, these remain** (nothing deletes them): the stopped DMS task and its
+endpoints; `config/_task/$TASK_NAME/` and the `config/_task_index/` record; every CDC file and its
+`processed/` copy in the bucket; the `cdc_control` rows; and any separate multi-column-PK CDC job
+(cutover never stops it — stop it yourself). The same DMS task can't be migrated again
+([Clean-slate reload](#clean-slate-reload)). Delete what you no longer need once you are confident
+in the cutover.
 
 ---
 
-## Doing more than one task
+## Running many tasks with the fleet
 
-Steps 1–4 are done once. For each additional DMS task, repeat **Step 5** (pick the task, stage
-its table list, start) and later **Step 6**. Nothing else changes.
+If you have more than a handful of DMS tasks, don't run Step 5 by hand for each one. The **fleet
+launcher** starts the shared `startup` (or `cutover`) for a whole list of tasks from one trigger.
+It checks every task first, starts one per-task execution per task (5 at a time), confirms each got
+past its own input checks, and finishes in minutes. Each task's migration then runs on its own,
+exactly as if you had started it with `{"taskArn": "..."}`. Full details, including the result
+meanings, are in [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md).
 
-To start or cut over **many tasks from one list** with a single trigger, use the optional fleet
-launcher: [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md). It checks every task first and then
-starts the same per-task workflows.
+> The fleet on `main` is the reworked launcher. It has been exercised in a state-machine simulator
+> but **not yet run live on AWS**. Before using it for a large wave, run one small live fleet of a
+> task or two first.
 
-- Each task gets its own folder, its own Glue jobs and its own CDC run. One task failing or
-  cutting over never affects another.
-- **Each source table belongs to exactly one task.** All tasks share the same S3 target, and DMS
-  writes each table to its own `<schema>/<table>/` folder, so two tasks with the same table would
-  write into the same files.
-- **Stagger startups** (or raise your account's Glue concurrency limit): each load job can use up
-  to 10 G.4X workers, and several full loads at once can hit the limit.
-- **Reusing a deleted task's name:** the startup refuses to use a folder another task ARN created
-  (its old status files would make CDC skip tables this task never loaded). Archive the old folder
-  first — the error message gives the command.
+### Deploy the fleet (once)
 
----
+This adds an **eighth** Lambda (`$PROJECT-preflight-tasks`), three roles and two state machines
+(`$PROJECT-fleet-startup`, `$PROJECT-fleet-cutover`). `preflight_tasks.py` is already inside
+`fn.zip` from Step 2 (it reuses `resolve_task`). Needs the export block.
 
-## Running many tasks, and what happens if runs overlap
+```bash
+# 1. Fill the fleet IAM files (Step 1's loop already produced these *.filled.json too)
+for f in iam/preflight-tasks-role.policy.json iam/fleet-startup-role.policy.json iam/fleet-cutover-role.policy.json; do
+  sed -e "s|<<REGION>>|$REGION|g" -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" \
+      -e "s|<<BUCKET>>|$BUCKET|g" -e "s|<<PROJECT>>|$PROJECT|g" "$f" > "${f%.json}.filled.json"
+done
 
-Run as many tasks at once as you like: start one startup execution per DMS task. Each task has its
-own folder, its own five Glue jobs and its own CDC job. What the pipeline guarantees when runs
-overlap:
+# 2. preflight-tasks role + function (its trust file needs no fill)
+aws iam create-role --role-name "$PROJECT-preflight-tasks-role" \
+  --assume-role-policy-document file://iam/preflight-tasks-role.trust.json \
+  --query Role.RoleName --output text
+aws iam put-role-policy --role-name "$PROJECT-preflight-tasks-role" --policy-name preflight \
+  --policy-document file://iam/preflight-tasks-role.policy.filled.json
+sleep 10
+aws lambda create-function --function-name "$PROJECT-preflight-tasks" --runtime python3.12 \
+  --handler preflight_tasks.handler --zip-file fileb://fn.zip --timeout 300 --memory-size 256 \
+  --role "arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-preflight-tasks-role" \
+  --query FunctionName --output text
+aws lambda wait function-active-v2 --function-name "$PROJECT-preflight-tasks"
+
+# 3. The two fleet Step Functions roles (their trust files only need ACCOUNT_ID)
+sed -e "s|<<ACCOUNT_ID>>|$ACCOUNT_ID|g" iam/fleet-startup-role.trust.json > fleet-trust.filled.json
+for w in startup cutover; do
+  aws iam create-role --role-name "$PROJECT-fleet-$w-role" \
+    --assume-role-policy-document file://fleet-trust.filled.json --query Role.RoleName --output text
+  aws iam put-role-policy --role-name "$PROJECT-fleet-$w-role" --policy-name fleet \
+    --policy-document "file://iam/fleet-$w-role.policy.filled.json"
+done
+
+# 4. The two fleet state machines
+SM="arn:aws:states:$REGION:$ACCOUNT_ID:stateMachine"
+for w in startup cutover; do
+  sed -e "s|<<PROJECT>>|$PROJECT|g" \
+      -e "s|<<PREFLIGHT_TASKS_LAMBDA_ARN>>|arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT-preflight-tasks|g" \
+      -e "s|<<STARTUP_STATE_MACHINE_ARN>>|$SM:$PROJECT-startup|g" \
+      -e "s|<<CUTOVER_STATE_MACHINE_ARN>>|$SM:$PROJECT-cutover|g" \
+      "stepfunctions/fleet-$w.asl.json" > "fleet-$w.filled.asl.json"
+  grep "<<" "fleet-$w.filled.asl.json" || echo "no placeholders left in fleet-$w"
+  aws stepfunctions create-state-machine --name "$PROJECT-fleet-$w" \
+    --definition "file://fleet-$w.filled.asl.json" \
+    --role-arn "arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-fleet-$w-role"
+done
+```
+
+### Run the fleet
+
+1. Build the task list CSV — `task_arn` (required), `task_suffix` (optional), `adopt_existing_folder`
+   (optional, startup only). Example in
+   [`config/fleet_tasks.example.csv`](config/fleet_tasks.example.csv):
+
+   ```csv
+   task_arn,task_suffix,adopt_existing_folder
+   arn:aws:dms:us-east-1:123456789012:task:ABCDEF1234567890,,
+   arn:aws:dms:us-east-1:123456789012:task:GHIJKL0987654321,orders-cdc,
+   ```
+
+2. For a **startup** fleet, stage each task's `table_manifest.csv` first (Step 5b for every task).
+3. Upload the list and start the fleet:
+
+   ```bash
+   aws s3 cp fleet_tasks.csv "s3://$BUCKET/config/fleet_tasks.csv"
+   SM="arn:aws:states:$REGION:$ACCOUNT_ID:stateMachine"
+   aws stepfunctions start-execution --state-machine-arn "$SM:$PROJECT-fleet-startup" \
+     --input "{\"bucket\":\"$BUCKET\",\"inputPrefix\":\"config\"}"
+   ```
+
+   The fleet reads `config/pipeline.json` (the same file every task uses — it does not write it)
+   and `config/<inputPrefix>/fleet_tasks.csv`. `FleetStarted` means every task got past its input
+   checks, **not** that the migrations succeeded — watch each `$PROJECT-startup` /
+   `$PROJECT-cutover` execution. For a **cutover** fleet, do the whole
+   [Before you start checklist](#before-you-start--checklist) for every task in the list first.
+
+### Rules for many tasks
+
+- **Each source table belongs to exactly one task.** All tasks share the one S3 layout, so two
+  tasks with the same table would collide in the same folder.
+- **Reusing a deleted task's name:** the startup refuses a folder that another task ARN created
+  (its old status files would make CDC skip tables this task never loaded). The error gives the
+  `aws s3 mv` command to archive the old folder to `config/_archive/`.
+- **Tables with a multi-column primary key** are left alone by the main CDC job (it lists them at
+  startup). Run your own separate CDC job for them; it must write `cdc_control.cdc_file_status` the
+  same way the main job does — `table_name` = `<dsql_schema>.<dsql_table>`, `cdc_file` = the S3 key
+  of the change file (or ending with its file name), and `status='done'` (or
+  `all_rows_committed=true`). Cutover waits for the newest change file of each such table to be
+  marked done, and never stops or deletes that separate job.
+
+### Capacity and overlap
+
+Per-task Glue job sizes (each template allows 10 concurrent runs):
+
+| Job | Workers | | Job | Workers |
+|---|---|---|---|---|
+| discovery | 5 × G.2X | | validate | 10 × G.4X |
+| load | 10 × G.4X | | CDC | 1 DPU (Python shell) or 2 × G.1X (Spark) |
+| load-big | 20 × G.8X | | | |
+
+One startup fans out up to **6 groups at once**, so a single task can ask for up to 6 × 20 = **120
+G.8X workers** on its big groups. Check your Glue concurrent-run and DPU quotas before starting
+several full loads together. Each load run also opens up to `max_write_concurrency` (default 150)
+DSQL connections.
+
+What the pipeline guarantees when runs overlap:
 
 | Situation | What happens |
 |---|---|
-| Many tasks started together | They run independently. The first task to need the CDC drivers prepares them (about a minute); the others reuse that set or, if they start in the same moment, prepare an identical copy. Many CDC jobs creating the shared `cdc_control` tables at once retry automatically. |
-| A second startup for the same task while the first is still running | Stops at `ResolveFailed` before touching DMS or S3. The same applies to two cutover runs for one task. |
-| The same CDC job started twice (console **Run** plus the workflow, say) | Glue refuses the second run: the CDC jobs allow one run at a time. |
-| Two **different** CDC jobs applying the same table (an old per-task workflow next to the shared one, a hand-made copy, two DMS tasks that include the same table) | Each change is still applied once, in order: every step checks that the table's progress in `cdc_control.cdc_status` is where this run left it, and DSQL rejects the slower of two simultaneous steps. The run that loses that check leaves the table for that cycle and logs `another CDC run is applying this table`. This is wasted work, so find and stop the extra job. Cutover only stops this task's own CDC job. |
-| A table set to `blocked` while a run is applying it | The run stops that table at its next step. |
-| A table with a multi-column primary key | The CDC job leaves it alone and lists it at startup; run your separate multi-column-key CDC job for it. Cutover waits for it (see Troubleshooting). |
-| A load job started by hand while the workflow runs the same group | **Not guarded.** Tables with a primary key are safe (duplicate rows are rejected), but tables without one can get duplicate rows, which validation then reports. Don't start load jobs by hand during a run. |
-
-Limits to plan for: Glue's concurrent-run and DPU quotas, and DSQL's connection quota. Each load
-group opens up to `max_writers_per_loader` connections (100-150 by default), so ten tasks loading
-at the same time can open a few thousand.
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| Each `aws` command seems to **hang** until you press **Ctrl-C**, then the next one runs (e.g. only 1 Lambda created per loop) | the AWS CLI **pager** is paging the JSON output and waiting for you to quit it | run `export AWS_PAGER=""` (and/or add `--no-cli-pager`) before the loop, then re-run it — each command returns on its own. Any functions you already Ctrl-C'd were still created; the re-run reports them as already-exists and fills in the rest |
-| Spark job fails `DataNotFoundError: endpoints` | a `boto3`/`botocore` wheel leaked into `driver-fullload/` or `driver-validation/` | remove it — those folders hold the 5 pg8000 wheels ONLY (re-check Step 3b verify) |
-| Any Glue job fails `UnknownServiceError: Unknown service: 'dsql'` | Glue 4.0's bundled boto3 predates DSQL, and `driver-cdc/` is missing the modern boto3 set (the Spark jobs also get boto3 from there) | upload the boto3 set to `driver-cdc/` (Step 3b) and redeploy the Lambdas |
-| Glue job fails `InterfaceError: Can't create a connection to host ...dsql... port 5432` | the job isn't running inside your VPC (no Glue connection attached) | create the connection (Step 1b), put its exact name in `glue_connection` in `config/pipeline.json` (Step 3c), then start the task again. Check: `aws glue get-job --job-name <job> --query Job.Connections` |
-| Startup stops at `ResolveFailed` | the task or settings check failed before DMS was started | the execution's error says why: a DMS task setting (`StopTaskCachedChangesApplied`, `AddColumnName`, wrong bucket, task already past full load), a `pipeline.json` problem (missing file, missing key, leftover `<...>`), or the folder owner check (next row). Fix it and start again with the same input |
-| `ResolveFailed` with `FolderOwnerError` | `config/_task/<task name>/` was created by a different task ARN (a deleted task's name was reused), or holds files from an older run with no owner record | archive the folder (the error gives the `aws s3 mv` command) or pass a different `taskSuffix`; if the files are this task's own, start with `"adoptExistingFolder": true` |
-| Startup stops at `MissingTaskArn` | started without input | start with `--input '{"taskArn":"arn:aws:dms:..."}'` (Step 5c) |
-| Startup stops at `DriversFailed` (`DriverCheckError`) | a `driver-cdc/` wheel can't work in the Python-shell CDC job (needs Python 3.10, e.g. scramp 1.4.7+ or boto3/botocore 1.43+; urllib3 2.x; two versions of one package; a missing package; a `.zip`), or a driver folder has no pg8000 | the error names the wheel and what to use instead. Fix `driver-cdc/` (Step 3b) and start again with the same input; DMS was not started |
-| Startup ends at `CdcRunFailed` with `54000` and a schema-count message | the DSQL database already has 10 schemas, so the CDC job can't create `cdc_control` | drop unused schemas (test leftovers), or migrate into fewer schemas; DSQL's limit of 10 schemas per database can't be raised |
-| `ResolveFailed`: `Another startup run is already running for this DMS task` | a startup for this task is still running (or stuck) | wait for it, or stop it in the Step Functions console, then start again |
-| Cutover `DrainCheck` keeps listing a table with a multi-column primary key in `pending` | this CDC job doesn't apply those tables (its startup log lists them); the separate multi-column-key CDC job isn't running, or doesn't mark files `done` in `cdc_control.cdc_file_status` under the same `<schema>.<table>` name | start that job and let it catch up; the drain check then passes |
-| CDC log: `another CDC run is applying this table` | two different CDC jobs (or runs) are applying the same table | find the extra one: `aws glue get-job-runs` on each CDC job, or look for an old per-task workflow's job. Stop all but this task's own CDC job. No change was applied twice |
-| `DriversFailed` with `prepare_cdc_wheels.py is missing from this Lambda's zip` | the Lambdas were updated from an `fn.zip` built before this file was added to `lambdas/` | rebuild `fn.zip` from the current `lambdas/` folder and update the functions (Step 2) |
-| `DriverDiscoveryCdc` fails with `Task timed out` or out of memory | the driver-discovery Lambda still has the old 128 MB / 2 min settings (the first preparation unpacks botocore) | `aws lambda update-function-configuration --function-name $PROJECT-driver-discovery --memory-size 1024 --timeout 300`, then start again |
-| Startup log shows `CdcDriverFallback` and the run succeeds | the Python-shell CDC job's drivers failed, so the job was re-created as Spark (same name) | nothing to fix for the migration. Read the reason in `config/_task/<task name>/_cdc_engine.json`; fix `driver-cdc/` (Step 3b) and delete that file if you want Python shell for this task again |
-| Startup ends at `CdcFallbackFailed` | the CDC drivers failed and re-creating the job as Spark failed (often another run of the CDC job is active) | stop the other run (`aws glue batch-stop-job-run`), then switch the job with `tools/switch_cdc_engine.py` and start it with `--config_prefix` |
-| Cutover ends at `GlueJobsNotDeleted` | DMS is stopped, CDC is drained and stopped and the tracking column is dropped; only deleting a Glue job failed (the cause names it and the error, e.g. a missing `glue:DeleteJob` permission) | fix the cause, then delete the job by hand (`aws glue delete-job --job-name <name>`) or start the cutover again |
-| CDC log: `The DMS API is not reachable` or `CloudWatch is not reachable` | no VPC endpoint or NAT route to that service | nothing is lost: CDC keeps applying. Add a DMS endpoint if you want column renames detected (otherwise a renamed column is added as a new column) |
-| Startup ends at `CdcRunFailed` or `CdcRunEnded` | the CDC run failed or stopped right after starting (the error is Glue's own message) | full load is done and DMS is capturing changes. Read the CDC run's log, fix the cause, then start the CDC job with `--config_prefix` (USAGE_GUIDE → Monitoring) |
-| Startup ends at `CdcStartNotConfirmed` | the CDC run is still running but never wrote its start marker within 45 min | check the CDC log for `entering poll loop` and `start marker`. If the log shows the poll loop, the run is fine: check that the Step Functions role has the `ConfirmCdcStarted` statement (Step 1) and the Glue role can write to `config/_task/` |
-| CDC job fails `...whl installation failed ... CalledProcessError` after ~20 min, or its log shows `pypi.org` timeouts | the job was started with the raw `driver-cdc/` list (an older per-task workflow, or a hand-made start) | use the shared startup (it saves the prepared list on the job), or start the job without `--extra-py-files` so it uses the saved list |
-| `CreateGlueJobs` fails `not authorized to perform: iam:PassRole` | `<<GLUE_EXEC_ROLE_NAME>>` wasn't replaced in the Lambda policy | re-run the Step 1 fill-in command and `put-role-policy` for the Lambda role |
-| Discovery fails: `None of the N table(s) in this task has a DMS folder` | the table list names a schema or table DMS didn't write (often the source schema when the DMS mapping renames it), the DMS endpoint writes under a different BucketFolder, or DMS hasn't finished its full load | the error lists the folders that do exist: put those names in the table list (any case), then start the task again. For a task whose tables really are all empty, run discovery with `--allow_all_empty true` |
-| Discovery log: `no folder for table '<name>'` | that table had no rows at full load (normal), or its name in the table list is wrong | if the source table has rows, fix its name in the table list (Step 5b) and start the task again |
-| A driver job fails "no pg8000" | driver folder empty or wrong-platform wheels | re-run the platform-pinned `pip download` (Step 3b) and re-upload |
-| Load "SUCCEEDED" but 0 rows loaded | a stale per-group `_load_status.json` marks tables done | `aws s3 rm ${CONFIG_PREFIX}_orchestrator/ --recursive` (the group plan is rebuilt on the next run), then re-run |
-| Validation fails `CONTENT_DIFF` on a column | the stored values of that column differ from what DMS wrote (the report names the column, the check, and both values) | open `_validation_report.json` in the group's folder; compare a few rows of that column in Oracle and DSQL. Common causes: a DMS mapping or column-type mismatch, or a value rounded by a narrower DSQL type |
-| Validation fails `No full-load status file` | the group's `_load_status.json` is missing, so nothing proves the load ran | re-run the startup workflow (it reloads the group). Run validation by hand with `--require_full_load_done false` only to compare what's in DSQL now |
-| Validation log: `per-value hash check disabled` | the DSQL cluster rejected `md5()` | the other checks still run; nothing to do |
-| Load or CDC stops with `BINARY GUARD` | a binary (RAW/BLOB) column holds a value that isn't hexadecimal, which is how DMS writes binary data | check the DMS mapping for that column; the table stops rather than store wrong bytes |
-| Startup run ends in `GroupsFailed` (`GroupLoadOrValidateFailed`) | a table group's load or validation failed, so the run stopped before resuming DMS | open the `GroupFanOut` step in the execution to see which group failed, read that Glue job run's log, fix it, and start a new execution (finished files and tables are skipped) |
-| CDC job keeps logging `full load not done ... waiting` | the CDC job can't see the per-group status files, or a table's load really isn't done | make sure `s3://$BUCKET/scripts/glue_cdc_continuous.py` is the current version (it reads `_orchestrator/group-*/_load_status.json`), then check `aws s3 ls ${CONFIG_PREFIX}_orchestrator/ --recursive \| grep _load_status` |
-| `processed/_manifest.json` shows `pending_copy` that doesn't go down | S3 copies to `processed/` keep failing (throttling, permissions) | nothing is lost (originals are kept and retried each cycle); see `last_copy_error` in the manifest and the CDC log for `copy to processed/ failed` |
-| CDC runs but applies 0 rows | CDC looking in the wrong S3 folder | confirm the DMS S3 target matches where the CDC job reads (auto-derived; see USAGE_GUIDE) |
-| Text values such as `NA` or `NONE` are NULL in DSQL | rows loaded or changed by a version before the NULL-marker fix (which treated them as NULL) | deploy the current scripts (Step 3a), then reload the affected tables or correct the rows (USAGE_GUIDE §4b has the query to find them) |
-| A table shows `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into a NOT NULL column) | fix the cause (drop the column on the DSQL target / allow NULL or fix the source row), then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'`; CDC resumes the blocked file at its saved offset. Never delete the row: applied files stay in the folder and would all be replayed |
-| `drain-check` / `drop-tags` Lambda errors | missing `pg8000` on those two Lambdas | attach a pg8000 layer or bundle it into the zip (Step 2) |
-
-For deeper operation, monitoring queries, schema-change handling, and clean-slate reloads, see
-**[`USAGE_GUIDE.md`](USAGE_GUIDE.md)**. For architecture, known limitations, and the DDL
-support matrix, see **[`ENGINEERING_RECORD.md`](ENGINEERING_RECORD.md)**.
+| Many tasks started together | they run independently; the first to need the CDC drivers prepares them, the rest reuse that set; several CDC jobs creating the shared `cdc_control` tables at once retry automatically |
+| A second startup (or cutover) for the **same** task while one is running | stops at `ResolveFailed` before touching DMS or S3 (needs `states:ListExecutions`/`DescribeExecution` on the Lambda role, Step 1) |
+| The same CDC job started twice | Glue refuses the second run (one run at a time) |
+| Two **different** CDC jobs applying the same table | each change is still applied once, in order; the losing run logs `another CDC run is also applying`. Find and stop the extra job |
+| A load job started by hand during a run of the same group | **not guarded**; tables with a primary key are safe, keyless tables can get duplicate rows. Don't start load jobs by hand during a run |
 
 ---
 
-## Reference — what runs, and the runtime contract
+## If a run fails: how to continue
+
+**Where the run stopped decides what to do.** In the Step Functions console, the execution graph
+shows the failed step and its error. Startup first, then cutover.
+
+### Startup
+
+| Stopped at | What's already done | How to continue |
+|---|---|---|
+| `MissingTaskArn` | nothing | start with `--input '{"taskArn":"..."}'` (5c) |
+| `ResolveFailed`, `DriversFailed` | nothing; **DMS was not started** | fix the cause in the error, start again with the same input |
+| `GroupsFailed`, or `PipelineFailed` at `CreateGlueJobs` / `RunDiscovery` / `PlanSplit` / `GroupFanOut` | DMS full load is in S3; DMS is paused at `STOPPED_AFTER_CACHED_EVENTS` | fix the cause (the failed group's Glue log has it), start again with the same input — finished files and tables are skipped |
+| `DmsFailed` (error `DmsTaskFailed`) | DMS failed or a table errored during the full load | fix it in the DMS console (task → **Table statistics** and the task's CloudWatch log; reload the errored table). The startup can only start a task that hasn't finished its full load; see [Clean-slate reload](#clean-slate-reload) if DMS is already past it |
+| `DmsTimedOut` (error `DmsPollBudgetExceeded`) | DMS didn't reach `STOPPED_AFTER_CACHED_EVENTS` within 24 h | usually a DMS task that was already past its full load, or was stopped partway (see [Known issues](#known-issues-temporary)); or a genuinely long load. Check the DMS task; reload with a new DMS task if needed |
+| `PipelineFailed` at `ResumeDmsToCdc` | load done and validated; DMS probably still paused | check the DMS task. If it's still stopped, resume it: `aws dms start-replication-task --replication-task-arn "$TASK_ARN" --start-replication-task-type resume-processing`, then start the CDC job by hand (below) |
+| `CdcRunFailed`, `CdcRunEnded`, `CdcFallbackFailed`, or `PipelineFailed` at `StartCdcJob` / `GetCdcRun` / `CheckCdcStarted` | load done; **DMS is in CDC**, capturing changes to S3 | **don't start the startup again** — it would stop at `ResolveFailed` (the task is past its full load). First check whether a CDC run is already RUNNING (5d); if not, fix the cause in the CDC run's log and start the CDC job by hand (below). Nothing is lost while it's down: DMS keeps writing change files |
+| `CdcStartNotConfirmed` | the CDC run is running but didn't write its start marker in 45 min | check the CDC log (5d). If it shows `entering poll loop`, CDC is fine and the marker couldn't be written — see [Troubleshooting → CDC](#cdc) |
+
+**Start the CDC job by hand** (needs `TASK_NAME` and `CONFIG_PREFIX` from 5a). The job keeps its
+saved settings; pass `--config_prefix` as a run argument so cutover can find and stop the run:
+
+```bash
+aws glue start-job-run --job-name "$PROJECT-$TASK_NAME-cdc" \
+  --arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}" --query JobRunId --output text
+```
+
+Then check it as in 5d. **Don't use the console's Run button** for the CDC job: a console run has
+no `--config_prefix` run argument, so cutover would not find and stop it.
+
+### Cutover
+
+| Stopped at | What's already done | How to continue |
+|---|---|---|
+| `MissingTaskArn`, `ResolveFailed` | nothing | fix the input/cause, start the cutover again |
+| `CutoverFailed` **while DMS is still running** (at `StopCdcDmsTask`, before it stopped) | nothing changed | fix the error, start the cutover again |
+| `CdcDrainTimedOut` | DMS stopped; drain didn't finish in ~12 h; nothing stopped/dropped/deleted | fix the drain cause ([Troubleshooting → Cutover](#cutover)), let CDC catch up, then **finish by hand** (Step 6) — don't re-run |
+| `CutoverFailed` at `DrainCheck` / `StopCdcRun` / `DropTags` | **DMS is stopped** | fix the error (often missing pg8000 or VPC on the two DSQL Lambdas), then **finish by hand** (Step 6) — don't re-run |
+| `GlueJobsNotDeleted` | fully cut over; only a Glue job delete failed | `aws glue delete-job --job-name <name>` — don't re-run the cutover |
+
+---
+
+## Clean-slate reload
+
+To load a task again from scratch, everything from the earlier attempt must go **together** —
+otherwise leftover status makes the pipeline skip or replay work. There is no supported in-place
+reload; a reload needs a DMS task that hasn't finished its full load.
+
+1. Stop this task's CDC run and the DMS task (use the task's **recorded** name for the job stem if
+   it was renamed or started with a `taskSuffix` — see [5a](#5a--pick-the-task)):
+   ```bash
+   RUN=$(aws glue get-job-runs --job-name "$PROJECT-$TASK_NAME-cdc" \
+     --query "JobRuns[?JobRunState=='RUNNING'].Id" --output text)
+   [ -n "$RUN" ] && aws glue batch-stop-job-run --job-name "$PROJECT-$TASK_NAME-cdc" --job-run-ids "$RUN"
+   aws dms stop-replication-task --replication-task-arn "$TASK_ARN"
+   ```
+2. Delete each table's DMS folder, **including `processed/`**. If your DMS S3 target endpoint has
+   a `BucketFolder`, prefix it (the same `cdcRoot` the pipeline derives from the endpoint — an
+   empty value / `.` means none, so omit it):
+   `aws s3 rm "s3://$BUCKET/<bucketFolder>/<schema>/<table>/" --recursive`
+   (no BucketFolder: `aws s3 rm "s3://$BUCKET/<schema>/<table>/" --recursive`)
+3. Delete the task's run state: `aws s3 rm "${CONFIG_PREFIX}_orchestrator/" --recursive`
+4. In DSQL, drop and re-create the target tables, and delete their rows from **all six** control
+   tables: `cdc_status`, `cdc_file_status`, `cdc_chunk_log`, `cdc_apply_exceptions`,
+   `cdc_validation_failures`, `cdc_skipped_ops`. Only delete `cdc_control` rows **together with**
+   step 2 — applied change files stay in the folder and would otherwise all be replayed.
+5. **Start with a DMS task that hasn't run yet.** The startup refuses a task past its full load, so
+   create a new DMS task with the same settings and table mapping (a new name gives it a new
+   folder), and run it as in Step 5. If you reuse the old name, archive the old
+   `config/_task/<name>/` folder first (`aws s3 mv ... s3://$BUCKET/config/_archive/<name>-<date>/ --recursive`).
+
+> USAGE_GUIDE §8 describes the S3/DSQL purge but not the "new DMS task" requirement — follow this
+> section for the DMS part.
+
+---
+
+## Upgrading an existing deployment
+
+When you pull a newer version of this repo, redo the one-time steps in this order. Each is safe to
+re-run.
+
+1. **Step 1 part 1 and the `put-role-policy` commands** (policies gain new permissions over time).
+   Skip `create-role`; the roles already exist. If you deployed the fleet, re-put its policies too.
+2. **Step 2** (rebuild `fn.zip` with pg8000 and run the create-or-update loop). This updates every
+   function's code **and** resets memory/timeout to 1024 MB / 300 s. If the fleet is deployed, also
+   update it: `aws lambda update-function-code --function-name "$PROJECT-preflight-tasks" --zip-file fileb://fn.zip`
+   then `aws lambda wait function-updated --function-name "$PROJECT-preflight-tasks"`.
+3. **Step 3a**, including the checksum check. **The Glue scripts are a separate upload:** if you
+   update the Lambdas and state machines but not `scripts/`, the jobs keep running the old scripts.
+4. **Step 4** (updates both shared state machines; redeploy the fleet state machines the same way
+   with `update-state-machine` if deployed).
+5. **A CDC run that is already running keeps its old script.** Stop it, wait for `STOPPED`, and
+   start it by hand ([If a run fails](#if-a-run-fails-how-to-continue)) so it picks up the new script.
+
+Tasks still running on older **per-task** state machines (`$PROJECT-startup-<suffix>`) keep working
+with the new Lambdas, including their cutover. Leave them; use the shared pair for new tasks.
+
+---
+
+## Known issues (temporary)
+
+These are known bugs in the current code. Each has a safe workaround below; this list exists so it
+can be deleted row by row as the bugs are fixed.
+
+| # | Issue | Workaround until fixed |
+|---|---|---|
+| 1 | **Cutover can't be re-run once DMS is stopped.** The cutover's first step stops the DMS task; on a task that is already stopped the DMS API rejects it, so a re-run ends at `CutoverFailed` within ~2 min without finishing. | After any cutover failure that happened **after** DMS was stopped (`CdcDrainTimedOut`, `CutoverFailed` at a later step, or `GlueJobsNotDeleted`), **finish by hand** with the Step 6 block — don't start the cutover again. |
+| 2 | **A real DMS start failure makes the startup wait 24 h.** If DMS can't start (e.g. a task stopped partway through its full load, or an endpoint that fails its test), the startup polls for 24 h and ends at `DmsTimedOut`. | Don't start the pipeline on a DMS task that has already run partway. Use a task that has never run, or [clean-slate reload](#clean-slate-reload) with a new task. If you hit the 24 h wait, stop the execution, fix DMS, and start again. |
+| 3 | **CDC Glue runs stop after 7 days.** Every CDC job has a 7-day (10080-minute) Glue timeout — the Glue maximum. A long migration's CDC run ends on its own. | Watch the CDC run (5d). If it stops with no error after ~7 days, start it again by hand ([If a run fails](#if-a-run-fails-how-to-continue)); it resumes from where it left off. Cut over before 7 days where you can. |
+| 4 | **`config/pipeline.example.json` fails the placeholder check.** Its `description` line contains `<bucket>`, and any value with `<`/`>` is rejected, so a copied-as-is template makes every run fail at `ResolveFailed`. | Generate `pipeline.json` with the Step 3c script (it omits `description`). If you must hand-edit, delete the `description` key, or any value containing `<` or `>`. |
+| 5 | **A console "Run" of the CDC job is not stopped by cutover.** Cutover finds the CDC run by its `--config_prefix` **run** argument; a console run (or a `start-job-run` without that argument) has none, so cutover leaves it running. | Always start the CDC job with `--arguments "{\"--config_prefix\":\"$CONFIG_PREFIX\"}"` (the block in [If a run fails](#if-a-run-fails-how-to-continue)). Never use the console Run button for the CDC job. If one slips through, stop it with `aws glue batch-stop-job-run` after cutover. |
+
+> The **parameters CSV** ([planned change](#params-csv)) is not a bug — it is a not-yet-built
+> enhancement. Remove its note and wire up the one setup line once it ships.
+
+---
+
+## Troubleshooting
+
+Grouped by where the problem shows up. For the next step after a failed run, see
+[If a run fails](#if-a-run-fails-how-to-continue).
+
+### Setup
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| An `aws` command seems to hang until **Ctrl-C** (e.g. a loop creates only one Lambda) | the CLI pager is waiting for you | `export AWS_PAGER=""` and run it again; whatever you Ctrl-C'd was still created |
+| `create-function`: *The role defined for the function cannot be assumed by Lambda* | the role is seconds old | wait 10 s and re-run the Step 2 loop |
+| `CreateGlueJobs`: `not authorized to perform: iam:PassRole` | the Lambda policy still has `<<GLUE_EXEC_ROLE_NAME>>` | redo Step 1 part 1 and `put-role-policy` for the Lambda role |
+| A Glue job carries a literal `<<BUCKET>>` | templates uploaded unfilled **and** the Lambda substitution was bypassed | redo Step 3a; the Lambda also refuses any leftover `<<...>>` at run time |
+
+### Startup checks (`ResolveFailed`, `DriversFailed`)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `MissingTaskArn` | started without input | start with `--input '{"taskArn":"arn:aws:dms:..."}'` |
+| `ResolveFailed` (`SettingsError`) | a `pipeline.json` problem: missing file or required key, a value with leftover `<`/`>`, a non-ARN `glue_role_arn`, or a region that differs from the task ARN's region | the error names it; fix `pipeline.json` (Step 3c) and start again |
+| `ResolveFailed` (`TaskCheckError`) | a DMS task setting: not `full-load-and-cdc`, `StopTaskCachedChangesApplied` not true, `AddColumnName` false, wrong target bucket, or the task is past its full load | fix the DMS task/endpoint, then start again |
+| `ResolveFailed`: `Another startup run is already running for this DMS task` | a startup for this task is still running | wait for it or stop it, then start again |
+| `ResolveFailed` (`FolderOwnerError`) | `config/_task/<name>/` was created by a different task ARN, or holds files from an older run with no owner record, or you passed a `taskSuffix` that differs from the recorded one | archive the folder (the error gives the `aws s3 mv` command) or use the recorded suffix; if the files are this task's own pre-shared-workflow run, start with `"adoptExistingFolder": true`. Changed the DMS name after a failed first startup? delete `config/_task_index/<task id>.json` and the old `_task.json` |
+| `DriversFailed` (`DriverCheckError`) | a `driver-cdc/` wheel can't run on Python 3.9 (scramp 1.4.7+, boto3/botocore 1.43+, urllib3 2.x), two versions of one package, a missing package, or a Spark driver folder without pg8000 | the error names the wheel and what to use; fix the folder (Step 3b) and start again |
+| `DriversFailed`: `prepare_cdc_wheels.py is missing from this Lambda's zip` | `fn.zip` was built from an old `lambdas/` | rebuild and redeploy (Step 2) |
+| `DriverDiscoveryCdc`: `Task timed out`, or out of memory | the driver-discovery function still has 128 MB / a short timeout | re-run the Step 2 loop (it sets 1024 MB / 300 s) |
+
+### Full load and validation
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Discovery: `None of the N table(s) in this task has a DMS folder` | the table list names a schema/table DMS didn't write (often the source schema when the mapping renames it), a different BucketFolder, or DMS hasn't finished | the error lists the folders that exist; use those names (any case) in the table list and start again |
+| Discovery log: `no folder for table '<name>'` | the table had no rows at full load (normal), or the name is wrong | if the source table has rows, fix its name (5b) and start again |
+| Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
+| Any Glue job: `Unknown service: 'dsql'` | `driver-cdc/` lacks a current boto3 set (the Spark jobs take boto3 from it too) | upload it (Step 3b) and start again |
+| Glue job: `Can't create a connection to host ...dsql... port 5432`, or `Name or service not known` | the job isn't in your VPC | create the connection (Step 1b), set `glue_connection` (3c), start again. Check: `aws glue get-job --job-name <job> --query Job.Connections` |
+| `GroupsFailed` (`GroupLoadOrValidateFailed`) | a group's load or validation failed | open `GroupFanOut` in the execution, read the group's Glue log, fix, start again |
+| Load "succeeded" with 0 rows | a stale `_load_status.json` marks tables done | **only if the startup stopped before `ResumeDmsToCdc` and no CDC run is running:** archive the state with `aws s3 mv "${CONFIG_PREFIX}_orchestrator/" "s3://$BUCKET/config/_archive/$TASK_NAME-$(date +%Y%m%d%H%M)/" --recursive`, then start again. (If CDC is already running, this would stall it — [clean-slate reload](#clean-slate-reload) instead.) |
+| Validation `CONTENT_DIFF` on a column | stored values differ from what DMS wrote (the report names the column, the check and both values) | read the group's `_validation_report.json`; compare a few rows in Oracle and DSQL. Usual causes: a mapping/type mismatch, or rounding by a narrower DSQL type |
+| Validation: `No full-load status file` | the group's `_load_status.json` is missing | start the startup again (it reloads the group) |
+| Validation log: `per-value hash check disabled` | the cluster rejected `md5()` | nothing to do; the other checks still run |
+| Load or CDC stops with `BINARY GUARD` | a binary (RAW/BLOB) column holds a value that isn't hex, which is how DMS writes binary | check the DMS mapping for that column |
+| `NA`/`NONE` text shows as NULL in DSQL | rows loaded by a version before the NULL-marker fix | deploy the current scripts (3a) and reload or correct the rows |
+
+### CDC
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `CdcRunFailed` / `CdcRunEnded` | the CDC run failed or stopped right after starting (the error is Glue's) | read the CDC run's log, fix, start the CDC job by hand |
+| The run ends with no error after ~7 days | the 7-day Glue timeout ([Known issues](#known-issues-temporary) #3) | start the CDC job by hand; it resumes |
+| Execution shows `CdcDriverFallback` and then succeeds | the Python-shell drivers failed; the job is now Spark | nothing to fix. The reason is in `${CONFIG_PREFIX}_cdc_engine.json`; fix `driver-cdc/` and delete that file to go back to Python shell for this task |
+| `CdcFallbackFailed` | re-creating the CDC job as Spark failed (often another run of it is active) | stop the other run (`aws glue batch-stop-job-run`), switch it with `python3 tools/switch_cdc_engine.py --job "$PROJECT-$TASK_NAME-cdc" --region "$REGION" --bucket "$BUCKET" --to spark --yes` (omit `--yes` for a dry run), then start the CDC job by hand |
+| `CdcStartNotConfirmed`, but the log shows `entering poll loop` | the CDC job can't write its start marker, or the workflow can't see it | check the Glue role can write `config/_task/<task>/_cdc_started/`. If instead the run ended at `PipelineFailed` at `CheckCdcStarted`, the Step Functions role is missing the `ConfirmCdcStarted` statement — redo Step 1 |
+| CDC fails `...whl installation failed ... CalledProcessError` after ~20 min, or logs `pypi.org` timeouts | the run was started with the raw `driver-cdc/` list (an old per-task workflow, or a hand start with `--extra-py-files`) | start it without `--extra-py-files`, so it uses the prepared list saved on the job |
+| CDC keeps logging `full load not done ... waiting` | the CDC script in S3 is old, or a table's load isn't done | re-check Step 3a's checksums, then `aws s3 ls "${CONFIG_PREFIX}_orchestrator/" --recursive | grep _load_status` |
+| A table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` — CDC resumes where it stopped. **Never delete the row**: applied files stay in the folder and would all be replayed |
+| CDC log: `another CDC run is also applying` | two different CDC jobs apply the same table | find and stop the extra one; no change was applied twice |
+| CDC log: `The DMS API is not reachable` or `CloudWatch is not reachable` | no VPC endpoint or NAT for that service | nothing is lost. Add a DMS endpoint if you want column renames detected (otherwise a renamed column is added as a new one) |
+| `processed/_manifest.json` `pending_copy` doesn't drop | copies to `processed/` keep failing (throttling, permissions) | nothing is lost (originals are kept and retried); see `last_copy_error` in the manifest |
+| DSQL rejects a `CREATE SCHEMA` with a schema-limit error when CDC starts | the database already has 10 schemas; `cdc_control` can't be created | drop unused schemas (DSQL allows 10 per database, not adjustable; keep ≤ 9 of your own), then start the CDC job by hand |
+
+### Cutover
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `CutoverFailed` at `StopCdcDmsTask`, DMS already stopped | you re-ran a cutover after DMS was stopped ([Known issues](#known-issues-temporary) #1) | don't re-run; finish by hand (Step 6) |
+| `CdcDrainTimedOut` for a multi-column-key table (named in `DrainCheck`'s output) | the separate CDC job for those tables isn't running or doesn't mark files `done` under the same `<schema>.<table>` | run it until it catches up, then finish by hand (Step 6) |
+| `CdcDrainTimedOut` for a normal table | that table is `blocked`, or the CDC run stopped | check `cdc_control.cdc_status` and the CDC log; fix, start the CDC job by hand, let it catch up, finish by hand (Step 6) |
+| `CutoverFailed` at `DrainCheck`: `No module named 'pg8000'` | `fn.zip` was built without pg8000 | rebuild and redeploy (Step 2), then finish by hand (Step 6) |
+| `CutoverFailed` at `DrainCheck`: timed out connecting to DSQL | the two DSQL Lambdas aren't in your VPC | Step 2 part 3, then finish by hand (Step 6) |
+| `GlueJobsNotDeleted` | deleting a Glue job failed (named in the error, e.g. missing `glue:DeleteJob`), or the delete step's Lambda errored | fix it, then `aws glue delete-job --job-name <name>` for each of the five jobs still present |
+| A console-started CDC run keeps going after cutover | the run had no `--config_prefix` ([Known issues](#known-issues-temporary) #5) | `aws glue batch-stop-job-run --job-name "$PROJECT-$TASK_NAME-cdc" --job-run-ids <id>` |
+
+More: [`USAGE_GUIDE.md`](USAGE_GUIDE.md) (monitoring, manual runs) and
+[`ENGINEERING_RECORD.md`](ENGINEERING_RECORD.md) (architecture, limitations, DDL matrix).
+
+---
+
+## Reference
 
 <details>
-<summary>Blanks in the repo files, and where each value comes from (click to expand)</summary>
+<summary>Blanks in the repo files, and where each value comes from</summary>
 
-**Filled once, by you:**
+**Filled by you, once:**
 
-| Blank | Where | Meaning | Example |
+| Blank | In | Meaning | Example |
 |---|---|---|---|
-| `<<BUCKET>>` | state machines, job templates, IAM policies | your pipeline bucket (no `s3://`, no slash) | `my-migration-bucket` |
-| `<<*_LAMBDA_ARN>>` | state machines | the 7 Lambda ARNs (Step 2), built in Step 4a | `arn:aws:lambda:…:function:dms-dsql-resolve-task` |
-| `<<ACCOUNT_ID>>` / `<<REGION>>` / `<<PROJECT>>` | IAM policies (Step 1) | account, region, name prefix | `123456789012` / `us-east-1` / `dms-dsql` |
+| `<<BUCKET>>` | state machines, job templates, IAM policies | your pipeline bucket | `my-migration-bucket` |
+| `<<*_LAMBDA_ARN>>` | state machines | the 7 Lambda ARNs (Step 4) | `arn:aws:lambda:…:function:dms-dsql-resolve-task` |
+| `<<ACCOUNT_ID>>`, `<<REGION>>`, `<<PROJECT>>` | IAM policies (Step 1) | account, region, name prefix | `123456789012`, `us-east-1`, `dms-dsql` |
 | `<<DSQL_CLUSTER_ID>>` | IAM policies (Step 1) | first label of the DSQL endpoint | `abcd` |
-| `<<GLUE_EXEC_ROLE_NAME>>` | Lambda IAM policy (`iam:PassRole`) | Glue role name | `dms-dsql-glue-exec-role` |
+| `<<GLUE_EXEC_ROLE_NAME>>` | Lambda policy (`iam:PassRole`) | Glue role name | `dms-dsql-glue-exec-role` |
+| `<<PREFLIGHT_TASKS_LAMBDA_ARN>>`, `<<STARTUP/CUTOVER_STATE_MACHINE_ARN>>` | fleet state machines (fleet deploy) | the preflight Lambda and the two shared state machine ARNs | — |
 
-**Read from `config/pipeline.json` at runtime (Step 3c):** `project`, `region`, `dsql_endpoint`,
-`dsql_user`, `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
-`control_schema`. Per task, `config/_task/<task name>/_cdc_engine.json` (written by an automatic
-switch to Spark) overrides `cdc_engine` for that task.
+**Read from `config/pipeline.json` at run time:** `project`, `region`, `dsql_endpoint`,
+`dsql_user`, `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`,
+`cdc_spark_fallback`, `control_schema`. Per task, `config/_task/<task name>/_cdc_engine.json`
+(written by an automatic switch to Spark) overrides `cdc_engine`.
 
-**Worked out per task at runtime, from the start input `{"taskArn": "..."}`:**
+**Worked out per task, from `{"taskArn": "..."}`:**
 
 | Value | From | Example |
 |---|---|---|
-| task name / suffix | the DMS task's name (or the input's `taskSuffix`; after the first startup, the name recorded for the task's ARN) | `task-orders-02` |
-| config folder | `s3://<bucket>/config/_task/<task name>/` | `s3://my-migration-bucket/config/_task/task-orders-02/` |
+| task name | the DMS task's name, or `taskSuffix`; after the first startup, the name recorded for the ARN in `config/_task_index/<task id>.json` | `task-orders-02` |
+| config folder | `s3://<bucket>/config/_task/<task name>/` | `.../config/_task/task-orders-02/` |
 | Glue job names | `<project>-<task name>-{discovery,load,load-big,validate,cdc}` | `dms-dsql-task-orders-02-cdc` |
-| folder owner record | `config/_task/<task name>/_task.json` (task ARN that owns the folder) | written at first startup |
-| name-by-ARN record | `config/_task_index/<task id>.json` (keeps a renamed task on its original folder) | written at first startup |
-| S3 layout | the DMS task's S3 target endpoint (`BucketFolder`, `TimestampColumnName`, …) | `cdcRoot` = `.` when there is no BucketFolder |
+| folder owner record | `config/_task/<task name>/_task.json` | written at first startup (before DMS starts) |
+| S3 layout | the DMS S3 endpoint (`BucketFolder`, `TimestampColumnName`, `CsvNullValue`, …) | `cdcRoot` = `.` with no BucketFolder |
 
 </details>
 
 <details>
-<summary>What the state machines run (click to expand)</summary>
+<summary>What each state machine step runs</summary>
 
-**Lambdas** (invoked by the ARNs you filled in at Step 4a):
-
-| SM step | Lambda (handler) | Does |
+| Step | Runs | Does |
 |---|---|---|
-| `ResolveTask` / `CutoverResolveTask` | `resolve_task.handler` | reads `config/pipeline.json` and the DMS task → task name, folder, job names, S3 settings from the endpoint; startup also checks the task before DMS starts and records the folder owner. (Without a `mode` it behaves as before, for older per-task state machines.) |
-| `DriverDiscovery` (×3) | `driver_discovery.handler` | lists each `driver-*/*.whl` → per-job wheel lists (fails if no pg8000; only `driver-cdc/` includes boto3/botocore). Runs before DMS starts. For a Python-shell CDC job it also checks `driver-cdc/` for Python 3.9 and returns prepared copies from `driver-cdc-prepared/<fingerprint>/` (uses `prepare_cdc_wheels.py`, bundled in the same zip) |
-| `GetCdcRun` / `CheckCdcStarted` | (Glue and S3 directly) | after `StartCdcJob`: wait until the CDC run writes `_cdc_started/<execution name>.json`; fail on a failed or stopped run |
-| `CreateGlueJobs` | `create_glue_jobs.handler` | reads `glue-templates/<role>.json` (CDC: `cdc.json` or `cdc-spark.json` per `cdc_engine`), creates `<project>-<task name>-<role>` Glue jobs in your Glue connection |
-| `PlanSplit` | `plan_split.handler` | reads `_manifest_index.json` → per-group manifests |
-| (cutover) `DrainCheck` | `drain_check.handler` | waits until the latest CDC file is applied (needs pg8000) |
-| (cutover) `StopCdcRun` | `stop_cdc_run.handler` | stops this task's CDC Glue run |
-| (cutover) `DropTags` | `drop_tags.handler` | drops the `_cdc_file` column on this task's tables (needs pg8000) |
+| `ResolveTask` / `CutoverResolveTask` | `resolve-task` | reads `pipeline.json` and the DMS task; startup also checks the task and records the folder owner |
+| `DriverDiscoveryFullload` / `…Validation` / `…Cdc` | `driver-discovery` | checks each `driver-*` folder; for a Python-shell CDC job, prepares `driver-cdc/` into `driver-cdc-prepared/<fingerprint>/`. Runs before DMS starts |
+| `StartDmsTask` → `IsDmsDone` | DMS API | start DMS, poll (30 s × 2880 ≈ 24 h) until `STOPPED_AFTER_CACHED_EVENTS` |
+| `CreateGlueJobs` | `create-glue-jobs` | create `<project>-<task>-<role>` jobs from `glue-templates/` in your Glue connection |
+| `RunDiscovery` | Glue job 1 | writes `_manifest_index.json` |
+| `PlanSplit` | `plan-split` | writes per-group manifests under `_orchestrator/group-<n>/` |
+| `GroupFanOut` | Glue jobs 2 and 3 | load then validate each group (up to 6 groups at once) |
+| `ResumeDmsToCdc`, `StartCdcJob` | DMS API, Glue | resume DMS into CDC; start the CDC job (with `--config_prefix` as a run argument) |
+| `GetCdcRun` / `CheckCdcStarted` | Glue, S3 | wait up to 45 min for the CDC run's start marker |
+| `CdcDriverFallback` → `UseSparkCdcJob` | `create-glue-jobs` | on a driver failure, re-create the CDC job as Spark (once) |
+| cutover `StopCdcDmsTask` → `IsCdcTaskStopped` | DMS API | stop the DMS task (poll 15 s × 240 ≈ 1 h) |
+| cutover `DrainCheck` | `drain-check` | wait (10 s × 4320 ≈ 12 h) until each table's latest CDC file is applied |
+| cutover `StopCdcRun` | `stop-cdc-run` | stop this task's CDC run (found by `--config_prefix`) |
+| cutover `DropTags` | `drop-tags` | drop the `_cdc_file` column |
+| cutover `DeleteGlueJobs` → `AllGlueJobsDeleted` | `create-glue-jobs` | delete this task's five Glue jobs; any failure → `GlueJobsNotDeleted` |
 
-**Glue jobs** are created at runtime named `<project>-<task name>-{discovery,load,load-big,validate,cdc}`
-and deleted at cutover — they never accumulate.
+**CDC correctness:** a table with a real primary key (or a declared `logical_key`) gets correct
+inserts, updates and deletes. A table without one gets inserts and deletes; updates are skipped and
+logged to `cdc_control.cdc_skipped_ops`. Multi-column-PK tables are skipped by the main CDC job and
+need a separate job ([Running many tasks](#running-many-tasks-with-the-fleet)).
 
-**CDC correctness:** Tier-1 (real PK or a declared `logical_key`) = correct insert/update/delete;
-Tier-2 (keyless) = insert + delete applied, update skipped and logged to `cdc_control.cdc_skipped_ops`.
+**Control tables (in `control_schema`, default `cdc_control`):** `cdc_status`, `cdc_file_status`,
+`cdc_chunk_log`, `cdc_apply_exceptions`, `cdc_validation_failures`, `cdc_skipped_ops`.
+
+</details>
+
+<details>
+<summary>Fail states, by state machine</summary>
+
+**Startup:** `MissingTaskArn`, `ResolveFailed`, `DriversFailed` (before DMS starts) · `DmsFailed`
+(error `DmsTaskFailed`), `DmsTimedOut` (error `DmsPollBudgetExceeded`), `GroupsFailed`,
+`PipelineFailed` (before DMS resumes) · `CdcRunFailed`, `CdcRunEnded`, `CdcStartNotConfirmed`,
+`CdcFallbackFailed`, `PipelineFailed` (after DMS is in CDC).
+
+**Cutover:** `MissingTaskArn`, `ResolveFailed` (nothing touched) · `CutoverFailed` (DMS may be
+stopped — check the failed step), `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`),
+`GlueJobsNotDeleted` (fully cut over bar one job delete).
+
+See [If a run fails](#if-a-run-fails-how-to-continue) for the recovery keyed to each state.
 
 </details>

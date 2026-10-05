@@ -5,7 +5,9 @@ validation + CDC, handling schema changes (DDL), cutover, monitoring, and troubl
 
 Companion docs: `RUNBOOK.md` (one-time deploy of IAM/lambdas/state machines/scripts) and
 `ENGINEERING_RECORD.md` (architecture, fixes, DDL limitations). **Read the DDL limitations in
-the Engineering Record before relying on schema-change replication.**
+the Engineering Record before relying on schema-change replication.** This guide describes the
+code **as it is today, including bugs that aren't fixed yet** — those are called out inline and
+collected in `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary).
 
 ---
 
@@ -25,7 +27,11 @@ the Engineering Record before relying on schema-change replication.**
 
 ## 1. Prerequisites (per task)
 
-1. **One-time deploy done** (per `RUNBOOK.md`): IAM roles, 7 lambdas, scripts staged to
+1. **One-time deploy done** (per `RUNBOOK.md`): IAM roles, the Lambda functions
+   ([RUNBOOK Step 2](RUNBOOK.md#step-2--create-the-lambda-functions) — **seven** core functions,
+   plus the **eighth** `preflight-tasks` if you use the fleet; `lambdas/` holds **nine** `.py`
+   files because `prepare_cdc_wheels.py` ships inside the driver-discovery zip rather than as its
+   own function), scripts staged to
    `s3://<bucket>/scripts/`, glue-templates staged, and the **three driver folders** populated:
    - `driver-fullload/`, `driver-validation/` — DSQL driver wheels only (pg8000, scramp,
      asn1crypto, python-dateutil, six).
@@ -81,14 +87,20 @@ aws stepfunctions start-execution \
   --input '{"taskArn":"arn:aws:dms:<region>:<account>:task:<id>"}'
 ```
 
-It performs, in order:
+It performs, in order (matching the `startup` state machine; see
+`RUNBOOK.md` → [Step 5c](RUNBOOK.md#5c--start-it) for the per-step detail):
 1. **ResolveTask** → reads `config/pipeline.json`; derives the task's folder and job names from its
    name; derives `cdcRoot`, `timestampColumnName`, S3 settings from the endpoint; checks the DMS task
-   before starting it (fails at `ResolveFailed` if `StopTaskCachedChangesApplied` isn't true,
+   **before starting it** (fails at `ResolveFailed` if `StopTaskCachedChangesApplied` isn't true,
    `AddColumnName` isn't true, the endpoint writes to another bucket, the task is already past its
-   full load, `DatePartitionEnabled=true` or `CdcPath` set).
-2. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS`.
-3. **DriverDiscovery** ×3 (fullload / validation / cdc folders).
+   full load, `DatePartitionEnabled=true` or `CdcPath` set, or another startup for this task is
+   already running).
+2. **DriverDiscovery** ×3 (fullload / validation / cdc folders) → runs **before DMS starts**, so a
+   wrong or missing wheel fails in seconds at `DriversFailed` with **no DMS cost**. For a
+   Python-shell CDC job this step also prepares `driver-cdc-prepared/`. With `cdc_spark_fallback`
+   on, a problem that only affects Python shell (e.g. a wheel built for 3.10) builds this task's
+   CDC job as Spark instead of stopping.
+3. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS` (polled up to ~24 h).
 4. **CreateGlueJobs** → creates this task's 5 Glue jobs (discovery/load/load-big/validate/cdc).
 5. **RunDiscovery** (Job1) → writes `_manifest_index.json` + per-table column mappings.
 6. **PlanSplit** + **GroupFanOut** → runs **Job2 load** then **Job3 validate** per group.
@@ -168,6 +180,14 @@ ARN=<dms-task-arn>
 
 > The CDC job is a **continuous poller** — it stays RUNNING and applies new files each cycle.
 > Stop it with `aws glue batch-stop-job-run` when cutting over or pausing.
+>
+> **7-day limit (known issue).** The CDC Glue run has a hard **7-day (10080-minute)** timeout —
+> the Glue maximum, set on both `cdc.json` and `cdc-spark.json`. Nothing restarts it
+> automatically. A migration that stays in CDC for more than a week will have its CDC run end on
+> its own (DMS keeps writing change files, so nothing is lost); start the CDC job again by hand to
+> resume. Cut over within 7 days where you can. See
+> `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) #3 and
+> [If a run fails](RUNBOOK.md#if-a-run-fails-how-to-continue).
 
 ---
 
@@ -180,7 +200,7 @@ next data row after the DDL. Sequence any change as **DML → DDL → DML**.
 |---|---|---|
 | `ADD COLUMN` (single or many) | Auto-added to target | none |
 | `RENAME COLUMN` (single, multiple, or combined with ADD) | Auto-renamed on target (positional detection) | none |
-| `DROP COLUMN` | **Table BLOCKS** | remediate: `ALTER TABLE <target> DROP COLUMN <col>`, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'` (CDC resumes the blocked file at its saved offset; never delete the row) |
+| `DROP COLUMN` | **Blocks the table when a change row later omits a column that still exists on the target** (the missing-column guard can't tell a genuine DROP from a column accidentally omitted from a change row, which would silently NULL data, so it stops) | remediate: `ALTER TABLE <target> DROP COLUMN <col>`, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'` (CDC resumes the blocked file at its saved offset; never delete the row) |
 | `CHANGE DATA TYPE` | **Silent — value may be truncated/coerced to the old target type; no error** | avoid, or manually `ALTER` the target column type + re-apply affected rows |
 
 - To force a rename deterministically (instead of relying on positional detection), add to the
@@ -248,9 +268,8 @@ both values. To switch the content check off for a deployment, add `"--checksum_
 **Binary columns (Oracle RAW, LONG RAW, BLOB → DSQL `bytea`).** DMS writes them to the CSV as
 hexadecimal; the load and CDC store the real bytes. A value that isn't hexadecimal stops the
 table (`BINARY GUARD`) instead of storing wrong bytes. RAW columns mapped to `uuid` (as in most
-of these schemas) are unaffected.
-(`match` / `mismatch` / `skipped` per table; `skipped` = no single-column rangeable integer PK,
-which is by-design — the count is still checked by Job2's `_load_status.json`).
+of these schemas) are unaffected. _(Note: the `bytea`/BINARY GUARD path has been proven in
+simulation only — see `CDC_EDGE_CASE_RESULTS.md` §2.7.)_
 
 **Processed files and the per-table manifest:** after a CDC file is fully applied, the CDC job
 **copies** it to `<schema>/<table>/processed/` (with retries, verified by size). The original is
@@ -288,15 +307,34 @@ missing row would replay all of them from the start.
 
 ## 6. Cutover
 
+**Before you start — stop writes to the source first.** Cutover's **first** action is to stop the
+DMS task, so any change written to the source **after** that is never captured — silent data loss.
+Put the application into maintenance mode (or make the source read-only), let DMS deliver the last
+changes (CDCLatencySource/Target near zero, and wait past any `CdcMaxBatchInterval`), confirm no
+table is `blocked` and that the CDC run is RUNNING, and only then cut over. The full pre-cutover
+checklist is in `RUNBOOK.md` →
+[Step 6 → Before you start](RUNBOOK.md#before-you-start--checklist); do it for every table of every
+task in a fleet cutover.
+
 When CDC has caught up (all tables `idle`, source≈target), start the **cutover state machine**
-with the task's ARN (`{"taskArn": "..."}`, RUNBOOK Step 6). It:
+with the task's ARN (`{"taskArn": "..."}`, [RUNBOOK Step 6](RUNBOOK.md#step-6--cut-over)). It:
 1. Stops the DMS task.
 2. **Drain-checks** each table (latest CDC file applied) until quiesced.
 3. Stops this task's CDC run, drops the `_cdc_file` tracking column, and deletes the task's Glue
    jobs. If a job can't be deleted it ends at `GlueJobsNotDeleted`, naming it (the data is already
-   cut over; delete the job by hand or start the cutover again).
+   cut over; delete the job by hand — **do not re-run the cutover**).
 
-Then repoint the application to DSQL. For many tasks at once, see `docs/FLEET_LAUNCHER.md`.
+**You cannot re-run the cutover once DMS has been stopped (known issue).** Its first step stops
+the DMS task, which the DMS API rejects for an already-stopped task, so a second run just fails at
+`CutoverFailed` within ~2 minutes without finishing. If a cutover fails **after** DMS was stopped
+(`CdcDrainTimedOut`, a later `CutoverFailed`, or `GlueJobsNotDeleted`), **finish the remaining
+steps by hand** using the block in [RUNBOOK Step 6](RUNBOOK.md#step-6--cut-over) and
+[If a run fails → Cutover](RUNBOOK.md#if-a-run-fails-how-to-continue). See also
+`RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) #1.
+
+Then repoint the application to DSQL. For many tasks at once, see
+[`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) and
+`RUNBOOK.md` → [Running many tasks with the fleet](RUNBOOK.md#running-many-tasks-with-the-fleet).
 
 ---
 
@@ -325,8 +363,16 @@ Then repoint the application to DSQL. For many tasks at once, see `docs/FLEET_LA
 
 ## 8. Clean-slate checklist (for a fresh full reload)
 
-Stop the task's CDC run first. Then purge **all** of these together, or you will get
-stale-state artifacts (see Engineering Record §3). In particular, never delete a table's
+> **A reload needs a DMS task that has not finished its full load.** The shared startup
+> **refuses** a task that is already past its full load (`ResolveFailed` / `past_full_load`), so
+> you **cannot** reload by re-running Section 2 against the same, already-run DMS task. There is no
+> supported in-place reload. After purging the state below, you must **create a new DMS task** (or
+> otherwise reset one so it hasn't completed its full load) and run that. The full, ordered
+> procedure — including the new-task step and archiving a reused folder name — is in
+> `RUNBOOK.md` → [Clean-slate reload](RUNBOOK.md#clean-slate-reload); use it for the DMS part.
+
+Stop the task's CDC run (and the DMS task) first. Then purge **all** of these together, or you will
+get stale-state artifacts (see Engineering Record §3). In particular, never delete a table's
 `cdc_control` rows without also purging its S3 prefix: applied CDC files stay in the table
 folder, so CDC would apply every one of them again on top of the fresh load.
 ```bash
@@ -334,10 +380,13 @@ folder, so CDC would apply every one of them again on top of the fresh load.
 aws s3 rm s3://<bucket>/<schema>/<table>/ --recursive     # per table
 # 2) config status files
 aws s3 rm s3://<bucket>/config/_task/<task name>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
-# 3) DSQL: drop+recreate target tables, and clear control rows
-DELETE FROM cdc_control.cdc_status        WHERE table_name='<schema.table>';
-DELETE FROM cdc_control.cdc_file_status   WHERE table_name='<schema.table>';
-DELETE FROM cdc_control.cdc_chunk_log     WHERE table_name='<schema.table>';
-DELETE FROM cdc_control.cdc_apply_exceptions WHERE table_name='<schema.table>';
+# 3) DSQL: drop+recreate target tables, and clear control rows (ALL SIX control tables)
+DELETE FROM cdc_control.cdc_status             WHERE table_name='<schema.table>';
+DELETE FROM cdc_control.cdc_file_status        WHERE table_name='<schema.table>';
+DELETE FROM cdc_control.cdc_chunk_log          WHERE table_name='<schema.table>';
+DELETE FROM cdc_control.cdc_apply_exceptions   WHERE table_name='<schema.table>';
+DELETE FROM cdc_control.cdc_validation_failures WHERE table_name='<schema.table>';
+DELETE FROM cdc_control.cdc_skipped_ops        WHERE table_name='<schema.table>';
 ```
-Then run the pipeline from Section 2 or 3.
+Then start a **new (not-yet-run) DMS task** and run the pipeline from Section 2 (or Section 3 for a
+single-step manual run). Re-running Section 2 on the old task will stop at `ResolveFailed`.

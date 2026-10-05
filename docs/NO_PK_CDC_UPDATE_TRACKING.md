@@ -256,9 +256,9 @@ Implemented in `glue_cdc_continuous_v4.py` (AST+pyflakes clean, exit 0). FINAL o
 **Code added:**
 - `collapse_net_ops_nonpk` — keyless collapse: I→INSERT netop, D→DELETE netop (full image), U→skipped list. No key folding.
 - `apply_file_nonpk` — Tier-2 apply; SAME return shape as apply_file (total_applied, file_watermark, chunks_committed=1) so process_table handling is identical.
-- `_ensure_nonpk_tag_columns` — idempotent ALTER ADD `_cdc_file`/`_dms_ts` on the target (target-only; excluded from content match + from the missing-column guard).
+- `_ensure_nonpk_tag_columns` — idempotent ALTER ADD `_cdc_file` on the target (target-only; excluded from content match + from the missing-column guard). (`_dms_ts` was dropped before this shipped — see the bullets above — so it is not added.)
 - `cdc_control.cdc_skipped_ops` table (repurposed from the earlier cdc_nonpk_duplicates); `insert_skipped_op_cur`; `emit_skipped_update_metric`.
-- Constants `NONPK_FILE_TAG_COLUMN='_cdc_file'`, `NONPK_DMS_TS_COLUMN='_dms_ts'`.
+- Constant `NONPK_FILE_TAG_COLUMN='_cdc_file'`. (No `NONPK_DMS_TS_COLUMN` is defined — the `_dms_ts` column was dropped, so only the `_cdc_file` tag constant ships.)
 - Router: process_table branches `_apply_fn = apply_file if ctx["apply_key"] is not None else apply_file_nonpk`. collapse_net_ops keyed path now has a defensive INTERNAL guard if ever called keyless (routing invariant).
 
 **Superseded:** the earlier "accept-duplicates + cdc_nonpk_duplicates audit + no CSV writer" plan and the Tier-3 fail-closed/two-placeholder-raises. Final = skip-and-log (no duplicates created, no block, no reconcile).

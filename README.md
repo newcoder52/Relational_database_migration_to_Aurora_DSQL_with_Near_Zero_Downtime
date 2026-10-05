@@ -1,11 +1,11 @@
 # Relational Database Migration to Amazon Aurora DSQL — with Near-Zero Downtime
 
 A schema-agnostic pipeline that migrates relational data (validated against Oracle sources)
-into **Amazon Aurora DSQL** with a **full load → validate → continuous CDC → cutover** flow,
-so the application can keep running against the source until you're ready to switch over.
+into **Amazon Aurora DSQL** with a **full load → validate → continuous CDC → cutover** flow, so
+the application keeps running against the source until you are ready to switch over.
 
-It uses **AWS DMS** to extract to S3 as CSV, **AWS Glue** to load/validate/apply changes into
-Aurora DSQL, and **AWS Step Functions** to orchestrate one migration task end to end.
+**AWS DMS** extracts to Amazon S3 as CSV, **AWS Glue** loads, validates and continuously applies
+the changes into Aurora DSQL, and **AWS Step Functions** runs each migration task end to end.
 
 ```
 Source DB ──DMS (full load + CDC)──▶ S3 (CSV) ──AWS Glue──▶ Amazon Aurora DSQL
@@ -17,156 +17,153 @@ Source DB ──DMS (full load + CDC)──▶ S3 (CSV) ──AWS Glue──▶ 
 
 ![Full-load + CDC migration architecture](docs/architecture.png)
 
+> **To deploy and run the pipeline, follow [`RUNBOOK.md`](RUNBOOK.md).** This page explains what
+> the pipeline is and how it behaves; the RUNBOOK has every command, in order.
+
 ---
 
 ## Table of contents
 
 - [Why this exists](#why-this-exists)
 - [How it works](#how-it-works)
-- [The four Glue jobs](#the-four-glue-jobs)
-- [Repository layout](#repository-layout)
-- [Prerequisites](#prerequisites)
-- [Deploy (one-time)](#deploy-one-time)
-- [Run a migration](#run-a-migration)
+- [The Glue jobs and Lambdas](#the-glue-jobs-and-lambdas)
+- [What a startup run does](#what-a-startup-run-does)
+- [If a run fails](#if-a-run-fails)
+- [Cutover](#cutover)
 - [Monitoring](#monitoring)
 - [Schema changes during CDC](#schema-changes-during-cdc)
-- [Cutover](#cutover)
-- [Clean-slate reload](#clean-slate-reload)
 - [Known limitations](#known-limitations)
+- [Repository layout](#repository-layout)
 - [Security](#security)
+- [License](#license)
 
 ---
 
 ## Why this exists
 
-Aurora DSQL is a distributed SQL database with a different write model than a traditional
-RDBMS (per-transaction row/size limits, ~1-hour connection cap, optimistic concurrency, no
-`TRUNCATE`/`ctid`). DMS cannot write to DSQL directly, so this pipeline lands DMS output in
-S3 and uses Glue to load and continuously apply changes into DSQL within those constraints —
-extracting once, validating exactly, and keeping the target in sync via CDC until cutover.
+Aurora DSQL is a distributed SQL database with a different write model than a traditional RDBMS
+(per-transaction row and size limits, a ~1-hour connection cap, optimistic concurrency, no
+`TRUNCATE`). DMS cannot write to DSQL directly, so this pipeline lands DMS output in S3 and uses
+Glue to load and continuously apply it to DSQL within those limits: extract once, validate, and
+keep the target in sync until cutover.
 
-**Near-zero downtime:** the source stays live through full load and CDC. You only stop writes
-at the final cutover, once CDC has drained and the target matches the source.
+**Near-zero downtime:** the source stays live through full load and CDC. You stop writes to the
+source only at cutover, once CDC has caught up and the target matches the source.
 
 ## How it works
 
-- **Two shared Step Functions state machines (startup, cutover) serve every DMS task.** You start
-  them with just the task's ARN; shared settings come from `s3://<bucket>/config/pipeline.json`, and
-  the DMS task's **name** becomes its config folder (`s3://<bucket>/config/_task/<task name>/`) and
-  its Glue job names. Tasks run and cut over independently.
-- DMS writes CSVs to `s3://<bucket>/<schema>/<table>/` — full load as `LOAD*.csv`, CDC as
-  `<timestamp>.csv` with a leading `Op` column.
-- The startup state machine runs: **start DMS → discover → load → validate → resume to CDC →
-  start the continuous CDC job**. The cutover state machine drains CDC and finalizes.
-- Endpoint settings (bucket folder, timestamp column, headers) are **auto-derived** at
-  runtime — you don't hardcode them.
+- **Two shared Step Functions state machines — `startup` and `cutover` — serve every DMS task.**
+  You start either one with just the DMS task's ARN: `{"taskArn": "arn:aws:dms:..."}`. Nothing
+  runs on a schedule.
+- Settings shared by all tasks (project prefix, region, DSQL endpoint/user/database, Glue role,
+  Glue network connection, CDC engine, control schema) live in one file,
+  `s3://<bucket>/config/pipeline.json`. An edit applies to runs started after it.
+- The DMS task's **name** becomes its config folder, `s3://<bucket>/config/_task/<task name>/`,
+  and the middle of its Glue job names, `<project>-<task name>-<role>` (for example
+  `<project>-<task name>-load`). Each task runs and cuts over independently.
+- DMS writes CSVs to `s3://<bucket>/[<BucketFolder>/]<schema>/<table>/` — the full load as
+  `LOAD*.csv`, changes as `<timestamp>.csv` with a leading `Op` column. Folder names are used in
+  the case DMS writes them.
+- The S3 layout (`BucketFolder`, the timestamp column, the header row, the NULL marker) is read
+  from the DMS endpoint at run time, not typed in.
+- An optional **fleet launcher** starts the shared `startup` (or `cutover`) for a whole list of
+  tasks from one trigger — the normal way to run more than a handful. See
+  [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md).
 
-## The four Glue jobs
+## The Glue jobs and Lambdas
+
+Each task gets its own **five Glue jobs**, created by the startup run and deleted at cutover:
 
 | Job | File | What it does |
 |-----|------|--------------|
-| **Job 1 — Discovery** | `scripts/job1_discovery.py` | Reads the DSQL target schema (authoritative for column set/order) and builds per-table type + primary-key metadata. Writes `_manifest_index.json` + per-table column-mapping JSONs. |
-| **Job 2 — Load** | `scripts/job2_load.py` | Full-load apply (Spark, driver-side pg8000). Large tables load via **per-file parallelism** (250 MB files, up to 30 in parallel); per-file S3 resume; exact per-file no-loss gate. |
-| **Job 3 — Validate** | `scripts/job3_validate.py` | Post-load validation, per key range: row counts plus a content check of **every column**, chosen from its DSQL type (text: count, length, min/max, value hash; numbers: exact sum after the load's rounding; timestamps/dates: sum of instants; boolean: true count; binary: as text). Names the column that differs. Fails instead of skipping (missing status file, table not loaded, key that can't be split = whole-table compare). |
-| **CDC — Continuous** | `scripts/glue_cdc_continuous.py` | Long-running Python-shell job that applies inserts/updates/deletes to DSQL, multi-table, with crash-proof resume via DSQL `cdc_control` tables and a no-missed/no-dup guarantee. |
+| **Job 1 — Discovery** | `scripts/job1_discovery.py` | Reads the DSQL target schema (authoritative for the column set) and builds per-table type and primary-key metadata. Finds each table's DMS folder whatever its letter case; fails loudly if none of the task's tables has a folder. |
+| **Job 2 — Load** (`load`, `load-big`) | `scripts/job2_load.py` | Full load (Spark reads, pg8000 writes from the driver). Big tables load **per file in parallel** (250 MB files, up to 30 at once), with per-file S3 resume and a per-file rows-read = rows-committed check. |
+| **Job 3 — Validate** | `scripts/job3_validate.py` | Per key range: row counts plus a content check of **every column**, chosen by its real DSQL type — integer/numeric: exact sum (after the load's rounding); real/double: sum with a small float tolerance; text/binary: non-null count, length, min, max; boolean: true count; timestamp/date: sum of instants; json: non-null count. A per-value hash is added when DSQL supports `md5()`. Names the column that differs; fails instead of skipping. |
+| **CDC — Continuous** | `scripts/glue_cdc_continuous.py` | Long-running job that applies inserts, updates and deletes to DSQL, multi-table, with crash-proof resume through the DSQL `cdc_control` tables. Runs as a **Python shell** job by default; as a **Spark** job if `cdc_engine` is `spark`, or automatically if the Python-shell drivers fail (see below). |
 
-## Repository layout
+The state machines call **eight Lambdas** (seven for the core workflows, plus `preflight_tasks`
+for the fleet): `resolve_task`, `driver_discovery`, `plan_split`, `create_glue_jobs`,
+`stop_cdc_run`, `drain_check`, `drop_tags`, and `preflight_tasks`. All ship in one zip;
+`drain_check` and `drop_tags` connect to DSQL (they bundle `pg8000`), and `driver_discovery`
+imports `prepare_cdc_wheels.py` from the same zip. The RUNBOOK's Step 2 covers packaging.
 
-```
-scripts/                    The 4 Glue job scripts  (job1_discovery, job2_load,
-                            job3_validate, glue_cdc_continuous)
-lambdas/                    Orchestration lambdas (resolve_task, plan_split, create_glue_jobs,
-                            driver_discovery, drain_check, stop_cdc_run, drop_tags,
-                            preflight_tasks for the fleet launcher)
-stepfunctions/              startup + cutover state machines (ASL), plus the optional
-                            fleet-startup / fleet-cutover launchers
-tools/                      switch_cdc_engine.py (switch a CDC job Python shell <-> Spark by hand)
-config/                     pipeline.example.json, fleet_tasks.example.csv
-glue-templates/             Glue job-definition templates
-iam/                        Role trust + policy documents
-RUNBOOK.md                  Full step-by-step deploy + operate reference
-USAGE_GUIDE.md              End-to-end operational usage
-ENGINEERING_RECORD.md       Architecture, every bug found + fix, DDL support matrix
-CDC_EDGE_CASE_RESULTS.md    CDC edge-case + data-type limitations (with fixes)
-docs/
-  FLEET_LAUNCHER.md                 Start or cut over many DMS tasks with one trigger
-  NO_PK_CDC_UPDATE_TRACKING.md      Design note: no-PK CDC update tracking
-  CONSIDERATIONS_AND_LIMITATIONS.docx   Word-format copies of the guides
-  PERFORMANCE_GUIDE.docx
-  USAGE_GUIDE.docx
-  architecture.png                  Architecture diagram (full load + CDC)
-  FullLoad_CDC_oracle-DSQL.drawio   Editable draw.io source for the diagram
-```
+## What a startup run does
 
-> The complete, authoritative deploy/operate reference is **[`RUNBOOK.md`](RUNBOOK.md)**.
-> The sections below summarize it so you can get oriented without leaving this page.
+In the order the code runs them:
 
-## Prerequisites
+1. **Check the task** (seconds). Reads `config/pipeline.json`, works out the folder and job
+   names, and checks the DMS task **before starting it**: type `full-load-and-cdc`,
+   `StopTaskCachedChangesApplied=true` (and `StopTaskCachedChangesNotApplied` not true),
+   `AddColumnName=true`, an S3 target endpoint writing to the pipeline bucket, the same region as
+   `pipeline.json`, a name of letters/digits/hyphens, and a task not already past its full load.
+   A problem ends the run at **`ResolveFailed`**; DMS is untouched. A second startup for the same
+   task while one is running also stops here, as does a folder owned by a different task ARN.
+2. **Check the driver files** (seconds; about a minute the first time). Checks the three
+   `driver-*` folders and, for a Python-shell CDC job, prepares the `driver-cdc/` wheels into
+   `driver-cdc-prepared/<fingerprint>/` so Glue can install them with no internet. A bad or
+   missing wheel ends the run at **`DriversFailed`**, still before DMS starts — unless the Spark
+   fallback can take over (step 7): if the Python-3.9 driver-cdc check fails but boto3, botocore
+   and s3transfer are usable, this task's CDC job is built as Spark instead.
+3. **Start DMS** and wait for the full load to finish (`STOPPED_AFTER_CACHED_EVENTS`; polled every
+   30 s for up to 24 h, else **`DmsTimedOut`**; a DMS failure is **`DmsFailed`**).
+4. **Create this task's five Glue jobs** from `glue-templates/`.
+5. **Discover, then load and validate each table group** (up to six groups at once). If any group
+   fails, the run stops at **`GroupsFailed`** and **DMS stays paused**, so CDC never starts on top
+   of an incomplete load.
+6. **Resume DMS into CDC and start the CDC job**, then wait up to 45 min until the CDC job
+   confirms it reached its poll loop (**`CdcStartNotConfirmed`** if it never does;
+   **`CdcRunFailed`** / **`CdcRunEnded`** if the run fails or stops first).
+7. **Spark fallback, once.** If a Python-shell CDC run fails because Glue couldn't install or
+   import its drivers (pip/PyPI timeouts, a missing or wrong-Python wheel, `No module named
+   'pg8000'`, `Unknown service: 'dsql'`), the CDC job is re-created **with the same name** as
+   Spark and started again. Any other error (DSQL, permissions, data) is not retried; a second
+   failure ends at **`CdcFallbackFailed`**. The switch is recorded in
+   `config/_task/<task name>/_cdc_engine.json`, so later startups of that task build Spark
+   straight away; delete that file to go back to Python shell. Set `cdc_spark_fallback: false` in
+   `pipeline.json` to disable it, or switch a job by hand with `tools/switch_cdc_engine.py`.
 
-- **Aurora DSQL cluster** with the **target tables already created** in the (lowercased)
-  target schema — the pipeline loads into existing tables, it never creates them. Use a
-  single-column PK where possible (best for CDC apply + content validation).
-- **DMS task** of type `full-load-and-cdc` with `StopTaskCachedChangesApplied=true`, and an
-  **S3 target endpoint** with `AddColumnName=true`, `TimestampColumnName=dms_timestamp`,
-  `Rfc4180=true`, `DatePartitionEnabled=false`, and no custom `CdcPath`.
-- A DMS **table mapping that lowercases** column names. Schema and table names can be in any
-  case: the pipeline finds DMS's folders case-insensitively and loads into the lowercased names.
-  The task's table list names each table as DMS writes it (after any schema rename).
-- For **no-PK tables**: configure DMS to emit **insert/delete only** (updates are skipped and
-  logged — see the no-PK design note).
+When the run succeeds, the full load is in DSQL and validated, and CDC is applying changes.
+Optional input keys (rarely needed): `taskSuffix` uses a different folder and job name than the
+DMS task's name, and `adoptExistingFolder: true` reuses a folder from a run made before the shared
+state machines existed. Commands are in the RUNBOOK's
+[Step 5](RUNBOOK.md#step-5--run-one-task-by-hand).
 
-## Deploy (one-time)
+## If a run fails
 
-Detailed commands are in **[`RUNBOOK.md`](RUNBOOK.md)** (Steps 0–4). In brief:
+**Where the run stopped decides what to do** — because once DMS has been resumed into CDC it is
+past its full load, and starting the startup again just ends at `ResolveFailed`. The RUNBOOK's
+[If a run fails](RUNBOOK.md#if-a-run-fails-how-to-continue) has the exact command for each state.
 
-0. **Stage to one S3 bucket** (fixed folder layout): the 4 scripts → `scripts/`, the 5 job
-   templates → `glue-templates/`, and driver wheels into **three** per-job folders —
-   `driver-fullload/`, `driver-validation/` (DSQL drivers only) and `driver-cdc/` (DSQL
-   drivers **plus** modern boto3/botocore for the Python-shell CDC job, downloaded for Python 3.9;
-   the startup workflow checks and prepares them automatically so they install without internet), and the
-   settings file `config/pipeline.json` (template: `config/pipeline.example.json`).
-1. **Create the IAM roles** (Glue, Lambda, Step Functions) from `iam/`.
-2. **Create the 7 Lambdas** from `lambdas/`.
-3. **Create the shared startup and cutover state machines** from `stepfunctions/` (fill in the
-   bucket and Lambda ARNs once).
-4. **Per task:** upload its `table_manifest.csv` to `config/_task/<task name>/`.
+| The run stopped… | What is already done | Then |
+|---|---|---|
+| **Before DMS started** — `MissingTaskArn`, `ResolveFailed`, `DriversFailed` | nothing; DMS untouched | Fix the cause in the error and start the startup again with the same input. |
+| **During the full load** — `DmsFailed`, `DmsTimedOut` | DMS was starting/running | Fix it in the DMS console. The startup can only start a task that hasn't finished its full load; a task already past it needs a [clean-slate reload](RUNBOOK.md#clean-slate-reload) with a new DMS task. |
+| **Load/validate** — `GroupsFailed`, or `PipelineFailed` before `ResumeDmsToCdc` | full load is in S3; DMS is paused | Fix the failed group (its Glue log has the cause) and start again with the same input — finished tables are skipped. |
+| **After DMS was resumed into CDC** — `CdcRunFailed`, `CdcRunEnded`, `CdcFallbackFailed`, `CdcStartNotConfirmed`, or `PipelineFailed` at `StartCdcJob` | full load done; **DMS is capturing changes to S3** | **Do not start the startup again.** Nothing is lost while CDC is down. Fix the cause and start the CDC job by hand with its `--config_prefix` argument (RUNBOOK). |
 
-## Run a migration
+## Cutover
 
-Start the shared startup state machine with the DMS task's ARN:
+When CDC has caught up (every table idle in `cdc_control.cdc_status`), cut over:
 
-```bash
-aws stepfunctions start-execution \
-  --state-machine-arn <arn-of-$PROJECT-startup> \
-  --name <task-name>-$(date +%Y%m%d%H%M) \
-  --input '{"taskArn":"arn:aws:dms:<region>:<account>:task:<id>"}'
-```
+1. **Stop writes to the source** for this task's tables, and let DMS deliver the last changes
+   (its CDC latencies near zero). The cutover's **first step stops DMS**, so any source change
+   made after that is never migrated — getting this order wrong loses data silently.
+2. Start the shared **cutover** state machine with `{"taskArn": "..."}`. It stops the DMS task,
+   waits until each table's latest CDC file is applied (up to ~12 h, else **`CdcDrainTimedOut`**),
+   stops this task's CDC run, drops the internal `_cdc_file` tracking column, and deletes the
+   task's five Glue jobs. It finds the task by its ARN, so a renamed task still cuts over its
+   original folder and jobs. Other tasks are unaffected.
+3. Repoint the application at Aurora DSQL.
 
-It performs, in order:
-
-1. **ResolveTask** → reads `config/pipeline.json`, derives the task's folder and job names from
-   its name, derives `cdcRoot`, `timestampColumnName` and S3 settings from the endpoint, and checks
-   the DMS task before starting it (fails in seconds at `ResolveFailed` if a setting is wrong).
-2. **StartDmsTask** → full load; waits for `STOPPED_AFTER_CACHED_EVENTS`.
-3. **DriverDiscovery** ×3 (fullload / validation / cdc folders).
-4. **CreateGlueJobs** → creates this task's Glue jobs (discovery/load/load-big/validate/cdc).
-5. **RunDiscovery** (Job 1) → writes `_manifest_index.json` + per-table column mappings.
-6. **PlanSplit + GroupFanOut** → runs **Job 2 load** then **Job 3 validate** per group.
-7. **ResumeDmsToCdc** → resumes DMS from the cached-changes stop into ongoing CDC.
-8. **StartCdcJob** → launches the continuous CDC job and waits until it confirms it started. If a
-   Python-shell CDC run fails on its drivers (pip/PyPI, a missing or wrong wheel), the job is
-   re-created as Spark with the same name and started again, once (`cdc_spark_fallback`, on by
-   default; recorded in `config/_task/<task name>/_cdc_engine.json`).
-
-To start or cut over many tasks from one list, use the optional fleet launcher
-([`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md)).
-
-After this, full load is in DSQL, validated, and CDC is live. To resume after any failure,
-just start the machine again — each stage skips completed work via its status files.
+End states: `CutoverSucceeded`; `GlueJobsNotDeleted` (data is cut over, a Glue job delete failed —
+delete it by hand); `CdcDrainTimedOut`, or `CutoverFailed` at a later step (DMS is stopped);
+`ResolveFailed` or `CutoverFailed` while DMS is still running (nothing changed). **Once DMS is
+stopped, do not start the cutover again** — its first step would fail on the already-stopped task;
+finish by hand instead ([RUNBOOK Step 6](RUNBOOK.md#step-6--cut-over)).
 
 ## Monitoring
 
-**CDC control tables** (DSQL schema `cdc_control`):
+**CDC control tables** (in the control schema, `cdc_control` by default):
 
 ```sql
 -- per-table status (idle = caught up, blocked = needs attention)
@@ -176,68 +173,101 @@ SELECT table_name, status, error FROM cdc_control.cdc_status;
 SELECT cdc_file, status, rows_applied, all_rows_committed
 FROM cdc_control.cdc_file_status WHERE table_name = 'target_schema.table' ORDER BY 1;
 
--- updates skipped for no-PK tables
+-- updates skipped for tables without a primary key
 SELECT * FROM cdc_control.cdc_skipped_ops WHERE table_name = 'target_schema.table';
 ```
 
-**Validation report:** `s3://<bucket>/config/_task/<task name>/_validation_report.json`
-(`match` / `mismatch` / `skipped` per table). **Glue logs:** CloudWatch
-`/aws-glue/python-jobs/*` (CDC) and `/aws-glue/jobs/output` (Spark load/validate).
+**Validation report:** one per table group, at
+`s3://<bucket>/config/_task/<task name>/_orchestrator/group-<n>/_validation_report.json`
+(`match`, `mismatch` or `error` per table, naming the differing column — never `skipped`).
+
+**Glue logs** (CloudWatch): the Spark jobs (discovery, load, validate, and CDC when it runs as
+Spark) log to `/aws-glue/jobs/output` and `/aws-glue/jobs/error`; a Python-shell CDC job logs to
+`/aws-glue/python-jobs/output` and `/aws-glue/python-jobs/error`. After a Spark fallback the CDC
+job's logs move to the Spark log groups.
+
+To unblock a table after you have fixed the cause:
+`UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` — never
+delete the row (applied files stay in the folder and would all be replayed).
 
 ## Schema changes during CDC
 
-Golden rule: **every DDL must be followed by DML** (DMS only surfaces a schema change on the
-next data row). Full matrix is in `ENGINEERING_RECORD.md` §4.
+Golden rule: **every DDL must be followed by DML** (DMS only surfaces a schema change on the next
+data row). The full matrix is in `ENGINEERING_RECORD.md` §4.
 
 | Source change | Behavior | Action |
 |---|---|---|
-| `ADD COLUMN` (one or many) | Auto-added to target | none |
-| `RENAME COLUMN` (single/multiple/with add) | Auto-renamed (positional detection) | none |
-| `DROP COLUMN` | **Table blocks** (guard can't tell a drop from an omitted column) | drop on target, then set `cdc_status.status='active'` (never delete the row) |
-| `CHANGE DATA TYPE` | **Silent** — not detected by name-based header diff | `ALTER` target type + re-apply affected rows |
-
-## Cutover
-
-When CDC has caught up (all tables `idle`, source ≈ target), start the shared **cutover state
-machine** with the same input, `{"taskArn": "..."}`. It stops the DMS task, drain-checks each table
-until quiesced, stops this task's CDC run, drops the `_cdc_file` tracking column and deletes the
-task's Glue jobs. Then repoint the application to Aurora DSQL. Other tasks are unaffected.
-
-## Clean-slate reload
-
-For a fresh full reload, purge **all** prior state together or you'll get stale-state
-artifacts (see `USAGE_GUIDE.md` §8):
-
-```bash
-aws s3 rm s3://<bucket>/<schema>/<table>/ --recursive          # per table (incl. processed/ + failed/)
-aws s3 rm s3://<bucket>/config/_task/<task name>/_orchestrator/ --recursive   # per-group load status, _file_status/, validation reports (rebuilt next run)
-# DSQL: drop+recreate target tables, and clear the cdc_control rows for the table
-```
+| `ADD COLUMN` (one or many) | Added to the target automatically | none |
+| `RENAME COLUMN` | Renamed automatically (needs the DMS API reachable from the CDC job; without it the column is added as new) | none |
+| `DROP COLUMN` | **Table blocks** (a drop can't be told apart from an omitted column) | drop it on the target, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>'` (never delete the row) |
+| `CHANGE DATA TYPE` | **Not detected** by the header-diff reconciliation | `ALTER` the target type and re-apply the affected rows |
 
 ## Known limitations
 
-See `ENGINEERING_RECORD.md` and `CDC_EDGE_CASE_RESULTS.md` for detail.
+Details are in `ENGINEERING_RECORD.md` and `CDC_EDGE_CASE_RESULTS.md`.
 
-- **NULL marker:** only the DMS endpoint's `CsvNullValue` (default `NULL`) or an empty field is stored as
-  NULL; every other text value, including `NA` and `NONE`, is stored as written (USAGE_GUIDE §4b).
-- **Multi-column primary keys:** the CDC job leaves these tables to a separate CDC job (it lists them
-  at startup). Cutover waits until that job has marked their latest change files `done` in
-  `cdc_control.cdc_file_status`.
-- **DROP COLUMN** during CDC blocks the affected table (resumable after operator remediation).
-- **In-place CHANGE DATA TYPE** is not detected by the header-diff schema reconciliation.
-- Validation compares per-range summaries, not individual rows: values swapped between two rows
-  of the same range can cancel out. Tables whose key can't be split into ranges are compared as
-  one whole-table range.
-- CDC requires the source schema to exist in the Oracle LogMiner dictionary before capture
-  (a schema created after the dictionary build needs a DBA dictionary rebuild).
-- **No-PK tables:** inserts and deletes are applied; **updates are skipped and logged** to
-  `cdc_control.cdc_skipped_ops` (unless an operator declares a stable logical key).
+- **NULL marker:** only an empty field or the DMS endpoint's `CsvNullValue` (default `NULL`) is
+  stored as NULL. Every other text value, including `NA`, `NONE` and `N/A`, is stored as written
+  (USAGE_GUIDE §4b). Don't change `CsvNullValue` partway through a migration.
+- **Multi-column primary keys:** the main CDC job leaves these tables alone and lists them at
+  startup; run a separate CDC job for them. Cutover treats such a table as caught up only when its
+  newest S3 CDC file has a `cdc_control.cdc_file_status` row with `table_name` = `<dsql_schema>.<table>`
+  (lowercase), `cdc_file` = the file's S3 key (or a value ending in its file name) and
+  `status='done'` (or `all_rows_committed=true`); otherwise cutover waits the full ~12 h.
+- **Tables without a primary key:** inserts and deletes are applied; **updates are skipped and
+  logged** to `cdc_control.cdc_skipped_ops`, unless you declare a stable logical key.
+- **DROP COLUMN** during CDC blocks the table until you fix it; **CHANGE DATA TYPE** isn't
+  detected.
+- **Validation** compares per-range summaries, not individual rows: two values swapped between
+  rows of the same range can cancel out. A table whose key can't be split is compared as one
+  whole-table range.
+- **DSQL allows at most 10 schemas per database** (not adjustable), and the CDC job adds one
+  (`cdc_control`), so keep ≤ 9 of your own; the fleet preflight enforces it.
+- **CDC Glue runs stop after 7 days** (the 10080-minute Glue maximum). A long migration's CDC run
+  ends on its own — restart it by hand (RUNBOOK), or cut over before 7 days.
+- **A DMS task can be loaded only once:** the startup refuses a task already past its full load, so
+  a clean-slate reload needs a **new** DMS task (new name → new folder).
+- CDC needs the source schema in the Oracle LogMiner dictionary before capture starts.
+- Applied CDC files are **copied** to `<table>/processed/` (the originals are never deleted, so S3
+  use grows). Without DMS/CloudWatch reachable from the CDC job, those optional calls time out
+  after a few seconds and rename detection is off; changes still apply.
+
+## Repository layout
+
+```
+scripts/                    The 4 Glue job scripts (job1_discovery, job2_load,
+                            job3_validate, glue_cdc_continuous)
+lambdas/                    The 7 orchestration Lambdas (resolve_task, driver_discovery,
+                            plan_split, create_glue_jobs, stop_cdc_run, drain_check,
+                            drop_tags), prepare_cdc_wheels.py (used by driver_discovery,
+                            same zip), and preflight_tasks.py (fleet launcher only)
+stepfunctions/              startup + cutover state machines, plus the optional
+                            fleet-startup / fleet-cutover launchers
+glue-templates/             The 6 Glue job templates (discovery, load, load-big, validate,
+                            cdc, cdc-spark)
+iam/                        Role trust + policy documents (core roles, plus the fleet roles)
+config/                     pipeline.example.json, fleet_tasks.example.csv
+tools/                      switch_cdc_engine.py (switch a CDC job Python shell <-> Spark by hand)
+RUNBOOK.md                  Step-by-step deploy and operate guide
+USAGE_GUIDE.md              Day-to-day operation, monitoring, manual runs
+ENGINEERING_RECORD.md       Architecture, every bug found and fixed, DDL support matrix
+CDC_EDGE_CASE_RESULTS.md    CDC edge cases and data-type limitations
+docs/
+  FLEET_LAUNCHER.md                     Start or cut over many DMS tasks with one trigger
+  NO_PK_CDC_UPDATE_TRACKING.md          Design note: CDC for tables without a primary key
+  USAGE_GUIDE.docx                      Word version of the usage guide
+  CONSIDERATIONS_AND_LIMITATIONS.docx   Considerations and limitations
+  PERFORMANCE_GUIDE.docx                Sizing and performance
+  architecture.png                      Architecture diagram (full load + CDC)
+  FullLoad_CDC_oracle-DSQL.drawio       Editable draw.io source for the diagram
+```
 
 ## Security
 
-No credentials or account-specific values are committed. Supply your own bucket, cluster
-endpoint, schema, and role ARNs via the config / runtime arguments described in the RUNBOOK.
-DSQL auth uses short-lived IAM tokens generated at runtime (no stored DB passwords).
+No credentials or account-specific values are committed. You supply your own bucket, cluster
+endpoint, schema and role ARNs through `config/pipeline.json` and the RUNBOOK's fill-in steps. The
+IAM policies in `iam/` are least-privilege templates scoped to your project prefix and bucket.
+DSQL authentication uses short-lived IAM tokens generated at run time — no stored passwords.
 
 ## License
 
