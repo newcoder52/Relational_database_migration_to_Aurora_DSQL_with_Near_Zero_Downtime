@@ -407,6 +407,21 @@ def main():
         print(f"\n{len(all_gaps)} unguarded missing-path gap(s).")
         return 1
     print(f"ASL PATH AUDIT: PASS ({len(files)} state machines, no unguarded missing paths)")
+
+    # B19: the reachability audit above treats a Lambda's $.Payload result as OPAQUE, so it
+    # cannot see that a ResultSelector reads a $.Payload.<field> the Lambda never returns (the
+    # exact bug that broke cutover at CutoverResolveTask). Run the Payload-contract audit, which
+    # scans each Lambda's returned keys per mode, as part of this suite.
+    try:
+        import test_asl_payload_contract as payload_contract
+    except ImportError:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import test_asl_payload_contract as payload_contract
+    pc_rc = payload_contract.main()
+    if pc_rc != 0:
+        print("ASL PAYLOAD-CONTRACT AUDIT: FAIL")
+        return 1
+    print("ASL PAYLOAD-CONTRACT AUDIT: PASS (every $.Payload.<field> read is a returned key)")
     return 1 if failed else 0
 
 

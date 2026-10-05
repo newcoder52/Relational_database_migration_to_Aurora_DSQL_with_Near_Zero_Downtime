@@ -93,6 +93,9 @@
         "validateNumWorkers.$": "$.Payload.validateNumWorkers",
         "validateTimeoutMinutes.$": "$.Payload.validateTimeoutMinutes",
         "validateRowsPerRange.$": "$.Payload.validateRowsPerRange",
+        "validateParallelism.$": "$.Payload.validateParallelism",
+        "validateTargetSecondsPerRange.$": "$.Payload.validateTargetSecondsPerRange",
+        "validateHash.$": "$.Payload.validateHash",
         "maxParallelTables.$": "$.Payload.maxParallelTables",
         "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb"
       },
@@ -591,6 +594,9 @@
           "validateNumWorkers.$": "$.resolved.validateNumWorkers",
           "validateTimeoutMinutes.$": "$.resolved.validateTimeoutMinutes",
           "validateRowsPerRange.$": "$.resolved.validateRowsPerRange",
+          "validateParallelism.$": "$.resolved.validateParallelism",
+          "validateTargetSecondsPerRange.$": "$.resolved.validateTargetSecondsPerRange",
+          "validateHash.$": "$.resolved.validateHash",
           "maxParallelTables.$": "$.resolved.maxParallelTables",
           "perWorkerMemBudgetMb.$": "$.resolved.perWorkerMemBudgetMb",
           "account_id.$": "$.resolved.accountId"
@@ -755,6 +761,9 @@
           "validateNumWorkers.$": "$.resolved.validateNumWorkers",
           "validateTimeoutMinutes.$": "$.resolved.validateTimeoutMinutes",
           "validateRowsPerRange.$": "$.resolved.validateRowsPerRange",
+          "validateParallelism.$": "$.resolved.validateParallelism",
+          "validateTargetSecondsPerRange.$": "$.resolved.validateTargetSecondsPerRange",
+          "validateHash.$": "$.resolved.validateHash",
           "maxParallelTables.$": "$.resolved.maxParallelTables",
           "perWorkerMemBudgetMb.$": "$.resolved.perWorkerMemBudgetMb",
           "account_id.$": "$.resolved.accountId"

@@ -77,11 +77,22 @@ conn_budget,900
 #   concurrency (min <= max).
 min_writers_per_loader,100
 max_writers_per_loader,150
-# validate_rows_per_range: rows per key-range for job3 validation (shared validate job AND every
-# composite ck-validate fork). Lowered default so a per-range per-column aggregate returns under
-# DSQL's 300s txn-age limit AND the client read timeout on very large/wide tables; a range that
-# still times out is auto re-split smaller. Raise it for narrow tables to validate in fewer ranges.
+# validate_rows_per_range: STARTING value / upper cap for job3's adaptive range sizer (shared
+# validate job AND every composite ck-validate fork). The sizer grows/shrinks each range from the
+# measured query time, so you do NOT tune this for throughput or StackOverflow; the source side
+# never builds one Spark plan over all ranges. Lower it only to cap the largest range on a very
+# wide row.
 validate_rows_per_range,10000
+# validate_parallelism: concurrent per-range DSQL validation queries — the main throughput lever.
+# 0 = auto (sized from the validate worker type/count), then hard-capped by conn_budget and DSQL's
+# 10,000-connection cluster limit, so validation never exhausts the cluster.
+validate_parallelism,0
+# validate_target_seconds_per_range: the adaptive sizer aims each range query at this many seconds
+# (5-20s band), well under DSQL's 300s transaction-age limit.
+validate_target_seconds_per_range,12
+# validate_hash: per-value md5 content check scope — all | keys | off (md5 computed ONCE per
+# value). all=every text/char/uuid/bytea column; keys=only key columns; off=count+length+min/max.
+validate_hash,all
 
 # ---- Glue job sizing (SPEED over cost — size up, don't throttle). Worker TYPES are checked
 # against an allow-list {G.1X,G.2X,G.4X,G.8X,G.12X,G.16X,R.1X,R.2X,R.4X,R.8X}; counts 1-299;

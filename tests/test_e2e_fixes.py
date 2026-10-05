@@ -462,7 +462,8 @@ def _b7_decide(empty_at_discovery, source_present, target_count):
     inj = {"Decimal": Decimal,
            "connect_dsql": lambda autocommit=True: _V1Conn(target_count)}
     ns = H.load_defs("scripts/job3_validate.py",
-                     ["split_s3", "s3_prefix_has_objects", "target_range_summary"], inj)
+                     ["split_s3", "s3_prefix_has_objects", "_build_target_sql",
+                      "target_range_summary"], inj)
     s3 = _V1S3(source_present)
     dms_s3_path = "s3://bucket/DMS_SAMPLE/TICKET_PURCHASE_HIST"
     b, p = ns["split_s3"](dms_s3_path)

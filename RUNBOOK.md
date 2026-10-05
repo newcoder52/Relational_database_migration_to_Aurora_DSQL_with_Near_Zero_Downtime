@@ -203,7 +203,10 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders; sets writers-per-loader (the planner never exceeds it) |
 | `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency. Must be **≤** `max_writers_per_loader` |
 | `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency. Must be **≥** `min_writers_per_loader` |
-| `validate_rows_per_range` | optional | `10000` | int ≥ 1. Rows per key-range for job3 validation (shared validate job **and** every composite ck-validate fork). Lowered default so a per-range per-column aggregate returns under DSQL's 300 s transaction-age limit **and** the client read timeout on very large/wide tables; a range that still times out is auto re-split smaller. Raise it for narrow tables to validate in fewer ranges |
+| `validate_rows_per_range` | optional | `10000` | int ≥ 1. **Starting value / upper cap** for job3's adaptive range sizer (shared validate job **and** every composite ck-validate fork). The sizer grows or shrinks each range from the measured query time (see `validate_target_seconds_per_range`), so you do **not** tune this for throughput or StackOverflow — the source side never builds one Spark plan over all ranges. Lower it only to cap the largest range on an unusually wide row |
+| `validate_parallelism` | optional | `0` | int 0–10000. Concurrent per-range DSQL validation queries — **the main throughput lever**. `0` = auto (sized from the validate worker type/count), then **hard-capped** by `conn_budget` and DSQL's 10,000-connection cluster limit, so validation can never exhaust the cluster. Raise for more rows/sec on big tables if the connection budget allows |
+| `validate_target_seconds_per_range` | optional | `12` | int 1–120. The adaptive sizer aims each range query at this many seconds (5–20 s band), well under DSQL's 300 s transaction-age limit. Smaller = more, shorter queries; larger = fewer, longer ones |
+| `validate_hash` | optional | `all` | `all` \| `keys` \| `off`. Scope of the per-value md5 content check (md5 is computed **once** per value). `all` hashes every text/char/uuid/bytea column; `keys` only key columns; `off` uses count + length + min/max only. Use `keys`/`off` to speed validation of very wide or large-object (LOB) tables |
 | `glue_version` | optional | `4.0` | `4.0` (tested default) or `5.0` (re-test the pg8000/boto3 driver wheels on Python 3.11 first). Applied to the Spark jobs |
 | `discovery_worker_type` | optional | `G.2X` | Glue worker type for discovery. One of G.1X/G.2X/G.4X/G.8X/G.12X/G.16X/R.1X/R.2X/R.4X/R.8X (G.12X+/R.* are newer, higher startup latency — confirm Region/version) |
 | `discovery_num_workers` | optional | `5` | int 1–299. Discovery worker count |
@@ -226,12 +229,13 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
-Forty keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Forty-three keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
 `control_schema`, `cdc_validation`, `cdc_validation_sample`, `max_composite_forks`,
 `max_big_cdc_forks`, `big_table_row_threshold`, `file_fanout_threshold`, `big_table_bytes_threshold`,
 `max_groups`, `map_max_concurrency`, `max_files_in_parallel`, `writers_per_file`, `conn_budget`,
-`min_writers_per_loader`, `max_writers_per_loader`, `validate_rows_per_range`, `glue_version`,
+`min_writers_per_loader`, `max_writers_per_loader`, `validate_rows_per_range`,
+`validate_parallelism`, `validate_target_seconds_per_range`, `validate_hash`, `glue_version`,
 `discovery_worker_type`,
 `discovery_num_workers`, `discovery_timeout_minutes`, `load_worker_type`, `load_num_workers`,
 `load_timeout_minutes`, `load_big_worker_type`, `load_big_num_workers`, `load_big_timeout_minutes`,
@@ -722,7 +726,7 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Startup** BuildTableList logs `(warn) … is NOT in the task's current selection rules — IGNORING it` | a table DMS still reports in `describe_table_statistics` (its stats/S3 folder linger from a prior run) is **not** matched by the task's **current** selection rules | nothing to fix — the table is **ignored** (never loaded, validated or CDC-applied, and not in the manifest/discovery index). The table list is built from DMS stats **cross-checked against the live selection rules**, not from leftover S3 folders. The warning gives the exact `aws s3 rm s3://…/<schema>/<table>/ --recursive` to delete the stale folder if you want the storage back |
 | **Startup** `GroupsFailed` at load, child log shows `♻ RESUME … auto-reblanking whole table` on a **composite-PK** table | a composite table was previously loaded (target non-empty) and is being reloaded on resume | nothing to fix — the reblank now pages by the **full composite key tuple**, so every DELETE transaction stays under DSQL's ~3000-row cap and the composite table reloads cleanly (earlier this failed with `54000: transaction row limit exceeded` because it paged by a single non-unique key column). A no-PK table's reblank additionally **auto-shrinks** its batch on a row/size-limit error |
 | **Startup** `GroupsFailed`, or `PipelineFailed` at `CreateGlueJobs`/`RunDiscovery`/`PlanSplit`/`GroupFanOut` | DMS full load is in S3; DMS is paused at `STOPPED_AFTER_CACHED_EVENTS` | fix the cause (the failed group's Glue log has it), re-trigger the fleet — finished files/tables are skipped; the task isn't past full load, so it isn't skipped |
-| **Startup** validation (`GroupValidate`) fails or logs a re-split | the validate Glue job compares every column S3-vs-DSQL per key range | **Empty source tables now PASS** on every path — a 0-row source with a 0-row target is `0 == 0` (this holds for composite and fork-validate tables too, whether or not discovery flagged the table empty); only an empty source whose DSQL target has rows is a real mismatch. **Large/wide tables:** each range query runs in its own short transaction under a server statement timeout, and the client socket read timeout is set **above** that server timeout so the server fails first; a range that hits DSQL's 300s limit **or** a client read timeout is **auto re-split** and retried (the log shows `validation re-split … after a transaction-age/timeout error`). The default `validate_rows_per_range` is **10000** (lowered so a range returns within both limits on 8M–16M-row tables); if validation still times out after the bounded re-splits (a single key / very wide row), lower `validate_rows_per_range` in `params.csv` and re-trigger; the data itself is unaffected (full load already matched) |
+| **Startup** validation (`GroupValidate`) fails or logs a re-split | the validate Glue job compares every column S3-vs-DSQL per key range | **Empty source tables now PASS** on every path — a 0-row source with a 0-row target is `0 == 0` (holds for composite and fork-validate tables too, whether or not discovery flagged the table empty); only an empty source whose DSQL target has rows is a real mismatch. **Large/wide tables (B18 — `StackOverflowError` in validate, now handled):** validation no longer builds one Spark plan over hundreds of ranges — the source side uses a broadcast range-join (O(1) plan depth) and bounded per-plan chunks, so a 1B-row table at the default range size does not overflow the JVM stack. The per-value md5 content hash is computed **once per value** (a derived table), not ~6× per value, so a range query no longer burns the 300 s limit on md5. Ranges are sized by **time** (adaptive, aiming `validate_target_seconds_per_range`) and run in parallel (`validate_parallelism`, auto-sized, capped by `conn_budget` + DSQL's 10,000-connection limit); a range that still hits DSQL's 300 s limit or a client read timeout is **auto re-split** and retried (log: `validation re-split … after a transaction-age/timeout error`). **Do NOT raise `validate_rows_per_range` to avoid a StackOverflow or to speed validation** — it is only a starting value / cap; raise `validate_parallelism` for throughput, or set `validate_hash=keys\|off` for very wide/LOB tables. The validate log prints per-table throughput (ranges, parallelism, rows/s). Data is unaffected (full load already matched) |
 | **Startup** `PipelineFailed` at `ResumeDmsToCdc` | load done and validated; DMS probably still paused | **don't re-trigger the fleet for this task.** If DMS is still stopped, resume it: `aws dms start-replication-task --replication-task-arn "$TASK_ARN" --start-replication-task-type resume-processing`, then **start the CDC job by hand** (below) |
 | **Startup** `CdcRunFailed`/`CdcRunEnded`/`CdcFallbackFailed`, or `PipelineFailed` at `StartCdcJob`/`GetCdcRun`/`CheckCdcStarted` | load done; **DMS is in CDC**, capturing changes to S3 | **don't re-trigger the fleet** (it skips this task). Check whether a CDC run is already RUNNING ([§6](#6-watch-progress)); if not, fix the cause in the CDC log and **start the CDC job by hand** (below). Nothing is lost while it's down — DMS keeps writing change files |
 | **Startup** `CdcStartNotConfirmed` | the CDC run is running but didn't write its start marker in 45 min | check the CDC log ([§6](#6-watch-progress)). If it shows `entering poll loop`, CDC is fine and the marker couldn't be written — check the Glue role can write `config/_task/<task>/_cdc_started/` |
@@ -789,6 +793,48 @@ for j in $(aws glue list-jobs --query 'JobNames[]' --output text | tr '\t' '\n')
     && aws glue delete-job --job-name "$j"
 done
 ```
+
+### Time one validation range query on your own table (EXPLAIN ANALYZE)
+
+If validation feels slow, time a single range query the way job3 runs it — a per-column
+aggregate over one key range, with md5 computed **once per value** in a derived table. Connect
+to DSQL (psql with an IAM auth token) and run, substituting your schema/table, key column and a
+range that holds ~10k–50k rows:
+
+```sql
+-- One range: count + a cheap per-value hash sum (md5 computed ONCE per value in the subquery).
+EXPLAIN (ANALYZE, TIMING)
+SELECT count(*),
+       COALESCE(SUM( (strpos('0123456789abcdef', substr(h_c,1,1))-1)::bigint*1048576
+                   + (strpos('0123456789abcdef', substr(h_c,2,1))-1)::bigint*65536
+                   + (strpos('0123456789abcdef', substr(h_c,3,1))-1)::bigint*4096
+                   + (strpos('0123456789abcdef', substr(h_c,4,1))-1)::bigint*256
+                   + (strpos('0123456789abcdef', substr(h_c,5,1))-1)::bigint*16
+                   + (strpos('0123456789abcdef', substr(h_c,6,1))-1)::bigint ), 0)
+FROM (SELECT md5(some_text_col::text) AS h_c
+      FROM your_schema.your_table
+      WHERE id >= 1000000 AND id < 1050000) s;   -- one 50k-row key range
+```
+
+The `Execution Time` line is the per-range cost. Compare it to the **old** form (md5 recomputed
+per hex digit) to see the win:
+
+```sql
+-- OLD (SLOW): md5(some_text_col::text) is evaluated 6x per row (one per substr position).
+EXPLAIN (ANALYZE, TIMING)
+SELECT count(*),
+       COALESCE(SUM( (strpos('0123456789abcdef', substr(md5(some_text_col::text),1,1))-1)::bigint*1048576
+                   + (strpos('0123456789abcdef', substr(md5(some_text_col::text),2,1))-1)::bigint*65536
+                   -- ...4 more md5(...) calls...
+                   ), 0)
+FROM your_schema.your_table
+WHERE id >= 1000000 AND id < 1050000;
+```
+
+Aim for each range query to land in the 5–20 s band (`validate_target_seconds_per_range`); the
+job sizes ranges automatically to hit it. If a single range is still slow, raise
+`validate_parallelism` (throughput) or set `validate_hash=keys` / `off` for very wide / large-
+object tables — do **not** raise `validate_rows_per_range`.
 
 ---
 

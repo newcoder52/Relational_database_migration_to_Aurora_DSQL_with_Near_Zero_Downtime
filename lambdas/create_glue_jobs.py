@@ -690,6 +690,21 @@ def handler(event, context):
             _vrr = event.get("validateRowsPerRange")
             if _vrr not in (None, ""):
                 args["--validate_rows_per_range"] = str(_vrr)
+            # B18 throughput controls: parallelism (0 = job auto-sizes), the time-sizer target,
+            # the per-value-hash scope, and the shared DSQL conn budget that hard-caps
+            # parallelism. Each is OPTIONAL (older workflows omit them -> job3 built-in defaults).
+            _vp = event.get("validateParallelism")
+            if _vp not in (None, ""):
+                args["--validate_parallelism"] = str(_vp)
+            _vts = event.get("validateTargetSecondsPerRange")
+            if _vts not in (None, ""):
+                args["--validate_target_seconds_per_range"] = str(_vts)
+            _vh = event.get("validateHash")
+            if _vh not in (None, ""):
+                args["--validate_hash"] = str(_vh)
+            _cb = event.get("connBudget")
+            if _cb not in (None, ""):
+                args["--conn_budget"] = str(_cb)
         if is_cdc:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema

@@ -192,7 +192,8 @@ def _v1_namespace(target_count):
         "connect_dsql": lambda autocommit=True: _FakeConn(target_count),
     }
     ns = H.load_defs("scripts/job3_validate.py",
-                     ["split_s3", "s3_prefix_has_objects", "target_range_summary"], inj)
+                     ["split_s3", "s3_prefix_has_objects", "_build_target_sql",
+                      "target_range_summary"], inj)
     return ns
 
 

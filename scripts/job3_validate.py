@@ -156,6 +156,43 @@ CHECKSUM_MODE = "aggregate"
 # tables in the manifest.
 REQUIRE_FULL_LOAD_DONE = True
 
+# =============================================================================
+# B18: throughput-targeted validation (parallel, time-sized ranges, cheap hashing)
+# =============================================================================
+# PARALLELISM. How many per-range TARGET (DSQL) queries run concurrently across all tables on
+# the driver. This is THE throughput lever: validation rows/sec ~= parallelism * (rows/range /
+# seconds/range). It is sized from the worker type/count when not set (see _default_parallelism)
+# and is HARD-BOUNDED by conn_budget and DSQL's 10,000-connection cluster limit so validation
+# can never exhaust the cluster's connections. `validate_parallelism` (params.csv) overrides the
+# default; MAX_QUERY_CONCURRENCY stays as the legacy alias/back-compat arg.
+CONN_BUDGET = 900                 # DSQL connection budget shared across the task (params.csv)
+DSQL_MAX_CLUSTER_CONNECTIONS = 10000
+VALIDATE_PARALLELISM = None       # None => _default_parallelism(); set by --validate_parallelism
+# ADAPTIVE RANGE SIZE BY TIME. Each DSQL range query targets this many seconds (well under the
+# 300s txn-age limit and the client read timeout). The sizer starts from a row-width estimate
+# (VALIDATE_ROWS_PER_RANGE as the STARTING value / upper cap) and grows or shrinks the next
+# range from the measured seconds/range so it converges on the target band with no manual
+# tuning. The auto re-split on a timeout (B14) is unchanged.
+VALIDATE_TARGET_SECONDS_PER_RANGE = 12.0     # aim ~5-20s; mid-band default
+VALIDATE_MIN_SECONDS_PER_RANGE = 5.0
+VALIDATE_MAX_SECONDS_PER_RANGE = 20.0
+VALIDATE_MIN_ROWS_PER_RANGE = 1000           # never size a range below this
+VALIDATE_MAX_ROWS_PER_RANGE = 5000000        # never size a range above this (B14/300s safety)
+# BOUNDED SPARK PLANS (the StackOverflow fix). The source side must never build ONE Spark plan
+# whose expression depth grows with the range count (the old N-deep F.when chain overflowed the
+# JVM stack at ~800 ranges). Source range summaries are computed with an ARITHMETIC bucket
+# (O(1) plan depth, see source_range_summaries) and, as a belt-and-suspenders cap, in chunks of
+# at most this many ranges per Spark action.
+VALIDATE_SOURCE_RANGES_PER_PLAN = 50
+# VALUE-HASH SCOPE. The per-value hash catches a changed value whose length and the column's
+# min/max are unchanged. It is the most expensive check (one md5 per value), so it is now
+# computed with md5 run ONCE per value (derived table; see build_metrics/target_range_summary)
+# and can be scoped:
+#   all  (DEFAULT) : hash every text/char/uuid/bytea column
+#   keys           : hash only PK / key columns (cheap; still catches key corruption)
+#   off            : no per-value hash (count+length+min+max only)
+VALIDATE_HASH = "all"
+
 CONN_RECYCLE_SECONDS = 50 * 60
 GLUE_API_TIMEOUT = 5
 
@@ -179,10 +216,14 @@ def _apply_job3_arg_overrides():
     global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
     global CHECKSUM_MODE, MAX_PARALLEL_TABLES, VALIDATE_ROWS_PER_RANGE, MAX_QUERY_CONCURRENCY
     global REQUIRE_FULL_LOAD_DONE
+    global VALIDATE_PARALLELISM, CONN_BUDGET, VALIDATE_HASH
+    global VALIDATE_TARGET_SECONDS_PER_RANGE
     optional = ["config_prefix", "index_s3_key", "dsql_endpoint", "dsql_user",
                 "dsql_database", "region", "dsql_endpoint_candidates",
                 "checksum_mode", "max_parallel_tables", "validate_rows_per_range",
-                "max_query_concurrency", "require_full_load_done", "csv_null_value"]
+                "max_query_concurrency", "require_full_load_done", "csv_null_value",
+                "validate_parallelism", "conn_budget", "validate_hash",
+                "validate_target_seconds_per_range"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -227,6 +268,28 @@ def _apply_job3_arg_overrides():
             MAX_QUERY_CONCURRENCY = max(1, int(ov["max_query_concurrency"]))
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid max_query_concurrency={ov['max_query_concurrency']!r}")
+    if "validate_parallelism" in ov:
+        try:
+            VALIDATE_PARALLELISM = max(1, int(ov["validate_parallelism"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid validate_parallelism={ov['validate_parallelism']!r}")
+    if "conn_budget" in ov:
+        try:
+            CONN_BUDGET = max(1, int(ov["conn_budget"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid conn_budget={ov['conn_budget']!r}")
+    if "validate_hash" in ov:
+        _vh = str(ov["validate_hash"]).strip().lower()
+        if _vh in ("all", "keys", "off"):
+            VALIDATE_HASH = _vh
+        else:
+            print(f"  ⚠️ ignoring invalid validate_hash={ov['validate_hash']!r} (use all|keys|off)")
+    if "validate_target_seconds_per_range" in ov:
+        try:
+            VALIDATE_TARGET_SECONDS_PER_RANGE = float(ov["validate_target_seconds_per_range"])
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid validate_target_seconds_per_range="
+                  f"{ov['validate_target_seconds_per_range']!r}")
     if "csv_null_value" in ov and ov["csv_null_value"] is not None:
         _nv = str(ov["csv_null_value"])
         CSV_NULL_VALUE = "" if _nv == "__EMPTY__" else _nv
@@ -450,6 +513,118 @@ def connect_dsql(autocommit=True):
     with _dsql_resolve_lock:
         _dsql_endpoint_resolved = False   # pinned host stopped working -> re-probe next call
     raise _last
+
+
+# =============================================================================
+# B18: parallelism sizing + adaptive (time-based) range sizing
+# =============================================================================
+_WORKER_DPU = {"G.1X": 1, "G.2X": 2, "G.4X": 4, "G.8X": 8, "G.025X": 1,
+               "Standard": 1, "Z.2X": 2, "R.1X": 1, "R.2X": 2, "R.4X": 4, "R.8X": 8}
+
+
+def _default_parallelism():
+    """Concurrent per-range TARGET (DSQL) queries, HARD-bounded so validation can never exhaust
+    DSQL connections. Explicit validate_parallelism wins; otherwise size from the Glue worker
+    type/count (bigger driver -> more concurrent client sockets), then clamp to:
+      * conn_budget                     (the task's DSQL connection budget), and
+      * ~1/8 of DSQL's 10,000-connection cluster limit (leave headroom for CDC/other tasks).
+    MAX_QUERY_CONCURRENCY stays the legacy floor so an older deployment behaves as before."""
+    if VALIDATE_PARALLELISM is not None:
+        base = int(VALIDATE_PARALLELISM)
+    else:
+        try:
+            wt = globals().get("VALIDATE_WORKER_TYPE") or "G.8X"
+            nw = int(globals().get("VALIDATE_NUM_WORKERS") or 10)
+        except Exception:
+            wt, nw = "G.8X", 10
+        # ~8 concurrent queries per DPU of the driver, sized for a big driver; this is the
+        # 32-64 band the design calls for on G.4X/G.8X and grows with worker count a little.
+        per_dpu = 8
+        base = max(MAX_QUERY_CONCURRENCY, _WORKER_DPU.get(wt, 4) * per_dpu + min(nw, 16))
+    hard = min(int(CONN_BUDGET), DSQL_MAX_CLUSTER_CONNECTIONS // 8)
+    return max(1, min(base, hard))
+
+
+class _AdaptiveRangeSizer:
+    """Size each range by TIME, not a fixed row count (B18). Start from an estimate derived from
+    row width, then grow/shrink the next range's row target from the MEASURED seconds/range so
+    queries converge on [VALIDATE_MIN_SECONDS_PER_RANGE, VALIDATE_MAX_SECONDS_PER_RANGE] around
+    VALIDATE_TARGET_SECONDS_PER_RANGE -- no manual tuning. VALIDATE_ROWS_PER_RANGE is only the
+    STARTING value (a seed); the hard upper cap is VALIDATE_MAX_ROWS_PER_RANGE so the sizer can
+    GROW past the seed to hit the time target on a fast/narrow table (that is the throughput
+    lever on top of parallelism). Thread-safe (the target queries run in parallel)."""
+
+    def __init__(self, start_rows, ncols, nmetrics):
+        # Rough width factor: more columns/metrics -> fewer rows per time budget.
+        width = max(1, ncols) + max(0, nmetrics)
+        est = int(max(VALIDATE_MIN_ROWS_PER_RANGE,
+                      min(VALIDATE_MAX_ROWS_PER_RANGE, int(2_000_000 / max(1, width)) * 10)))
+        # Seed near the smaller of the width estimate and the configured start value, but the
+        # sizer may grow above the seed later (bounded only by VALIDATE_MAX_ROWS_PER_RANGE).
+        self._rows = max(VALIDATE_MIN_ROWS_PER_RANGE,
+                         min(est, max(int(start_rows), VALIDATE_MIN_ROWS_PER_RANGE)))
+        self._cap = VALIDATE_MAX_ROWS_PER_RANGE
+        self._lock = threading.Lock()
+        self._samples = 0
+
+    def current(self):
+        with self._lock:
+            return int(self._rows)
+
+    def observe(self, rows, seconds):
+        """Feed a measured (rows, seconds); adjust the rows/range target toward the time band."""
+        if rows <= 0 or seconds <= 0:
+            return
+        with self._lock:
+            self._samples += 1
+            rate = rows / seconds                      # rows per second actually achieved
+            target = int(rate * VALIDATE_TARGET_SECONDS_PER_RANGE)
+            # Exponential-ish convergence: move the target halfway toward the measured ideal.
+            self._rows = int((self._rows + max(VALIDATE_MIN_ROWS_PER_RANGE, target)) / 2)
+            # If a query ran long, shrink harder; if very short, allow growth up to the cap.
+            if seconds > VALIDATE_MAX_SECONDS_PER_RANGE:
+                self._rows = max(VALIDATE_MIN_ROWS_PER_RANGE, int(self._rows * 0.5))
+            elif seconds < VALIDATE_MIN_SECONDS_PER_RANGE:
+                self._rows = min(self._cap, int(self._rows * 1.5))
+            self._rows = max(VALIDATE_MIN_ROWS_PER_RANGE,
+                             min(self._rows, self._cap, VALIDATE_MAX_ROWS_PER_RANGE))
+
+    @property
+    def samples(self):
+        return self._samples
+
+
+def _probe_and_size(sizer, dsql_schema, dsql_table, pk_col, pk_kind, mn, mx, total, metrics):
+    """Measure ONE small probe range near the low end of the key space, feed the time to the
+    sizer, and return the converged rows/range for planning. Bounded + best-effort: any probe
+    error (incl. a timeout) just leaves the width-estimated size in place, and the per-range
+    re-split still protects a too-big range. Keeps DSQL queries small (B14)."""
+    try:
+        probe_rows = min(sizer.current(), max(VALIDATE_MIN_ROWS_PER_RANGE, int(total // 20) or 1))
+        if pk_kind == "integer":
+            lo = int(mn)
+            span = (int(mx) - int(mn)) + 1
+            hi = lo + max(1, (span * probe_rows) // max(1, total))
+            lo_v, hi_v = lo, min(hi, int(mx) + 1)
+        elif pk_kind == "uuid":
+            lo_i = hex_to_int(mn)
+            span = (hex_to_int(mx) - lo_i) + 1
+            hi_i = lo_i + max(1, (span * probe_rows) // max(1, total))
+            lo_v, hi_v = int_to_hex(lo_i), int_to_hex(min(hi_i, hex_to_int(mx) + 1))
+        else:
+            return sizer.current()
+        pred = _range_predicate_sql(pk_col, pk_kind, lo_v, hi_v, False)
+        t0 = time.time()
+        cnt, _ = _target_query(dsql_schema, dsql_table, pred, metrics)
+        sizer.observe(cnt, time.time() - t0)
+    except Exception as e:
+        if not is_txn_age_error(e):
+            print(f"    (probe) non-timeout error sizing {dsql_schema}.{dsql_table}: "
+                  f"{type(e).__name__}: {e}; using width estimate")
+        else:
+            # too big even for the probe -> shrink and let planning use the smaller size
+            sizer.observe(sizer.current(), VALIDATE_MAX_SECONDS_PER_RANGE * 2)
+    return sizer.current()
 
 
 # =============================================================================
@@ -734,13 +909,22 @@ _HASH_STATE = {"ok": None}
 _HASH_LOCK = threading.Lock()
 
 
-def _hash_sql(text_expr):
-    """DSQL: the first _HASH_DIGITS hex digits of md5(value) as an integer, using only
-    md5/substr/strpos (no bit-string casts)."""
-    h = f"md5({text_expr})"
-    terms = [f"(strpos('{_HEX}', substr({h}, {i + 1}, 1)) - 1)::bigint * {16 ** (_HASH_DIGITS - 1 - i)}"
+def _hash_int_from_md5(md5_expr):
+    """DSQL: the first _HASH_DIGITS hex digits of an ALREADY-COMPUTED md5 hex string, as an
+    integer, using only substr/strpos (no bit-string casts). `md5_expr` must be an expression
+    that evaluates to the md5 hex string ONCE per row (e.g. a derived-table alias), so md5 is
+    NOT recomputed per hex digit. The arithmetic is byte-identical to the previous
+    md5-per-digit form, so the summed values match historical reports for the same data."""
+    terms = [f"(strpos('{_HEX}', substr({md5_expr}, {i + 1}, 1)) - 1)::bigint * {16 ** (_HASH_DIGITS - 1 - i)}"
              for i in range(_HASH_DIGITS)]
     return "(" + " + ".join(terms) + ")"
+
+
+def _hash_sql(text_expr):
+    """Back-compat shim: first _HASH_DIGITS hex digits of md5(value) as an integer, md5 computed
+    inline. Retained for the hash_supported() probe and any direct caller; the per-range target
+    query uses a DERIVED TABLE so md5 runs once per value (see build_metrics/target_range_summary)."""
+    return _hash_int_from_md5(f"md5({text_expr})")
 
 
 def hash_supported():
@@ -768,28 +952,55 @@ def hash_supported():
         return _HASH_STATE["ok"]
 
 
-def build_metrics(columns, target_types, with_hash=False):
+def build_metrics(columns, target_types, with_hash=False, key_cols=None):
     """Per-column summaries with the same meaning on both sides. Each metric is a dict:
-         col, check, src (fn(F, column) -> Spark aggregate), sql (DSQL aggregate),
-         cmp ('exact' | 'decimal' | 'float'), tol (allowed difference: per row for decimal,
-         relative for float), empty (its value over zero rows)."""
+         col, check, src (fn(F, column) -> Spark aggregate),
+         proj (list of (alias, inner_sql) projected ONCE per row in the DSQL derived table),
+         agg (DSQL outer aggregate, over raw columns and/or proj aliases),
+         cmp ('exact' | 'decimal' | 'float'), tol, empty (its value over zero rows).
+
+    B18 cost fixes:
+      * The per-value md5 hash is computed ONCE per value: the metric projects `md5(<t_>)` as a
+        derived-table alias and the outer SUM applies the 6-digit strpos conversion to that
+        alias (not a fresh md5 per hex digit). ~6x fewer md5 calls per text/uuid/bytea value.
+      * TEXT/CHAR MIN/MAX are DROPPED when the per-value hash is active for that column: the
+        hash sum already changes if any value changes, and length catches truncation, so MIN/MAX
+        over text (two extra ::text casts + ordering) added cost without catching anything the
+        hash+length miss. When hashing is OFF they are KEPT (they are then the only content
+        signal). UUID keeps MIN/MAX only when hashing is off (uuid has no length check).
+      * validate_hash scope: 'all' hashes every text/char/uuid/bytea column; 'keys' hashes only
+        key columns; 'off' hashes none.
+
+    Checks that remain and what each catches:
+      - non-null count   : NULLed / added / dropped values (every column).
+      - total length     : truncation / padding changes (text/char).
+      - value hash sum   : ANY changed value whose length and (when kept) min/max are unchanged
+                           (text/char/uuid/bytea), the strongest per-value signal.
+      - min / max        : value shifts when hashing is off (text/char/uuid); numeric kinds use
+                           sum instead.
+      - sum              : numeric/int/float value changes (additive).
+      - true count       : boolean flips.
+      - sum of instants  : timestamp/date shifts.
+    (A pure swap of two values WITHIN one range can cancel in additive sums; that is the one
+    thing summaries can't see, unchanged from before.)
+    """
+    key_cols = {str(c).lower() for c in (key_cols or [])}
     m = []
     for c in columns:
         dt, prec, scale, dtp = target_types[c]
         kind = column_kind(dt)
         q = '"' + c.replace('"', '""') + '"'
         tick = '`' + c.replace('`', '``') + '`'
+        hash_this = bool(with_hash) and (VALIDATE_HASH == "all"
+                                         or (VALIDATE_HASH == "keys" and c.lower() in key_cols))
 
-        def add(check, src, sql, cmp="exact", tol=0, empty=0, _c=c, _k=kind, _dt=dt):
+        def add(check, src, agg, cmp="exact", tol=0, empty=0, proj=None, _c=c, _k=kind, _dt=dt):
             m.append({"col": _c, "kind": _k, "type": _dt, "check": check, "src": src,
-                      "sql": sql, "cmp": cmp, "tol": tol, "empty": empty})
+                      "agg": agg, "sql": agg, "cmp": cmp, "tol": tol, "empty": empty,
+                      "proj": proj or []})
 
         add("non-null count", lambda F, x: F.count(x), f"COUNT({q})")
         if kind in ("text", "char", "uuid", "bytea"):
-            # Source value = what the load stored. Target ::text = the stored value as text
-            # (lowercase canonical uuid; '\x' + lowercase hex for binary; char(n) without its
-            # padding, so the source drops trailing spaces for char columns too). DSQL uses the
-            # C collation (byte order), the same order Spark uses for min/max on strings.
             if kind == "char":
                 s = lambda F, x: F.rtrim(x)
             else:
@@ -798,16 +1009,21 @@ def build_metrics(columns, target_types, with_hash=False):
             if kind != "uuid":
                 add("total length", lambda F, x, s=s: F.coalesce(F.sum(F.length(s(F, x))), F.lit(0)),
                     f"COALESCE(SUM(length({t_})), 0)")
-            add("min", lambda F, x, s=s: F.min(s(F, x)), f"MIN({t_})", empty=None)
-            add("max", lambda F, x, s=s: F.max(s(F, x)), f"MAX({t_})", empty=None)
-            if with_hash:
-                # Sum of a per-value hash: catches a changed value even when its length and the
-                # column's min/max stay the same. md5 is over the UTF-8 bytes on both sides.
+            if hash_this:
+                # Compute md5 ONCE per value in the derived table, then sum the 6-hex-digit
+                # integer of that precomputed hash. Catches a changed value even when length and
+                # min/max are unchanged. The Spark side is unchanged (md5 over UTF-8 bytes).
+                halias = f"h__{len(m)}"
                 add("value hash sum",
                     lambda F, x, s=s: F.coalesce(F.sum(F.conv(F.substring(F.md5(s(F, x)), 1, _HASH_DIGITS),
                                                               16, 10).cast("decimal(38,0)")),
                                                  F.lit(0).cast("decimal(38,0)")),
-                    f"COALESCE(SUM({_hash_sql(t_)}), 0)", "decimal", 0)
+                    f"COALESCE(SUM({_hash_int_from_md5(halias)}), 0)", "decimal", 0,
+                    proj=[(halias, f"md5({t_})")])
+            else:
+                # No hash for this column -> MIN/MAX are the content signal, so keep them.
+                add("min", lambda F, x, s=s: F.min(s(F, x)), f"MIN({t_})", empty=None)
+                add("max", lambda F, x, s=s: F.max(s(F, x)), f"MAX({t_})", empty=None)
         elif kind == "bool":
             add("true count",
                 lambda F, x: F.coalesce(F.sum(F.when(x == F.lit("true"), 1).otherwise(0)), F.lit(0)),
@@ -819,9 +1035,6 @@ def build_metrics(columns, target_types, with_hash=False):
                                               F.lit(0).cast("decimal(38,0)")),
                 f"COALESCE(SUM({q}), 0)", "decimal", 0)
         elif kind == "numeric":
-            # numeric(p,s) stores the value rounded to s places (half away from zero); Spark's
-            # cast to decimal(38,s) rounds the same way. Unconstrained or very wide numerics are
-            # summed at 10 places with a matching tolerance.
             exact = scale is not None and 0 <= int(scale) <= 18 and (prec is None or int(prec) <= 31)
             s_eff = int(scale) if exact else 10
             add("sum", lambda F, x, s_eff=s_eff: F.coalesce(F.sum(x.cast(f"decimal(38,{s_eff})")),
@@ -858,51 +1071,107 @@ def _same(metric, s, t, rows):
     return abs(a - b) <= metric["tol"] * max(1.0, abs(a), abs(b))
 
 
-def target_range_summary(conn, dsql_schema, dsql_table, pred, metrics):
-    """(row count, [metric values]) for one range of the DSQL target (pred None = whole table)."""
-    parts = ["count(*)"] + [m["sql"] for m in metrics]
+def _build_target_sql(dsql_schema, dsql_table, pred, metrics):
+    """SELECT count(*), <outer aggregates> FROM (SELECT <projections once/row> FROM t WHERE pred) s
+
+    Every metric's `proj` (e.g. md5(col) AS h__k) is projected ONCE per row in the derived
+    table, so an expensive per-value expression (md5) is evaluated a single time and the outer
+    aggregates reference the alias. Metrics with no projection reference the raw columns, which
+    are available in the subquery because we `SELECT *` the base rows (DSQL optimizes unused
+    columns out of the aggregate, and the WHERE prunes rows before projection)."""
+    projs = []
+    seen = set()
+    for mt in metrics:
+        for alias, expr in mt.get("proj", []):
+            if alias not in seen:
+                seen.add(alias)
+                projs.append(f"{expr} AS {alias}")
     where = f" WHERE {pred}" if pred else ""
+    inner_select = "*" + ("" if not projs else ", " + ", ".join(projs))
+    inner = f"(SELECT {inner_select} FROM {dsql_schema}.{dsql_table}{where}) s"
+    parts = ["count(*)"] + [m["agg"] for m in metrics]
+    return f'SELECT {", ".join(parts)} FROM {inner}'
+
+
+def target_range_summary(conn, dsql_schema, dsql_table, pred, metrics):
+    """(row count, [metric values]) for one range of the DSQL target (pred None = whole table).
+    md5-per-value is computed once in a derived table (see _build_target_sql)."""
+    sql = _build_target_sql(dsql_schema, dsql_table, pred, metrics)
     cur = conn.cursor()
     try:
-        cur.execute(f'SELECT {", ".join(parts)} FROM {dsql_schema}.{dsql_table}{where}')
+        cur.execute(sql)
         r = cur.fetchone()
         return int(r[0]), list(r[1:])
     finally:
         cur.close()
 
 
-def source_range_summaries(df, pk_src_col, pk_kind, ranges, metrics):
-    """{range index: (row count, [metric values])} on the transformed SOURCE, in one pass.
-    pk_kind None = the whole table as a single range."""
+def _key_col_expr(F, pk_src_col, pk_kind):
+    """The source key as the SAME representation the ranges use (long for integer, dash-stripped
+    lowercase hex string for uuid, string otherwise)."""
+    if pk_kind == "uuid":
+        return F.lower(F.regexp_replace(F.col(pk_src_col), "-", ""))
+    if pk_kind == "integer":
+        return F.col(pk_src_col).cast("long")
+    return F.col(pk_src_col).cast("string")
+
+
+def _source_summaries_one_plan(df, keyc, pk_kind, ranges, base_index, metrics):
+    """Summaries for ONE bounded chunk of ranges via a BROADCAST RANGE-JOIN.
+
+    The chunk's (index, lo, hi) descriptors become a tiny DataFrame; the source is joined on
+    key in [lo, hi). A range-join is a SINGLE plan node whatever the range count, so the plan
+    depth does NOT grow with the number of ranges -- this is the fix for the StackOverflowError
+    the old N-deep F.when chain hit at ~800 ranges. Returns {global_range_index: (cnt, [vals])}."""
     from pyspark.sql import functions as F
-    if pk_kind is None:
-        bucket = F.lit(0)
-    else:
-        if pk_kind == "uuid":
-            keyc = F.lower(F.regexp_replace(F.col(pk_src_col), "-", ""))
-        else:
-            keyc = F.col(pk_src_col).cast("string")
-        bucket = F.lit(-1)
-        for i, (lo, hi) in enumerate(ranges):
-            is_top = (i == len(ranges) - 1)
-            if pk_kind == "integer":
-                keyi = F.col(pk_src_col).cast("long")
-                cond = (keyi >= F.lit(int(lo))) if is_top else \
-                    ((keyi >= F.lit(int(lo))) & (keyi < F.lit(int(hi))))
-            else:
-                cond = (keyc >= F.lit(str(lo))) if is_top else \
-                    ((keyc >= F.lit(str(lo))) & (keyc < F.lit(str(hi))))
-            bucket = F.when(cond, F.lit(i)).otherwise(bucket)
-    dfb = df.withColumn("_rng", bucket)
+    rows = []
+    n = len(ranges)
+    for i, (lo, hi) in enumerate(ranges):
+        is_top = (base_index + i) == (base_index + n - 1)   # top of THIS chunk
+        rows.append((base_index + i,
+                     (int(lo) if pk_kind == "integer" else str(lo)),
+                     (int(hi) if pk_kind == "integer" else str(hi)),
+                     bool(is_top)))
+    rng_df = spark.createDataFrame(rows, ["_ri", "_lo", "_hi", "_is_top"])
+    dfk = df.withColumn("_k", keyc)
+    # key >= lo AND (is_top OR key < hi). Only the GLOBAL top range is unbounded above; within a
+    # chunk every range has a finite hi except possibly the overall last one (carried in _is_top).
+    cond = (dfk["_k"] >= rng_df["_lo"]) & (rng_df["_is_top"] | (dfk["_k"] < rng_df["_hi"]))
+    joined = dfk.join(F.broadcast(rng_df), cond, "inner")
     aggs = [F.count(F.lit(1)).alias("_cnt")]
     for j, m in enumerate(metrics):
         aggs.append(m["src"](F, F.col(m["col"])).alias(f"_m{j}"))
     out = {}
-    for row in dfb.groupBy("_rng").agg(*aggs).collect():
-        ri = row["_rng"]
-        if ri is None or ri < 0:
+    for row in joined.groupBy("_ri").agg(*aggs).collect():
+        ri = row["_ri"]
+        if ri is None:
             continue
-        out[ri] = (int(row["_cnt"]), [row[f"_m{j}"] for j in range(len(metrics))])
+        out[int(ri)] = (int(row["_cnt"]), [row[f"_m{j}"] for j in range(len(metrics))])
+    return out
+
+
+def source_range_summaries(df, pk_src_col, pk_kind, ranges, metrics):
+    """{range index: (row count, [metric values])} on the transformed SOURCE.
+    pk_kind None = the whole table as a single range.
+
+    Bounded Spark plans (B18): never builds one plan whose expression depth grows with the range
+    count. The whole-table case is one grouped aggregate; the ranged case uses a broadcast
+    range-join (O(1) plan depth) and, as a belt-and-suspenders cap, processes at most
+    VALIDATE_SOURCE_RANGES_PER_PLAN ranges per Spark action so even a pathological planner can
+    never see hundreds of range descriptors in one plan."""
+    from pyspark.sql import functions as F
+    if pk_kind is None or not ranges or (len(ranges) == 1 and ranges[0][0] is None):
+        aggs = [F.count(F.lit(1)).alias("_cnt")]
+        for j, m in enumerate(metrics):
+            aggs.append(m["src"](F, F.col(m["col"])).alias(f"_m{j}"))
+        row = df.agg(*aggs).collect()[0]
+        return {0: (int(row["_cnt"]), [row[f"_m{j}"] for j in range(len(metrics))])}
+    keyc = _key_col_expr(F, pk_src_col, pk_kind)
+    out = {}
+    step = max(1, int(VALIDATE_SOURCE_RANGES_PER_PLAN))
+    for start in range(0, len(ranges), step):
+        chunk = ranges[start:start + step]
+        out.update(_source_summaries_one_plan(df, keyc, pk_kind, chunk, start, metrics))
     return out
 
 
@@ -1209,7 +1478,7 @@ def validate_one_table(s3, entry):
     not_in_source = [c for c in target_columns if c not in df_t.columns]
     if not_in_source:
         notes.append(f"not in the DMS CSV (filled by DSQL defaults), not compared: {not_in_source}")
-    metrics = build_metrics(compared, target_types, with_hash=hash_supported()) \
+    metrics = build_metrics(compared, target_types, with_hash=hash_supported(), key_cols=pk_cols) \
         if CHECKSUM_MODE != "off" else []
 
     if rangeable:
@@ -1218,6 +1487,7 @@ def validate_one_table(s3, entry):
         mn = mx = None
         total = df_t.count()
 
+    sizer = _AdaptiveRangeSizer(VALIDATE_ROWS_PER_RANGE, len(compared), len(metrics))
     if total == 0:
         ranges = [(None, None)]
         src = {}
@@ -1226,33 +1496,47 @@ def validate_one_table(s3, entry):
         rangeable_now = rangeable
         if not rangeable:
             ranges = [(None, None)]
-        elif pk_kind == "uuid":
-            ranges = plan_ranges_hex(mn, mx, total, VALIDATE_ROWS_PER_RANGE)
-        elif pk_kind == "integer":
-            ranges = plan_ranges(mn, mx, total, VALIDATE_ROWS_PER_RANGE)
         else:
-            ranges = [(mn, mx)]
+            # Adaptive: size the initial rows/range by TIME. Probe ONE mid range at the current
+            # (width-estimated) size, measure it, let the sizer converge, then plan all ranges
+            # at the converged size. VALIDATE_ROWS_PER_RANGE is the starting value / upper cap.
+            per = sizer.current()
+            if pk_kind in ("uuid", "integer") and total > per:
+                per = _probe_and_size(sizer, dsql_schema, dsql_table, pk_col, pk_kind,
+                                      mn, mx, total, metrics)
+            if pk_kind == "uuid":
+                ranges = plan_ranges_hex(mn, mx, total, per)
+            elif pk_kind == "integer":
+                ranges = plan_ranges(mn, mx, total, per)
+            else:
+                ranges = [(mn, mx)]
         src = source_range_summaries(df_t, pk_col if rangeable else None,
                                      pk_kind if rangeable else None, ranges, metrics)
 
     # ---- TARGET: per-range summaries (DSQL, parallel) ----
     tgt = {}
     lock = threading.Lock()
+    timings = []
 
     def _one(i_rg):
         i, (lo, hi) = i_rg
         is_top = (i == len(ranges) - 1)
+        t0 = time.time()
         if not rangeable_now:
             res = _target_query(dsql_schema, dsql_table, None, metrics)
         else:
-            # V2: run with re-split-on-timeout so a too-large range is halved and retried
-            # instead of erroring the whole table at the DSQL 300s limit.
+            # Re-split-on-timeout so a too-large range is halved and retried instead of erroring
+            # the whole table at the DSQL 300s limit (B14).
             res = target_range_resplit(dsql_schema, dsql_table, pk_col, pk_kind,
                                        lo, hi, is_top, metrics)
+        dt_s = time.time() - t0
         with lock:
             tgt[i] = res
+            timings.append((res[0], dt_s))
+        sizer.observe(res[0], dt_s)   # keep converging for later tables sharing this process
 
-    with ThreadPoolExecutor(max_workers=max(1, MAX_QUERY_CONCURRENCY),
+    parallelism = _default_parallelism()
+    with ThreadPoolExecutor(max_workers=max(1, parallelism),
                             thread_name_prefix="vquery") as pool:
         for f in as_completed([pool.submit(_one, (i, rg)) for i, rg in enumerate(ranges)]):
             f.result()
@@ -1277,10 +1561,31 @@ def validate_one_table(s3, entry):
                                    "column_type": mt["type"], "check": mt["check"],
                                    "source": str(s_vals[j])[:120], "target": str(t_vals[j])[:120]})
 
+    # ---- THROUGHPUT (B18): rows/sec, ranges, parallelism, slowest range ----
+    wall = max(t for _, t in timings) if timings else 0.0   # parallel => wall ~ slowest query
+    # Elapsed under parallelism approximates total_query_seconds / parallelism, but we only have
+    # per-range seconds; report the achieved rate as target rows over the summed query time
+    # divided by the parallelism actually used (a conservative, explainable figure).
+    sum_secs = sum(t for _, t in timings)
+    eff_secs = (sum_secs / max(1, parallelism)) if sum_secs else 0.0
+    rows_per_sec = (tgt_total / eff_secs) if eff_secs > 0 else None
+    slowest = max((t for _, t in timings), default=0.0)
+    throughput = {
+        "ranges": len(ranges),
+        "parallelism": parallelism,
+        "rows_per_range_final": sizer.current(),
+        "validate_hash": VALIDATE_HASH,
+        "metrics_per_range": len(metrics),
+        "slowest_range_seconds": round(slowest, 2),
+        "sum_query_seconds": round(sum_secs, 2),
+        "rows_per_second_est": int(rows_per_sec) if rows_per_sec else None,
+    }
+
     status = "match" if (not mismatches and src_total == tgt_total) else "mismatch"
     return {
         "table": label, "status": status, "ranges": len(ranges),
         "source_rows": src_total, "target_rows": tgt_total,
+        "throughput": throughput,
         "checksum_mode": CHECKSUM_MODE, "columns_compared": len(compared) if metrics else 0,
         "columns_differing": sorted(bad_cols),
         "mismatches": mismatches[:50], "mismatch_count": len(mismatches), "notes": notes,
@@ -1292,8 +1597,9 @@ def validate_one_table(s3, entry):
 # =============================================================================
 print("=" * 70)
 print("JOB 3 VALIDATION — S3 source vs Aurora DSQL target (per-range fingerprint)")
-print(f"  rows/range={VALIDATE_ROWS_PER_RANGE} query_conc={MAX_QUERY_CONCURRENCY} "
-      f"parallel_tables={MAX_PARALLEL_TABLES} checksum={CHECKSUM_MODE}")
+print(f"  rows/range(start/cap)={VALIDATE_ROWS_PER_RANGE} parallelism={_default_parallelism()} "
+      f"(conn_budget={CONN_BUDGET}) target_s/range={VALIDATE_TARGET_SECONDS_PER_RANGE} "
+      f"parallel_tables={MAX_PARALLEL_TABLES} checksum={CHECKSUM_MODE} hash={VALIDATE_HASH}")
 print("=" * 70)
 
 s3_main = make_boto_client('s3')
@@ -1339,6 +1645,11 @@ def _run(entry):
              f"src={r.get('source_rows')} tgt={r.get('target_rows')}, "
              f"columns compared={r.get('columns_compared', 0)}"
              + (f", differing={r['columns_differing']}" if r.get('columns_differing') else "")
+             + (f"; {r['throughput']['ranges']} ranges @ parallelism "
+                f"{r['throughput']['parallelism']}, "
+                f"~{r['throughput']['rows_per_second_est']} rows/s, "
+                f"slowest range {r['throughput']['slowest_range_seconds']}s"
+                if r.get('throughput') else "")
              + ")"
              if r['status'] in ('match', 'mismatch') else
              f" — {r.get('reason', '')}"))

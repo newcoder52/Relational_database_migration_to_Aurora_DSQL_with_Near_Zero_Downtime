@@ -271,6 +271,13 @@ SETTINGS_DEFAULTS = {
     "validate_rows_per_range": 10000,     # job3 rows per validation key-range (B14: lowered so a
                                           # range query returns under DSQL's 300s + the client
                                           # read timeout on big tables; a too-big range re-splits)
+    # B18: validation throughput controls. validate_parallelism 0 = auto (sized from the validate
+    # worker type/count, hard-capped by conn_budget and DSQL's 10,000-conn limit). The sizer aims
+    # each range query at validate_target_seconds_per_range (5-20s band). validate_hash scopes the
+    # per-value md5 check (all|keys|off); md5 is computed once per value.
+    "validate_parallelism": 0,
+    "validate_target_seconds_per_range": 12,
+    "validate_hash": "all",
     # ── GLUE JOB SIZING (speed over cost — size up; create_glue_jobs applies these to the job
     # definitions). Worker TYPES validated against an allow-list; counts/timeouts are ints.
     # The load is DRIVER-SIDE so a bigger WORKER TYPE (=bigger driver) is the lever; defaults
@@ -485,6 +492,13 @@ def _validate_settings(cfg, warnings):
     min_w = _pos_int("min_writers_per_loader")
     max_w = _pos_int("max_writers_per_loader")
     _pos_int("validate_rows_per_range")
+    _pos_int("validate_parallelism", lo=0, hi=10000)   # 0 = auto-size
+    _pos_int("validate_target_seconds_per_range", lo=1, hi=120)
+    vh = str(cfg.get("validate_hash", "all")).strip().lower()
+    if vh not in ("all", "keys", "off"):
+        raise SettingsError(f"pipeline.json 'validate_hash' must be 'all', 'keys' or 'off' "
+                            f"(got {cfg['validate_hash']!r}).")
+    cfg["validate_hash"] = vh
     if min_w > max_w:
         raise SettingsError(f"pipeline.json 'min_writers_per_loader' ({min_w}) must be <= "
                             f"'max_writers_per_loader' ({max_w}).")
@@ -903,6 +917,9 @@ def handler_shared(event, context):
         "minWritersPerLoader": cfg["min_writers_per_loader"],
         "maxWritersPerLoader": cfg["max_writers_per_loader"],
         "validateRowsPerRange": cfg["validate_rows_per_range"],
+        "validateParallelism": cfg["validate_parallelism"],
+        "validateTargetSecondsPerRange": cfg["validate_target_seconds_per_range"],
+        "validateHash": cfg["validate_hash"],
         "glueVersion": cfg["glue_version"],
         "discoveryWorkerType": cfg["discovery_worker_type"],
         "discoveryNumWorkers": cfg["discovery_num_workers"],

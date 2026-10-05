@@ -54,8 +54,6 @@
         "dsqlDatabase.$": "$.Payload.dsqlDatabase",
         "controlSchema.$": "$.Payload.controlSchema",
         "cdcJobName.$": "$.Payload.cdcJobName",
-        "compositeCdcJobName.$": "$.Payload.compositeCdcJobName",
-        "hasCompositeTables.$": "$.Payload.hasCompositeTables",
         "cdcRoot.$": "$.Payload.cdcRoot",
         "warnings.$": "$.Payload.warnings",
         "region.$": "$.Payload.region",

@@ -100,6 +100,21 @@ OPTIONAL_DEFAULTS = {
     # the client socket read timeout on very large/wide tables; a range that still times out is
     # auto re-split smaller. Raise it for narrow tables to validate faster. (B14.)
     "validate_rows_per_range": "10000",
+    # B18: validation throughput controls (no manual tuning needed up to ~1B rows).
+    #   validate_parallelism               : concurrent per-range DSQL queries; blank/0 = auto
+    #                                        (sized from the validate worker type/count, then
+    #                                        hard-capped by conn_budget and DSQL's 10,000-conn
+    #                                        cluster limit). This is the main throughput lever.
+    #   validate_target_seconds_per_range  : adaptive sizer aims each range query at this many
+    #                                        seconds (5-20s band), well under DSQL's 300s limit.
+    #   validate_hash                      : per-value md5 scope — all | keys | off. 'all'
+    #                                        (default) hashes every text/char/uuid/bytea column
+    #                                        (md5 computed ONCE per value); 'keys' only key
+    #                                        columns; 'off' uses count+length+min/max only.
+    # validate_rows_per_range is now only the STARTING value / upper cap for the time sizer.
+    "validate_parallelism": "0",
+    "validate_target_seconds_per_range": "12",
+    "validate_hash": "all",
     # Glue job SIZING (speed over cost — size up, do not throttle). worker types validated
     # against an allow-list; counts/timeouts validated as ints. The load runs DRIVER-SIDE, so a
     # bigger WORKER TYPE (= bigger driver) is what speeds a big table; executor COUNT only helps
@@ -172,6 +187,7 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "writers_per_file", "conn_budget",
                  "min_writers_per_loader", "max_writers_per_loader",
                  "validate_rows_per_range",
+                 "validate_parallelism", "validate_target_seconds_per_range", "validate_hash",
                  "glue_version",
                  "discovery_worker_type", "discovery_num_workers", "discovery_timeout_minutes",
                  "load_worker_type", "load_num_workers", "load_timeout_minutes",
@@ -222,6 +238,11 @@ _PLANNING_INT_KEYS = (
     ("min_writers_per_loader", 1, None),
     ("max_writers_per_loader", 1, None),
     ("validate_rows_per_range", 1, None),
+    # B18 throughput controls. validate_parallelism 0 = auto-size; else a concrete cap (<=10000,
+    # the DSQL cluster connection limit). validate_target_seconds_per_range 1..120 (kept well
+    # under DSQL's 300s txn-age limit). validate_hash is an enum, validated in resolve_task.
+    ("validate_parallelism", 0, 10000),
+    ("validate_target_seconds_per_range", 1, 120),
     # Job sizing counts/timeouts (worker TYPES are validated by resolve_task against an
     # allow-list). num_workers capped at 299 (a per-job sanity cap; the real limit is the
     # account DPU quota, raised in Service Quotas). timeouts 1..10080 min = up to Glue's 7-day
