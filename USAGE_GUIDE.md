@@ -37,7 +37,7 @@ collected in `RUNBOOK.md`.
 ## 1. Prerequisites (per task)
 
 1. **One-time deploy done** (per `RUNBOOK.md`): IAM roles, the Lambda functions
-   ([RUNBOOK Step 2](RUNBOOK.md#step-2--create-the-lambda-functions) — **eight** functions:
+   ([RUNBOOK Step 2](RUNBOOK.md#4-set-up) — **eight** functions:
    seven for the per-task workflows plus `preflight-tasks` for the fleet; `lambdas/` holds **nine**
    `.py` files because `prepare_cdc_wheels.py` ships inside the driver-discovery zip rather than as
    its own function), scripts staged to
@@ -45,12 +45,12 @@ collected in `RUNBOOK.md`.
    - `driver-fullload/`, `driver-validation/` — DSQL driver wheels only (pg8000, scramp,
      asn1crypto, python-dateutil, six).
    - `driver-cdc/` — the same DSQL drivers **plus** modern `boto3`/`botocore` wheels, downloaded
-     **for Python 3.9** ([RUNBOOK Step 3b](RUNBOOK.md#step-3b--driver-wheels)). The startup
+     **for Python 3.9** ([RUNBOOK Step 3b](RUNBOOK.md#4-set-up)). The startup
      workflow checks them and prepares install-safe copies in `driver-cdc-prepared/` before DMS
      starts, so the Python shell CDC job installs them without internet.
-   - `config/pipeline.json` written ([RUNBOOK Step 3c](RUNBOOK.md#step-3c--pipeline-settings)) and
+   - `config/pipeline.json` written ([RUNBOOK Step 3c](RUNBOOK.md#4-set-up)) and
      the two shared per-task state machines plus the two fleet state machines created
-     ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)). The quickest way to do all
+     ([RUNBOOK Step 4](RUNBOOK.md#4-set-up)). The quickest way to do all
      of this is one `params.csv`: copy `config/params.example.csv`, fill it in, upload it as
      `s3://<bucket>/config/params.csv`, and run `tools/setup.sh s3://<bucket>/config/params.csv`
      (idempotent; `--dry-run` previews, `--with-drivers` stages the driver wheels). The fleet reads
@@ -90,7 +90,7 @@ collected in `RUNBOOK.md`.
 Starting a migration — one task or many — always goes through the **fleet-startup** state machine.
 Put one row per DMS task in `fleet_tasks.csv` (columns `task_arn`, optional `task_suffix`, optional
 `adopt_existing_folder`), upload it to the bucket, and launch the fleet once with the bucket and
-the folder that holds it ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)):
+the folder that holds it ([RUNBOOK Step 4](RUNBOOK.md#4-set-up)):
 
 ```bash
 aws stepfunctions start-execution \
@@ -344,7 +344,7 @@ is RUNNING, and only then launch the fleet. **The fleet checks inputs, not readi
 is irreversible per task** — only list tasks whose CDC has caught up.
 
 When CDC has caught up (all tables `idle`, source≈target), launch the **fleet-cutover** state
-machine ([RUNBOOK Step 4](RUNBOOK.md#step-4--create-the-state-machines)):
+machine ([RUNBOOK Step 4](RUNBOOK.md#4-set-up)):
 
 ```bash
 aws stepfunctions start-execution \
@@ -383,7 +383,7 @@ see [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for its inputs, skip rule
 | CDC log: `another CDC run is applying this table` (cycle summary lists the table as applied by another run) | two different CDC jobs or runs are applying the same table | each change is still applied once; find the extra job (old per-task workflow, hand-made copy, a second DMS task with the same table) and stop it |
 | Startup stops at `ResolveFailed`: `Another startup run is already running` | a startup for this task is still running | wait for it or stop it, then launch the fleet again (the task is skipped while running) |
 | CDC startup log: `NOT applied by this job (multi-column primary key)` | the table's primary key has more than one column | expected: run the separate multi-column-key CDC job for it; cutover waits until that job has caught up |
-| Startup stops at `DriversFailed` | a `driver-cdc/` wheel can't work on Python 3.9, or one is missing | the error names the wheel; fix `driver-cdc/` ([RUNBOOK Step 3b](RUNBOOK.md#step-3b--driver-wheels)) and launch the fleet again (DMS was not started) |
+| Startup stops at `DriversFailed` | a `driver-cdc/` wheel can't work on Python 3.9, or one is missing | the error names the wheel; fix `driver-cdc/` ([RUNBOOK Step 3b](RUNBOOK.md#4-set-up)) and launch the fleet again (DMS was not started) |
 | Fleet stops at `PreflightFailed` | one or more rows failed a per-task check before anything started | the cause lists every problem by row; fix them and launch the fleet again (nothing was started) |
 | CDC job fails installing a `.whl` (`CalledProcessError`, `pypi.org` timeouts), often after ~20 min | the run was given the raw `driver-cdc/` list (older per-task workflow, or a hand-made start with `--extra-py-files`) | start it without `--extra-py-files` so it uses the prepared list saved on the job |
 | Startup ends at `CdcRunFailed`, `CdcRunEnded` or `CdcStartNotConfirmed` | the CDC run failed, stopped, or never reached its poll loop | full load is done and DMS is capturing changes: read the CDC log, fix, restart the CDC job with `--config_prefix` |

@@ -17,16 +17,16 @@ task's migration then runs on its own, exactly as if the per-task workflow had b
 
 Deploying the fleet (and everything it needs) is part of the one-time setup in
 [`RUNBOOK.md`](../RUNBOOK.md): the `preflight-tasks` Lambda in
-[Step 2](../RUNBOOK.md#step-2--create-the-lambda-functions), the shared settings in
-[Step 3c](../RUNBOOK.md#step-3c--pipeline-settings), and the fleet state machines (on the shared
+[Step 2](../RUNBOOK.md#4-set-up), the shared settings in
+[Step 3c](../RUNBOOK.md#4-set-up), and the fleet state machines (on the shared
 Step Functions role) in
-[Step 4](../RUNBOOK.md#step-4--create-the-state-machines). This page is the reference for how
+[Step 4](../RUNBOOK.md#4-set-up). This page is the reference for how
 the fleet behaves once it exists.
 
 ## Inputs
 
 **Settings:** the same `s3://<bucket>/config/pipeline.json` every task already uses
-([RUNBOOK Step 3c](../RUNBOOK.md#step-3c--pipeline-settings)). The fleet never writes it directly.
+([RUNBOOK Step 3c](../RUNBOOK.md#4-set-up)). The fleet never writes it directly.
 If you keep a `pipeline.json` next to the task list too, it must be identical, or preflight stops
 (the per-task workflows would not use it).
 
@@ -39,7 +39,7 @@ the candidate equals the live file nothing is written; if a cutover, or anything
 listing executions fails, it stops at `PreflightFailed` and writes nothing (fail closed). A
 `params.csv` plus a second `<inputPrefix>/pipeline.json` is ambiguous and fails. No `params.csv` →
 exactly today's behaviour. The output reports `paramsPublished` / `backupKey` / `paramsReason`. See
-the [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings).
+the [safe-publish rule](../RUNBOOK.md#4-set-up).
 
 **Task list:** a CSV in the bucket, e.g. `s3://<bucket>/config/fleet_tasks.csv`
 ([example](../config/fleet_tasks.example.csv)):
@@ -68,7 +68,7 @@ The `preflight-tasks` Lambda reuses the per-task workflow's own checks (`resolve
 
 - `params.csv` (if present): parsed and validated; its `project` must match the fleet's per-task
   state machine; on a startup with nothing running it publishes `config/pipeline.json` (see the
-  [safe-publish rule](../RUNBOOK.md#step-3c--pipeline-settings)) before the settings check below;
+  [safe-publish rule](../RUNBOOK.md#4-set-up)) before the settings check below;
 - the settings file (all of `resolve_task`'s settings checks);
 - every row: a DMS task ARN in the pipeline's region, listed once, that exists; a legal folder
   name short enough for the Glue job names; no two rows on the same folder; a folder not owned by

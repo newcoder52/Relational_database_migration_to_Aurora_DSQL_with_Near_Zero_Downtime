@@ -21,8 +21,8 @@ end-to-end for **full load + validation** — see §4.
 > are **not applied** by the main CDC job since 2026-10-03 (a separate job is required, or
 > cutover waits — see §2.6 and `ENGINEERING_RECORD.md` 2026-10-03). For how to operate and
 > recover from these cases, see `RUNBOOK.md` →
-> [Known issues](RUNBOOK.md#known-issues-temporary) and
-> [Troubleshooting → CDC](RUNBOOK.md#cdc).
+> [Known issues](RUNBOOK.md#8-if-something-fails) and
+> [Troubleshooting → CDC](RUNBOOK.md#8-if-something-fails).
 
 ---
 
@@ -156,7 +156,7 @@ file survives).
   `RUNBOOK.md` → [Rules for many tasks](RUNBOOK.md#rules-for-the-task-list)). The drain check still
   waits for those tables, so **cutover cannot finish until the separate job has caught up**.
 - **Not in the repo:** the separate composite-key CDC job is not shipped here (known gap — see
-  `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) and the checklist WP10).
+  `RUNBOOK.md` → [Known issues](RUNBOOK.md#8-if-something-fails) and the checklist WP10).
 - All CDC results in §1–§2 are for **single-column-PK** tables only.
 
 ### 2.7 Binary (RAW/BLOB → bytea) stored as ASCII of the hex text (silent) ✅ FIXED 2026-10-04 (simulator only)
@@ -182,8 +182,8 @@ file survives).
   folder, which blocks the later case re-find), and the drain check then reports it caught up —
   cutover can succeed with that table never applied. This does **not** affect single-column-PK
   tables that have data at full load (the folder is found). See
-  `RUNBOOK.md` → [Known issues](RUNBOOK.md#known-issues-temporary) /
-  [Troubleshooting → CDC](RUNBOOK.md#cdc) and the checklist (F02).
+  `RUNBOOK.md` → [Known issues](RUNBOOK.md#8-if-something-fails) /
+  [Troubleshooting → CDC](RUNBOOK.md#8-if-something-fails) and the checklist (F02).
 
 ---
 
@@ -229,7 +229,7 @@ captured ZERO changes** for these tables.
 - **Fix (DBA-side, outside the pipeline):** before CDC starts, confirm every source schema
   existed before the LogMiner mining dictionary was built, or rebuild it
   (`DBMS_LOGMNR_D.BUILD` / redo-log dictionary). This belongs in the RUNBOOK prerequisites — see
-  `RUNBOOK.md` → [Prerequisites checklist](RUNBOOK.md#prerequisites-checklist).
+  `RUNBOOK.md` → [Prerequisites checklist](RUNBOOK.md#2-what-you-need).
 - **Operator first step before blaming LogMiner:** check the DMS task's table statistics and the
   S3 folder `<BucketFolder>/<schema>/<table>/` for timestamped CDC files. If DMS shows changes but
   the files are under a different-case folder, it is a path/case issue (§2.8), not LogMiner.
