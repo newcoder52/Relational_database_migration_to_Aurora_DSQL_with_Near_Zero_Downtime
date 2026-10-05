@@ -41,6 +41,7 @@ provides (`params.csv`, `fleet_tasks.csv`), so the fleet reads `config/params.cs
 - [4. Set up](#4-set-up)
 - [5. Run tasks with the fleet](#5-run-tasks-with-the-fleet)
 - [6. Watch progress](#6-watch-progress)
+  - [Connect to DSQL and check progress](#connect-to-dsql-and-check-progress)
 - [7. Cut over with the fleet](#7-cut-over-with-the-fleet)
 - [8. If something fails](#8-if-something-fails)
 - [9. Reload a task from scratch](#9-reload-a-task-from-scratch)
@@ -410,11 +411,72 @@ aws logs tail "$LG" --log-stream-names "$RUN" --since 1h | grep -E "Full-load ga
 ```
 
 Healthy: `RUNNING`, then `Full-load gate: N/N table(s) marked 'done'` and `entering poll loop`. Per
-table: `SELECT table_name, status, error FROM cdc_control.cdc_status;` (more queries in
-[`USAGE_GUIDE.md`](USAGE_GUIDE.md)).
+table: `SELECT table_name, status, error FROM cdc_control.cdc_status;` — to run that query (and the
+others cutover and recovery need) see [Connect to DSQL and check progress](#connect-to-dsql-and-check-progress)
+below.
 
 If a child run stops at any Fail state, go to [§8](#8-if-something-fails) — what to do depends on
 **where** it stopped.
+
+### Connect to DSQL and check progress
+
+The progress queries, the cutover finish-by-hand step ([§7](#7-cut-over-with-the-fleet)) and the
+recovery rows ([§8](#8-if-something-fails)) all need a SQL session on DSQL — run these from
+CloudShell in the pipeline's region.
+
+**Connect from CloudShell.** DSQL takes an IAM auth token as the password (no stored password) and
+`psql` must use TLS. Install `psql` if missing, then connect with your `params.csv` values
+(`dsql_endpoint`; `dsql_user` default `admin`; `dsql_database` default `postgres`):
+
+```bash
+REGION="<region>"; DSQL_ENDPOINT="<dsql_endpoint>"
+DSQL_USER="admin"; DSQL_DATABASE="postgres"          # dsql_user / dsql_database from params.csv
+command -v psql >/dev/null || sudo dnf install -y postgresql15   # CloudShell: install the client once
+# admin user (the pipeline's default) -> admin token:
+export PGPASSWORD="$(aws dsql generate-db-connect-admin-auth-token \
+  --region "$REGION" --expires-in 3600 --hostname "$DSQL_ENDPOINT")"
+# NON-admin dsql_user instead -> drop 'admin' from the command:
+#   export PGPASSWORD="$(aws dsql generate-db-connect-auth-token \
+#     --region "$REGION" --expires-in 3600 --hostname "$DSQL_ENDPOINT")"
+psql "host=$DSQL_ENDPOINT user=$DSQL_USER dbname=$DSQL_DATABASE sslmode=require"
+```
+
+> CloudShell must reach the DSQL **public** endpoint. If DSQL is only reachable through a VPC
+> endpoint (the `<cluster>.dsql-<id>.<region>.on.aws` form, [§2](#2-what-you-need)), run `psql` from
+> a host inside that VPC (e.g. a CloudShell VPC environment or an EC2 instance in the subnet).
+
+**Progress queries** (control-table schema `cdc_control`, the `control_schema` default; `table_name`
+is the lowercased `<schema>.<table>`):
+
+```sql
+-- per-table status: active (applying) / idle (caught up) / blocked (needs attention),
+-- the last fully-applied CDC file, and the error if blocked
+SELECT table_name, status, last_done_file, error FROM cdc_control.cdc_status ORDER BY table_name;
+
+-- files still to apply vs. already applied, for one table (status 'done' = applied)
+SELECT status, count(*) FROM cdc_control.cdc_file_status
+WHERE table_name = '<schema>.<table>' GROUP BY status;
+```
+
+A table is **caught up** when its `cdc_status.status` is `idle` (the CDC job marks it `idle` once no
+pending files remain). To **resume a blocked table** after fixing the cause, set it back to
+`active` — never `DELETE` the row (applied files stay in the folder and would all replay):
+
+```sql
+UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema>.<table>';
+```
+
+**The SQL the cutover finish-by-hand step needs** ([§7](#7-cut-over-with-the-fleet) /
+[§8](#8-if-something-fails)) — drop the internal `_cdc_file` tracking column from each of the task's
+target tables (quoted identifiers, as the cutover's `drop-tags` step runs it):
+
+```sql
+ALTER TABLE "<schema>"."<table>" DROP COLUMN IF EXISTS "_cdc_file";
+```
+
+**Glue job logs** (CloudWatch): the CDC Python-shell job logs to `/aws-glue/python-jobs/output` and
+`/aws-glue/python-jobs/error`; the Spark load/validate (and Spark CDC) jobs log to
+`/aws-glue/jobs/output`. The run id is the Glue job-run id (see the `aws logs tail` command above).
 
 ---
 
@@ -434,7 +496,8 @@ wrong loses data silently.
       **CDCLatencyTarget** are near zero, and you've waited past any `CdcMaxBatchInterval` so the last
       change file has landed in S3.
 - [ ] **No table is blocked** for any task:
-      `SELECT table_name FROM cdc_control.cdc_status WHERE status='blocked';` returns nothing. If not,
+      `SELECT table_name FROM cdc_control.cdc_status WHERE status='blocked';` returns nothing (run it
+      per [Connect to DSQL and check progress](#connect-to-dsql-and-check-progress)). If not,
       fix the cause and unblock ([§8](#8-if-something-fails)) first.
 - [ ] **Each task's CDC run is RUNNING** ([§6](#6-watch-progress)). Cutover doesn't verify this; if a
       run isn't running, that task's cutover stops DMS and waits the full drain budget (~12 h) before
@@ -520,7 +583,7 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Startup** execution shows `CdcDriverFallback` then succeeds | the Python-shell drivers failed; the job is now Spark | nothing to fix. The reason is in `config/_task/<task name>/_cdc_engine.json`; fix `driver-cdc/` and delete that file to go back to Python shell |
 | **Cutover** `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed | fix the error, re-run cutover for this task via the fleet (keep only this task in the CSV, or remove already-cut-over tasks first) |
 | **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **finish by hand** (below). **Do not re-list this task in a cutover fleet** — its first step would fail on the already-stopped DMS task |
-| **CDC** a table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` — CDC resumes. **Never delete the row** (applied files stay and would all be replayed) |
+| **CDC** a table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` ([how to connect](#connect-to-dsql-and-check-progress)) — CDC resumes. **Never delete the row** (applied files stay and would all be replayed) |
 | **CDC** run ends with no error after ~7 days | the 7-day Glue timeout (the 10080-minute maximum) | start the CDC job by hand (below); it resumes from where it left off. Cut over before 7 days where you can |
 | **CDC** Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
 | **CDC/Glue** `Unknown service: 'dsql'` | `driver-cdc/` lacks a current boto3 set | re-stage drivers (§4), re-trigger the fleet |
@@ -543,7 +606,8 @@ Then check it as in [§6](#6-watch-progress). **Don't use the console's Run butt
 a console run has no `--config_prefix`, so cutover would not find and stop it.
 
 **Finish a cutover by hand** (after any failure once DMS is stopped; set `TASK_NAME` to the
-folder/job stem):
+folder/job stem). The SQL steps (checking status, dropping `_cdc_file`) use a DSQL session — see
+[Connect to DSQL and check progress](#connect-to-dsql-and-check-progress):
 
 ```bash
 PROJECT="<project>"; BUCKET="<bucket>"; export AWS_PAGER=""

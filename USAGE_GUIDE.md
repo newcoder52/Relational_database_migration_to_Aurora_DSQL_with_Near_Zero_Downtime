@@ -271,7 +271,8 @@ that never appears in your data before the full load.
 -- target (DSQL):   SELECT COUNT(*) FROM target_schema.table;
 ```
 
-**CDC control tables (DSQL schema `cdc_control`):**
+**CDC control tables (DSQL schema `cdc_control`):** to open a DSQL session for these queries, see
+[RUNBOOK → Connect to DSQL and check progress](RUNBOOK.md#connect-to-dsql-and-check-progress).
 ```sql
 -- per-table status (idle = caught up, blocked = needs attention)
 SELECT table_name, status, error FROM cdc_control.cdc_status;
