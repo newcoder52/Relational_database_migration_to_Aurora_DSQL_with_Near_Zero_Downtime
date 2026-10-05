@@ -306,7 +306,8 @@ are split the same way. If validation still times out, lower `validate_rows_per_
 **CDC validation (Tier-2)** is **on by default** (`cdc_validation=true`): each CDC job re-reads a
 sample (`cdc_validation_sample`, default 20) of every committed file's rows by key and records
 persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover stops at
-`CdcValidationFailed` if any row has `resolved=false`; review each, then clear it with
+`CdcValidationFailed` if any row is unresolved (`resolved IS NOT TRUE` — a NULL counts as
+unresolved); review each, then clear it with
 `UPDATE cdc_control.cdc_validation_failures SET resolved=true WHERE table_name='<schema>.<table>'`
 (never `DELETE`) and re-run cutover. Set `cdc_validation=false` in `params.csv` to disable.
 

@@ -191,8 +191,9 @@ def _validation_gate(event):
     machine calls it twice — once BEFORE StopCdcDmsTask (pre-check) and once AFTER the drain
     completes (final check) — with the same payload plus "mode": "validation_gate".
 
-    Counts only resolved=false rows, scoped to the task's table labels (dsql_schema.dsql_table,
-    exactly what the CDC jobs write as cdc_validation_failures.table_name). A table/schema that
+    Counts rows where `resolved IS NOT TRUE` (so a NULL 'resolved' — e.g. a row added before an
+    older control table was upgraded — counts as unresolved and gates), scoped to the task's
+    table labels (dsql_schema.dsql_table, exactly what the CDC jobs write as cdc_validation_failures.table_name). A table/schema that
     was never created (no CDC ever ran) counts as 0: the failures table may not exist yet, which
     is treated as "no failures" so cutover still works for a task that never produced CDC.
 
@@ -249,8 +250,8 @@ def _validation_gate(event):
         for label in labels:
             cur.execute(
                 f'SELECT count(*) FROM {control_schema}.cdc_validation_failures '
-                f'WHERE table_name = %s AND resolved = %s',
-                (label, False))
+                f'WHERE table_name = %s AND resolved IS NOT TRUE',
+                (label,))
             n = cur.fetchone()[0]
             if n:
                 by_table[label] = int(n)

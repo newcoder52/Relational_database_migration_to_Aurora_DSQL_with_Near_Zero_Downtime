@@ -341,7 +341,8 @@ MAX_PARALLEL_TABLES = 1
 # cdc_control.cdc_validation_failures (with resolved=false). The apply is NOT blocked (the
 # apply already succeeded and is authoritative). It runs on the table's own connection,
 # AFTER the commit, never inside a chunk transaction, so it never touches the apply hot path.
-# CUTOVER reads cdc_validation_failures: any unresolved row (resolved=false) STOPS cutover.
+# CUTOVER reads cdc_validation_failures: any unresolved row (resolved IS NOT TRUE; NULL counts
+# as unresolved) STOPS cutover.
 VALIDATION_ENABLED = True                # ON by default; override with --cdc_validation false
 VALIDATION_SAMPLE_PER_FILE = 20          # net-ops sampled per file (0 = all — expensive)
 VALIDATION_RETRY_DELAY_SECONDS = 5       # re-check a mismatch after this, before recording
@@ -1260,6 +1261,42 @@ def ensure_control_tables():
             time.sleep(_bo)
 
 
+def _ensure_resolved_column(cur):
+    """Idempotently ensure cdc_control.cdc_validation_failures has the 'resolved' boolean column
+    on an OLDER control table that predates it, WITHOUT ever using a DEFAULT on ALTER.
+
+    DSQL rejects `ALTER TABLE ... ADD COLUMN ... DEFAULT ...` at PARSE time (SQLSTATE 0A000),
+    even with IF NOT EXISTS and even when the column already exists — so we must not emit a
+    DEFAULT. Strategy:
+      1. Probe information_schema.columns; if 'resolved' already exists, do nothing.
+      2. Otherwise ADD COLUMN resolved boolean (NO DEFAULT) -> existing rows get NULL.
+      3. Backfill those NULLs to false in batches strictly under the DSQL ~3000-rows/txn cap.
+    Readers treat NULL as unresolved (`resolved IS NOT TRUE`), so the gate is correct even
+    between steps 2 and 3. `cur` is an autocommit cursor on CONTROL_SCHEMA."""
+    cur.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s AND column_name = %s LIMIT 1",
+        (CONTROL_SCHEMA, "cdc_validation_failures", "resolved"))
+    if cur.fetchone() is not None:
+        return  # already present (fresh CREATE TABLE path or already-upgraded)
+    print(f"  ↻ upgrading {CONTROL_SCHEMA}.cdc_validation_failures: adding 'resolved' column "
+          f"(no DEFAULT; DSQL forbids DEFAULT on ALTER) + backfilling NULL->false in batches",
+          flush=True)
+    cur.execute(f"ALTER TABLE {CONTROL_SCHEMA}.cdc_validation_failures ADD COLUMN resolved boolean")
+    # Backfill existing rows (NULL -> false) in batches comfortably under the ~3000-rows/txn cap.
+    batch = 2000
+    while True:
+        cur.execute(
+            f"UPDATE {CONTROL_SCHEMA}.cdc_validation_failures SET resolved = false "
+            f"WHERE id IN (SELECT id FROM {CONTROL_SCHEMA}.cdc_validation_failures "
+            f"WHERE resolved IS NULL LIMIT {batch})")
+        n = cur.rowcount or 0
+        if n:
+            print(f"    …backfilled {n} row(s) resolved=false", flush=True)
+        if n < batch:
+            break
+
+
 def _ensure_control_tables_once():
     conn = connect_dsql_with_retry(autocommit=True, what="ensure_control_tables")
     cur = conn.cursor()
@@ -1297,6 +1334,12 @@ def _ensure_control_tables_once():
         # details). A validation failure is a DISCREPANCY REPORT, not an apply failure —
         # the apply already committed; this flags that the target row didn't match the
         # expected net-op image for investigation. id supplied by Python (uuid4).
+        # 'resolved' is in the CREATE TABLE so a fresh control schema never needs an ALTER.
+        # The cutover gate counts only UNRESOLVED rows; readers treat NULL as unresolved via
+        # `resolved IS NOT TRUE` (never `resolved = false`), so a backfilled NULL still gates.
+        # An operator clears an investigated failure with
+        #   UPDATE {CONTROL_SCHEMA}.cdc_validation_failures SET resolved=true WHERE table_name=...
+        # (never DELETE — the audit row is kept).
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.cdc_validation_failures (
                 id            uuid PRIMARY KEY,
@@ -1305,16 +1348,18 @@ def _ensure_control_tables_once():
                 cdc_file      varchar(1024),
                 pk_value      varchar(1024),
                 failure_type  varchar(64),
-                details       varchar(8000)
+                details       varchar(8000),
+                resolved      boolean
             )
         """)
-        # resolved: the cutover gate counts only unresolved rows (resolved=false). An operator
-        # clears an investigated failure with
-        #   UPDATE {CONTROL_SCHEMA}.cdc_validation_failures SET resolved=true WHERE table_name=...
-        # (never DELETE — the audit row is kept). ADD COLUMN IF NOT EXISTS so an older control
-        # schema is upgraded in place; new rows default to false (unresolved).
-        cur.execute(f"ALTER TABLE {CONTROL_SCHEMA}.cdc_validation_failures "
-                    f"ADD COLUMN IF NOT EXISTS resolved boolean DEFAULT false")
+        # UPGRADE PATH for a control table created by an OLDER build WITHOUT 'resolved'. DSQL
+        # rejects `ADD COLUMN ... DEFAULT` at PARSE time (0A000) even when the column already
+        # exists (IF NOT EXISTS does NOT short-circuit the DEFAULT parse), so we must NEVER emit
+        # a DEFAULT on ALTER. Instead: probe information_schema.columns; only if 'resolved' is
+        # missing do we ADD COLUMN with NO DEFAULT, then backfill existing rows to false in
+        # batches well under the DSQL ~3000-rows/txn cap. New inserts always set resolved
+        # explicitly (see _record_validation_failure).
+        _ensure_resolved_column(cur)
         # PER-FILE LEDGER — one durable row per (table_name, cdc_file) recording the file's
         # apply lifecycle. This is ADDITIVE observability/audit on top of cdc_status (which
         # holds only the single moving resume position per table); it never changes how rows

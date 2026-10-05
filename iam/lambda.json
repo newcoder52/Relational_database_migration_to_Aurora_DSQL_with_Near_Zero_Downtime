@@ -40,13 +40,6 @@
         "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
       },
       {
-        "Sid": "DsqlResolvePrivateLinkHostname",
-        "_comment": "resolve-task derives the DSQL PrivateLink connection-endpoint hostname (<cluster-id>.<service-identifier>.<region>.on.aws) from get-vpc-endpoint-service-name so in-VPC Glue jobs can reach DSQL when the public name is unreachable. Read-only; scoped to this cluster (the action supports the Cluster resource type).",
-        "Effect": "Allow",
-        "Action": ["dsql:GetVpcEndpointServiceName"],
-        "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
-      },
-      {
         "Sid": "GlueManageJobsAtRuntime",
         "Effect": "Allow",
         "Action": ["glue:CreateJob", "glue:UpdateJob", "glue:DeleteJob", "glue:GetJob",

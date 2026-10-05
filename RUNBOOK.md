@@ -586,12 +586,12 @@ WHERE table_name = '<schema>.<table>' GROUP BY status;
 
 -- unresolved CDC validation failures per table (cutover is blocked while any exist):
 SELECT table_name, count(*) AS unresolved FROM cdc_control.cdc_validation_failures
-WHERE resolved = false GROUP BY table_name ORDER BY unresolved DESC;
+WHERE resolved IS NOT TRUE GROUP BY table_name ORDER BY unresolved DESC;
 
 -- detail for one table (what mismatched, which file, which key):
 SELECT failure_time, cdc_file, pk_value, failure_type, details
 FROM cdc_control.cdc_validation_failures
-WHERE resolved = false AND table_name = '<schema>.<table>' ORDER BY failure_time;
+WHERE resolved IS NOT TRUE AND table_name = '<schema>.<table>' ORDER BY failure_time;
 ```
 
 A table is **caught up** when its `cdc_status.status` is `idle` (the CDC job marks it `idle` once no
@@ -733,7 +733,7 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Cutover** `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed | fix the error, re-run cutover for this task via the fleet (keep only this task in the CSV, or remove already-cut-over tasks first) |
 | **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **re-run cutover for this task**. Cutover is now re-runnable: it describes the DMS task first and skips the stop when it is already stopped (`InvalidResourceStateFault` is also tolerated), re-drains, and every later step is idempotent (stop-CDC no-op when nothing runs, `_cdc_file` drop `IF EXISTS`, Glue delete treats an already-gone job as deleted, a fork job already absent is fine) |
 | **Cutover** `CdcValidationFailed` (from `CdcValidationFailedPre`, **before** DMS is stopped) | nothing touched — DMS still running, CDC still running | investigate the unresolved rows (query below), confirm each is explained/benign, then clear them and re-run cutover: `UPDATE cdc_control.cdc_validation_failures SET resolved = true WHERE table_name = '<schema>.<table>';` (never `DELETE` — keep the audit) |
-| **Cutover** `CdcValidationFailed` (from `CdcValidationFailedFinal`, **after** the drain) | DMS is **stopped**; the CDC run, the `_cdc_file` column and the Glue jobs are **untouched** | same `UPDATE … SET resolved = true` after review, then re-run cutover (it re-stops DMS idempotently, re-drains, re-checks). The query: `SELECT table_name, count(*) FROM cdc_control.cdc_validation_failures WHERE resolved=false GROUP BY table_name;` |
+| **Cutover** `CdcValidationFailed` (from `CdcValidationFailedFinal`, **after** the drain) | DMS is **stopped**; the CDC run, the `_cdc_file` column and the Glue jobs are **untouched** | same `UPDATE … SET resolved = true` after review, then re-run cutover (it re-stops DMS idempotently, re-drains, re-checks). The query: `SELECT table_name, count(*) FROM cdc_control.cdc_validation_failures WHERE resolved IS NOT TRUE GROUP BY table_name;` |
 | **CDC** a table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` ([how to connect](#connect-to-dsql-and-check-progress)) — CDC resumes. **Never delete the row** (applied files stay and would all be replayed) |
 | **CDC** run ends with no error after ~7 days | the 7-day Glue timeout (the 10080-minute maximum) | start the CDC job by hand (below); it resumes from where it left off. Cut over before 7 days where you can |
 | **CDC** Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
