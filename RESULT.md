@@ -148,7 +148,8 @@ job args). `conn_budget` is now also passed to the validate job (caps parallelis
 
 ## Commit
 - Author: `newcoder52 <aash.798@gmail.com>`, plain `git push` (osxkeychain). No tokens/API, never force.
-- Commit SHA: see DONE (filled after commit); verified in a 2nd fresh clone.
+- Commit SHA: **`dd88d83`** (parent `5e4adf8`); pushed `5e4adf8..dd88d83` to `main`; verified in
+  a 2nd fresh clone (HEAD `dd88d83`, all suites green).
 
 ## Runtime files changed
 - `scripts/job3_validate.py` — B18: single-md5 derived table, metric pruning, `validate_hash`,

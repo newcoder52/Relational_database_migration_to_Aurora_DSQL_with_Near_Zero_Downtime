@@ -1,0 +1,52 @@
+DONE
+
+Task: fix B19 and B18 from real-e2e/REPORT.md. Offline only; no AWS account touched.
+
+Base HEAD (verified via git ls-remote): 5e4adf8
+Commit:                               dd88d83  (parent 5e4adf8, fast-forward)
+Author:                               newcoder52 <aash.798@gmail.com>
+Pushed:                               origin/main  5e4adf8..dd88d83  (plain git push, no force)
+Verified:                             2nd fresh clone at HEAD dd88d83, all 9 suites green,
+                                      cutover composite reads gone (grep = 0).
+
+B19 (HIGH): removed the two obsolete $.Payload reads (compositeCdcJobName, hasCompositeTables)
+from cutover.asl.json CutoverResolveTask — forks are found by tag at cutover, so the fields are
+dead. Added tests/test_asl_payload_contract.py (every $.Payload.<field> a ResultSelector reads
+must be returned by the Lambda in that mode, all 4 state machines incl. fleet-*; + fake-invoke
+of resolve_task cutover mode). test_asl_paths.py now also runs this audit.
+
+B18 (HIGH): job3_validate.py now (1) computes md5 ONCE per value via a derived table
+(identical numbers, ~6x fewer md5 calls — the 300s root cause), (2) drops redundant text
+MIN/MAX when hashing + adds validate_hash=all|keys|off, (3) replaces the N-deep F.when source
+bucketing with a broadcast range-join + bounded ranges-per-plan (StackOverflow fix), (4) runs
+per-range DSQL queries in parallel sized from the worker and hard-capped by conn_budget + DSQL's
+10,000-conn cluster limit, (5) sizes ranges by TIME (adaptive, 5-20s band) with
+validate_rows_per_range as a seed, (6) logs per-table throughput. Settings validate_parallelism /
+validate_target_seconds_per_range / validate_hash wired params.csv -> pipeline.json ->
+resolve_task -> startup ASL -> validate/ck-validate job args. Tests:
+tests/test_b18_validate_throughput.py (8M/100M/1B bounded plans, parallelism <= conn_budget,
+sizer converges, single-md5 identical, parallel >> sequential).
+
+Docs: RUNBOOK §3/§8 + MANUAL_SETUP §3/§3c + params.example.csv + pipeline.example.json updated;
+removed advice to raise validate_rows_per_range for StackOverflow; added an EXPLAIN ANALYZE
+snippet (RUNBOOK §8) to time one range query.
+
+Runtime files changed:
+  scripts/job3_validate.py
+  lambdas/resolve_task.py
+  lambdas/create_glue_jobs.py
+  lambdas/params_csv.py
+  stepfunctions/cutover.asl.json
+  stepfunctions/startup.asl.json
+(glue-templates/ unchanged — validate args are injected by create_glue_jobs.)
+
+Tests added/changed: tests/test_asl_payload_contract.py, tests/test_b18_validate_throughput.py,
+tests/test_asl_paths.py, tests/test_e2e_fixes.py, tests/test_fix6.py.
+Docs/examples: RUNBOOK.md, docs/MANUAL_SETUP.md, config/params.example.csv, config/pipeline.example.json.
+Deliverables: RESULT.md, DONE.
+
+Sync: ~/Downloads/dms-s3-glue-dsql-migration/ backed up to
+~/Downloads/cdc_backups/before-dd88d83/ (no .git), then the 15 changed files copied in
+(byte-identical to repo); its .git was not touched. Sync target suites green.
+
+All existing suites green (9/9).
