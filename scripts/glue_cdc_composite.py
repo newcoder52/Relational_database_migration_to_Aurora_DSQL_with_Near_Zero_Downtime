@@ -318,16 +318,17 @@ CDC_MODS_PER_INSERT = 1              # an INSERT/UPDATE net-op = 1 upsert (ON CO
 MAX_PARALLEL_TABLES = 1
 
 # ---- TIER-2 CDC VALIDATION (deferred, sampled by-PK net-state check) ----------------
-# OFF by default — it adds target reads AFTER a file commits, so it costs some time/IO.
-# When on, after a file's apply fully commits, v4 samples up to VALIDATION_SAMPLE_PER_FILE
-# of that file's net-ops and re-reads each row by PK from the target, comparing to the
-# expected net-op image (INSERT -> row present + values match; DELETE -> row absent). A
-# mismatch is RE-CHECKED after VALIDATION_RETRY_DELAY_SECONDS (absorbs any commit lag);
-# only a persistent mismatch is recorded in cdc_control.cdc_validation_failures. This is a
-# DISCREPANCY REPORT — it does NOT block the apply (the apply already succeeded and is
-# authoritative). It runs on the table's own connection, AFTER the commit, never inside a
-# chunk transaction, so it never touches the apply hot path.
-VALIDATION_ENABLED = False               # opt-in; keeps apply latency flat by default
+# ON by default (override with --cdc_validation false). It adds target reads AFTER a file
+# commits, so it costs some time/IO. After a file's apply fully commits, v4 samples up to
+# VALIDATION_SAMPLE_PER_FILE of that file's net-ops and re-reads each row by its key(s) from
+# the target, comparing to the expected net-op image (INSERT -> row present + values match;
+# DELETE -> row absent). A mismatch is RE-CHECKED after VALIDATION_RETRY_DELAY_SECONDS
+# (absorbs any commit lag); only a persistent mismatch is recorded in
+# cdc_control.cdc_validation_failures (resolved=false). The apply is NOT blocked (the apply
+# already succeeded and is authoritative). It runs on the table's own connection, AFTER the
+# commit, never inside a chunk transaction, so it never touches the apply hot path.
+# CUTOVER reads cdc_validation_failures: any unresolved row (resolved=false) STOPS cutover.
+VALIDATION_ENABLED = True                # ON by default; override with --cdc_validation false
 VALIDATION_SAMPLE_PER_FILE = 20          # net-ops sampled per file (0 = all — expensive)
 VALIDATION_RETRY_DELAY_SECONDS = 5       # re-check a mismatch after this, before recording
 VALIDATION_MAX_FAILURES_PER_TABLE = 100  # circuit breaker: stop validating a table past this
@@ -441,11 +442,13 @@ def _apply_cdc_arg_overrides():
     global DMS_TASK_ARN, CONTROL_SCHEMA
     global MAX_PARALLEL_TABLES, REQUIRE_FULL_LOAD_DONE, POLL_INTERVAL
     global DMS_TIMESTAMP_COLUMN, SINGLE_SWAP_IS_RENAME
+    global VALIDATION_ENABLED, VALIDATION_SAMPLE_PER_FILE
     optional = ["config_prefix", "index_s3_key", "load_status_key", "s3_bucket", "cdc_root",
                 "dsql_endpoint", "dsql_database", "dsql_user", "region",
                 "dms_task_arn", "control_schema",
                 "max_parallel_tables", "require_full_load_done", "poll_interval",
-                "timestamp_column", "single_swap_is_rename"]
+                "timestamp_column", "single_swap_is_rename",
+                "cdc_validation", "cdc_validation_sample"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -502,6 +505,16 @@ def _apply_cdc_arg_overrides():
             print(f"  ⚠️ ignoring invalid poll_interval={ov['poll_interval']!r}")
     if "require_full_load_done" in ov:
         REQUIRE_FULL_LOAD_DONE = str(ov["require_full_load_done"]).strip().lower() in ("true", "1", "yes")
+    if "cdc_validation" in ov and ov["cdc_validation"] is not None:
+        # Missing arg leaves the ON-by-default constant untouched; an explicit value overrides.
+        VALIDATION_ENABLED = str(ov["cdc_validation"]).strip().lower() in ("true", "1", "yes")
+        print(f"  ↪ VALIDATION_ENABLED overridden -> {VALIDATION_ENABLED}")
+    if "cdc_validation_sample" in ov and ov["cdc_validation_sample"] is not None:
+        try:
+            VALIDATION_SAMPLE_PER_FILE = max(0, int(ov["cdc_validation_sample"]))
+            print(f"  ↪ VALIDATION_SAMPLE_PER_FILE overridden -> {VALIDATION_SAMPLE_PER_FILE}")
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid cdc_validation_sample={ov['cdc_validation_sample']!r}")
 
 
 _apply_cdc_arg_overrides()
@@ -1156,6 +1169,12 @@ def _ensure_control_tables_once():
                 details       varchar(8000)
             )
         """)
+        # resolved: cutover counts only unresolved rows (resolved=false). Operator clears an
+        # investigated failure with UPDATE ... SET resolved=true (never DELETE). ADD COLUMN IF
+        # NOT EXISTS upgrades an older schema in place; new rows default to false. Same column
+        # as the main CDC job writes — both jobs share CONTROL_SCHEMA.cdc_validation_failures.
+        cur.execute(f"ALTER TABLE {CONTROL_SCHEMA}.cdc_validation_failures "
+                    f"ADD COLUMN IF NOT EXISTS resolved boolean DEFAULT false")
         # PER-FILE LEDGER — one durable row per (table_name, cdc_file) recording the file's
         # apply lifecycle. This is ADDITIVE observability/audit on top of cdc_status (which
         # holds only the single moving resume position per table); it never changes how rows
@@ -1471,61 +1490,130 @@ def _record_validation_failure(conn, table_name, cdc_file, pk_value, failure_typ
         try:
             c.execute(
                 f'INSERT INTO {CONTROL_SCHEMA}.cdc_validation_failures '
-                f'(id, table_name, failure_time, cdc_file, pk_value, failure_type, details) '
-                f'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+                f'(id, table_name, failure_time, cdc_file, pk_value, failure_type, details, resolved) '
+                f'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
                 (str(uuid.uuid4()), table_name, utc_now_iso(), cdc_file,
-                 str(pk_value)[:1024], failure_type, str(details)[:8000]))
+                 str(pk_value)[:1024], failure_type, str(details)[:8000], False))
         finally:
             c.close()
     except Exception as e:
         print(f"    ⚠️ could not record validation failure for {table_name} (non-fatal): {e}")
 
 
+def _canon_timestamp(x):
+    """Canonicalize a timestamp/date value (convert_value string form or a DB-native
+    datetime/date) to one comparable string, so a normalized expected string and the datetime
+    pg8000 reads back compare equal. Parse to a datetime, drop tzinfo (the pipeline is UTC),
+    format with microseconds; unparseable -> trimmed string with a trailing UTC marker removed."""
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        dt = x.replace(tzinfo=None) if x.tzinfo is not None else x
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    s = str(x).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            dt = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            continue
+    return re.sub(r'\s*(?:\+00:00|Z|UTC)\s*$', '', s, flags=re.IGNORECASE)
+
+
+def _canon_bytea(x):
+    """Canonicalize a bytea value to lowercase '\\x<hex>'. Accepts the convert_value string form
+    ('\\xcbde'), a raw/0x-prefixed hex string, or the Python bytes/memoryview pg8000 returns."""
+    if x is None:
+        return None
+    if isinstance(x, (bytes, bytearray, memoryview)):
+        return '\\x' + bytes(x).hex()
+    s = str(x).strip()
+    h = _BYTEA_PREFIX.sub('', s, count=1)
+    return '\\x' + h.lower() if _HEX_BYTES.match(h) else s
+
+
 def _values_match(expected, actual, category):
-    """Compare an expected net-op value (already convert_value-normalized to the string
-    form v4 sends) against the value read back from the target, tolerantly per category.
-    Both sides are coerced to comparable strings; None==None. This is a best-effort
-    content check, not a byte-exact one (DSQL may normalize casing/precision)."""
+    """Compare an expected net-op value (already convert_value-normalized to the string form v4
+    sends to DSQL) against the value READ BACK from the target. The read returns DB-native Python
+    types (datetime, Decimal, bool, bytes, int/float), so each category coerces BOTH sides to one
+    canonical form before comparing — otherwise a correct row reads back as a false mismatch.
+    Mirrors the apply's normalisation (convert_value / sql_literal casts): None==None; uuid
+    case/dash-insensitive; boolean folded; bytea '\\x'+hex; numeric by value (scale-insensitive);
+    int by integer value; timestamp/date as tz-naive UTC datetime; json structurally; text/char
+    EXACT (significant leading/trailing spaces + case preserved, matching the ::text cast)."""
     if expected is None:
         return actual is None
     if actual is None:
         return False
-    e = str(expected).strip()
-    a = str(actual).strip()
     if category == 'uuid':
-        return e.lower().replace("-", "") == a.lower().replace("-", "")
+        return str(expected).strip().lower().replace("-", "") == \
+               str(actual).strip().lower().replace("-", "")
     if category == 'boolean':
         norm = {"true": "t", "t": "t", "1": "t", "false": "f", "f": "f", "0": "f"}
-        return norm.get(e.lower(), e.lower()) == norm.get(a.lower(), a.lower())
+        def _b(v):
+            if isinstance(v, bool):
+                return "t" if v else "f"
+            s = str(v).strip().lower()
+            return norm.get(s, s)
+        return _b(expected) == _b(actual)
+    if category == 'bytea':
+        return _canon_bytea(expected) == _canon_bytea(actual)
+    if category in ('timestamptz', 'timestamp', 'date'):
+        return _canon_timestamp(expected) == _canon_timestamp(actual)
+    if category in ('json', 'jsonb'):
+        try:
+            return json.loads(str(expected)) == (actual if not isinstance(actual, (str, bytes, bytearray))
+                                                 else json.loads(actual if isinstance(actual, str)
+                                                                 else actual.decode('utf-8')))
+        except (ValueError, TypeError):
+            return str(expected).strip() == str(actual).strip()
     if category in ('integer', 'bigint', 'smallint'):
         try:
-            return int(float(e)) == int(float(a))
+            return int(float(expected)) == int(float(actual))
         except (ValueError, TypeError):
-            return e == a
-    if category in ('numeric', 'float'):
+            return str(expected).strip() == str(actual).strip()
+    if category in ('numeric', 'float', 'double', 'real'):
         try:
-            return abs(float(e) - float(a)) < 1e-9
-        except (ValueError, TypeError):
-            return e == a
-    return e == a
+            from decimal import Decimal
+            return Decimal(str(expected)) == Decimal(str(actual))
+        except Exception:  # noqa: BLE001
+            try:
+                return abs(float(expected) - float(actual)) < 1e-9
+            except (ValueError, TypeError):
+                return str(expected).strip() == str(actual).strip()
+    return str(expected) == str(actual)
 
 
 def validate_file_netops(ctx, cdc_key, netops, col_category):
     """TIER-2 (deferred, sampled) validation for ONE just-committed file. For a sample of
-    the file's net-ops, re-read the target row by PK and compare to the expected net-op
-    image (INSERT -> present + values match; DELETE -> absent). Retry a mismatch once after
-    a short delay (absorbs any lag), then record persistent mismatches to
-    cdc_validation_failures. Runs on its OWN autocommit connection AFTER the file committed
-    — never inside the apply transaction, so it can't affect apply latency/correctness.
+    the file's net-ops, re-read the target row by its key(s) and compare to the expected
+    net-op image (INSERT -> present + values match; DELETE -> absent). Retry a mismatch once
+    after a short delay (absorbs any lag), then record persistent mismatches to
+    cdc_validation_failures (resolved=false). Runs on its OWN autocommit connection AFTER the
+    file committed — never inside the apply transaction, so it can't affect apply latency.
 
-    KNOWN LIMITATION (why it's advisory, sampled, and off by default): this checks a
-    single file's net-ops against the CURRENT target. If a later CDC file re-inserts a PK
-    this file DELETEd (or updates a PK this file INSERTed), the deferred check can see the
-    LATER state and report a false MISSING_DELETE / RECORD_DIFF. The retry-once absorbs the
-    immediate lag window; genuine drift persists across the retry. Treat recorded failures
-    as leads to investigate (query cdc_validation_failures + the source), not hard proof.
+    NO FALSE FAILURES ON LATER-FILE OVERWRITES: a deferred by-key check sees the CURRENT
+    target, so a LATER CDC file re-inserting a key this file DELETEd (or changing a key this
+    file INSERTed) would wrongly read as MISSING_DELETE / RECORD_DIFF. Two guards prevent
+    recording such a false failure, so a recorded failure always means real target drift (and
+    therefore safely gates cutover):
+      1. Per-table serial apply means no later file for THIS table commits during this pass,
+         so the retry delay cannot straddle a newer file.
+      2. Before RECORDING a persistent mismatch we re-check the per-file ledger: if ANY file
+         for this table with a filename LATER than this one is already committed/done, the key
+         may have been superseded, so we SKIP it (do not record). A genuine drift on a key no
+         later file touched still persists and is recorded. (Supersession is ledger-keyed, not
+         per-key, so it can only ever SKIP, never invent, a failure.)
 
-    Returns the number of persistent discrepancies found (0 = clean)."""
+    Composite keys: the WHERE clause uses EVERY key column (apply_keys / netop['keys']), so a
+    multi-column PK row is targeted exactly as the apply targeted it.
+
+    Returns the number of persistent discrepancies recorded (0 = clean)."""
     if not VALIDATION_ENABLED or not netops:
         return 0
     label = ctx["label"]
@@ -1535,6 +1623,26 @@ def validate_file_netops(ctx, cdc_key, netops, col_category):
     # reached for keyed (Tier-1) tables; keyless tables never produce keyed netops.
     apply_keys = ctx.get("apply_keys") or ([ctx["apply_key"]] if ctx.get("apply_key") else [])
     _key_suffix = [CAST_SUFFIX.get(col_category.get(k, 'varchar'), '') for k in apply_keys]
+    _this_base = cdc_key.split("/")[-1]
+
+    def _superseded_by_later_file(conn):
+        """True if a LATER CDC file for this table is already committed/done in the ledger —
+        the current target may reflect that later file, so a mismatch on this (older) file's
+        keys must NOT be recorded. Best-effort: any error -> False (never suppress a real one)."""
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f'SELECT 1 FROM {CONTROL_SCHEMA}.cdc_file_status '
+                    f'WHERE table_name = %s '
+                    f'AND (status = %s OR all_rows_committed = %s) '
+                    f'AND split_part(cdc_file, %s, -1) > %s LIMIT 1',
+                    (label, "done", True, "/", _this_base))
+                return cur.fetchone() is not None
+            finally:
+                cur.close()
+        except Exception:
+            return False
 
     def _key_where(netop):
         """WHERE clause targeting the net-op's key(s): "k1"=lit1 AND "k2"=lit2 ... For a
@@ -1595,6 +1703,13 @@ def validate_file_netops(ctx, cdc_key, netops, col_category):
             res2 = _check_one(conn, netop)
             if res2 is None:
                 continue   # cleared on retry -> was just lag, not a real discrepancy
+            # Still mismatched after the retry. Don't record a false positive if a LATER
+            # committed file for this table may have superseded this key (would block cutover).
+            if _superseded_by_later_file(conn):
+                print(f"    ↪ VALIDATION {label} {cdc_key.split('/')[-1]}: key "
+                      f"{str(netop['pk'])[:60]} superseded by a later committed file; "
+                      f"not recorded.")
+                continue
             ftype, details = res2
             _record_validation_failure(conn, label, cdc_key, netop["pk"], ftype, details)
             failures += 1

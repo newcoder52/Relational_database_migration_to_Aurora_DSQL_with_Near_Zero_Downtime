@@ -86,8 +86,17 @@ job.init(args['JOB_NAME'], args)
 # CONFIGURATION — infrastructure endpoints only, no per-table column lists
 # =============================================================================
 DSQL_ENDPOINT = "<YOUR_CLUSTER>.dsql.<REGION>.on.aws"  # overridden at runtime via --dsql_endpoint
+# Ordered, comma-separated DSQL hostnames to try (resolve_task derives a PrivateLink candidate
+# and passes --dsql_endpoint_candidates). connect_dsql() tries each in order, pins the first
+# that connects into DSQL_ENDPOINT, and all later connects reuse the pinned host. Empty -> just
+# DSQL_ENDPOINT is used (full backward compatibility).
+DSQL_ENDPOINT_CANDIDATES = ""
 REGION = "us-east-1"
 DSQL_USER = "admin"
+# M11: the DSQL database to connect to. Default "postgres" (unchanged for the common case);
+# overridable via --dsql_database so a non-default database works for discovery too (job2/job3/CDC
+# already honor it).
+DSQL_DATABASE = "postgres"
 
 # S3 bucket that DMS writes CSVs into (BucketFolder="" so tables live at bucket root
 # under <schema>/<table>/). Used to derive each table's DMS CSV path from the manifest.
@@ -123,8 +132,10 @@ INDEX_S3_PATH = CONFIG_PREFIX + "_manifest_index.json"
 def _apply_job1_arg_overrides():
     global CONFIG_PREFIX, INDEX_S3_PATH, MANIFEST_S3_PATH
     global DSQL_ENDPOINT, DSQL_USER, REGION, DMS_BUCKET, DMS_BUCKET_FOLDER, ALLOW_ALL_EMPTY
-    optional = ["config_prefix", "dsql_endpoint", "dsql_user", "region", "dms_bucket",
-                "cdc_root", "allow_all_empty"]
+    global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
+    global DSQL_DATABASE   # M11: honor --dsql_database
+    optional = ["config_prefix", "dsql_endpoint", "dsql_user", "dsql_database", "region", "dms_bucket",
+                "cdc_root", "allow_all_empty", "dsql_endpoint_candidates"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -144,11 +155,21 @@ def _apply_job1_arg_overrides():
         if _de:
             DSQL_ENDPOINT = _de
             print(f"  ↪ DSQL_ENDPOINT overridden -> {DSQL_ENDPOINT}")
+    if "dsql_endpoint_candidates" in ov:
+        _dc = str(ov["dsql_endpoint_candidates"]).strip()
+        if _dc:
+            DSQL_ENDPOINT_CANDIDATES = _dc
+            print(f"  ↪ DSQL_ENDPOINT_CANDIDATES -> {DSQL_ENDPOINT_CANDIDATES}")
     if "dsql_user" in ov:
         _du = str(ov["dsql_user"]).strip()
         if _du:
             DSQL_USER = _du
             print(f"  ↪ DSQL_USER overridden -> {DSQL_USER}")
+    if "dsql_database" in ov:
+        _dd = str(ov["dsql_database"]).strip()
+        if _dd:
+            DSQL_DATABASE = _dd
+            print(f"  ↪ DSQL_DATABASE overridden -> {DSQL_DATABASE}")
     if "region" in ov:
         _rg = str(ov["region"]).strip()
         if _rg:
@@ -283,30 +304,99 @@ def read_manifest(s3_client, manifest_path):
     return specs
 
 
+# Socket connect timeout (seconds) per candidate probe during endpoint failover: a wrong
+# PrivateLink/public host should fail FAST so we move to the next candidate.
+DSQL_CANDIDATE_CONNECT_TIMEOUT = 10
+_dsql_endpoint_resolved = False
+
+# === DSQL ENDPOINT FAILOVER HELPER (shared; keep byte-identical across all copies) =========
+# One operator-supplied endpoint, but connectivity differs by where this code runs: Glue in a
+# private VPC reaches DSQL over a PrivateLink connection endpoint whose working hostname is
+# <cluster-id>.<service-identifier>.<region>.on.aws, while the public console name
+# <cluster-id>.dsql.<region>.on.aws times out on 5432 there. resolve_task derives the private
+# candidate (via dsql.get_vpc_endpoint_service_name) and passes an ordered, comma-separated
+# --dsql_endpoint_candidates list; we try each in order and the first that connects wins. The
+# auth token MUST be minted for the host actually connected to, so the caller's make_conn(host)
+# builds the token from its host argument. This block is duplicated verbatim per script because
+# Glue copies each script to S3 as a single file; tests/test_helper_sync.py diffs the copies.
+# ============================================================================================
+def dsql_candidate_list(candidates_csv, given_endpoint):
+    """Ordered, de-duped candidate hostnames from the --dsql_endpoint_candidates CSV, always
+    ending with the operator-given endpoint as a backstop. Never raises: a blank/missing CSV
+    degrades to just [given_endpoint] so a connection is still attempted."""
+    out = []
+    for raw in (candidates_csv or "").split(","):
+        host = raw.strip()
+        if host and host not in out:
+            out.append(host)
+    g = (given_endpoint or "").strip()
+    if g and g not in out:
+        out.append(g)
+    return out
+
+
+def dsql_connect_first(candidates, make_conn, log=None):
+    """Try make_conn(host) for each candidate in order; return (conn, host) for the first that
+    connects. make_conn must mint the auth token for the host it is given. On total failure,
+    raise one RuntimeError naming every host tried and its error, plus a one-line network hint.
+    log(msg), if given, is called once with the hostname that worked."""
+    errors = []
+    for host in candidates:
+        try:
+            conn = make_conn(host)
+            if log:
+                log(host)
+            return conn, host
+        except Exception as e:   # noqa: BLE001 - any connect failure -> try the next host
+            errors.append((host, f"{type(e).__name__}: {e}"))
+    tried = "; ".join(f"{h} -> {err}" for h, err in errors) or "(no candidates)"
+    raise RuntimeError(
+        "Could not connect to Aurora DSQL on any candidate hostname [" + tried + "]. "
+        "Hint: Glue/Lambda needs a network route to DSQL: a DSQL VPC endpoint with private "
+        "DNS, or internet/NAT.")
+# === END DSQL ENDPOINT FAILOVER HELPER ======================================================
+
+
+def _make_dsql_conn(host):
+    """Open an authenticated pg8000 connection to ONE host (token minted for that host)."""
+    client = boto3.client("dsql", region_name=REGION)
+    token = client.generate_db_connect_admin_auth_token(host, Region=REGION, ExpiresIn=3600)
+    return pg8000.connect(
+        host=host, port=5432, database=DSQL_DATABASE, user=DSQL_USER, password=token,
+        ssl_context=ssl.create_default_context(), timeout=DSQL_CANDIDATE_CONNECT_TIMEOUT)
+
+
 def connect_dsql():
     """Open a fresh authenticated pg8000 connection to DSQL.
 
     Bounded retry with backoff: a fresh IAM token is minted on EVERY attempt (no cache here),
     so a transient open failure (08006 unable-to-connect, TLS blip, throttle) self-heals on
     the next attempt instead of failing the whole discovery run. On exhaustion the last error
-    is raised."""
+    is raised.
+
+    ENDPOINT FAILOVER: the first connect tries each candidate hostname (PrivateLink private
+    name vs public console name) and PINS the first that reaches DSQL into DSQL_ENDPOINT, so
+    later connects reuse it. If every retry fails, the pin is cleared so a later call
+    re-probes the full candidate list."""
+    global DSQL_ENDPOINT, _dsql_endpoint_resolved
     import time as _time
-    ctx = ssl.create_default_context()
     _last = None
     for _attempt in range(1, 5):   # up to 4 attempts
         try:
-            client = boto3.client("dsql", region_name=REGION)
-            token = client.generate_db_connect_admin_auth_token(
-                DSQL_ENDPOINT, Region=REGION, ExpiresIn=3600
-            )
-            return pg8000.connect(
-                host=DSQL_ENDPOINT, port=5432, database="postgres",
-                user=DSQL_USER, password=token, ssl_context=ctx
-            )
+            if not _dsql_endpoint_resolved:
+                candidates = dsql_candidate_list(DSQL_ENDPOINT_CANDIDATES, DSQL_ENDPOINT)
+                conn, host = dsql_connect_first(
+                    candidates, _make_dsql_conn,
+                    log=lambda h: print(f"  ↪ DSQL reachable on {h} (pinned for this run)"))
+                DSQL_ENDPOINT = host
+                _dsql_endpoint_resolved = True
+                return conn
+            return _make_dsql_conn(DSQL_ENDPOINT)
         except Exception as e:
             _last = e
             if _attempt < 4:
                 _time.sleep(min(8.0, 0.5 * (2 ** (_attempt - 1))))   # 0.5,1,2s backoff
+    _dsql_endpoint_resolved = False   # pinned host stopped working -> re-probe next call
     raise _last
 
 
@@ -915,3 +1005,23 @@ if commit_glue_reachable:
     print("  ✓ job.commit() succeeded")
 else:
     print("  ⚠️ Skipping job.commit() — Glue API not reachable (configs are already written to S3).")
+
+# M16 (B4): do NOT silently skip tables that have DMS data (or exist in the DMS task) but have
+# no target table in DSQL. Historically these went into skipped_missing_dsql and were dropped
+# from the manifest; if EVERY table was missing the index ended up empty and the downstream
+# PlanSplit failed with a confusing "index has no tables — run Job1". Fail discovery here with
+# ONE clear message naming every missing schema.table and what to do. The DMS task is still at
+# STOPPED_AFTER_CACHED_EVENTS (discovery runs after the full load; nothing has resumed DMS), so
+# after creating the target tables you simply re-trigger the fleet: startup sees the task still
+# STOPPED_AFTER_CACHED_EVENTS, re-runs BuildTableList -> discovery, and proceeds.
+if skipped_missing_dsql:
+    _missing = ", ".join(sorted(skipped_missing_dsql))
+    raise Exception(
+        "Discovery found " + str(len(skipped_missing_dsql)) + " table(s) with DMS data but NO "
+        "target table in Aurora DSQL: " + _missing + ". The pipeline loads into pre-existing "
+        "DSQL tables; it does NOT create them. Create each of these tables in DSQL first, WITH "
+        "its primary key (map an Oracle RAW/BLOB key column to uuid or text, not bytea — DSQL "
+        "rejects bytea in a key), then re-trigger the fleet: the DMS task is still at "
+        "STOPPED_AFTER_CACHED_EVENTS, so startup re-runs discovery and continues. "
+        "(No tables were loaded; nothing downstream ran.)")
+

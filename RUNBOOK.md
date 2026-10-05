@@ -103,16 +103,21 @@ Work through this before setup. Each item is something the pipeline assumes.
       aws s3api create-bucket --bucket "<bucket>" --region "<region>" \
         --create-bucket-configuration LocationConstraint="<region>"   # omit --create-bucket-configuration in us-east-1
       ```
-- [ ] **An Aurora DSQL cluster** and its endpoint. The public form is `<cluster>.dsql.<region>.on.aws`.
-      **Inside a VPC with no internet** (Glue reaches DSQL through a VPC endpoint), use the DSQL VPC
-      endpoint's **private DNS name** `<cluster>.dsql-<id>.<region>.on.aws` (note the `dsql-<id>`) —
-      the public name times out at discovery. Find it with `aws ec2 describe-vpc-endpoints` for
-      service `com.amazonaws.<region>.dsql-<id>` (the endpoint must have private DNS enabled). This is
-      the `dsql_endpoint` value in [§3](#3-fill-in-paramscsv).
-- [ ] **Target tables already created** in the target schema. The pipeline loads into existing
-      tables; it never creates them. A single-column primary key gets full insert/update/delete CDC;
-      a table with a **multi-column** primary key is skipped by the CDC job (see
-      [Rules for the task list](#rules-for-the-task-list)).
+- [ ] **An Aurora DSQL cluster** and its endpoint — the cluster endpoint from the DSQL console
+      (`<cluster>.dsql.<region>.on.aws`). This is the `dsql_endpoint` value in
+      [§3](#3-fill-in-paramscsv). If Glue has no internet, it needs a route to DSQL (a DSQL VPC
+      endpoint); the pipeline tries the reachable hostname automatically, so you still use the
+      console cluster endpoint either way.
+- [ ] **Target tables already created** in the target schema, each **with its primary key**. The
+      pipeline loads into existing tables; it never creates them. If a table that the DMS task
+      replicates has no table in DSQL, discovery now **fails fast** and names it (create it, then
+      re-trigger the fleet) rather than silently skipping it. A single-column primary key gets full
+      insert/update/delete CDC; a table with a **multi-column** primary key is applied by the
+      composite CDC job (see [Rules for the task list](#rules-for-the-task-list)).
+- [ ] **No binary (`bytea`) column in a primary key.** DSQL rejects `bytea` in a key
+      (`0A000: datatype bytea is not supported in a key`). Map an Oracle `RAW`/`BLOB` **key** column
+      to `uuid` (for 16-byte GUID keys) or `text` in the target DDL — not `bytea`. (The pipeline
+      itself maps `RAW`/`BLOB` keys to `uuid`.)
 - [ ] **At most 9 schemas of your own** in the DSQL database. DSQL allows 10 schemas per database
       (not adjustable) and the pipeline adds `cdc_control`. Count yours:
       `SELECT count(*) FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg\_%' AND schema_name <> 'information_schema';`
@@ -130,6 +135,17 @@ Work through this before setup. Each item is something the pipeline assumes.
   - An **S3 target endpoint** writing to **your pipeline bucket**, with `AddColumnName = true`,
     `TimestampColumnName = dms_timestamp`, `Rfc4180 = true`, and **no** `CompressionType` (plain CSV,
     default flat layout — `DatePartitionEnabled` must not be on).
+  - The S3 target endpoint's **`ServiceAccessRole` must be allowed to write to the pipeline bucket.**
+    A fresh bucket with a reused DMS role fails at full load (DMS writes nothing). Grant the role at
+    least these actions on the bucket and its objects:
+    ```json
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject",
+                 "s3:ListBucket", "s3:GetBucketLocation"],
+      "Resource": ["arn:aws:s3:::<bucket>", "arn:aws:s3:::<bucket>/*"]
+    }
+    ```
   - A table mapping with a **convert-lowercase rule for columns** (column names must be lowercase in
     DSQL; schema/table names may be any case). The DSQL schema name must match the DMS target schema
     in lowercase.
@@ -166,20 +182,23 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `account_id` | **required** | — | 12-digit AWS account id (setup/IAM only; never written to `pipeline.json`) |
 | `region` | **required** | — | AWS region of the DMS tasks and pipeline (must equal the task ARN's region) |
 | `project` | **required** | — | short prefix (letters, digits, hyphens) for role, Lambda and job names |
-| `dsql_endpoint` | **required** | — | Aurora DSQL endpoint, `<cluster>.dsql.<region>.on.aws`; inside a VPC with no internet use the VPC endpoint's private DNS name `<cluster>.dsql-<id>.<region>.on.aws` ([§2](#2-what-you-need)) |
+| `dsql_endpoint` | **required** | — | the cluster endpoint from the DSQL console, `<cluster>.dsql.<region>.on.aws`. If Glue has no internet, it needs a route to DSQL (e.g. a DSQL VPC endpoint); the pipeline picks the reachable hostname automatically |
 | `dsql_user` | optional | `admin` | DSQL user |
 | `dsql_database` | optional | `postgres` | DSQL database |
 | `glue_connection` | optional | `""` (no VPC) | the Glue network connection's **exact** name; `""` = Glue runs with no VPC connection |
 | `cdc_engine` | optional | `pythonshell` | `pythonshell` (1 DPU) or `spark` (Glue 4.0, 2 × G.1X) |
 | `cdc_spark_fallback` | optional | `true` | `true`: on a Python-shell CDC driver failure the startup re-creates that task's CDC job as Spark; `false`: stop at `DriversFailed` / `CdcRunFailed` |
+| `cdc_validation` | optional | `true` | Tier-2 CDC validation: each CDC job re-reads a sample of every committed file's rows by key and records persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover **stops** at `CdcValidationFailed` if any unresolved failure exists. Set `false` to disable |
+| `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = check every change — expensive) |
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
-Ten keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Twelve keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
-`control_schema`. `account_id`, `subnet_id` and `security_group_id` are used only by setup.
+`control_schema`, `cdc_validation`, `cdc_validation_sample`. `account_id`, `subnet_id` and
+`security_group_id` are used only by setup.
 
 ---
 
@@ -444,8 +463,8 @@ psql "host=$DSQL_ENDPOINT user=$DSQL_USER dbname=$DSQL_DATABASE sslmode=require"
 ```
 
 > CloudShell must reach the DSQL **public** endpoint. If DSQL is only reachable through a VPC
-> endpoint (the `<cluster>.dsql-<id>.<region>.on.aws` form, [§2](#2-what-you-need)), run `psql` from
-> a host inside that VPC (e.g. a CloudShell VPC environment or an EC2 instance in the subnet).
+> endpoint (no internet route), run `psql` from a host inside that VPC (e.g. a CloudShell VPC
+> environment or an EC2 instance in the subnet).
 
 **Progress queries** (control-table schema `cdc_control`, the `control_schema` default; `table_name`
 is the lowercased `<schema>.<table>`):
@@ -458,6 +477,15 @@ SELECT table_name, status, last_done_file, error FROM cdc_control.cdc_status ORD
 -- files still to apply vs. already applied, for one table (status 'done' = applied)
 SELECT status, count(*) FROM cdc_control.cdc_file_status
 WHERE table_name = '<schema>.<table>' GROUP BY status;
+
+-- unresolved CDC validation failures per table (cutover is blocked while any exist):
+SELECT table_name, count(*) AS unresolved FROM cdc_control.cdc_validation_failures
+WHERE resolved = false GROUP BY table_name ORDER BY unresolved DESC;
+
+-- detail for one table (what mismatched, which file, which key):
+SELECT failure_time, cdc_file, pk_value, failure_type, details
+FROM cdc_control.cdc_validation_failures
+WHERE resolved = false AND table_name = '<schema>.<table>' ORDER BY failure_time;
 ```
 
 A table is **caught up** when its `cdc_status.status` is `idle` (the CDC job marks it `idle` once no
@@ -538,20 +566,24 @@ renamed task still cuts over its original folder and jobs.
 
 > **† A cutover fleet re-triggers cutover for EVERY task in the CSV**, including ones already cut
 > over. The cutover preflight has no "already cut over" skip — it skips only a task whose
-> `$PROJECT-cutover` is *currently running* (`already_running`). Re-running `fleet-cutover` with an
-> already-cut-over task still in the CSV starts a **fresh** cutover for it, which then fails because
-> its first step stops a DMS task that is already stopped (the DMS API rejects it). **Remove
-> already-cut-over tasks from the CSV before triggering `fleet-cutover` again.**
+> `$PROJECT-cutover` is *currently running* (`already_running`). Re-running `fleet-cutover` with a
+> task whose cutover failed partway is now **safe**: cutover describes the DMS task first and skips
+> the stop if it is already stopped, and every later step is idempotent (drain re-checks, stop-CDC
+> is a no-op when nothing runs, `_cdc_file` is dropped with `IF EXISTS`, Glue deletes treat an
+> already-gone job as deleted). A task whose cutover already **succeeded** has nothing left to do;
+> re-running it simply drains (0 files), finds nothing to stop/drop/delete, and succeeds again —
+> but it is tidiest to remove fully-cut-over tasks from the CSV.
 
 Each child ends at one of:
 
 | Ends at | Meaning | What to do |
 |---|---|---|
 | `CutoverSucceeded` | done | point the application at Aurora DSQL |
-| `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed (named in the error; the jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus `-cdc-composite` when the task has composite-PK tables) | delete it by hand: `aws glue delete-job --job-name <name>`. **Do not re-list this task in a cutover fleet** |
+| `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed (named in the error; the jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus `-cdc-composite` when the task has composite-PK tables) | delete it by hand: `aws glue delete-job --job-name <name>`, or just re-run cutover for this task (it is idempotent — a job already gone counts as deleted) |
 | `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed for this task | fix the error shown, re-run cutover for this task via the fleet |
-| `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`) | DMS is stopped; a table's last file wasn't applied within ~12 h | fix the cause ([§8](#8-if-something-fails)), then **finish by hand** ([§8](#8-if-something-fails)) |
-| `CutoverFailed` at a step **after DMS was stopped** | DMS is stopped | open the failed state, fix it, then **finish by hand** ([§8](#8-if-something-fails)) |
+| `CdcValidationFailed` | unresolved CDC-validation discrepancies blocked cutover (pre-check: nothing touched; final check: DMS stopped, CDC run/`_cdc_file`/Glue jobs all untouched) | review `cdc_control.cdc_validation_failures`, clear each reviewed row with `UPDATE … SET resolved=true` (never `DELETE`), then re-run cutover ([§8](#8-if-something-fails)) |
+| `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`) | DMS is stopped; a table's last file wasn't applied within ~12 h | fix the cause ([§8](#8-if-something-fails)), then **re-run cutover for this task** — it skips the already-stopped DMS and re-drains |
+| `CutoverFailed` at a step **after DMS was stopped** | DMS is stopped | open the failed state, fix the cause, then **re-run cutover for this task** — it is now re-runnable (skips the already-stopped DMS, every later step is idempotent) |
 
 **After a successful cutover, these remain for each task** (nothing deletes them): the stopped DMS
 task and its endpoints; `config/_task/<task name>/` and the `config/_task_index/` record; every CDC
@@ -579,8 +611,10 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Startup** `DriversFailed` (`DriverCheckError`) | a `driver-cdc/` wheel can't run on Python 3.9 (scramp 1.4.7+, boto3/botocore 1.43+, urllib3 2.x), two versions of one package, a missing package, or a Spark driver folder without pg8000 | the error names the wheel; fix the folder (§4 driver wheels) and re-trigger the fleet |
 | **Startup** `DmsFailed` (`DmsTaskFailed`) | DMS failed or a table errored during full load | fix in the DMS console (**Table statistics** + CloudWatch; reload the errored table). A task can only be (re)started while it hasn't finished its full load — else see [§9](#9-reload-a-task-from-scratch) |
 | **Startup** `DmsTimedOut` (`DmsPollBudgetExceeded`) | DMS didn't reach `STOPPED_AFTER_CACHED_EVENTS` within 24 h — usually a task already past its full load, or stopped partway, or a genuinely long load | check the DMS task; reload with a new DMS task if needed ([§9](#9-reload-a-task-from-scratch)) |
+| **Startup** `DmsStartFailed` | `startReplicationTask` genuinely failed and the task is **not** running/starting and **not** already at a completed full load (bad endpoint/table-mapping, task in an unstartable state, etc.). This now fails **fast** with the real DMS error instead of being masked by a ~24 h poll that then reported a misleading timeout | read the DMS error in the execution (`$.startError`) and the describe result, fix the DMS task/endpoint, re-trigger the fleet (the task isn't past full load, so it isn't skipped) |
 | **Startup** `BuildTableListFailed` | building the table list from the DMS task failed: a table didn't load cleanly, a table-mapping transformation the pipeline can't reproduce for S3 folder names, or more than 9 distinct DSQL schemas | the error names the tables/schemas; fix the source or the DMS task's rules, re-trigger the fleet. No Glue jobs were created |
 | **Startup** `GroupsFailed`, or `PipelineFailed` at `CreateGlueJobs`/`RunDiscovery`/`PlanSplit`/`GroupFanOut` | DMS full load is in S3; DMS is paused at `STOPPED_AFTER_CACHED_EVENTS` | fix the cause (the failed group's Glue log has it), re-trigger the fleet — finished files/tables are skipped; the task isn't past full load, so it isn't skipped |
+| **Startup** validation (`GroupValidate`) fails or logs a re-split | the validate Glue job compares every column S3-vs-DSQL per key range | **Empty source tables now PASS** (a 0-row source with a 0-row target is `0 == 0`); only an empty source whose DSQL target has rows is a real mismatch. **Large tables:** each range query runs in its own short transaction under a statement timeout; a range that hits DSQL's 300s limit is **auto re-split** and retried — the log shows `validation re-split … after a transaction-age/timeout error`. If validation still times out after the bounded re-splits (a single key / very wide row), lower `validate_rows_per_range` on `glue-templates/validate.json` and re-trigger; the data itself is unaffected (full load already matched) |
 | **Startup** `PipelineFailed` at `ResumeDmsToCdc` | load done and validated; DMS probably still paused | **don't re-trigger the fleet for this task.** If DMS is still stopped, resume it: `aws dms start-replication-task --replication-task-arn "$TASK_ARN" --start-replication-task-type resume-processing`, then **start the CDC job by hand** (below) |
 | **Startup** `CdcRunFailed`/`CdcRunEnded`/`CdcFallbackFailed`, or `PipelineFailed` at `StartCdcJob`/`GetCdcRun`/`CheckCdcStarted` | load done; **DMS is in CDC**, capturing changes to S3 | **don't re-trigger the fleet** (it skips this task). Check whether a CDC run is already RUNNING ([§6](#6-watch-progress)); if not, fix the cause in the CDC log and **start the CDC job by hand** (below). Nothing is lost while it's down — DMS keeps writing change files |
 | **Startup** `CdcStartNotConfirmed` | the CDC run is running but didn't write its start marker in 45 min | check the CDC log ([§6](#6-watch-progress)). If it shows `entering poll loop`, CDC is fine and the marker couldn't be written — check the Glue role can write `config/_task/<task>/_cdc_started/` |
@@ -588,12 +622,14 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **Startup** `CompositeStartNotConfirmed` | the composite CDC run didn't write its start marker in 45 min (the main CDC job is running) | check the `-cdc-composite` run's log ([§6](#6-watch-progress)); if it shows `entering poll loop`, check the Glue role can write `config/_task/<task>/_cdc_started/`. Investigate before cutover |
 | **Startup** execution shows `CdcDriverFallback` then succeeds | the Python-shell drivers failed; the job is now Spark | nothing to fix. The reason is in `config/_task/<task name>/_cdc_engine.json`; fix `driver-cdc/` and delete that file to go back to Python shell |
 | **Cutover** `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed | fix the error, re-run cutover for this task via the fleet (keep only this task in the CSV, or remove already-cut-over tasks first) |
-| **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **finish by hand** (below). **Do not re-list this task in a cutover fleet** — its first step would fail on the already-stopped DMS task |
+| **Cutover** `CdcDrainTimedOut`, or `CutoverFailed`/`GlueJobsNotDeleted` **after DMS was stopped** | DMS is stopped (or fully cut over bar one job delete) | fix the cause, then **re-run cutover for this task**. Cutover is now re-runnable: it describes the DMS task first and skips the stop when it is already stopped (`InvalidResourceStateFault` is also tolerated), re-drains, and every later step is idempotent (stop-CDC no-op when nothing runs, `_cdc_file` drop `IF EXISTS`, Glue delete treats an already-gone job as deleted, composite job absent is fine) |
+| **Cutover** `CdcValidationFailed` (from `CdcValidationFailedPre`, **before** DMS is stopped) | nothing touched — DMS still running, CDC still running | investigate the unresolved rows (query below), confirm each is explained/benign, then clear them and re-run cutover: `UPDATE cdc_control.cdc_validation_failures SET resolved = true WHERE table_name = '<schema>.<table>';` (never `DELETE` — keep the audit) |
+| **Cutover** `CdcValidationFailed` (from `CdcValidationFailedFinal`, **after** the drain) | DMS is **stopped**; the CDC run, the `_cdc_file` column and the Glue jobs are **untouched** | same `UPDATE … SET resolved = true` after review, then re-run cutover (it re-stops DMS idempotently, re-drains, re-checks). The query: `SELECT table_name, count(*) FROM cdc_control.cdc_validation_failures WHERE resolved=false GROUP BY table_name;` |
 | **CDC** a table is `blocked` in `cdc_control.cdc_status` | a `DROP COLUMN` on the source, or a row DSQL rejected (e.g. NULL into NOT NULL) | fix the cause, then `UPDATE cdc_control.cdc_status SET status='active' WHERE table_name='<schema.table>';` ([how to connect](#connect-to-dsql-and-check-progress)) — CDC resumes. **Never delete the row** (applied files stay and would all be replayed) |
 | **CDC** run ends with no error after ~7 days | the 7-day Glue timeout (the 10080-minute maximum) | start the CDC job by hand (below); it resumes from where it left off. Cut over before 7 days where you can |
 | **CDC** Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
 | **CDC/Glue** `Unknown service: 'dsql'` | `driver-cdc/` lacks a current boto3 set | re-stage drivers (§4), re-trigger the fleet |
-| **Glue** `Can't create a connection to host ...dsql... port 5432` or `Name or service not known` | the job isn't in your VPC, or `dsql_endpoint` is the public name inside a no-internet VPC | set `glue_connection` and the VPC-endpoint `dsql_endpoint` ([§2](#2-what-you-need)/[§3](#3-fill-in-paramscsv)), re-trigger. Check: `aws glue get-job --job-name <job> --query Job.Connections` |
+| **Glue** `Can't create a connection to host ...dsql... port 5432` or `Name or service not known` | the job isn't in your VPC, or Glue has no route to DSQL | ensure `glue_connection` is set and Glue has a route to DSQL (a DSQL VPC endpoint); the pipeline tries the reachable DSQL hostname automatically. Re-trigger. Check: `aws glue get-job --job-name <job> --query Job.Connections` |
 | **Setup** an `aws` command seems to hang | the CLI pager is waiting | `export AWS_PAGER=""` and re-run; whatever you Ctrl-C'd was still created |
 | **Setup** `create-function`: *role cannot be assumed by Lambda* | the role is seconds old | wait 10 s and re-run `tools/setup.sh` |
 
@@ -611,8 +647,11 @@ aws glue start-job-run --job-name "$PROJECT-$TASK_NAME-cdc" \
 Then check it as in [§6](#6-watch-progress). **Don't use the console's Run button** for the CDC job:
 a console run has no `--config_prefix`, so cutover would not find and stop it.
 
-**Finish a cutover by hand** (after any failure once DMS is stopped; set `TASK_NAME` to the
-folder/job stem). The SQL steps (checking status, dropping `_cdc_file`) use a DSQL session — see
+**Finish a cutover by hand** — now rarely needed: cutover is **re-runnable**, so after a failure
+once DMS is stopped the simplest recovery is to **re-run cutover for this task** (it skips the
+already-stopped DMS and every later step is idempotent). Use the manual steps below only if you
+cannot re-run it (set `TASK_NAME` to the folder/job stem). The SQL steps (checking status, dropping
+`_cdc_file`) use a DSQL session — see
 [Connect to DSQL and check progress](#connect-to-dsql-and-check-progress):
 
 ```bash

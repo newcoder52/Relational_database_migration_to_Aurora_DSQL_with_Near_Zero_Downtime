@@ -49,6 +49,7 @@
         "project.$": "$.Payload.project",
         "region.$": "$.Payload.region",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+        "dsqlEndpointCandidates.$": "$.Payload.dsqlEndpointCandidates",
         "dsqlUser.$": "$.Payload.dsqlUser",
         "dsqlDatabase.$": "$.Payload.dsqlDatabase",
         "glueRoleArn.$": "$.Payload.glueRoleArn",
@@ -62,7 +63,9 @@
         "timestampColumnName.$": "$.Payload.timestampColumnName",
         "warnings.$": "$.Payload.warnings",
         "csvNullValue.$": "$.Payload.csvNullValue",
-        "cdcSparkFallback.$": "$.Payload.cdcSparkFallback"
+        "cdcSparkFallback.$": "$.Payload.cdcSparkFallback",
+        "cdcValidation.$": "$.Payload.cdcValidation",
+        "cdcValidationSample.$": "$.Payload.cdcValidationSample"
       },
       "ResultPath": "$.resolved",
       "Retry": [
@@ -119,11 +122,103 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "InitPollCount",
+          "Comment": "M03: do NOT swallow a real start failure into the ~24h poll. Describe the task and decide: a benign re-run (already running/starting, or stopped at full-load-complete / STOPPED_AFTER_CACHED_EVENTS) continues to the poll; any other state fails fast at DmsStartFailed with the real cause.",
+          "Next": "DescribeAfterStartError",
           "ResultPath": "$.startError"
         }
       ],
       "Next": "InitPollCount"
+    },
+    "DescribeAfterStartError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+      "Comment": "M03: startReplicationTask raised. Find out whether the task is actually making progress (a benign already-running / already-at-cached-events re-run) or genuinely did not start.",
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "replication-task-arn",
+            "Values.$": "$.resolved.taskArnList"
+          }
+        ]
+      },
+      "ResultPath": "$.startErrorDescribe",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Could not even describe the task after the start error -> report the original start failure.",
+          "Next": "DmsStartFailed",
+          "ResultPath": "$.describeError"
+        }
+      ],
+      "Next": "EvalStartError"
+    },
+    "EvalStartError": {
+      "Type": "Choice",
+      "Comment": "Benign re-run states -> poll as usual. Everything else -> DmsStartFailed with the DMS cause. 'running'/'starting' = the task was already (re)started; 'stopped' + FullLoadProgressPercent=100 or StopReason STOPPED_AFTER_CACHED_EVENTS = full load already finished (the earlier real test's benign re-run case).",
+      "Choices": [
+        {
+          "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+          "StringEquals": "running",
+          "Next": "InitPollCount"
+        },
+        {
+          "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+          "StringEquals": "starting",
+          "Next": "InitPollCount"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "NumericEquals": 100
+            }
+          ],
+          "Next": "InitPollCount"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].StopReason",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].StopReason",
+              "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"
+            }
+          ],
+          "Next": "InitPollCount"
+        }
+      ],
+      "Default": "DmsStartFailed"
+    },
+    "DmsStartFailed": {
+      "Type": "Fail",
+      "Error": "DmsStartFailed",
+      "Comment": "M03: startReplicationTask failed and the task is NOT running/starting and NOT already at a completed full load. This is a real start failure (bad endpoint, bad table mapping, task in an unstartable state, etc.), surfaced immediately with the DMS error instead of being masked by a ~24h poll that would then report the wrong (timeout) cause. See $.startError for the startReplicationTask error and the execution history for the describe result."
     },
     "InitPollCount": {
       "Type": "Pass",
@@ -441,6 +536,7 @@
           "glue_role_arn.$": "$.resolved.glueRoleArn",
           "region.$": "$.resolved.region",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "control_schema.$": "$.resolved.controlSchema",
@@ -449,7 +545,9 @@
           "cdc_engine.$": "$.driverCdc.engine",
           "csv_null_value.$": "$.resolved.csvNullValue",
           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
-          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles"
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample"
         }
       },
       "ResultSelector": {
@@ -541,7 +639,9 @@
           "cdc_engine.$": "$.driverCdc.engine",
           "csv_null_value.$": "$.resolved.csvNullValue",
           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
-          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles"
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample"
         }
       },
       "ResultSelector": {
@@ -1107,6 +1207,7 @@
           "glue_role_arn.$": "$.resolved.glueRoleArn",
           "region.$": "$.resolved.region",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "control_schema.$": "$.resolved.controlSchema",
@@ -1115,7 +1216,9 @@
           "csv_null_value.$": "$.resolved.csvNullValue",
           "error_message.$": "$.cdcRun.run.ErrorMessage",
           "failed_run_id.$": "$.cdcStart.JobRunId",
-          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles"
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample"
         }
       },
       "ResultSelector": {

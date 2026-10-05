@@ -71,9 +71,9 @@ time (scripts, templates, driver wheels, `config/pipeline.json`, `config/params.
 6. **Cut over:** when CDC has caught up, stop writes to the source and trigger `fleet-cutover`
    ([RUNBOOK §6](RUNBOOK.md#7-cut-over-with-the-fleet)).
 
-> **Inside a VPC with no internet:** set `dsql_endpoint` to the DSQL VPC endpoint's private DNS name
-> `<cluster>.dsql-<id>.<region>.on.aws`, not the public `<cluster>.dsql.<region>.on.aws` (which
-> times out at discovery) — see [RUNBOOK §1](RUNBOOK.md#2-what-you-need).
+> **If Glue has no internet:** it needs a route to DSQL (a DSQL VPC endpoint). Use the console
+> cluster endpoint for `dsql_endpoint` either way — the pipeline picks the reachable hostname
+> automatically. See [RUNBOOK §1](RUNBOOK.md#2-what-you-need).
 
 ## Limitations
 

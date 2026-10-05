@@ -49,10 +49,13 @@
         "configPrefix.$": "$.Payload.configPrefix",
         "project.$": "$.Payload.project",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+        "dsqlEndpointCandidates.$": "$.Payload.dsqlEndpointCandidates",
         "dsqlUser.$": "$.Payload.dsqlUser",
         "dsqlDatabase.$": "$.Payload.dsqlDatabase",
         "controlSchema.$": "$.Payload.controlSchema",
         "cdcJobName.$": "$.Payload.cdcJobName",
+        "compositeCdcJobName.$": "$.Payload.compositeCdcJobName",
+        "hasCompositeTables.$": "$.Payload.hasCompositeTables",
         "cdcRoot.$": "$.Payload.cdcRoot",
         "warnings.$": "$.Payload.warnings"
       },
@@ -79,7 +82,117 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "StopCdcDmsTask"
+      "Next": "CdcValidationPreCheck"
+    },
+    "CdcValidationPreCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "BEFORE stopping DMS: fail fast if any UNRESOLVED cdc_control.cdc_validation_failures rows exist for this task's tables. Reuses drain-check in mode=validation_gate (it already reads DSQL + the manifest index). Nothing is touched here, so on failure DMS is still running and CDC is still running. A task with no failures table / no tables counts as 0 and passes.",
+      "Parameters": {
+        "FunctionName": "<<DRAIN_CHECK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "validation_gate",
+          "config_prefix.$": "$.resolved.configPrefix",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema"
+        }
+      },
+      "ResultSelector": {
+        "ok.$": "$.Payload.ok",
+        "failures.$": "$.Payload.failures",
+        "byTable.$": "$.Payload.byTable"
+      },
+      "ResultPath": "$.validationPre",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CdcValidationPreGate"
+    },
+    "CdcValidationPreGate": {
+      "Type": "Choice",
+      "Comment": "Pass only when there are zero unresolved validation failures. Otherwise stop the cutover before touching DMS.",
+      "Choices": [
+        {
+          "Variable": "$.validationPre.ok",
+          "BooleanEquals": true,
+          "Next": "DescribeBeforeStop"
+        }
+      ],
+      "Default": "CdcValidationFailedPre"
+    },
+    "DescribeBeforeStop": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+      "Comment": "M02 re-runnability: describe the DMS task BEFORE trying to stop it. If a previous cutover already stopped it (any reason), stopReplicationTask would raise InvalidResourceStateFault and (pre-fix) fail the whole re-run. Instead, skip the stop when the task is already 'stopped' and continue straight to the stop-confirm loop. Only an actually-running/starting task is stopped.",
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "replication-task-arn",
+            "Values.$": "$.resolved.taskArnList"
+          }
+        ]
+      },
+      "ResultPath": "$.describeBeforeStop",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsAlreadyStopped"
+    },
+    "IsAlreadyStopped": {
+      "Type": "Choice",
+      "Comment": "Already 'stopped' (incl. STOPPED_AFTER_CACHED_EVENTS / any stop reason, which DMS reports as status 'stopped') -> skip StopCdcDmsTask and go straight to the stop-confirm loop (idempotent re-run). Anything else (running/starting) -> stop it.",
+      "Choices": [
+        {
+          "Variable": "$.describeBeforeStop.ReplicationTasks[0].Status",
+          "StringEquals": "stopped",
+          "Next": "InitDmsStopCount"
+        }
+      ],
+      "Default": "StopCdcDmsTask"
+    },
+    "CdcValidationFailedPre": {
+      "Type": "Pass",
+      "Comment": "Build a Cause naming each table and its unresolved-failure count, then fail. DMS is still running and CDC is still running — nothing was touched.",
+      "Parameters": {
+        "Error": "CdcValidationFailed",
+        "Cause.$": "States.Format('CDC validation found unresolved failures BEFORE DMS was stopped (DMS still running, CDC still running). Investigate cdc_control.cdc_validation_failures and clear with UPDATE ... SET resolved=true after review. Total={}, byTable={}', $.validationPre.failures, States.JsonToString($.validationPre.byTable))"
+      },
+      "ResultPath": "$.error",
+      "Next": "CdcValidationFailed"
     },
     "ResolveFailed": {
       "Type": "Fail",
@@ -97,6 +210,12 @@
       "Retry": [
         {
           "ErrorEquals": [
+            "DatabaseMigration.InvalidResourceStateFault"
+          ],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
             "States.ALL"
           ],
           "IntervalSeconds": 5,
@@ -105,6 +224,14 @@
         }
       ],
       "Catch": [
+        {
+          "ErrorEquals": [
+            "DatabaseMigration.InvalidResourceStateFault"
+          ],
+          "Comment": "M02: the task was already stopped (or not in a stoppable state) between DescribeBeforeStop and here. Treat as already stopped and continue to the confirm loop; do not fail the re-run.",
+          "Next": "InitDmsStopCount",
+          "ResultPath": "$.stopResult"
+        },
         {
           "ErrorEquals": [
             "States.ALL"
@@ -213,6 +340,7 @@
           "config_prefix.$": "$.resolved.configPrefix",
           "cdc_root.$": "$.resolved.cdcRoot",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "control_schema.$": "$.resolved.controlSchema"
@@ -249,10 +377,86 @@
         {
           "Variable": "$.drainResult.caughtUp",
           "BooleanEquals": true,
-          "Next": "StopCdcRun"
+          "Next": "WaitValidationSettle"
         }
       ],
       "Default": "IncrDrainCount"
+    },
+    "WaitValidationSettle": {
+      "Type": "Wait",
+      "Comment": "The drain confirmed every applied file is 'done', but each file's Tier-2 validation runs AFTER its commit (re-read + a VALIDATION_RETRY_DELAY_SECONDS=5s recheck). Wait comfortably longer than that recheck window (plus margin) so any in-flight validation of the LAST applied files has finished and recorded before the final gate reads the table. DMS is already stopped, so no new files arrive during this wait.",
+      "Seconds": 30,
+      "Next": "CdcValidationFinalCheck"
+    },
+    "CdcValidationFinalCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "AFTER the drain completed and BEFORE StopCdcRun / DropTags / DeleteGlueJobs: re-count unresolved cdc_control.cdc_validation_failures for this task's tables. DMS is already stopped at this point, but the CDC run, _cdc_file column and Glue jobs are all still untouched, so a failure here leaves everything downstream in place for investigation.",
+      "Parameters": {
+        "FunctionName": "<<DRAIN_CHECK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "validation_gate",
+          "config_prefix.$": "$.resolved.configPrefix",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema"
+        }
+      },
+      "ResultSelector": {
+        "ok.$": "$.Payload.ok",
+        "failures.$": "$.Payload.failures",
+        "byTable.$": "$.Payload.byTable"
+      },
+      "ResultPath": "$.validationFinal",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CutoverFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CdcValidationFinalGate"
+    },
+    "CdcValidationFinalGate": {
+      "Type": "Choice",
+      "Comment": "Pass only with zero unresolved validation failures. Otherwise stop before StopCdcRun (CDC run + jobs stay).",
+      "Choices": [
+        {
+          "Variable": "$.validationFinal.ok",
+          "BooleanEquals": true,
+          "Next": "StopCdcRun"
+        }
+      ],
+      "Default": "CdcValidationFailedFinal"
+    },
+    "CdcValidationFailedFinal": {
+      "Type": "Pass",
+      "Comment": "Unresolved validation failures after the drain. DMS is stopped; the CDC run, _cdc_file column and Glue jobs are all still untouched. Build a Cause naming each table and count, then fail.",
+      "Parameters": {
+        "Error": "CdcValidationFailed",
+        "Cause.$": "States.Format('CDC validation found unresolved failures AFTER the drain completed (DMS stopped; CDC run, _cdc_file and Glue jobs untouched). Investigate cdc_control.cdc_validation_failures and clear with UPDATE ... SET resolved=true after review, then re-run cutover. Total={}, byTable={}', $.validationFinal.failures, States.JsonToString($.validationFinal.byTable))"
+      },
+      "ResultPath": "$.error",
+      "Next": "CdcValidationFailed"
+    },
+    "CdcValidationFailed": {
+      "Type": "Fail",
+      "Comment": "CDC validation (Tier-2 by-key net-state check) recorded unresolved discrepancies in cdc_control.cdc_validation_failures. Cutover MUST stop until an operator reviews each row and clears it with UPDATE cdc_control.cdc_validation_failures SET resolved=true WHERE table_name='...' (never DELETE). The exact tables + counts are in the Cause.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
     },
     "IncrDrainCount": {
       "Type": "Pass",
@@ -312,11 +516,19 @@
     },
     "HasCompositeToStop": {
       "Type": "Choice",
-      "Comment": "Stop the composite CDC run too, but only if this task has composite-PK tables (so a task with none skips cleanly).",
+      "Comment": "Stop the composite CDC run too, but only if this task has composite-PK tables (so a task with none skips cleanly). IsPresent-guards hasCompositeTables first: if resolve_task did not supply it (older output / missing manifest), treat as no composite job and skip to DropTags rather than raising States.Runtime on a missing path.",
       "Choices": [
         {
-          "Variable": "$.resolved.hasCompositeTables",
-          "BooleanEquals": true,
+          "And": [
+            {
+              "Variable": "$.resolved.hasCompositeTables",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.hasCompositeTables",
+              "BooleanEquals": true
+            }
+          ],
           "Next": "StopCdcCompositeRun"
         }
       ],
@@ -377,6 +589,7 @@
         "Payload": {
           "config_prefix.$": "$.resolved.configPrefix",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "drop_cdc_file_tag": true

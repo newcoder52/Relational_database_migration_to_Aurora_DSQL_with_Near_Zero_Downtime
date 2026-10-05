@@ -54,6 +54,7 @@ import ssl
 import json
 import math
 import time
+import socket
 import threading
 from decimal import Decimal
 import boto3
@@ -85,6 +86,11 @@ CONFIG_PREFIX = 's3://<YOUR_S3_BUCKET>/<SCHEMA>/config/'   # Job 1 output prefix
 INDEX_S3_KEY = None                                        # else CONFIG_PREFIX+_manifest_index.json
 
 DSQL_ENDPOINT = '<YOUR_CLUSTER>.dsql.<REGION>.on.aws'
+# Ordered, comma-separated DSQL hostnames to try (resolve_task derives a PrivateLink candidate
+# and passes --dsql_endpoint_candidates). connect_dsql() tries each in order, pins the first
+# that connects into DSQL_ENDPOINT, and later connects reuse the pinned host. Empty -> just
+# DSQL_ENDPOINT is used (full backward compatibility).
+DSQL_ENDPOINT_CANDIDATES = ''
 DSQL_DATABASE = 'postgres'
 DSQL_USER = 'admin'
 REGION = 'us-east-1'
@@ -92,7 +98,23 @@ REGION = 'us-east-1'
 # ---- CUSTOMER-TUNABLE KNOBS -------------------------------------------------
 # Rows per validation range. Bigger = fewer, larger queries (watch the 300s DSQL txn
 # limit); smaller = more parallelism, more round-trips. Ranges are index-usable on the PK.
-VALIDATE_ROWS_PER_RANGE = 250000
+# V2: lowered from 250000 to 50000 so a single per-range per-column aggregate stays well under
+# DSQL's hard 300s transaction-age limit even on wide, large tables (the earlier real test hit
+# 303s at 250k on a 16.3M-row table). Each range query runs in its own short autocommit txn and
+# is additionally bounded by VALIDATE_STATEMENT_TIMEOUT_MS; a range that still times out is
+# auto re-split smaller and retried (see validate_one_table).
+VALIDATE_ROWS_PER_RANGE = 50000
+# V2: per-statement timeout (ms) set on every DSQL validation connection, kept comfortably
+# below DSQL's 300s transaction-age limit so a too-big range fails FAST and deterministically
+# (so it can be re-split) instead of burning ~300s and erroring the table.
+VALIDATE_STATEMENT_TIMEOUT_MS = 240000
+# V2: how many times a single range may be re-split (halved / sub-bucketed) and retried after a
+# transaction-age / statement-timeout error before giving up on that range.
+VALIDATE_MAX_RESPLIT_DEPTH = 6
+# V2: whole-table / composite-PK tables (no single rangeable column) are split into this many
+# key buckets (by the FIRST pk column's value ranges when a key exists) so a large composite
+# table is never validated in one unbounded transaction. Auto-grows with row count.
+VALIDATE_COMPOSITE_BUCKET_ROWS = 50000
 # Max concurrent per-range TARGET queries across all tables (DSQL connection budget).
 MAX_QUERY_CONCURRENCY = 20
 # Max tables validated concurrently on the driver.
@@ -139,10 +161,11 @@ CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
 def _apply_job3_arg_overrides():
     global CSV_NULL_VALUE
     global CONFIG_PREFIX, INDEX_S3_KEY, DSQL_ENDPOINT, DSQL_USER, DSQL_DATABASE, REGION
+    global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
     global CHECKSUM_MODE, MAX_PARALLEL_TABLES, VALIDATE_ROWS_PER_RANGE, MAX_QUERY_CONCURRENCY
     global REQUIRE_FULL_LOAD_DONE
     optional = ["config_prefix", "index_s3_key", "dsql_endpoint", "dsql_user",
-                "dsql_database", "region",
+                "dsql_database", "region", "dsql_endpoint_candidates",
                 "checksum_mode", "max_parallel_tables", "validate_rows_per_range",
                 "max_query_concurrency", "require_full_load_done", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
@@ -159,6 +182,9 @@ def _apply_job3_arg_overrides():
         INDEX_S3_KEY = str(ov["index_s3_key"]).strip()
     if "dsql_endpoint" in ov and str(ov["dsql_endpoint"]).strip():
         DSQL_ENDPOINT = str(ov["dsql_endpoint"]).strip()
+    if "dsql_endpoint_candidates" in ov and str(ov["dsql_endpoint_candidates"]).strip():
+        DSQL_ENDPOINT_CANDIDATES = str(ov["dsql_endpoint_candidates"]).strip()
+        print(f"  ↪ DSQL_ENDPOINT_CANDIDATES -> {DSQL_ENDPOINT_CANDIDATES}")
     if "dsql_user" in ov and str(ov["dsql_user"]).strip():
         DSQL_USER = str(ov["dsql_user"]).strip()
     if "dsql_database" in ov and str(ov["dsql_database"]).strip():
@@ -270,31 +296,129 @@ def split_s3(path):
     return parts[0], (parts[1] if len(parts) > 1 else "")
 
 
+def s3_prefix_has_objects(s3, bucket, prefix):
+    """V1: True if ANY object exists under the DMS table prefix. DMS writes no S3 folder for a
+    0-row source table, so an empty listing means 'no full-load files' (an empty source), which
+    the validator treats as 0 source rows instead of letting Spark raise 'Path does not exist'.
+    Best-effort: any listing error -> assume present so the normal read path still runs."""
+    try:
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix.lstrip("/"), MaxKeys=1)
+        return resp.get("KeyCount", 0) > 0 or bool(resp.get("Contents"))
+    except Exception:
+        return True
+
+
 # =============================================================================
 # DSQL CONNECTION
 # =============================================================================
+# Socket connect timeout (seconds) per candidate probe during endpoint failover: a wrong
+# PrivateLink/public host should fail FAST so we move to the next candidate.
+DSQL_CANDIDATE_CONNECT_TIMEOUT = 10
+_dsql_endpoint_resolved = False
+_dsql_resolve_lock = threading.Lock()
+
+# === DSQL ENDPOINT FAILOVER HELPER (shared; keep byte-identical across all copies) =========
+# One operator-supplied endpoint, but connectivity differs by where this code runs: Glue in a
+# private VPC reaches DSQL over a PrivateLink connection endpoint whose working hostname is
+# <cluster-id>.<service-identifier>.<region>.on.aws, while the public console name
+# <cluster-id>.dsql.<region>.on.aws times out on 5432 there. resolve_task derives the private
+# candidate (via dsql.get_vpc_endpoint_service_name) and passes an ordered, comma-separated
+# --dsql_endpoint_candidates list; we try each in order and the first that connects wins. The
+# auth token MUST be minted for the host actually connected to, so the caller's make_conn(host)
+# builds the token from its host argument. This block is duplicated verbatim per script because
+# Glue copies each script to S3 as a single file; tests/test_helper_sync.py diffs the copies.
+# ============================================================================================
+def dsql_candidate_list(candidates_csv, given_endpoint):
+    """Ordered, de-duped candidate hostnames from the --dsql_endpoint_candidates CSV, always
+    ending with the operator-given endpoint as a backstop. Never raises: a blank/missing CSV
+    degrades to just [given_endpoint] so a connection is still attempted."""
+    out = []
+    for raw in (candidates_csv or "").split(","):
+        host = raw.strip()
+        if host and host not in out:
+            out.append(host)
+    g = (given_endpoint or "").strip()
+    if g and g not in out:
+        out.append(g)
+    return out
+
+
+def dsql_connect_first(candidates, make_conn, log=None):
+    """Try make_conn(host) for each candidate in order; return (conn, host) for the first that
+    connects. make_conn must mint the auth token for the host it is given. On total failure,
+    raise one RuntimeError naming every host tried and its error, plus a one-line network hint.
+    log(msg), if given, is called once with the hostname that worked."""
+    errors = []
+    for host in candidates:
+        try:
+            conn = make_conn(host)
+            if log:
+                log(host)
+            return conn, host
+        except Exception as e:   # noqa: BLE001 - any connect failure -> try the next host
+            errors.append((host, f"{type(e).__name__}: {e}"))
+    tried = "; ".join(f"{h} -> {err}" for h, err in errors) or "(no candidates)"
+    raise RuntimeError(
+        "Could not connect to Aurora DSQL on any candidate hostname [" + tried + "]. "
+        "Hint: Glue/Lambda needs a network route to DSQL: a DSQL VPC endpoint with private "
+        "DNS, or internet/NAT.")
+# === END DSQL ENDPOINT FAILOVER HELPER ======================================================
+
+
+def _make_dsql_conn(host, autocommit=True):
+    """Open an authenticated pg8000 connection to ONE host (token minted for that host)."""
+    client = make_boto_client("dsql")
+    tok = client.generate_db_connect_admin_auth_token(host, Region=REGION, ExpiresIn=3600)
+    conn = pg8000.connect(host=host, port=5432, database=DSQL_DATABASE, user=DSQL_USER,
+                          password=tok, ssl_context=ssl.create_default_context(),
+                          timeout=DSQL_CANDIDATE_CONNECT_TIMEOUT)
+    conn.autocommit = autocommit
+    # V2: bound every statement well under DSQL's 300s transaction-age limit so a too-large
+    # range query fails fast and deterministically (then gets re-split) instead of running
+    # ~300s and raising 54000. Best-effort: ignore if the server rejects the GUC.
+    try:
+        _c = conn.cursor()
+        _c.execute(f"SET statement_timeout = {int(VALIDATE_STATEMENT_TIMEOUT_MS)}")
+        _c.close()
+    except Exception:
+        pass
+    return conn
+
+
 def connect_dsql(autocommit=True):
     """Open a short-lived DSQL connection for one range fingerprint query.
 
     Bounded retry with backoff: a fresh IAM token is minted on EVERY attempt, so a transient
     open failure (08006 unable-to-connect, TLS blip, throttle) retries instead of failing the
     whole table's validation. On exhaustion the last error is raised (the caller records the
-    table as 'error')."""
-    ctx = ssl.create_default_context()
+    table as 'error').
+
+    ENDPOINT FAILOVER: the first connect tries each candidate hostname (PrivateLink private
+    name vs public console name) and PINS the first that reaches DSQL into DSQL_ENDPOINT, so
+    later connects reuse it. If every retry fails, the pin is cleared so a later call
+    re-probes the full candidate list."""
+    global DSQL_ENDPOINT, _dsql_endpoint_resolved
     _last = None
     for _attempt in range(1, 5):   # up to 4 attempts
         try:
-            client = make_boto_client("dsql")
-            tok = client.generate_db_connect_admin_auth_token(
-                DSQL_ENDPOINT, Region=REGION, ExpiresIn=3600)
-            conn = pg8000.connect(host=DSQL_ENDPOINT, port=5432, database=DSQL_DATABASE,
-                                  user=DSQL_USER, password=tok, ssl_context=ctx)
-            conn.autocommit = autocommit
-            return conn
+            with _dsql_resolve_lock:
+                _need_resolve = not _dsql_endpoint_resolved
+            if _need_resolve:
+                candidates = dsql_candidate_list(DSQL_ENDPOINT_CANDIDATES, DSQL_ENDPOINT)
+                conn, host = dsql_connect_first(
+                    candidates, lambda h: _make_dsql_conn(h, autocommit),
+                    log=lambda h: print(f"  ↪ DSQL reachable on {h} (pinned for this run)"))
+                with _dsql_resolve_lock:
+                    DSQL_ENDPOINT = host
+                    _dsql_endpoint_resolved = True
+                return conn
+            return _make_dsql_conn(DSQL_ENDPOINT, autocommit)
         except Exception as e:
             _last = e
             if _attempt < 4:
                 time.sleep(min(8.0, 0.5 * (2 ** (_attempt - 1))))   # 0.5,1,2s backoff
+    with _dsql_resolve_lock:
+        _dsql_endpoint_resolved = False   # pinned host stopped working -> re-probe next call
     raise _last
 
 
@@ -763,6 +887,152 @@ def _target_query(dsql_schema, dsql_table, pred, metrics):
             pass
 
 
+# =============================================================================
+# V2: keep every validation query under DSQL's 300s transaction-age limit
+# =============================================================================
+def is_txn_age_error(exc):
+    """True if an exception is DSQL's transaction-age limit (SQLSTATE 54000) or a
+    statement_timeout (57014) — the two ways a too-large validation query fails. Matches on
+    SQLSTATE where pg8000 exposes it and on the message text otherwise."""
+    s = ""
+    try:
+        a0 = exc.args[0] if getattr(exc, "args", None) else None
+        if isinstance(a0, dict):
+            code = a0.get("C") or a0.get("code")
+            if code in ("54000", "57014"):
+                return True
+            s = str(a0.get("M") or a0.get("message") or a0)
+        else:
+            s = str(a0 if a0 is not None else exc)
+    except Exception:
+        s = str(exc)
+    s = s.lower()
+    return ("transaction age limit" in s or "54000" in s
+            or "statement timeout" in s or "statement_timeout" in s
+            or "canceling statement due to statement timeout" in s or "57014" in s)
+
+
+def combine_metric(check, a, b):
+    """Combine the per-range metric values of two adjacent sub-ranges into the value the single
+    unsplit query would have produced. Additive checks (counts/lengths/sums/hashes) add; min
+    takes the min; max takes the max. None means 'no rows contributed' for min/max."""
+    if check == "min":
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a <= b else b
+    if check == "max":
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if a >= b else b
+    # additive: non-null count, total length, true count, value hash sum, sum,
+    # sum of instants (us)
+    av = a if a is not None else 0
+    bv = b if b is not None else 0
+    try:
+        return av + bv
+    except TypeError:
+        return Decimal(str(av)) + Decimal(str(bv))
+
+
+def combine_summaries(res_a, res_b, metrics):
+    """Combine two (count, [metric values]) sub-range results into one, re-aggregating each
+    metric per combine_metric so a re-split range equals the unsplit range exactly."""
+    ca, va = res_a
+    cb, vb = res_b
+    merged = []
+    for j, m in enumerate(metrics):
+        merged.append(combine_metric(m["check"], va[j], vb[j]))
+    return (int(ca) + int(cb), merged)
+
+
+def split_bounds(lo, hi, pk_kind):
+    """Split a half-open key range [lo,hi) into [[lo,mid),[mid,hi)] with a midpoint in the same
+    representation the range uses. Returns None when it cannot be split further (degenerate
+    single-key range, or no bound to split on)."""
+    if lo is None or hi is None:
+        return None
+    if pk_kind == "integer":
+        lo_i, hi_i = int(lo), int(hi)
+        if hi_i - lo_i <= 1:
+            return None
+        mid = lo_i + (hi_i - lo_i) // 2
+        if mid <= lo_i or mid >= hi_i:
+            return None
+        return [(lo_i, mid), (mid, hi_i)]
+    # uuid/text ranges are compared as hex integers of the (dash-stripped) key
+    try:
+        lo_i, hi_i = hex_to_int(str(lo)), hex_to_int(str(hi))
+    except Exception:
+        return None
+    if hi_i - lo_i <= 1:
+        return None
+    mid = lo_i + (hi_i - lo_i) // 2
+    if mid <= lo_i or mid >= hi_i:
+        return None
+    return [(int_to_hex(lo_i), int_to_hex(mid)), (int_to_hex(mid), int_to_hex(hi_i))]
+
+
+def target_range_resplit(dsql_schema, dsql_table, pk_col, pk_kind, lo, hi, is_top,
+                         metrics, depth=0):
+    """Summarize ONE target range, re-splitting on a transaction-age / statement-timeout error.
+    The combined result equals what a single unsplit query would return (combine_summaries),
+    so the source side's fixed top-level ranges still line up. Each query runs in its own short
+    autocommit transaction (connect_dsql) bounded by statement_timeout; a range that still
+    times out is halved and retried up to VALIDATE_MAX_RESPLIT_DEPTH times. If it cannot be
+    split further, the error propagates (table recorded as 'error' with the real cause)."""
+    pred = None if (lo is None and hi is None and pk_col is None) \
+        else _range_predicate_sql(pk_col, pk_kind, lo, hi, is_top)
+    try:
+        return _target_query(dsql_schema, dsql_table, pred, metrics)
+    except Exception as e:
+        if not is_txn_age_error(e) or depth >= VALIDATE_MAX_RESPLIT_DEPTH:
+            raise
+        halves = split_bounds(lo, hi, pk_kind) if pk_col is not None else None
+        if not halves:
+            raise
+        (l1, h1), (l2, h2) = halves
+        print(f"    ↪ validation re-split {dsql_schema}.{dsql_table} range [{lo},{hi}) at depth "
+              f"{depth} after a transaction-age/timeout error; retrying two sub-ranges")
+        r1 = target_range_resplit(dsql_schema, dsql_table, pk_col, pk_kind, l1, h1,
+                                  False, metrics, depth + 1)
+        # the upper sub-range keeps the original is_top (only the very top range is unbounded)
+        r2 = target_range_resplit(dsql_schema, dsql_table, pk_col, pk_kind, l2, h2,
+                                  is_top, metrics, depth + 1)
+        return combine_summaries(r1, r2, metrics)
+
+
+def _first_pk_rangeable(pk_meta):
+    """For a COMPOSITE (multi-column) PK, decide whether its FIRST key column can be range-
+    split, and return (first_column_name, pk_kind) where pk_kind is 'integer' | 'uuid' | 'text'
+    — the kinds plan_ranges / spark_pk_bounds / _range_predicate_sql understand. Returns
+    (None, None) if the first column is not a rangeable kind (timestamp/float/scaled numeric/
+    bytea/bool) or metadata is missing. Value ranges on the first column partition every row
+    into exactly one bucket identically on Spark and DSQL."""
+    cols = pk_meta.get("columns") or []
+    if len(cols) < 2:
+        return (None, None)
+    data_types = pk_meta.get("data_types") or []
+    scales = pk_meta.get("numeric_scales") or []
+    dt0 = (data_types[0] if data_types else None)
+    scale0 = (scales[0] if scales else None)
+    kind = column_kind(dt0)
+    if kind == "int":
+        return (cols[0], "integer")
+    if kind == "numeric" and scale0 is not None and int(scale0) == 0:
+        return (cols[0], "integer")
+    if kind == "uuid":
+        return (cols[0], "uuid")
+    # NOTE: text/char first columns are intentionally NOT range-split here — job3 has no
+    # byte-string range planner (and split_bounds only halves integer/uuid key spaces), so a
+    # text first column would collapse to one unsplit range. Those stay whole-table, bounded by
+    # statement_timeout. (The real large composite tables key on integer/uuid first columns.)
+    return (None, None)
+
+
 def validate_one_table(s3, entry):
     """Validate ONE table: plan ranges, summarize the source (Spark, one pass) and the target
     (DSQL, parallel), compare. Every table ends as match, mismatch or error — never skipped."""
@@ -783,9 +1053,24 @@ def validate_one_table(s3, entry):
     pk_col = pk_cols[0] if rangeable else None
     notes = []
     if not rangeable:
-        notes.append("whole table compared as one range (no single-column key that can be "
-                     "split into ranges)")
-        pk_kind = None
+        # V2: a MULTI-column (composite) PK can still be split into index-usable ranges on its
+        # FIRST key column's value — every row falls in exactly one half-open first-column
+        # range, so per-range counts and additive metric sums (and min/max) sum to the whole-
+        # table result on BOTH the Spark source and the DSQL target. This keeps a large
+        # composite table (e.g. 16M+ rows) off the single-unbounded-transaction path that
+        # exceeds DSQL's 300s limit. Only a genuinely keyless table (no PK at all) stays
+        # whole-table (there is no column to range on); statement_timeout still bounds it.
+        fc_col, fc_kind = _first_pk_rangeable(pk_meta)
+        if len(pk_cols) > 1 and fc_col:
+            rangeable = True
+            pk_col = fc_col
+            pk_kind = fc_kind
+            notes.append(f"composite PK {pk_cols}: ranged on the first key column "
+                         f"{fc_col!r} ({fc_kind}) so each query stays under the DSQL 300s limit")
+        else:
+            notes.append("whole table compared as one range (no single-column key that can be "
+                         "split into ranges)")
+            pk_kind = None
 
     conn = connect_dsql(autocommit=True)
     try:
@@ -797,6 +1082,47 @@ def validate_one_table(s3, entry):
             pass
     if not target_types:
         return {"table": label, "status": "error", "reason": "target table not found in DSQL"}
+
+    # ---- V1: empty-source table (no DMS S3 folder) ----
+    # A 0-row source table produces NO DMS full-load folder, so reading it with Spark raises
+    # "Path does not exist". Detect the missing folder up front: if discovery recorded this
+    # table as empty-at-discovery (or 0 full-load rows), treat the source as 0 rows WITHOUT
+    # reading S3 and just compare the DSQL target count — 0 target rows = PASS (empty source,
+    # empty target), >0 = a real mismatch (rows in the target that are not in the empty source).
+    # A table discovery did NOT mark empty but whose folder is missing is a genuine problem and
+    # still surfaces as a clear error (not a silent pass).
+    _empty_at_discovery = bool(meta.get("empty_at_discovery")) or (meta.get("full_load_rows") == 0)
+    _src_bucket, _src_prefix = split_s3(dms_s3_path) if dms_s3_path else ("", "")
+    _source_present = bool(dms_s3_path) and s3_prefix_has_objects(s3, _src_bucket, _src_prefix)
+    if not _source_present:
+        conn = connect_dsql(autocommit=True)
+        try:
+            tgt_cnt, _ = target_range_summary(conn, dsql_schema, dsql_table, None, [])
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if _empty_at_discovery:
+            if int(tgt_cnt) == 0:
+                return {"table": label, "status": "match", "ranges": 0,
+                        "source_rows": 0, "target_rows": 0, "checksum_mode": CHECKSUM_MODE,
+                        "columns_compared": 0, "columns_differing": [], "mismatches": [],
+                        "mismatch_count": 0,
+                        "notes": ["empty source table (no DMS full-load folder) and empty "
+                                  "DSQL target: 0 == 0, PASS"]}
+            return {"table": label, "status": "mismatch", "ranges": 1,
+                    "source_rows": 0, "target_rows": int(tgt_cnt), "checksum_mode": CHECKSUM_MODE,
+                    "columns_compared": 0, "columns_differing": [],
+                    "mismatches": [{"range": ["whole table"], "type": "COUNT_DIFF",
+                                    "source": 0, "target": int(tgt_cnt)}],
+                    "mismatch_count": 1,
+                    "notes": ["empty source table (no DMS full-load folder) but the DSQL target "
+                              f"has {int(tgt_cnt)} row(s)"]}
+        return {"table": label, "status": "error",
+                "reason": f"no DMS full-load files under {dms_s3_path} and discovery did NOT "
+                          f"mark this table empty-at-discovery; cannot validate (is the DMS "
+                          f"folder/path correct?)"}
 
     # ---- SOURCE: read, rename DMS columns to their target names, THEN transform ----
     # Same order as the load: the per-type conversions are keyed by TARGET column name, so
@@ -814,8 +1140,16 @@ def validate_one_table(s3, entry):
             df = df.withColumnRenamed(old, new)
     df_t = apply_transform(df, target_columns, type_categories)
     if rangeable and pk_col not in df_t.columns:
-        return {"table": label, "status": "error",
-                "reason": f"key column {pk_col!r} not found in the DMS CSV"}
+        # The chosen key column isn't in the DMS CSV. For a single-column rangeable PK that's a
+        # real error (we cannot range or even identify rows); for a composite table ranged on
+        # its first key column, fall back to whole-table (statement_timeout still bounds it).
+        if len(pk_cols) == 1:
+            return {"table": label, "status": "error",
+                    "reason": f"key column {pk_col!r} not found in the DMS CSV"}
+        notes.append(f"first key column {pk_col!r} not in the DMS CSV; fell back to whole table")
+        rangeable = False
+        pk_col = None
+        pk_kind = None
 
     # Compared: every target column the source provides (the others get their DSQL DEFAULT).
     compared = [c for c in target_columns if c in df_t.columns and c in target_types]
@@ -854,9 +1188,14 @@ def validate_one_table(s3, entry):
 
     def _one(i_rg):
         i, (lo, hi) = i_rg
-        pred = None if not rangeable_now else \
-            _range_predicate_sql(pk_col, pk_kind, lo, hi, i == len(ranges) - 1)
-        res = _target_query(dsql_schema, dsql_table, pred, metrics)
+        is_top = (i == len(ranges) - 1)
+        if not rangeable_now:
+            res = _target_query(dsql_schema, dsql_table, None, metrics)
+        else:
+            # V2: run with re-split-on-timeout so a too-large range is halved and retried
+            # instead of erroring the whole table at the DSQL 300s limit.
+            res = target_range_resplit(dsql_schema, dsql_table, pk_col, pk_kind,
+                                       lo, hi, is_top, metrics)
         with lock:
             tgt[i] = res
 
@@ -994,7 +1333,23 @@ try:
 except Exception as e:
     print(f"  ⚠️ could not write report (non-fatal): {e}")
 
-job.commit()
+# M12: Guard job.commit() with a connectivity check — without a Glue VPC Interface
+# Endpoint this call HANGS for 10+ minutes on a no-internet Glue connection. (Same guard
+# as Job 1 / Job 2.) The validation report is already written to S3 above, so skipping the
+# commit when Glue is unreachable loses nothing.
+commit_glue_reachable = False
+try:
+    _sock = socket.create_connection((f"glue.{REGION}.amazonaws.com", 443), timeout=GLUE_API_TIMEOUT)
+    _sock.close()
+    commit_glue_reachable = True
+except (socket.timeout, socket.error, OSError):
+    pass
+
+if commit_glue_reachable:
+    job.commit()
+    print("  ✓ job.commit() succeeded")
+else:
+    print("  ⚠️ Skipping job.commit() — Glue API not reachable (validation report already written to S3).")
 
 if not results:
     raise Exception("Validation checked no tables, which can't be reported as success.")

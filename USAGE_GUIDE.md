@@ -291,11 +291,29 @@ every column is checked by its DSQL type; a `CONTENT_DIFF` entry names the colum
 both values. To switch the content check off for a deployment, add `"--checksum_mode": "off"` to
 `default_arguments` in `glue-templates/validate.json`.
 
+An **empty source table** (0 rows in the source, so DMS wrote no S3 folder) validates as `match`
+when the DSQL target is also empty (`0 == 0`) — it is no longer an error. A **very large table**
+is validated in per-key-range queries, each in its own short transaction under a statement timeout
+below DSQL's 300s limit; a range that still hits the limit is **auto re-split** smaller and retried
+(the log shows `validation re-split …`). Composite-PK tables are ranged on their first key column so they
+are split the same way. If validation still times out, lower `validate_rows_per_range` in
+`glue-templates/validate.json`.
+
+**CDC validation (Tier-2)** is **on by default** (`cdc_validation=true`): each CDC job re-reads a
+sample (`cdc_validation_sample`, default 20) of every committed file's rows by key and records
+persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover stops at
+`CdcValidationFailed` if any row has `resolved=false`; review each, then clear it with
+`UPDATE cdc_control.cdc_validation_failures SET resolved=true WHERE table_name='<schema>.<table>'`
+(never `DELETE`) and re-run cutover. Set `cdc_validation=false` in `params.csv` to disable.
+
 **Binary columns (Oracle RAW, LONG RAW, BLOB → DSQL `bytea`).** DMS writes them to the CSV as
 hexadecimal; the load and CDC store the real bytes. A value that isn't hexadecimal stops the
 table (`BINARY GUARD`) instead of storing wrong bytes. RAW columns mapped to `uuid` (as in most
-of these schemas) are unaffected. _(Note: the `bytea`/BINARY GUARD path has been proven in
-simulation only — see `CDC_EDGE_CASE_RESULTS.md` §2.7.)_
+of these schemas) are unaffected. **A `bytea` column cannot be part of a PRIMARY KEY** — DSQL
+rejects it (`0A000: datatype bytea is not supported in a key`), so an Oracle `RAW`/`BLOB` **key**
+column must map to `uuid` (16-byte GUID keys) or `text` in the target DDL, not `bytea`.
+_(Note: the `bytea`/BINARY GUARD path has been proven in simulation only — see
+`CDC_EDGE_CASE_RESULTS.md` §2.7.)_
 
 **Processed files and the per-table manifest:** after a CDC file is fully applied, the CDC job
 **copies** it to `<schema>/<table>/processed/` (with retries, verified by size). The original is

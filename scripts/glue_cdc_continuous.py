@@ -184,6 +184,11 @@ CDC_ROOT = 'cdc'
 
 # Aurora DSQL target.
 DSQL_ENDPOINT = '<YOUR_CLUSTER>.dsql.<REGION>.on.aws'
+# Ordered, comma-separated DSQL hostnames to try (resolve_task derives a PrivateLink candidate
+# and passes --dsql_endpoint_candidates). connect_dsql() tries each in order, pins the first
+# that connects into DSQL_ENDPOINT, and all later connects/reconnects reuse the pinned host.
+# Empty -> just DSQL_ENDPOINT is used (full backward compatibility).
+DSQL_ENDPOINT_CANDIDATES = ''
 DSQL_DATABASE = 'postgres'
 DSQL_USER = 'admin'
 REGION = 'us-east-1'
@@ -319,16 +324,17 @@ CDC_MODS_PER_INSERT = 1              # an INSERT/UPDATE net-op = 1 upsert (ON CO
 MAX_PARALLEL_TABLES = 1
 
 # ---- TIER-2 CDC VALIDATION (deferred, sampled by-PK net-state check) ----------------
-# OFF by default — it adds target reads AFTER a file commits, so it costs some time/IO.
-# When on, after a file's apply fully commits, v4 samples up to VALIDATION_SAMPLE_PER_FILE
-# of that file's net-ops and re-reads each row by PK from the target, comparing to the
-# expected net-op image (INSERT -> row present + values match; DELETE -> row absent). A
-# mismatch is RE-CHECKED after VALIDATION_RETRY_DELAY_SECONDS (absorbs any commit lag);
-# only a persistent mismatch is recorded in cdc_control.cdc_validation_failures. This is a
-# DISCREPANCY REPORT — it does NOT block the apply (the apply already succeeded and is
-# authoritative). It runs on the table's own connection, AFTER the commit, never inside a
-# chunk transaction, so it never touches the apply hot path.
-VALIDATION_ENABLED = False               # opt-in; keeps apply latency flat by default
+# ON by default (override with --cdc_validation false). It adds target reads AFTER a file
+# commits, so it costs some time/IO. After a file's apply fully commits, v4 samples up to
+# VALIDATION_SAMPLE_PER_FILE of that file's net-ops and re-reads each row by PK from the
+# target, comparing to the expected net-op image (INSERT -> row present + values match;
+# DELETE -> row absent). A mismatch is RE-CHECKED after VALIDATION_RETRY_DELAY_SECONDS
+# (absorbs any commit lag); only a persistent mismatch is recorded in
+# cdc_control.cdc_validation_failures (with resolved=false). The apply is NOT blocked (the
+# apply already succeeded and is authoritative). It runs on the table's own connection,
+# AFTER the commit, never inside a chunk transaction, so it never touches the apply hot path.
+# CUTOVER reads cdc_validation_failures: any unresolved row (resolved=false) STOPS cutover.
+VALIDATION_ENABLED = True                # ON by default; override with --cdc_validation false
 VALIDATION_SAMPLE_PER_FILE = 20          # net-ops sampled per file (0 = all — expensive)
 VALIDATION_RETRY_DELAY_SECONDS = 5       # re-check a mismatch after this, before recording
 VALIDATION_MAX_FAILURES_PER_TABLE = 100  # circuit breaker: stop validating a table past this
@@ -446,14 +452,18 @@ def _apply_cdc_arg_overrides():
     global CSV_NULL_VALUE
     global CONFIG_PREFIX, INDEX_S3_KEY, LOAD_STATUS_KEY, BUCKET, CDC_ROOT
     global DSQL_ENDPOINT, DSQL_DATABASE, DSQL_USER, REGION
+    global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
     global DMS_TASK_ARN, CONTROL_SCHEMA
     global MAX_PARALLEL_TABLES, REQUIRE_FULL_LOAD_DONE, POLL_INTERVAL
     global DMS_TIMESTAMP_COLUMN, SINGLE_SWAP_IS_RENAME
+    global VALIDATION_ENABLED, VALIDATION_SAMPLE_PER_FILE
     optional = ["config_prefix", "index_s3_key", "load_status_key", "s3_bucket", "cdc_root",
                 "dsql_endpoint", "dsql_database", "dsql_user", "region",
+                "dsql_endpoint_candidates",
                 "dms_task_arn", "control_schema",
                 "max_parallel_tables", "require_full_load_done", "poll_interval",
-                "timestamp_column", "single_swap_is_rename", "csv_null_value"]
+                "timestamp_column", "single_swap_is_rename", "csv_null_value",
+                "cdc_validation", "cdc_validation_sample"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -492,6 +502,9 @@ def _apply_cdc_arg_overrides():
         print(f"  ↪ SINGLE_SWAP_IS_RENAME overridden -> {SINGLE_SWAP_IS_RENAME}")
     if _s("dsql_endpoint"):
         DSQL_ENDPOINT = _s("dsql_endpoint")
+    if _s("dsql_endpoint_candidates"):
+        DSQL_ENDPOINT_CANDIDATES = _s("dsql_endpoint_candidates")
+        print(f"  ↪ DSQL_ENDPOINT_CANDIDATES -> {DSQL_ENDPOINT_CANDIDATES}")
     if _s("dsql_database"):
         DSQL_DATABASE = _s("dsql_database")
     if _s("dsql_user"):
@@ -514,6 +527,16 @@ def _apply_cdc_arg_overrides():
             print(f"  ⚠️ ignoring invalid poll_interval={ov['poll_interval']!r}")
     if "require_full_load_done" in ov:
         REQUIRE_FULL_LOAD_DONE = str(ov["require_full_load_done"]).strip().lower() in ("true", "1", "yes")
+    if "cdc_validation" in ov and ov["cdc_validation"] is not None:
+        # Missing arg leaves the ON-by-default constant untouched; an explicit value overrides.
+        VALIDATION_ENABLED = str(ov["cdc_validation"]).strip().lower() in ("true", "1", "yes")
+        print(f"  ↪ VALIDATION_ENABLED overridden -> {VALIDATION_ENABLED}")
+    if "cdc_validation_sample" in ov and ov["cdc_validation_sample"] is not None:
+        try:
+            VALIDATION_SAMPLE_PER_FILE = max(0, int(ov["cdc_validation_sample"]))
+            print(f"  ↪ VALIDATION_SAMPLE_PER_FILE overridden -> {VALIDATION_SAMPLE_PER_FILE}")
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid cdc_validation_sample={ov['cdc_validation_sample']!r}")
 
 
 _apply_cdc_arg_overrides()
@@ -1020,12 +1043,117 @@ def _invalidate_dsql_token():
         _dsql_token_born = 0.0
 
 
+# Socket connect timeout (seconds) per candidate probe during endpoint failover: a wrong
+# PrivateLink/public host should fail FAST so we move on to the next candidate rather than
+# blocking CDC startup on one unreachable name.
+DSQL_CANDIDATE_CONNECT_TIMEOUT = 10
+_dsql_endpoint_resolved = False
+_dsql_resolve_lock = threading.Lock()
+
+# === DSQL ENDPOINT FAILOVER HELPER (shared; keep byte-identical across all copies) =========
+# One operator-supplied endpoint, but connectivity differs by where this code runs: Glue in a
+# private VPC reaches DSQL over a PrivateLink connection endpoint whose working hostname is
+# <cluster-id>.<service-identifier>.<region>.on.aws, while the public console name
+# <cluster-id>.dsql.<region>.on.aws times out on 5432 there. resolve_task derives the private
+# candidate (via dsql.get_vpc_endpoint_service_name) and passes an ordered, comma-separated
+# --dsql_endpoint_candidates list; we try each in order and the first that connects wins. The
+# auth token MUST be minted for the host actually connected to, so the caller's make_conn(host)
+# builds the token from its host argument. This block is duplicated verbatim per script because
+# Glue copies each script to S3 as a single file; tests/test_helper_sync.py diffs the copies.
+# ============================================================================================
+def dsql_candidate_list(candidates_csv, given_endpoint):
+    """Ordered, de-duped candidate hostnames from the --dsql_endpoint_candidates CSV, always
+    ending with the operator-given endpoint as a backstop. Never raises: a blank/missing CSV
+    degrades to just [given_endpoint] so a connection is still attempted."""
+    out = []
+    for raw in (candidates_csv or "").split(","):
+        host = raw.strip()
+        if host and host not in out:
+            out.append(host)
+    g = (given_endpoint or "").strip()
+    if g and g not in out:
+        out.append(g)
+    return out
+
+
+def dsql_connect_first(candidates, make_conn, log=None):
+    """Try make_conn(host) for each candidate in order; return (conn, host) for the first that
+    connects. make_conn must mint the auth token for the host it is given. On total failure,
+    raise one RuntimeError naming every host tried and its error, plus a one-line network hint.
+    log(msg), if given, is called once with the hostname that worked."""
+    errors = []
+    for host in candidates:
+        try:
+            conn = make_conn(host)
+            if log:
+                log(host)
+            return conn, host
+        except Exception as e:   # noqa: BLE001 - any connect failure -> try the next host
+            errors.append((host, f"{type(e).__name__}: {e}"))
+    tried = "; ".join(f"{h} -> {err}" for h, err in errors) or "(no candidates)"
+    raise RuntimeError(
+        "Could not connect to Aurora DSQL on any candidate hostname [" + tried + "]. "
+        "Hint: Glue/Lambda needs a network route to DSQL: a DSQL VPC endpoint with private "
+        "DNS, or internet/NAT.")
+# === END DSQL ENDPOINT FAILOVER HELPER ======================================================
+
+
+def _probe_connect_dsql(host):
+    """Open a connection to ONE candidate host with a short socket timeout and a token minted
+    for THAT host (not the global cache). Used only during first-connect endpoint resolution."""
+    client = make_boto_client("dsql")
+    token = client.generate_db_connect_admin_auth_token(
+        host, Region=REGION, ExpiresIn=DSQL_TOKEN_EXPIRES_IN)
+    return pg8000.connect(
+        host=host, port=5432, database=DSQL_DATABASE, user=DSQL_USER, password=token,
+        ssl_context=_get_ssl_context(), timeout=DSQL_CANDIDATE_CONNECT_TIMEOUT)
+
+
+def _resolve_dsql_endpoint_once():
+    """On the FIRST connect, try each candidate hostname and PIN the first that reaches DSQL
+    into DSQL_ENDPOINT, so all later connects reuse it. The probe connection is closed (the
+    caller opens its own with the normal cached-token path). No-op once resolved. If no
+    candidate connects, raise the single clear error from dsql_connect_first."""
+    global DSQL_ENDPOINT, _dsql_endpoint_resolved
+    if _dsql_endpoint_resolved:
+        return
+    with _dsql_resolve_lock:
+        if _dsql_endpoint_resolved:
+            return
+        candidates = dsql_candidate_list(DSQL_ENDPOINT_CANDIDATES, DSQL_ENDPOINT)
+        if len(candidates) <= 1:
+            _dsql_endpoint_resolved = True   # nothing to choose; use DSQL_ENDPOINT as-is
+            return
+        conn, host = dsql_connect_first(
+            candidates, _probe_connect_dsql,
+            log=lambda h: print(f"  ↪ DSQL reachable on {h} (pinned for this run)", flush=True))
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if host != DSQL_ENDPOINT:
+            DSQL_ENDPOINT = host
+            _invalidate_dsql_token()   # re-mint the cached token for the pinned host
+        _dsql_endpoint_resolved = True
+
+
+def _unpin_dsql_endpoint():
+    """Clear the resolved-endpoint pin so the next connect re-probes the full candidate list
+    (the pinned host stopped working)."""
+    global _dsql_endpoint_resolved
+    with _dsql_resolve_lock:
+        _dsql_endpoint_resolved = False
+
+
 def connect_dsql(autocommit=False):
     # The IAM auth token is a BEARER credential valid for its whole ExpiresIn window (not
     # tied to one connection), and generation is a LOCAL SigV4 sign. CACHE one token and
     # reuse it across connections/recycles until it nears refresh age. ExpiresIn (2 h) is set
     # well above a connection's max life (~54-min recycle + ~5-min final chunk = ~59 min) so
     # a cached token never expires mid-connection; refresh every ~30 min keeps it young.
+    # ENDPOINT FAILOVER: the first connect pins the reachable candidate host into
+    # DSQL_ENDPOINT (PrivateLink vs public); later connects reuse it.
+    _resolve_dsql_endpoint_once()
     conn = pg8000.connect(
         host=DSQL_ENDPOINT, port=5432, database=DSQL_DATABASE,
         user=DSQL_USER, password=_get_cached_dsql_token(), ssl_context=_get_ssl_context())
@@ -1052,6 +1180,7 @@ def connect_dsql_with_retry(autocommit=False, what="connect"):
                 print(f"    ↻ {what}: DSQL connect attempt {_attempt}/{CONNECT_MAX_RETRIES} "
                       f"failed ({e}); fresh-token retry in {_bo:.1f}s", flush=True)
                 time.sleep(_bo)
+    _unpin_dsql_endpoint()   # pinned host stopped working -> re-probe candidates next time
     raise _last
 
 
@@ -1164,6 +1293,13 @@ def _ensure_control_tables_once():
                 details       varchar(8000)
             )
         """)
+        # resolved: the cutover gate counts only unresolved rows (resolved=false). An operator
+        # clears an investigated failure with
+        #   UPDATE {CONTROL_SCHEMA}.cdc_validation_failures SET resolved=true WHERE table_name=...
+        # (never DELETE — the audit row is kept). ADD COLUMN IF NOT EXISTS so an older control
+        # schema is upgraded in place; new rows default to false (unresolved).
+        cur.execute(f"ALTER TABLE {CONTROL_SCHEMA}.cdc_validation_failures "
+                    f"ADD COLUMN IF NOT EXISTS resolved boolean DEFAULT false")
         # PER-FILE LEDGER — one durable row per (table_name, cdc_file) recording the file's
         # apply lifecycle. This is ADDITIVE observability/audit on top of cdc_status (which
         # holds only the single moving resume position per table); it never changes how rows
@@ -1485,43 +1621,122 @@ def _record_validation_failure(conn, table_name, cdc_file, pk_value, failure_typ
         try:
             c.execute(
                 f'INSERT INTO {CONTROL_SCHEMA}.cdc_validation_failures '
-                f'(id, table_name, failure_time, cdc_file, pk_value, failure_type, details) '
-                f'VALUES (%s, %s, %s, %s, %s, %s, %s)',
+                f'(id, table_name, failure_time, cdc_file, pk_value, failure_type, details, resolved) '
+                f'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
                 (str(uuid.uuid4()), table_name, utc_now_iso(), cdc_file,
-                 str(pk_value)[:1024], failure_type, str(details)[:8000]))
+                 str(pk_value)[:1024], failure_type, str(details)[:8000], False))
         finally:
             c.close()
     except Exception as e:
         print(f"    ⚠️ could not record validation failure for {table_name} (non-fatal): {e}")
 
 
+def _canon_timestamp(x):
+    """Canonicalize a timestamp/date value (either the convert_value string form or a DB-native
+    datetime/date) to a single comparable string, so an expected normalized string and the
+    datetime pg8000 reads back compare equal. Strategy: parse to a datetime, drop any tzinfo
+    (the whole pipeline is UTC — convert_value emits naive-UTC '+00:00' only when an offset was
+    present), and format with microseconds. Anything unparseable falls back to a trimmed string
+    with a trailing '+00:00'/' UTC'/'Z' removed so '...05' and '...05+00:00' still match."""
+    if x is None:
+        return None
+    if isinstance(x, datetime):
+        dt = x.replace(tzinfo=None) if x.tzinfo is not None else x
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    s = str(x).strip()
+    # Try the common normalized/ISO shapes (with and without an explicit +00:00).
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            dt = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+            return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            continue
+    # Unparseable: strip a trailing UTC marker so the two sides still line up.
+    return re.sub(r'\s*(?:\+00:00|Z|UTC)\s*$', '', s, flags=re.IGNORECASE)
+
+
+def _canon_bytea(x):
+    """Canonicalize a bytea value to lowercase '\\x<hex>'. Accepts the convert_value string form
+    ('\\xcbde'), a raw/0x-prefixed hex string, or the Python bytes/memoryview pg8000 returns."""
+    if x is None:
+        return None
+    if isinstance(x, (bytes, bytearray, memoryview)):
+        return '\\x' + bytes(x).hex()
+    s = str(x).strip()
+    h = _BYTEA_PREFIX.sub('', s, count=1)
+    return '\\x' + h.lower() if _HEX_BYTES.match(h) else s
+
+
 def _values_match(expected, actual, category):
-    """Compare an expected net-op value (already convert_value-normalized to the string
-    form v4 sends) against the value read back from the target, tolerantly per category.
-    Both sides are coerced to comparable strings; None==None. This is a best-effort
-    content check, not a byte-exact one (DSQL may normalize casing/precision)."""
+    """Compare an expected net-op value (already convert_value-normalized to the string form v4
+    sends to DSQL) against the value READ BACK from the target. The target read returns DB-native
+    Python types (datetime, Decimal, bool, bytes, int/float), so each category coerces BOTH sides
+    to one canonical form before comparing — otherwise a correct row reads back as a false
+    mismatch (e.g. '\\xcbde' vs b'\\xcb\\xde', '2026-01-02 03:04:05' vs a datetime, '1.50' vs
+    Decimal('1.5')). None==None; a NULL on one side only is a real mismatch.
+
+    This mirrors the normalisation the APPLY uses (convert_value / sql_literal casts):
+      • NULL      : empty/sentinel -> None on both sides (_coerce_null); None==None.
+      • uuid      : case-insensitive, dashes ignored.
+      • boolean   : t/f/true/false/1/0 folded.
+      • bytea     : lowercase '\\x'+hex, DMS hex vs DB bytes reconciled.
+      • numeric   : Decimal/float compared by value (scale-insensitive: 1.50 == 1.5).
+      • int kinds : integer value.
+      • timestamp : parsed to a tz-naive UTC datetime (offset dropped, pipeline is UTC).
+      • json      : parsed and compared structurally (key order / whitespace ignored).
+      • text/char : exact (significant leading/trailing spaces preserved — convert_value keeps
+                    them for text, so trimming here would mask a real diff).
+    """
     if expected is None:
         return actual is None
     if actual is None:
         return False
-    e = str(expected).strip()
-    a = str(actual).strip()
     if category == 'uuid':
-        return e.lower().replace("-", "") == a.lower().replace("-", "")
+        return str(expected).strip().lower().replace("-", "") == \
+               str(actual).strip().lower().replace("-", "")
     if category == 'boolean':
         norm = {"true": "t", "t": "t", "1": "t", "false": "f", "f": "f", "0": "f"}
-        return norm.get(e.lower(), e.lower()) == norm.get(a.lower(), a.lower())
+        def _b(v):
+            if isinstance(v, bool):
+                return "t" if v else "f"
+            s = str(v).strip().lower()
+            return norm.get(s, s)
+        return _b(expected) == _b(actual)
+    if category == 'bytea':
+        return _canon_bytea(expected) == _canon_bytea(actual)
+    if category in ('timestamptz', 'timestamp', 'date'):
+        ce, ca = _canon_timestamp(expected), _canon_timestamp(actual)
+        return ce == ca
+    if category in ('json', 'jsonb'):
+        try:
+            return json.loads(str(expected)) == (actual if not isinstance(actual, (str, bytes, bytearray))
+                                                 else json.loads(actual if isinstance(actual, str)
+                                                                 else actual.decode('utf-8')))
+        except (ValueError, TypeError):
+            return str(expected).strip() == str(actual).strip()
     if category in ('integer', 'bigint', 'smallint'):
         try:
-            return int(float(e)) == int(float(a))
+            return int(float(expected)) == int(float(actual))
         except (ValueError, TypeError):
-            return e == a
-    if category in ('numeric', 'float'):
+            return str(expected).strip() == str(actual).strip()
+    if category in ('numeric', 'float', 'double', 'real'):
         try:
-            return abs(float(e) - float(a)) < 1e-9
-        except (ValueError, TypeError):
-            return e == a
-    return e == a
+            from decimal import Decimal
+            return Decimal(str(expected)) == Decimal(str(actual))
+        except Exception:  # noqa: BLE001 - any parse failure -> fall back to string compare
+            try:
+                return abs(float(expected) - float(actual)) < 1e-9
+            except (ValueError, TypeError):
+                return str(expected).strip() == str(actual).strip()
+    # text/char/varchar and anything else: EXACT (preserve significant whitespace + case; the
+    # apply stored the value verbatim via a ::text cast, so a trimmed/lowered compare here would
+    # hide a real target drift).
+    return str(expected) == str(actual)
 
 
 def validate_file_netops(ctx, cdc_key, netops, col_category):
@@ -1529,17 +1744,24 @@ def validate_file_netops(ctx, cdc_key, netops, col_category):
     the file's net-ops, re-read the target row by PK and compare to the expected net-op
     image (INSERT -> present + values match; DELETE -> absent). Retry a mismatch once after
     a short delay (absorbs any lag), then record persistent mismatches to
-    cdc_validation_failures. Runs on its OWN autocommit connection AFTER the file committed
-    — never inside the apply transaction, so it can't affect apply latency/correctness.
+    cdc_validation_failures (resolved=false). Runs on its OWN autocommit connection AFTER the
+    file committed — never inside the apply transaction, so it can't affect apply latency.
 
-    KNOWN LIMITATION (why it's advisory, sampled, and off by default): this checks a
-    single file's net-ops against the CURRENT target. If a later CDC file re-inserts a PK
-    this file DELETEd (or updates a PK this file INSERTed), the deferred check can see the
-    LATER state and report a false MISSING_DELETE / RECORD_DIFF. The retry-once absorbs the
-    immediate lag window; genuine drift persists across the retry. Treat recorded failures
-    as leads to investigate (query cdc_validation_failures + the source), not hard proof.
+    NO FALSE FAILURES ON LATER-FILE OVERWRITES: a deferred by-key check sees the CURRENT
+    target, so if a LATER CDC file re-inserts a key this file DELETEd (or changes a key this
+    file INSERTed) the raw check would wrongly report MISSING_DELETE / RECORD_DIFF. Two
+    guards prevent recording such a false failure, so a validation failure always means real
+    target drift (and therefore safely gates cutover):
+      1. Per-table serial apply means no later file for THIS table commits during this pass
+         (the apply loop is blocked here), so the retry delay cannot straddle a newer file.
+      2. Before RECORDING a persistent mismatch we re-check the per-file ledger: if ANY file
+         for this table with a filename LATER than this one is already committed/done, this
+         file's key may have been superseded, so we SKIP it (do not record) rather than record
+         a false failure. A genuine drift on a key no later file touched still persists and is
+         recorded. (Supersession is keyed on the ledger, not per-key, so it is conservative:
+         it can only ever SKIP, never invent, a failure.)
 
-    Returns the number of persistent discrepancies found (0 = clean)."""
+    Returns the number of persistent discrepancies recorded (0 = clean)."""
     if not VALIDATION_ENABLED or not netops:
         return 0
     label = ctx["label"]
@@ -1549,6 +1771,28 @@ def validate_file_netops(ctx, cdc_key, netops, col_category):
     # keyless tables never produce pk-keyed netops (the router diverts them earlier).
     pk_col = ctx["apply_key"]
     pk_suffix = CAST_SUFFIX.get(col_category.get(pk_col, 'varchar'), '')
+    # This file's basename, used to detect LATER committed files for the same table.
+    _this_base = cdc_key.split("/")[-1]
+
+    def _superseded_by_later_file(conn):
+        """True if a LATER CDC file for this table is already committed/done in the ledger —
+        meaning the current target may reflect that later file, so a mismatch on this (older)
+        file's keys must NOT be recorded. Best-effort: on any error, return False (do not
+        suppress a real failure)."""
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f'SELECT 1 FROM {CONTROL_SCHEMA}.cdc_file_status '
+                    f'WHERE table_name = %s '
+                    f'AND (status = %s OR all_rows_committed = %s) '
+                    f'AND split_part(cdc_file, %s, -1) > %s LIMIT 1',
+                    (label, "done", True, "/", _this_base))
+                return cur.fetchone() is not None
+            finally:
+                cur.close()
+        except Exception:
+            return False
 
     # Sample: first N net-ops (deterministic + cheap). 0 = all (expensive; opt-in).
     sample = netops if VALIDATION_SAMPLE_PER_FILE <= 0 else netops[:VALIDATION_SAMPLE_PER_FILE]
@@ -1601,6 +1845,15 @@ def validate_file_netops(ctx, cdc_key, netops, col_category):
             res2 = _check_one(conn, netop)
             if res2 is None:
                 continue   # cleared on retry -> was just lag, not a real discrepancy
+            # Still mismatched after the retry. Before recording it as a real failure (which
+            # will block cutover), make sure a LATER committed file for this table hasn't
+            # superseded this key — if so the current target reflects that later file, not a
+            # genuine drift, so skip rather than record a false positive.
+            if _superseded_by_later_file(conn):
+                print(f"    ↪ VALIDATION {label} {cdc_key.split('/')[-1]}: key "
+                      f"{str(netop['pk'])[:60]} superseded by a later committed file; "
+                      f"not recorded.")
+                continue
             ftype, details = res2
             _record_validation_failure(conn, label, cdc_key, netop["pk"], ftype, details)
             failures += 1
@@ -3612,6 +3865,7 @@ def process_table(ctx, load_status_map=None):
                       f"failed ({e}); fresh-token retry in {_bo:.1f}s")
                 time.sleep(_bo)
     if _last_err is not None:
+        _unpin_dsql_endpoint()   # pinned host stopped working -> re-probe candidates next poll
         print(f"    ⚠️ {label}: could not open DSQL session after {CONNECT_MAX_RETRIES} "
               f"attempts (isolated, retry next poll): {_last_err}")
         return {"table": label, "status": "error", "files": 0, "rows": 0, "error": str(_last_err)}

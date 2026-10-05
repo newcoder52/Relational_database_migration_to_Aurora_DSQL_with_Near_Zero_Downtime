@@ -613,6 +613,65 @@ fills dependency gaps and items 1 and 2 stay hidden.
   no-VPC dry-runs (5 scripts + 8 templates incl. the composite script and both composite templates),
   wrong-path rejection; suites composite 61, auto-table-list all checks, iam 95, params 54 + 19.
 
+### 2026-10-05 — Cutover/startup robustness, no-internet validation, and real-test prerequisites
+
+Hardens the irreversible/orchestration paths found in review and in a resumed real Oracle→DSQL
+test, folds in three offline-tested patches (setup hardening, automatic DSQL private-endpoint
+failover, CDC validation on by default), and records the infrastructure prerequisites the real test
+surfaced. All changes offline-tested; no AWS was touched.
+
+- **Cutover composite fields (critical).** `cutover.asl.json` `CutoverResolveTask.ResultSelector`
+  now carries `hasCompositeTables` and `compositeCdcJobName` (resolve_task already returns both in
+  cutover mode), and `HasCompositeToStop` **IsPresent-guards** `hasCompositeTables` before the
+  `BooleanEquals` — so a missing field means "no composite job" (→ `DropTags`) instead of raising
+  `States.Runtime` and failing every cutover after DMS/CDC are already stopped. Shipped with a static
+  **ASL path audit** (`tests/test_asl_paths.py`) that fails on any Choice/Parameters/ItemsPath read of
+  a `$.`-path not produced on every route in and not IsPresent-guarded, across all 4 state machines.
+- **Cutover is re-runnable.** Before `StopCdcDmsTask`, `DescribeBeforeStop` + `IsAlreadyStopped` skip
+  the stop when the DMS task is already `stopped`; `StopCdcDmsTask` also tolerates
+  `InvalidResourceStateFault`. Every later step was already idempotent (drain re-check, stop-CDC no-op
+  when nothing runs, `_cdc_file` drop `IF EXISTS`, Glue delete treats a missing job as deleted,
+  composite-absent tolerated). A cutover that failed partway can now simply be re-run.
+- **Startup fails fast on a real DMS start error.** `StartDmsTask`'s catch no longer routes straight
+  into the ~24 h poll. It describes the task; running/starting or stopped at full-load-complete /
+  `STOPPED_AFTER_CACHED_EVENTS` (benign re-run) continues to the poll, anything else fails immediately
+  at the new `DmsStartFailed` with the real DMS cause.
+- **`job1_discovery` honors `--dsql_database`.** Added `dsql_database` to the arg overlay and a
+  `DSQL_DATABASE` constant used in the connection (default `postgres` unchanged); the other jobs
+  already honored it.
+- **`job3_validate` guards `job.commit()`.** Same Glue-reachability socket probe as job1/job2, so a
+  no-internet Glue connection no longer hangs ~10 min at commit (the report is already written to S3).
+- **Missing target table fails fast.** Discovery now **fails** naming every `schema.table` that has
+  DMS data but no DSQL table, telling the operator to create them (with primary keys; `RAW`/`BLOB`
+  keys → `uuid`/`text`) and re-trigger — instead of silently skipping them and producing the confusing
+  downstream `index has no tables`. Re-trigger works because the DMS task is still at
+  `STOPPED_AFTER_CACHED_EVENTS` (discovery runs before DMS is resumed), so startup re-runs discovery.
+- **Empty source table validates correctly.** When a table's DMS folder has no files and discovery
+  marked it empty-at-discovery, `job3_validate` treats the source as 0 rows without reading S3 and
+  compares the DSQL count: 0 → PASS, >0 → FAIL; a missing folder NOT marked empty is a clear error.
+  Checked the siblings: `job2_load` already short-circuits empty-at-discovery (marks done(0) after an
+  S3 re-check); `plan_split` bin-packs `full_load_rows=0` tables and never reads S3; the CDC jobs
+  tolerate an empty/missing folder via `list_cdc_files`/`_refind_table_folder` — none needed a change.
+- **Large/composite validation stays under the DSQL 300s limit.** Every validation read runs in its
+  own short autocommit transaction with `statement_timeout` set below 300s; the default range size
+  dropped 250k→50k; a range that still hits the transaction-age/statement-timeout error is **auto
+  re-split** (halved) and retried (bounded depth), with sub-range results re-aggregated to equal the
+  unsplit result; composite-PK tables are ranged on their first key column so a 16M+-row composite
+  table is chunked too (not one unbounded transaction).
+- **Folded-in patches.** setup.sh IAM-propagation retry + `json.dumps` Glue connection + full
+  Lambda-zip check + clear VPC/AZ errors; one DSQL endpoint in, pipeline derives+tries the private
+  VPC-endpoint hostname (token per host); CDC validation on by default (`cdc_validation` /
+  `cdc_validation_sample`) with cutover gated on `cdc_control.cdc_validation_failures` before stopping
+  DMS and after the final drain.
+- **Prerequisites from the real test.** DMS S3 target `ServiceAccessRole` must be allowed to write the
+  pipeline bucket (minimal policy shown in the RUNBOOK); `FullLoadSettings.StopTaskCachedChangesApplied
+  = true` (preflight already enforces it); create every target table in DSQL first with its primary
+  key; DSQL rejects `bytea` in a key so `RAW`/`BLOB` keys map to `uuid`/`text`.
+- **Verified (offline, no AWS):** py_compile all `.py`; JSON parse all `.json`; ASL reachability +
+  the new path audit (4 state machines, 0 gaps); setup.sh `bash -n` + shellcheck + VPC/no-VPC
+  dry-runs; the three folded patches' own suites; the new `tests/test_fix6.py` (48 checks) and
+  `tests/test_asl_paths.py`; the sibling params/autotables/iam/composite suites.
+
 ---
 
 ## 7. Known issues still open (not yet fixed in this release)

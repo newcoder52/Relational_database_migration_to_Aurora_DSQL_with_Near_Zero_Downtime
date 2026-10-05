@@ -33,6 +33,12 @@ glue_connection,dms-dsql-vpc
 cdc_engine,pythonshell
 cdc_spark_fallback,true
 control_schema,cdc_control
+# cdc_validation: Tier-2 CDC validation (re-reads a sample of each committed CDC file and records
+#   persistent mismatches in cdc_control.cdc_validation_failures). ON by default; cutover REFUSES
+#   to proceed if any unresolved failure exists. Set to false only to disable the check entirely.
+cdc_validation,true
+# cdc_validation_sample: rows re-checked per committed CDC file (0 = check every change; costly).
+cdc_validation_sample,20
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
 # Only set it if your Glue role name differs from <project>-glue-exec-role.
 glue_role_arn,arn:aws:iam::123456789012:role/dms-dsql-glue-exec-role

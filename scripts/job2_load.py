@@ -114,6 +114,11 @@ def utc_now_iso():
 # CONFIGURATION
 # =============================================================================
 DSQL_ENDPOINT = "REPLACE_ME.dsql.us-east-1.on.aws"  # overridden at runtime from config; placeholder default
+# Ordered, comma-separated DSQL hostnames to try (resolve_task derives a PrivateLink candidate
+# and passes --dsql_endpoint_candidates). connect_dsql() tries each in order, pins the first
+# that connects to DSQL_ENDPOINT, and all later connects/reconnects reuse that pinned host.
+# Empty -> just DSQL_ENDPOINT is used (full backward compatibility).
+DSQL_ENDPOINT_CANDIDATES = ""
 REGION = "us-east-1"
 DSQL_USER = "admin"
 DSQL_DATABASE = "postgres"
@@ -448,11 +453,13 @@ def _apply_v6_arg_overrides():
     global MAX_FILES_IN_PARALLEL   # v16
     global CONFIG_PREFIX, INDEX_S3_PATH, STATUS_S3_PATH   # v16: per-group prefix override
     global DSQL_ENDPOINT, DSQL_USER, DSQL_DATABASE, REGION   # kit: connection overlay
+    global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
     optional = ["write_mode", "large_table_bytes_threshold", "target_rows_per_partition",
                 "max_write_concurrency", "v6_parallel_enabled",
                 "max_files_in_parallel",   # v16
                 "config_prefix",           # v16: orchestrator points each group at its own prefix
                 "dsql_endpoint", "dsql_user", "dsql_database", "region",  # kit: connection overlay
+                "dsql_endpoint_candidates",   # ordered PrivateLink/public failover list (CSV)
                 "chunk_fanout_enabled", "intra_table_writers", "force_v5_tables",
                 "auto_reblank_on_resume", "per_table_write_concurrency",
                 "verbose_chunks", "verbose_chunk_every", "csv_null_value"]
@@ -511,6 +518,11 @@ def _apply_v6_arg_overrides():
         if _de:
             DSQL_ENDPOINT = _de
             print(f"  ↪ DSQL_ENDPOINT overridden -> {DSQL_ENDPOINT}")
+    if "dsql_endpoint_candidates" in ov:
+        _dc = str(ov["dsql_endpoint_candidates"]).strip()
+        if _dc:
+            DSQL_ENDPOINT_CANDIDATES = _dc
+            print(f"  ↪ DSQL_ENDPOINT_CANDIDATES -> {DSQL_ENDPOINT_CANDIDATES}")
     if "dsql_user" in ov:
         _du = str(ov["dsql_user"]).strip()
         if _du:
@@ -1599,6 +1611,108 @@ class ConnPool:
                 pass
 
 
+# Socket connect timeout (seconds) per candidate probe during endpoint failover: a wrong
+# PrivateLink/public host should fail FAST so we move on to the next candidate rather than
+# blocking the whole load on one unreachable name.
+DSQL_CANDIDATE_CONNECT_TIMEOUT = 10
+_dsql_endpoint_resolved = False
+_dsql_resolve_lock = threading.Lock()
+
+# === DSQL ENDPOINT FAILOVER HELPER (shared; keep byte-identical across all copies) =========
+# One operator-supplied endpoint, but connectivity differs by where this code runs: Glue in a
+# private VPC reaches DSQL over a PrivateLink connection endpoint whose working hostname is
+# <cluster-id>.<service-identifier>.<region>.on.aws, while the public console name
+# <cluster-id>.dsql.<region>.on.aws times out on 5432 there. resolve_task derives the private
+# candidate (via dsql.get_vpc_endpoint_service_name) and passes an ordered, comma-separated
+# --dsql_endpoint_candidates list; we try each in order and the first that connects wins. The
+# auth token MUST be minted for the host actually connected to, so the caller's make_conn(host)
+# builds the token from its host argument. This block is duplicated verbatim per script because
+# Glue copies each script to S3 as a single file; tests/test_helper_sync.py diffs the copies.
+# ============================================================================================
+def dsql_candidate_list(candidates_csv, given_endpoint):
+    """Ordered, de-duped candidate hostnames from the --dsql_endpoint_candidates CSV, always
+    ending with the operator-given endpoint as a backstop. Never raises: a blank/missing CSV
+    degrades to just [given_endpoint] so a connection is still attempted."""
+    out = []
+    for raw in (candidates_csv or "").split(","):
+        host = raw.strip()
+        if host and host not in out:
+            out.append(host)
+    g = (given_endpoint or "").strip()
+    if g and g not in out:
+        out.append(g)
+    return out
+
+
+def dsql_connect_first(candidates, make_conn, log=None):
+    """Try make_conn(host) for each candidate in order; return (conn, host) for the first that
+    connects. make_conn must mint the auth token for the host it is given. On total failure,
+    raise one RuntimeError naming every host tried and its error, plus a one-line network hint.
+    log(msg), if given, is called once with the hostname that worked."""
+    errors = []
+    for host in candidates:
+        try:
+            conn = make_conn(host)
+            if log:
+                log(host)
+            return conn, host
+        except Exception as e:   # noqa: BLE001 - any connect failure -> try the next host
+            errors.append((host, f"{type(e).__name__}: {e}"))
+    tried = "; ".join(f"{h} -> {err}" for h, err in errors) or "(no candidates)"
+    raise RuntimeError(
+        "Could not connect to Aurora DSQL on any candidate hostname [" + tried + "]. "
+        "Hint: Glue/Lambda needs a network route to DSQL: a DSQL VPC endpoint with private "
+        "DNS, or internet/NAT.")
+# === END DSQL ENDPOINT FAILOVER HELPER ======================================================
+
+
+def _probe_connect_dsql(host):
+    """Open a connection to ONE candidate host with a short socket timeout and a token minted
+    for THAT host (not the global cache). Used only during first-connect endpoint resolution."""
+    client = make_boto_client("dsql")
+    token = client.generate_db_connect_admin_auth_token(
+        host, Region=REGION, ExpiresIn=DSQL_TOKEN_EXPIRES_IN)
+    return pg8000.connect(
+        host=host, port=5432, database=DSQL_DATABASE, user=DSQL_USER, password=token,
+        ssl_context=_get_ssl_context(), timeout=DSQL_CANDIDATE_CONNECT_TIMEOUT)
+
+
+def _resolve_dsql_endpoint_once():
+    """On the FIRST connect, try each candidate hostname and PIN the first that reaches DSQL
+    into DSQL_ENDPOINT, so all later connects reuse it. The probe connection is closed (the
+    caller opens its own with the normal cached-token path). No-op once resolved. If no
+    candidate connects, raise the single clear error from dsql_connect_first."""
+    global DSQL_ENDPOINT, _dsql_endpoint_resolved
+    if _dsql_endpoint_resolved:
+        return
+    with _dsql_resolve_lock:
+        if _dsql_endpoint_resolved:
+            return
+        candidates = dsql_candidate_list(DSQL_ENDPOINT_CANDIDATES, DSQL_ENDPOINT)
+        if len(candidates) <= 1:
+            _dsql_endpoint_resolved = True   # nothing to choose; use DSQL_ENDPOINT as-is
+            return
+        conn, host = dsql_connect_first(
+            candidates, _probe_connect_dsql,
+            log=lambda h: print(f"  ↪ DSQL reachable on {h} (pinned for this run)"))
+        try:
+            conn.close()
+        except Exception:
+            pass
+        if host != DSQL_ENDPOINT:
+            DSQL_ENDPOINT = host
+            _invalidate_dsql_token()   # re-mint the cached token for the pinned host
+        _dsql_endpoint_resolved = True
+
+
+def _unpin_dsql_endpoint():
+    """Clear the resolved-endpoint pin so the next connect re-probes the full candidate list
+    (the pinned host stopped working)."""
+    global _dsql_endpoint_resolved
+    with _dsql_resolve_lock:
+        _dsql_endpoint_resolved = False
+
+
 def connect_dsql():
     """Open a fresh authenticated pg8000 connection to DSQL from the driver.
 
@@ -1615,10 +1729,17 @@ def connect_dsql():
     class failure (08006 unable-to-connect, dropped/closed pipe, TLS drop) the cached token is
     INVALIDATED so each retry mints a FRESH token. A stale/expired cached token can otherwise
     make every reconnect fail identically (the 08006 stall). On exhaustion the last error is
-    raised so the caller's existing per-chunk/per-table guard isolates it."""
+    raised so the caller's existing per-chunk/per-table guard isolates it.
+
+    ENDPOINT FAILOVER: the FIRST connect resolves which candidate hostname actually reaches
+    DSQL (PrivateLink private name vs public console name) and PINS it into DSQL_ENDPOINT, so
+    every later connect/reconnect reuses the working host at zero extra cost. If the pinned
+    host later stops connecting (retries exhausted), the pin is cleared so the next connect
+    re-probes the full candidate list."""
     _last = None
     for _attempt in range(1, CONNECT_MAX_RETRIES + 1):
         try:
+            _resolve_dsql_endpoint_once()
             return pg8000.connect(
                 host=DSQL_ENDPOINT, port=5432, database=DSQL_DATABASE,
                 user=DSQL_USER, password=_get_cached_dsql_token(),
@@ -1630,6 +1751,7 @@ def connect_dsql():
                 _invalidate_dsql_token()   # next attempt gets a fresh token
             if _attempt < CONNECT_MAX_RETRIES:
                 time.sleep(server_backoff_seconds(_attempt))
+    _unpin_dsql_endpoint()   # pinned host stopped working -> re-probe candidates next time
     raise _last
 
 

@@ -9,5 +9,7 @@
   "glue_connection": "<exact Glue connection name, or empty string for no VPC>",
   "cdc_engine": "pythonshell",
   "cdc_spark_fallback": true,
-  "control_schema": "cdc_control"
+  "control_schema": "cdc_control",
+  "cdc_validation": true,
+  "cdc_validation_sample": 20
 }

@@ -32,6 +32,8 @@ KEYS
     cdc_engine         = pythonshell
     cdc_spark_fallback = true
     control_schema     = cdc_control
+    cdc_validation     = true                (Tier-2 CDC validation on; cutover blocks on failures)
+    cdc_validation_sample = 20               (rows re-checked per committed CDC file; 0 = all)
     glue_role_arn      = arn:aws:iam::<account_id>:role/<project>-glue-exec-role
   Setup-only (used by tools/setup.sh for the Glue network connection; NOT part of pipeline.json):
     subnet_id, security_group_id            both together, or neither
@@ -69,6 +71,8 @@ OPTIONAL_DEFAULTS = {
     "cdc_engine": "pythonshell",
     "cdc_spark_fallback": "true",
     "control_schema": "cdc_control",
+    "cdc_validation": "true",
+    "cdc_validation_sample": "20",
 }
 # Setup-only keys: consumed by tools/setup.sh (Glue network connection), never in pipeline.json.
 SETUP_ONLY = ("subnet_id", "security_group_id")
@@ -84,7 +88,7 @@ ALLOWED = tuple(REQUIRED) + tuple(OPTIONAL_DEFAULTS) + _DERIVED_DEFAULT + SETUP_
 # setup-only keys are intentionally absent.
 PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_database",
                  "glue_role_arn", "glue_connection", "cdc_engine", "cdc_spark_fallback",
-                 "control_schema")
+                 "control_schema", "cdc_validation", "cdc_validation_sample")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
 

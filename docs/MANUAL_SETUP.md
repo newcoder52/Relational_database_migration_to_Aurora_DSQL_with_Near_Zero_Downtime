@@ -10,9 +10,11 @@ This page is **standalone**: it repeats getting the code, the bucket and `params
 follow it on its own. Run everything **from the repo root**.
 
 > **Before you start** you also need the same AWS prerequisites as Option A, which this page does not
-> repeat in full: an **Aurora DSQL cluster**, the **target tables already created**, **≤ 9 schemas of
+> repeat in full: an **Aurora DSQL cluster**, the **target tables already created (each with its
+> primary key**; a `RAW`/`BLOB` key column maps to `uuid`/`text`, not `bytea`)**, **≤ 9 schemas of
 > your own**, a **network path from Glue/Lambdas to DSQL** if locked down, and a **`full-load-and-cdc`
-> DMS task** per source whose S3 target endpoint writes to the bucket below. See
+> DMS task** per source whose S3 target endpoint writes to the bucket below (its `ServiceAccessRole`
+> must be allowed to write that bucket). See
 > [RUNBOOK §2 "What you need"](../RUNBOOK.md#2-what-you-need) for the full checklist (including the
 > exact DMS task settings preflight requires).
 
@@ -62,12 +64,14 @@ cp config/params.example.csv params.csv
 | `account_id` | **required** | — | 12-digit AWS account id (setup/IAM only; never in `pipeline.json`) |
 | `region` | **required** | — | AWS region of the DMS tasks and pipeline (must equal the task ARN's region) |
 | `project` | **required** | — | short prefix (letters, digits, hyphens) for role, Lambda and job names |
-| `dsql_endpoint` | **required** | — | Aurora DSQL endpoint `<cluster>.dsql.<region>.on.aws`; inside a VPC with no internet use the VPC endpoint's private DNS name `<cluster>.dsql-<id>.<region>.on.aws` |
+| `dsql_endpoint` | **required** | — | the cluster endpoint from the DSQL console, `<cluster>.dsql.<region>.on.aws`. If Glue has no internet it needs a route to DSQL (a DSQL VPC endpoint); the pipeline picks the reachable hostname automatically |
 | `dsql_user` | optional | `admin` | DSQL user |
 | `dsql_database` | optional | `postgres` | DSQL database |
 | `glue_connection` | optional | `""` (no VPC) | the Glue network connection's **exact** name; `""` = no VPC |
 | `cdc_engine` | optional | `pythonshell` | `pythonshell` (1 DPU) or `spark` (Glue 4.0, 2 × G.1X) |
 | `cdc_spark_fallback` | optional | `true` | on a Python-shell CDC driver failure, re-create that task's CDC job as Spark |
+| `cdc_validation` | optional | `true` | Tier-2 CDC validation on; cutover stops at `CdcValidationFailed` on unresolved `cdc_control.cdc_validation_failures`. `false` disables |
+| `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = all) |
 | `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection; both-or-neither with `security_group_id` |
@@ -81,7 +85,7 @@ new shell):
 export ACCOUNT_ID="123456789012"             # account_id
 export REGION="us-east-1"                     # region
 export PROJECT="dms-dsql"                     # project
-export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"   # dsql_endpoint (VPC/no-internet: abcd.dsql-<id>.us-east-1.on.aws)
+export DSQL_ENDPOINT="abcd.dsql.us-east-1.on.aws"   # dsql_endpoint (cluster endpoint from the DSQL console)
 export DSQL_CLUSTER_ID="abcd"                 # first label of dsql_endpoint (DERIVED — not a params key)
 export DSQL_USER="admin"                      # dsql_user
 export DSQL_DATABASE="postgres"               # dsql_database
@@ -348,6 +352,8 @@ is rejected at run time.
 | `cdc_engine` | `cdc_engine` | `pythonshell` |
 | `cdc_spark_fallback` | `cdc_spark_fallback` | `true` |
 | `control_schema` | `control_schema` | `cdc_control` |
+| `cdc_validation` | `cdc_validation` | `true` |
+| `cdc_validation_sample` | `cdc_validation_sample` | `20` |
 
 Write it from the export block and upload it to the fixed key `config/pipeline.json`:
 
@@ -366,6 +372,8 @@ cfg = {
     "cdc_engine": "pythonshell",
     "cdc_spark_fallback": True,
     "control_schema": "cdc_control",
+    "cdc_validation": True,
+    "cdc_validation_sample": 20,
 }
 open("pipeline.json", "w").write(json.dumps(cfg, indent=2) + "\n")
 print(json.dumps(cfg, indent=2))

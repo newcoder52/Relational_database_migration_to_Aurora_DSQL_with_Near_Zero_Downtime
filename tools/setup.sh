@@ -88,6 +88,51 @@ TMPDIR_SETUP="$(mktemp -d 2>/dev/null || mktemp -d -t setup)"
 cleanup() { rm -rf "$TMPDIR_SETUP" 2>/dev/null || true; }
 trap cleanup EXIT
 
+# run_role_retry: like run(), but on a fresh account a just-created IAM role takes a few seconds to
+# propagate, so the first create-function / create-state-machine / glue create-* can fail with an
+# "role cannot be assumed" / InvalidParameterValueException propagation error even though the role
+# exists. Retry ONLY those errors, with bounded backoff (~2 min total), then give up and surface
+# the real error. Any OTHER (non-propagation) failure is returned immediately — no retry, no
+# masking. Idempotent and portable (POSIX sh constructs; no bashisms beyond what the script uses).
+# In --dry-run it just prints the command (no AWS call), like run().
+run_role_retry() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRYRUN:'; printf ' %q' "$@"; printf '\n'
+    return 0
+  fi
+  # retry on these substrings only (IAM role propagation to Lambda / SFN / Glue)
+  _delays="5 10 15 20 30 40"      # ~2 min of bounded backoff across 6 retries
+  _attempt=0
+  while :; do
+    _err="$TMPDIR_SETUP/.role_retry.err"
+    if "$@" 2>"$_err"; then
+      cat "$_err" >&2 || true
+      return 0
+    fi
+    _msg="$(cat "$_err" 2>/dev/null || true)"
+    case "$_msg" in
+      *"cannot be assumed"*|*"not authorized to perform: iam:PassRole"*|\
+      *"InvalidParameterValueException"*"role"*|*"Invalid principal in policy"*)
+        # pick the Nth delay without unquoted word-splitting
+        _next="$(printf '%s\n' "$_delays" | tr ' ' '\n' | sed -n "$((_attempt+1))p")"
+        if [ -z "$_next" ]; then
+          echo "ERROR: IAM role still not usable after retrying ~2 min:" >&2
+          printf '%s\n' "$_msg" >&2
+          return 1
+        fi
+        echo "(waiting ${_next}s for IAM role propagation, then retrying: $1 $2 ...)" >&2
+        sleep "$_next"
+        _attempt=$((_attempt+1))
+        ;;
+      *)
+        # Not a propagation error — surface it immediately and fail (no retry).
+        printf '%s\n' "$_msg" >&2
+        return 1
+        ;;
+    esac
+  done
+}
+
 # ---------------------------------------------------------------------------------------------
 # Resolve bucket + local copy of params.csv
 # ---------------------------------------------------------------------------------------------
@@ -298,8 +343,36 @@ if [ "$HAVE_VPC" -eq 1 ] && [ -n "$P_GLUE_CONNECTION" ]; then
     --protocol tcp --port 0-65535 --source-group "$P_SECURITY_GROUP_ID" || \
     echo "(self-ingress rule already present or not permitted; continuing)"
   AZ="$(capture aws ec2 describe-subnets --subnet-ids "$P_SUBNET_ID" \
-        --query 'Subnets[0].AvailabilityZone' --output text)"
-  CONN_INPUT="{\"Name\":\"$P_GLUE_CONNECTION\",\"ConnectionType\":\"NETWORK\",\"ConnectionProperties\":{},\"PhysicalConnectionRequirements\":{\"SubnetId\":\"$P_SUBNET_ID\",\"SecurityGroupIdList\":[\"$P_SECURITY_GROUP_ID\"],\"AvailabilityZone\":\"${AZ:-AZ_LOOKED_UP_AT_RUNTIME}\"}}"
+        --query 'Subnets[0].AvailabilityZone' --output text 2>/dev/null || true)"
+  # describe-subnets can fail (bad/unreadable subnet) or print "None"; the `|| true` keeps set -e
+  # from aborting here so we can give a clear message. In --dry-run `capture` echoes "" by design,
+  # so skip the hard check there (nothing is created).
+  if [ "$DRY_RUN" -eq 0 ] && { [ -z "$AZ" ] || [ "$AZ" = "None" ]; }; then
+    echo "ERROR: could not resolve the Availability Zone for subnet '$P_SUBNET_ID'." >&2
+    echo "       Check that subnet_id is correct and that you have ec2:DescribeSubnets, then re-run." >&2
+    exit 1
+  fi
+  # Build the Glue connection input as JSON with python3 (json.dumps) rather than shell string
+  # interpolation, so a quote/brace/backslash in glue_connection/subnet/sg (none are character-
+  # validated upstream) can never produce malformed JSON (F-M1). Values are passed via env.
+  CONN_INPUT="$(P_GLUE_CONNECTION="$P_GLUE_CONNECTION" P_SUBNET_ID="$P_SUBNET_ID" \
+    P_SECURITY_GROUP_ID="$P_SECURITY_GROUP_ID" P_AZ="${AZ:-}" python3 - <<'PY'
+import json, os
+pcr = {
+    "SubnetId": os.environ["P_SUBNET_ID"],
+    "SecurityGroupIdList": [os.environ["P_SECURITY_GROUP_ID"]],
+}
+az = os.environ.get("P_AZ", "")
+if az:
+    pcr["AvailabilityZone"] = az
+print(json.dumps({
+    "Name": os.environ["P_GLUE_CONNECTION"],
+    "ConnectionType": "NETWORK",
+    "ConnectionProperties": {},
+    "PhysicalConnectionRequirements": pcr,
+}))
+PY
+)"
   if [ "$DRY_RUN" -eq 0 ] && aws glue get-connection --name "$P_GLUE_CONNECTION" >/dev/null 2>&1; then
     run aws glue update-connection --name "$P_GLUE_CONNECTION" --connection-input "$CONN_INPUT"
   else
@@ -322,9 +395,30 @@ else
   cp lambdas/*.py "$BUILD/"
   python3 -m pip install pg8000 -t "$BUILD/" --quiet
   ( cd "$BUILD" && zip -qr "$FN_ZIP" . )
-  n="$(unzip -l "$FN_ZIP" | grep -cE ' (resolve_task\.py|params_csv\.py|pg8000/__init__\.py)$' || true)"
-  [ "$n" -eq 3 ] || { echo "ERROR: fn.zip is missing resolve_task.py / params_csv.py / pg8000 (found $n/3)" >&2; exit 1; }
-  echo "built $FN_ZIP (resolve_task.py, params_csv.py and pg8000 present)"
+  # Verify EVERY lambdas/*.py made it into the zip (all 8 handlers + shared modules like
+  # params_csv.py / prepare_cdc_wheels.py / preflight_tasks.py), derived from the folder rather
+  # than a hard-coded list, plus pg8000. Fail naming exactly what is missing (F-M3). The check is
+  # done in python3 (portable, no fragile grep over the unzip columns): compare the set of required
+  # names against the basenames/paths zipimport actually stored.
+  if ! unzip -Z1 "$FN_ZIP" 2>/dev/null > "$TMPDIR_SETUP/fn.zip.names"; then
+    unzip -l "$FN_ZIP" | awk 'NR>3{ $1=$2=$3=""; sub(/^ +/,""); if ($0!="") print }' \
+      > "$TMPDIR_SETUP/fn.zip.names"
+  fi
+  python3 - "$TMPDIR_SETUP/fn.zip.names" lambdas/*.py <<'PY'
+import os, sys
+names_file, srcs = sys.argv[1], sys.argv[2:]
+entries = [ln.strip() for ln in open(names_file, encoding="utf-8") if ln.strip()]
+bases = {os.path.basename(e.rstrip("/")) for e in entries}
+required = [os.path.basename(s) for s in srcs]          # every lambdas/*.py
+missing = [r for r in required if r not in bases]
+# pg8000 must be present as a package (any pg8000/ entry in the zip)
+if not any(e == "pg8000/__init__.py" or e.startswith("pg8000/") for e in entries):
+    missing.append("pg8000/__init__.py")
+if missing:
+    sys.stderr.write("ERROR: fn.zip is missing: " + " ".join(missing) + "\n")
+    sys.exit(1)
+print("built fn.zip (all %d lambdas/*.py + pg8000 present)" % len(required))
+PY
 fi
 
 # name-suffix : handler-module
@@ -351,7 +445,7 @@ while IFS=: read -r sfx mod; do
       --runtime python3.12 --memory-size 1024 --timeout 300 --query FunctionName --output text
     run aws lambda wait function-updated --function-name "$name"
   else
-    run aws lambda create-function --function-name "$name" --zip-file "fileb://$FN_ZIP" \
+    run_role_retry aws lambda create-function --function-name "$name" --zip-file "fileb://$FN_ZIP" \
       --handler "$handler" --runtime python3.12 --memory-size 1024 --timeout 300 \
       --role "$role" --query FunctionName --output text
     run aws lambda wait function-active-v2 --function-name "$name"
@@ -520,7 +614,7 @@ create_or_update_sm() {
     run aws stepfunctions update-state-machine --state-machine-arn "$arn" \
       --definition "file://$def_file" --role-arn "$role_arn"
   else
-    run aws stepfunctions create-state-machine --name "$name" \
+    run_role_retry aws stepfunctions create-state-machine --name "$name" \
       --definition "file://$def_file" --role-arn "$role_arn"
   fi
 }

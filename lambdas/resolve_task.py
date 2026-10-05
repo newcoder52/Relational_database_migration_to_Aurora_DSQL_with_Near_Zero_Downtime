@@ -238,6 +238,14 @@ SETTINGS_DEFAULTS = {
     # install when the CDC run starts), re-create the CDC job as Spark and carry on.
     "cdc_spark_fallback": True,
     "control_schema": "cdc_control",
+    # ── CDC VALIDATION (Tier-2 deferred, sampled by-PK net-state check) ──────────────────
+    # cdc_validation ON by default: each CDC job re-reads a sample of every committed file's
+    # rows and records persistent mismatches in cdc_control.cdc_validation_failures; cutover
+    # then refuses to proceed if any unresolved failure exists. cdc_validation_sample is the
+    # per-file sample size (0 = check every net-op; expensive). Passed to every CDC job as
+    # --cdc_validation / --cdc_validation_sample (create_glue_jobs).
+    "cdc_validation": True,
+    "cdc_validation_sample": 20,
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
 GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
@@ -352,6 +360,30 @@ def _validate_settings(cfg, warnings):
         raise SettingsError(f"pipeline.json 'cdc_spark_fallback' must be true or false "
                             f"(got {cfg['cdc_spark_fallback']!r}).")
     cfg["cdc_spark_fallback"] = fb
+    # cdc_validation: accept bool or the strings "true"/"false" (same shape as cdc_spark_fallback).
+    cv = cfg["cdc_validation"]
+    if isinstance(cv, str) and cv.strip().lower() in ("true", "false"):
+        cv = cv.strip().lower() == "true"
+    if not isinstance(cv, bool):
+        raise SettingsError(f"pipeline.json 'cdc_validation' must be true or false "
+                            f"(got {cfg['cdc_validation']!r}).")
+    cfg["cdc_validation"] = cv
+    # cdc_validation_sample: a non-negative integer (0 = check every net-op). Accept an int or
+    # a digit string; reject anything else so a typo can't silently disable the gate.
+    cs = cfg["cdc_validation_sample"]
+    if isinstance(cs, bool):   # bool is an int subclass; a bare true/false here is a mistake
+        raise SettingsError(f"pipeline.json 'cdc_validation_sample' must be a non-negative "
+                            f"integer (got {cfg['cdc_validation_sample']!r}).")
+    if isinstance(cs, str):
+        cs = cs.strip()
+        if not cs.isdigit():
+            raise SettingsError(f"pipeline.json 'cdc_validation_sample' must be a non-negative "
+                                f"integer (got {cfg['cdc_validation_sample']!r}).")
+        cs = int(cs)
+    if not isinstance(cs, int) or cs < 0:
+        raise SettingsError(f"pipeline.json 'cdc_validation_sample' must be a non-negative "
+                            f"integer (got {cfg['cdc_validation_sample']!r}).")
+    cfg["cdc_validation_sample"] = cs
     conn = cfg.get("glue_connection") or ""
     if isinstance(conn, list):
         conn = ",".join(str(c).strip() for c in conn if str(c).strip())
@@ -359,9 +391,14 @@ def _validate_settings(cfg, warnings):
     if not cfg["glue_connection"]:
         warnings.append("pipeline.json has no glue_connection: Glue jobs run outside your VPC "
                         "(fine only if Glue can reach DSQL without one).")
-    if ".dsql" not in str(cfg["dsql_endpoint"]):
+    # Endpoint-form sanity note only — NEVER a failure. The pipeline figures out connectivity
+    # itself (resolve derives a PrivateLink candidate; the jobs try each form), so any endpoint
+    # the operator pastes is accepted. We only emit a soft note if it doesn't look like a DSQL
+    # host at all, in case of an obvious typo.
+    _ep = str(cfg["dsql_endpoint"])
+    if ".dsql" not in _ep and not _ep.endswith(".on.aws"):
         warnings.append(f"dsql_endpoint {cfg['dsql_endpoint']!r} does not look like an Aurora "
-                        f"DSQL endpoint (expected <cluster>.dsql[-xxxx].<region>.on.aws).")
+                        f"DSQL cluster endpoint; using it as given.")
     return cfg
 
 
@@ -562,6 +599,64 @@ def _check_no_other_run(event, task_arn, mode, warnings):
                         f"states:ListExecutions and states:DescribeExecution to the Lambda role "
                         f"(RUNBOOK Step 1). Don't start two runs for one task at once.")
 
+def _dsql_cluster_id(endpoint):
+    """Cluster id = the first dotted label of the endpoint (matches params_csv.dsql_cluster_id)."""
+    return str(endpoint or "").strip().split(".", 1)[0]
+
+
+def _build_dsql_endpoint_candidates(cfg, warnings):
+    """Return an ordered, de-duped list of DSQL hostnames for the Glue jobs/Lambdas to try.
+
+    The operator gives ONE endpoint (cfg['dsql_endpoint']) — normally the public console name
+    <cluster-id>.dsql.<region>.on.aws. When Glue runs in a private VPC and reaches DSQL through
+    a PrivateLink connection endpoint (private DNS enabled), that public name times out on 5432
+    and the working hostname is <cluster-id>.<service-identifier>.<region>.on.aws, where the
+    service identifier is the last label of dsql.get_vpc_endpoint_service_name()'s serviceName
+    (e.g. com.amazonaws.<region>.dsql-fnh4 -> dsql-fnh4). We derive that private candidate here
+    (resolve_task runs OUTSIDE the VPC, so it has DSQL control-plane API access the in-VPC jobs
+    may lack) and hand both forms to the jobs, which try each in order.
+
+    Ordering: if a Glue connection is configured (jobs run in the VPC) the private form is tried
+    FIRST, else the given form first. The given endpoint is always included as a backstop.
+
+    NEVER FAILS: any API error (AccessDenied, action not available, cluster not found, ...) is
+    logged as a warning and we fall back to [given] so the pipeline is never blocked over the
+    endpoint form."""
+    given = str(cfg["dsql_endpoint"]).strip()
+    region = str(cfg["region"]).strip()
+    cluster_id = _dsql_cluster_id(given)
+    private = None
+    if cluster_id:
+        try:
+            client = boto3.client("dsql", region_name=region)
+            resp = client.get_vpc_endpoint_service_name(identifier=cluster_id)
+            service_name = str(resp.get("serviceName") or "").strip()
+            service_identifier = service_name.split(".")[-1] if service_name else ""
+            if service_identifier:
+                private = f"{cluster_id}.{service_identifier}.{region}.on.aws"
+        except Exception as e:   # noqa: BLE001 - never block the pipeline on this lookup
+            code = str((getattr(e, "response", None) or {}).get("Error", {}).get("Code", "")
+                       or type(e).__name__)
+            warnings.append(
+                f"could not derive the DSQL PrivateLink hostname via "
+                f"dsql:GetVpcEndpointServiceName ({code}); using the given endpoint only. If "
+                f"Glue runs in a private VPC and cannot reach the public DSQL name, grant that "
+                f"action to the Lambda role or ensure Glue has a route to DSQL.")
+
+    has_glue_connection = bool(str(cfg.get("glue_connection") or "").strip())
+    if private and private != given:
+        ordered = [private, given] if has_glue_connection else [given, private]
+    else:
+        ordered = [given]   # no private form, or the given endpoint already IS the private form
+    # de-dup, preserve order, drop blanks
+    out = []
+    for h in ordered:
+        h = (h or "").strip()
+        if h and h not in out:
+            out.append(h)
+    return out
+
+
 def handler_shared(event, context):
     mode = event["mode"]
     bucket = event["bucket"]
@@ -630,6 +725,7 @@ def handler_shared(event, context):
         "project": cfg["project"],
         "region": cfg["region"],
         "dsqlEndpoint": cfg["dsql_endpoint"],
+        "dsqlEndpointCandidates": ",".join(_build_dsql_endpoint_candidates(cfg, warnings)),
         "dsqlUser": cfg["dsql_user"],
         "dsqlDatabase": cfg["dsql_database"],
         "glueRoleArn": cfg["glue_role_arn"],
@@ -637,6 +733,8 @@ def handler_shared(event, context):
         "cdcEngine": cdc_engine,
         "cdcSparkFallback": cfg["cdc_spark_fallback"],
         "controlSchema": cfg["control_schema"],
+        "cdcValidation": cfg["cdc_validation"],
+        "cdcValidationSample": cfg["cdc_validation_sample"],
         "jobNames": jobs,
         "cdcJobName": jobs["cdc"],
         "compositeCdcJobName": composite_cdc_job,
@@ -677,9 +775,13 @@ def handler_shared(event, context):
 # Returns: {"ok": true, "count": N, "distinctSchemas": [...], "manifestKey": "...",
 #           "sourceKey": "...", "replacedExisting": bool, "warnings": [...]}
 
-# DMS table-load states we treat as healthy (full load done, or legitimately empty). Compared
-# case-insensitively. Anything else -> the table failed to load and we fail the build naming it.
-_HEALTHY_TABLE_STATES = {"table completed", "table loaded", "fully loaded"}
+# DMS table-load states we treat as healthy. Per the DMS API the TableState enum is exactly:
+#   "Table does not exist" | "Before load" | "Full load" | "Table completed" |
+#   "Table cancelled" | "Table error" | "Table is being reloaded"
+# Only "Table completed" means the full load for that table has finished, so it is the one state
+# that lets the table into the manifest. Compared case-insensitively; every other state (and an
+# empty/unknown one) is fail-closed and fails the build naming the table (see _table_state_advice).
+_HEALTHY_TABLE_STATES = {"table completed"}
 # Transformation rule-actions that CAN change a schema/table name and that we can reproduce
 # exactly. Any OTHER transformation on a schema/table target -> fail (we can't predict the folder).
 _NAME_TRANSFORMS = {"rename", "convert-lowercase", "convert-uppercase", "add-prefix",
@@ -699,6 +801,25 @@ def _is_error_table_state(state):
         return False
     # Explicit error wording, and a fail-closed default for anything else unexpected.
     return True
+
+
+def _table_state_advice(state):
+    """What the operator should do about a table that is NOT 'Table completed', keyed on the DMS
+    TableState. Keeps the per-table failure message actionable instead of a bare state dump."""
+    s = str(state or "").strip().lower()
+    if not s:
+        return "DMS reported no state for this table; wait for the full load to finish, then re-run."
+    if s == "table does not exist":
+        return ("the source object was not found; fix the task's selection rule (it matches a "
+                "table that does not exist) or remove it, then re-run.")
+    if s in ("before load", "full load", "table is being reloaded"):
+        return ("the full load has not finished for this table; wait for the task to reach "
+                "STOPPED_AFTER_CACHED_EVENTS, then re-run (or reload the table in DMS).")
+    if s in ("table error", "table cancelled"):
+        return ("the table failed to load; fix the source/DMS problem and reload the table in DMS "
+                "(or exclude it in the task's selection rules), then start the task again.")
+    return ("unexpected table state; wait for the full load to finish or reload the table in DMS, "
+            "then re-run.")
 
 
 def _wildcard_to_regex(pat):
@@ -811,14 +932,24 @@ def _describe_table_statistics(dms, task_arn):
     return stats
 
 
+def _distinct_schema_name(rules, src_schema, src_table, task_arn):
+    """The lowercased TARGET (DSQL) schema name for one source (schema, table), i.e. the schema
+    folder name after the task's TableMappings transforms. This is the single place the
+    distinct-schema count is derived from, so preflight's pre-start estimate and BuildTableList's
+    authoritative count agree by construction (F-L1): both transform the source name then lower()."""
+    folder_schema, _ = _transform_names(rules, src_schema, src_table, task_arn)
+    return folder_schema.lower() if folder_schema else ""
+
+
 def _estimate_selection_schemas(rules):
     """Best-effort distinct DSQL schemas the task's SELECTION rules load into, for preflight's
     pre-start cap estimate (BuildTableList does the authoritative check from real stats).
 
     Returns (schemas:set, wildcard:bool). `schemas` is the explicit (non-wildcard) source schema
-    names from 'include' selection rules, with the task's schema-level name transformations
-    applied, lowercased as discovery does. `wildcard` is True if any include selection rule's
-    schema is a wildcard (so the real count can't be known before full load)."""
+    names from 'include' selection rules, transformed to their TARGET DSQL schema names with the
+    same transform-then-lowercase logic BuildTableList uses (via _distinct_schema_name), so the
+    estimate counts the same names the authoritative build will. `wildcard` is True if any include
+    selection rule's schema is a wildcard (so the real count can't be known before full load)."""
     schemas, wildcard = set(), False
     for r in rules:
         if (r.get("rule-type") or "").lower() != "selection":
@@ -830,16 +961,17 @@ def _estimate_selection_schemas(rules):
         if (not s) or ("%" in s) or ("*" in s) or ("_" in s):
             wildcard = True
             continue
-        # Apply schema-target transforms to the explicit name (table left as a wildcard match).
+        # Apply the SAME transform-then-lowercase BuildTableList applies to the loaded names.
+        # Table left empty: schema-target rules don't depend on the table name.
         try:
-            tschema, _ = _transform_names(rules, s, "", "")
+            tschema = _distinct_schema_name(rules, s, "", "")
         except TableListError:
             # An unsupported transform is a hard error at BuildTableList; for the estimate just
             # treat this schema as unknown rather than failing preflight here.
             wildcard = True
             continue
         if tschema:
-            schemas.add(tschema.lower())
+            schemas.add(tschema)
     return schemas, wildcard
 
 
@@ -893,7 +1025,7 @@ def handler_build_table_list(event, context):
         if not src_schema or not src_table:
             continue   # DMS sometimes reports aggregate/control rows with no name; skip them
         if _is_error_table_state(state):
-            errored.append(f"{src_schema}.{src_table} (state={state!r})")
+            errored.append(f"{src_schema}.{src_table} (state={state!r}) — {_table_state_advice(state)}")
             continue
         folder_schema, folder_table = _transform_names(rules, src_schema, src_table, task_arn)
         if not folder_schema or not folder_table:
@@ -907,16 +1039,17 @@ def handler_build_table_list(event, context):
 
     if errored:
         raise TableListError(
-            f"DMS task {task_arn} has {len(errored)} table(s) that did not load cleanly; the "
-            f"table list was not built and no Glue jobs were created:\n  - "
-            + "\n  - ".join(sorted(errored))
-            + "\nFix the source/DMS problem (or exclude the table in the task's selection rules) "
-              "and start the task again.")
+            f"DMS task {task_arn} has {len(errored)} table(s) that are not 'Table completed'; the "
+            f"table list was not built and no Glue jobs were created. Only 'Table completed' means "
+            f"a table's full load has finished. Per table (state and what to do):\n  - "
+            + "\n  - ".join(sorted(errored)))
     if not rows:
         raise TableListError(
             f"DMS task {task_arn} loaded no tables with a usable schema/table name. Check the "
             f"task's selection rules.")
 
+    # Authoritative distinct-schema count: the lowercased TARGET schema folder names (what
+    # _distinct_schema_name derives for the estimate). rows[] already hold transformed names.
     distinct_schemas = sorted({s.lower() for s, _ in rows})
     if len(distinct_schemas) > _MAX_DISTINCT_SCHEMAS:
         raise TableListError(

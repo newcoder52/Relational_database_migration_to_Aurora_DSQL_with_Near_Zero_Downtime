@@ -49,7 +49,14 @@ Input event: {
                        # job's pg8000 stack is taken from (after extraPyFiles = driver-fullload)
   "glue_role_arn", "region",
   "dsql_endpoint", "dsql_user", "dsql_database",
+  "dsql_endpoint_candidates",   # optional: ordered PrivateLink/public failover list (CSV) from
+                       # resolve_task; set on every job as --dsql_endpoint_candidates. Absent/
+                       # empty -> scripts use --dsql_endpoint only (backward compatible).
   "cdc_root", "control_schema", "dms_task_arn",  # dms_task_arn used by the cdc role only
+  "cdc_validation",        # optional: true|false (default true). Set on every CDC job as
+                           # --cdc_validation; turns the Tier-2 deferred validation on/off.
+  "cdc_validation_sample", # optional: int (default 20; 0 = all). Set on every CDC job as
+                           # --cdc_validation_sample. Absent (older workflows): script uses ON/20.
   "csv_null_value",    # optional: the DMS endpoint's CsvNullValue (how DMS writes a real NULL);
                        # set on load/load-big/validate/cdc as --csv_null_value ("" -> "__EMPTY__").
                        # Absent (older workflows): the scripts use the DMS default "NULL".
@@ -313,6 +320,9 @@ def handler(event, context):
     glue_role_arn = event["glue_role_arn"]
     region = event.get("region", REGION)
     dsql_endpoint = event["dsql_endpoint"]
+    # Ordered PrivateLink/public failover list (CSV) derived by resolve_task. Optional for
+    # backward compatibility; the scripts fall back to --dsql_endpoint when it is absent/empty.
+    dsql_endpoint_candidates = event.get("dsql_endpoint_candidates", "")
     dsql_user = event.get("dsql_user", "admin")
     dsql_database = event.get("dsql_database", "postgres")
     cdc_root = event.get("cdc_root", "cdc")
@@ -402,6 +412,10 @@ def handler(event, context):
             "--enable-continuous-cloudwatch-log": "true",
             "--job-language": "python",
         }
+        if dsql_endpoint_candidates:
+            # Ordered failover list (PrivateLink + public). The scripts try each host and pin
+            # the first that connects; absent/empty -> they use --dsql_endpoint only.
+            args["--dsql_endpoint_candidates"] = dsql_endpoint_candidates
         if extra_py_files:
             args["--extra-py-files"] = extra_py_files
         if role == "discovery" and "cdc_root" in event:
@@ -415,6 +429,18 @@ def handler(event, context):
         if role in _CDC_ROLES:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema
+            # CDC validation (Tier-2 deferred by-PK net-state check). ON by default; the two
+            # args are passed to EVERY CDC job (main cdc, cdc-spark fallback, cdc-composite and
+            # its spark template) so the engine switch never changes the validation behaviour.
+            # Absent from the event (older workflows) -> the CDC script defaults to ON / 20.
+            _cv = event.get("cdc_validation")
+            if _cv is not None:
+                # Glue argument values are strings; the CDC script's overlay parses true/false.
+                args["--cdc_validation"] = "true" if (_cv is True or str(_cv).strip().lower()
+                                                       in ("true", "1", "yes")) else "false"
+            _cvs = event.get("cdc_validation_sample")
+            if _cvs is not None:
+                args["--cdc_validation_sample"] = str(_cvs)
             _ts_col = event.get("timestampColumnName")
             if _ts_col:
                 # The DMS TimestampColumnName (CDC watermark), derived from the endpoint by
