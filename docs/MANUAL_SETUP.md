@@ -77,12 +77,29 @@ cp config/params.example.csv params.csv
 | `max_big_cdc_forks` | optional | `8` | max big single-/no-PK tables that get their own `bg` CDC job; over the cap they stay on the main CDC job with a warning (not a failure) |
 | `big_table_row_threshold` | optional | `6000000` | int ≥ 1. A table with ≥ this many rows is big (own load-big group + own bg CDC job). Applies to tasks started after publish; never re-assigns a table whose CDC started |
 | `file_fanout_threshold` | optional | `8` | int ≥ 1. A table with ≥ this many LOAD part-files is also big |
+| `big_table_bytes_threshold` | optional | `1000000000` | int ≥ 1. A table with ≥ this many total full-load bytes is also big (rescues a huge single-file table with no row count) |
 | `max_groups` | optional | `10` | int ≥ 1. Cap on load/validate groups per task (= CDC job pool size) |
 | `map_max_concurrency` | optional | `6` | int 1–40. Groups/forks that load+validate at once (also the GroupFanOut Map concurrency) |
 | `max_files_in_parallel` | optional | `30` | int ≥ 1. Per-loader cap on LOAD files read at once |
+| `writers_per_file` | optional | `8` | int ≥ 1. Concurrent DSQL writers for one part-file (parallelises a big single-file table); 1 = old behaviour |
 | `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders |
 | `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency; ≤ max_writers_per_loader |
 | `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency; ≥ min_writers_per_loader |
+| `glue_version` | optional | `4.0` | `4.0` (tested) or `5.0` (re-test drivers first); applied to the Spark jobs |
+| `discovery_worker_type` | optional | `G.2X` | Glue worker type for discovery (allow-list G.1X–G.16X/R.1X–R.8X) |
+| `discovery_num_workers` | optional | `5` | int 1–299 |
+| `discovery_timeout_minutes` | optional | `480` | int 1–10080 (7-day max) |
+| `load_worker_type` | optional | `G.4X` | Glue worker type for the small-group load (bigger = bigger driver) |
+| `load_num_workers` | optional | `10` | int 1–299 |
+| `load_timeout_minutes` | optional | `2880` | int 1–10080 |
+| `load_big_worker_type` | optional | `G.8X` | Glue worker type for the big-table load (128 GB driver; raise to G.12X/G.16X) |
+| `load_big_num_workers` | optional | `10` | int 1–299 |
+| `load_big_timeout_minutes` | optional | `2880` | int 1–10080 (raise toward 7 days for very large tables) |
+| `validate_worker_type` | optional | `G.8X` | Glue worker type for validate |
+| `validate_num_workers` | optional | `10` | int 1–299 |
+| `validate_timeout_minutes` | optional | `2880` | int 1–10080 |
+| `max_parallel_tables` | optional | `20` | int 1–40. Tables loaded at once on the driver |
+| `per_worker_mem_budget_mb` | optional | `1500` | int ≥ 1. Per-table driver-memory budget (throttle never drops to 1) |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection; both-or-neither with `security_group_id` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection; both-or-neither with `subnet_id` |
@@ -344,7 +361,7 @@ rm -rf /tmp/_cdc_check && python3 lambdas/prepare_cdc_wheels.py _cdc/ /tmp/_cdc_
 
 ## Step 3c — config/pipeline.json
 
-*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Twenty-two of the `params.csv` values
+*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Thirty-nine of the `params.csv` values
 become `config/pipeline.json`. Each key maps straight across (defaults applied where you left a row
 out); `account_id`, `subnet_id`, `security_group_id` are **not** written. Don't copy
 `config/pipeline.example.json` as-is — its `description` holds `<bucket>`, and any value with `<`/`>`
@@ -368,12 +385,29 @@ is rejected at run time.
 | `max_big_cdc_forks` | `max_big_cdc_forks` | `8` |
 | `big_table_row_threshold` | `big_table_row_threshold` | `6000000` |
 | `file_fanout_threshold` | `file_fanout_threshold` | `8` |
+| `big_table_bytes_threshold` | `big_table_bytes_threshold` | `1000000000` |
 | `max_groups` | `max_groups` | `10` |
 | `map_max_concurrency` | `map_max_concurrency` | `6` |
 | `max_files_in_parallel` | `max_files_in_parallel` | `30` |
+| `writers_per_file` | `writers_per_file` | `8` |
 | `conn_budget` | `conn_budget` | `900` |
 | `min_writers_per_loader` | `min_writers_per_loader` | `100` |
 | `max_writers_per_loader` | `max_writers_per_loader` | `150` |
+| `glue_version` | `glue_version` | `4.0` |
+| `discovery_worker_type` | `discovery_worker_type` | `G.2X` |
+| `discovery_num_workers` | `discovery_num_workers` | `5` |
+| `discovery_timeout_minutes` | `discovery_timeout_minutes` | `480` |
+| `load_worker_type` | `load_worker_type` | `G.4X` |
+| `load_num_workers` | `load_num_workers` | `10` |
+| `load_timeout_minutes` | `load_timeout_minutes` | `2880` |
+| `load_big_worker_type` | `load_big_worker_type` | `G.8X` |
+| `load_big_num_workers` | `load_big_num_workers` | `10` |
+| `load_big_timeout_minutes` | `load_big_timeout_minutes` | `2880` |
+| `validate_worker_type` | `validate_worker_type` | `G.8X` |
+| `validate_num_workers` | `validate_num_workers` | `10` |
+| `validate_timeout_minutes` | `validate_timeout_minutes` | `2880` |
+| `max_parallel_tables` | `max_parallel_tables` | `20` |
+| `per_worker_mem_budget_mb` | `per_worker_mem_budget_mb` | `1500` |
 
 Write it from the export block and upload it to the fixed key `config/pipeline.json`:
 
@@ -398,12 +432,29 @@ cfg = {
     "max_big_cdc_forks": 8,
     "big_table_row_threshold": 6000000,
     "file_fanout_threshold": 8,
+    "big_table_bytes_threshold": 1000000000,
     "max_groups": 10,
     "map_max_concurrency": 6,
     "max_files_in_parallel": 30,
+    "writers_per_file": 8,
     "conn_budget": 900,
     "min_writers_per_loader": 100,
     "max_writers_per_loader": 150,
+    "glue_version": "4.0",
+    "discovery_worker_type": "G.2X",
+    "discovery_num_workers": 5,
+    "discovery_timeout_minutes": 480,
+    "load_worker_type": "G.4X",
+    "load_num_workers": 10,
+    "load_timeout_minutes": 2880,
+    "load_big_worker_type": "G.8X",
+    "load_big_num_workers": 10,
+    "load_big_timeout_minutes": 2880,
+    "validate_worker_type": "G.8X",
+    "validate_num_workers": 10,
+    "validate_timeout_minutes": 2880,
+    "max_parallel_tables": 20,
+    "per_worker_mem_budget_mb": 1500,
 }
 open("pipeline.json", "w").write(json.dumps(cfg, indent=2) + "\n")
 print(json.dumps(cfg, indent=2))

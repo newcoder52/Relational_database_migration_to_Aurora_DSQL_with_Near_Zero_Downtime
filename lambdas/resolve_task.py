@@ -260,12 +260,35 @@ SETTINGS_DEFAULTS = {
     # pack into, how many loaders run at once, and the per-loader DSQL writer concurrency.
     "big_table_row_threshold": 6000000,   # FullLoadRows >= this => table is "big"
     "file_fanout_threshold": 8,           # num LOAD part-files >= this => table is "big"
+    "big_table_bytes_threshold": 1000000000,  # total full-load bytes >= this => "big" (sizes a huge single-file table with no/low row count)
     "max_groups": 10,                     # cap on load/validate groups (== CDC job pool size)
     "map_max_concurrency": 6,             # how many loaders plan_split lets run at once
     "max_files_in_parallel": 30,          # per-loader LOAD-file read cap (--max_files_in_parallel)
+    "writers_per_file": 8,                # intra-file concurrent DSQL writers (1 = serial; raise to parallelise a single big file)
     "conn_budget": 900,                   # DSQL connection budget shared across in-flight loaders
     "min_writers_per_loader": 100,        # floor for a small group's --max_write_concurrency
     "max_writers_per_loader": 150,        # ceiling for a small group's --max_write_concurrency
+    # ── GLUE JOB SIZING (speed over cost — size up; create_glue_jobs applies these to the job
+    # definitions). Worker TYPES validated against an allow-list; counts/timeouts are ints.
+    # The load is DRIVER-SIDE so a bigger WORKER TYPE (=bigger driver) is the lever; defaults
+    # put load-big + validate on G.8X (128 GB), load on G.4X (64 GB), discovery on G.2X.
+    "glue_version": "4.0",
+    "discovery_worker_type": "G.2X",
+    "discovery_num_workers": 5,
+    "discovery_timeout_minutes": 480,
+    "load_worker_type": "G.4X",
+    "load_num_workers": 10,
+    "load_timeout_minutes": 2880,
+    "load_big_worker_type": "G.8X",
+    "load_big_num_workers": 10,
+    "load_big_timeout_minutes": 2880,
+    "validate_worker_type": "G.8X",
+    "validate_num_workers": 10,
+    "validate_timeout_minutes": 2880,
+    # job2 driver-side parallelism (how many tables load at once + the per-table driver-memory
+    # budget used to size that). The throttle can never silently drop to 1 (see job2_load).
+    "max_parallel_tables": 20,
+    "per_worker_mem_budget_mb": 1500,
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
 GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
@@ -450,9 +473,11 @@ def _validate_settings(cfg, warnings):
 
     _pos_int("big_table_row_threshold")
     _pos_int("file_fanout_threshold")
+    _pos_int("big_table_bytes_threshold")
     _pos_int("max_groups")
     map_max = _pos_int("map_max_concurrency", lo=1, hi=40)
     _pos_int("max_files_in_parallel")
+    _pos_int("writers_per_file")
     conn_budget = _pos_int("conn_budget")
     min_w = _pos_int("min_writers_per_loader")
     max_w = _pos_int("max_writers_per_loader")
@@ -474,6 +499,55 @@ def _validate_settings(cfg, warnings):
                         f"holds, squeezing per-loader writers below max_writers_per_loader. Raise "
                         f"conn_budget (watch the DSQL connection limit) or lower the writers/"
                         f"concurrency to use the full per-loader width.")
+
+    # ── GLUE JOB SIZING ──────────────────────────────────────────────────────────────────
+    _pos_int("writers_per_file")
+    _pos_int("discovery_num_workers", lo=1, hi=299)
+    _pos_int("discovery_timeout_minutes", lo=1, hi=10080)
+    _pos_int("load_num_workers", lo=1, hi=299)
+    _pos_int("load_timeout_minutes", lo=1, hi=10080)
+    _pos_int("load_big_num_workers", lo=1, hi=299)
+    _pos_int("load_big_timeout_minutes", lo=1, hi=10080)
+    _pos_int("validate_num_workers", lo=1, hi=299)
+    _pos_int("validate_timeout_minutes", lo=1, hi=10080)
+    _pos_int("max_parallel_tables", lo=1, hi=40)
+    _pos_int("per_worker_mem_budget_mb")
+    # Worker TYPE allow-list (AWS-docs-verified Glue worker types). G.1X-G.8X are the broadly
+    # available Glue 3.0/4.0 types; G.12X/G.16X and R.1X-R.8X are newer (opt-in, higher startup
+    # latency, not in every Region/version). The pipeline accepts any listed type but WARNS on
+    # the newer ones so an operator confirms Region/version availability. Case-insensitive.
+    _GLUE_WORKER_TYPES = {"G.1X", "G.2X", "G.4X", "G.8X", "G.12X", "G.16X",
+                          "R.1X", "R.2X", "R.4X", "R.8X"}
+    _NEWER_WORKER_TYPES = {"G.12X", "G.16X", "R.1X", "R.2X", "R.4X", "R.8X"}
+    for _wk in ("discovery_worker_type", "load_worker_type", "load_big_worker_type",
+                "validate_worker_type"):
+        _wt = str(cfg.get(_wk, "")).strip().upper().replace(" ", "")
+        if _wt not in _GLUE_WORKER_TYPES:
+            raise SettingsError(
+                f"pipeline.json {_wk!r} must be one of {sorted(_GLUE_WORKER_TYPES)} "
+                f"(got {cfg.get(_wk)!r}).")
+        cfg[_wk] = _wt
+        if _wt in _NEWER_WORKER_TYPES:
+            warnings.append(
+                f"{_wk}={_wt} is a newer Glue worker type (G.12X/G.16X/R.*) with higher startup "
+                f"latency and is not available in every Region/Glue version — confirm it exists "
+                f"in your Region ({cfg.get('region')}) and Glue version before relying on it.")
+    # Glue version allow-list. 4.0 is the tested default; 5.0 is accepted but the operator must
+    # re-test the pg8000/boto3 driver wheels on its Python 3.11 first (warn). 6.0+ not offered.
+    _gv = str(cfg.get("glue_version", "4.0")).strip()
+    if _gv not in ("4.0", "5.0"):
+        raise SettingsError(f"pipeline.json 'glue_version' must be '4.0' or '5.0' (got {_gv!r}).")
+    cfg["glue_version"] = _gv
+    if _gv != "4.0":
+        warnings.append(f"glue_version={_gv}: the full-load/validate/CDC scripts and their driver "
+                        f"wheels (pg8000, boto3) are tested on Glue 4.0 (Python 3.10). Re-test the "
+                        f"drivers on {_gv} before a production migration.")
+    # Driver-memory budget sanity: a very large per-table budget on a modest driver would make
+    # the auto-throttle pick 1 table. The job also enforces a floor (never silently 1); warn here.
+    if cfg["per_worker_mem_budget_mb"] > 65536:
+        warnings.append(f"per_worker_mem_budget_mb={cfg['per_worker_mem_budget_mb']} is very large; "
+                        f"on a smaller driver the table auto-throttle would pick few tables. The "
+                        f"loader enforces a floor so it never drops to 1, but check the sizing.")
     return cfg
 
 
@@ -816,12 +890,29 @@ def handler_shared(event, context):
         "maxBigCdcForks": cfg["max_big_cdc_forks"],
         "bigTableRowThreshold": cfg["big_table_row_threshold"],
         "fileFanoutThreshold": cfg["file_fanout_threshold"],
+        "bigTableBytesThreshold": cfg["big_table_bytes_threshold"],
         "maxGroups": cfg["max_groups"],
         "mapMaxConcurrency": cfg["map_max_concurrency"],
         "maxFilesInParallel": cfg["max_files_in_parallel"],
+        "writersPerFile": cfg["writers_per_file"],
         "connBudget": cfg["conn_budget"],
         "minWritersPerLoader": cfg["min_writers_per_loader"],
         "maxWritersPerLoader": cfg["max_writers_per_loader"],
+        "glueVersion": cfg["glue_version"],
+        "discoveryWorkerType": cfg["discovery_worker_type"],
+        "discoveryNumWorkers": cfg["discovery_num_workers"],
+        "discoveryTimeoutMinutes": cfg["discovery_timeout_minutes"],
+        "loadWorkerType": cfg["load_worker_type"],
+        "loadNumWorkers": cfg["load_num_workers"],
+        "loadTimeoutMinutes": cfg["load_timeout_minutes"],
+        "loadBigWorkerType": cfg["load_big_worker_type"],
+        "loadBigNumWorkers": cfg["load_big_num_workers"],
+        "loadBigTimeoutMinutes": cfg["load_big_timeout_minutes"],
+        "validateWorkerType": cfg["validate_worker_type"],
+        "validateNumWorkers": cfg["validate_num_workers"],
+        "validateTimeoutMinutes": cfg["validate_timeout_minutes"],
+        "maxParallelTables": cfg["max_parallel_tables"],
+        "perWorkerMemBudgetMb": cfg["per_worker_mem_budget_mb"],
         "warnings": warnings,
     })
     for w in warnings:
@@ -1101,6 +1192,7 @@ def handler_build_table_list(event, context):
             f"selection rules.")
 
     errored, rows, seen = [], [], set()
+    rowcounts = {}   # lowercased "<folder_schema>.<folder_table>" -> DMS FullLoadRows (int)
     for st in stats:
         src_schema = str(st.get("SchemaName") or "").strip()
         src_table = str(st.get("TableName") or "").strip()
@@ -1119,6 +1211,17 @@ def handler_build_table_list(event, context):
             continue
         seen.add(dedup)
         rows.append((folder_schema, folder_table))
+        # DMS FullLoadRows is the authoritative source row count. Capture it keyed by the
+        # FOLDER label (lowercased) that the discovery index / plan_split use, so a big table
+        # (e.g. a 16.3M-row single-file table) is classified "big" and gets its own load-big
+        # group + bg CDC job instead of silently sizing as small. FullLoadRows absent -> omit
+        # (discovery leaves full_load_rows=None and plan_split warns + sizes by bytes/files).
+        _flr = st.get("FullLoadRows")
+        if _flr is not None:
+            try:
+                rowcounts[f"{folder_schema}.{folder_table}".lower()] = int(_flr)
+            except (TypeError, ValueError):
+                pass
 
     if errored:
         raise TableListError(
@@ -1159,10 +1262,22 @@ def handler_build_table_list(event, context):
     _put_json(s3, bucket, source_key, {
         "source": "dms", "count": len(rows), "taskArn": task_arn, "generatedAt": _now()})
 
+    # DMS FullLoadRows sidecar: the authoritative per-table source row count that discovery
+    # folds into the master index so plan_split sizes big tables correctly (a big single-file
+    # table was being mis-classified as small because the index carried no row count). Keyed by
+    # the lowercased folder label discovery uses. Best-effort for size CLASSIFICATION only — a
+    # missing/partial sidecar makes plan_split warn and fall back to S3 bytes + file count.
+    rowcounts_key = key_prefix + "table_rowcounts.json"
+    _put_json(s3, bucket, rowcounts_key, {
+        "source": "dms-describe-table-statistics", "taskArn": task_arn, "generatedAt": _now(),
+        "count": len(rowcounts), "rowcounts": rowcounts})
+
     print(f"(info) build_table_list: task {task_arn} -> {len(rows)} table(s) in "
-          f"{len(distinct_schemas)} schema(s) {distinct_schemas}; wrote s3://{bucket}/{manifest_key}")
+          f"{len(distinct_schemas)} schema(s) {distinct_schemas}; wrote s3://{bucket}/{manifest_key} "
+          f"and FullLoadRows for {len(rowcounts)} table(s) -> s3://{bucket}/{rowcounts_key}")
     return {"ok": True, "count": len(rows), "distinctSchemas": distinct_schemas,
             "manifestKey": manifest_key, "sourceKey": source_key,
+            "rowcountsKey": rowcounts_key, "rowcountsCount": len(rowcounts),
             "replacedExisting": bool(replaced), "warnings": warnings}
 
 

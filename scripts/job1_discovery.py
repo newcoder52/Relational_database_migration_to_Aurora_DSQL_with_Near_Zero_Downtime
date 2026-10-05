@@ -609,6 +609,67 @@ def s3_prefix_has_objects(s3_client, bucket, prefix):
     return resp.get('KeyCount', 0) > 0
 
 
+def _is_full_load_name(key):
+    """True only for a DMS FULL-LOAD CSV (LOAD*.csv), never CDC (timestamp-named, under
+    processed/ or failed/). Mirrors job2_load._is_full_load_key so discovery's file/byte
+    counts match what the loader will actually read."""
+    kl = key.lower()
+    segs = kl.split("/")
+    if "processed" in segs or "failed" in segs:
+        return False
+    base = segs[-1]
+    return base.startswith("load") and base.endswith(".csv")
+
+
+def s3_fullload_files_and_bytes(s3_client, dms_s3_path):
+    """(num_files, total_bytes) for the DMS FULL-LOAD part-files under a table's prefix
+    (LOAD*.csv only). Metadata only (no data scanned); paginated. Lets plan_split classify a
+    big table by size even when the DMS row count is unavailable in the index."""
+    bucket, prefix = split_s3(dms_s3_path)
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    n, total, token = 0, 0, None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kw)
+        for o in resp.get("Contents", []):
+            key = o["Key"]
+            size = int(o.get("Size", 0))
+            if key.endswith("/") or size <= 0 or not _is_full_load_name(key):
+                continue
+            n += 1
+            total += size
+        if resp.get("IsTruncated"):
+            token = resp.get("NextContinuationToken")
+        else:
+            break
+    return n, total
+
+
+def load_rowcounts_sidecar(s3_client, config_prefix):
+    """Read the per-table DMS FullLoadRows sidecar BuildTableList writes
+    (config/_task/<suffix>/table_rowcounts.json: {"<schema>.<table>": <int>, ...}). Returns a
+    dict (lowercased label -> int), or {} if absent/unreadable (best-effort). This is the
+    authoritative source row count (DMS describe_table_statistics) that lets plan_split size
+    big tables correctly; discovery itself never knows FullLoadRows."""
+    bucket, key = split_s3(config_prefix.rstrip("/") + "/table_rowcounts.json")
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        doc = json.loads(obj['Body'].read().decode('utf-8'))
+        rc = doc.get("rowcounts", doc) if isinstance(doc, dict) else {}
+        out = {}
+        for k, v in (rc or {}).items():
+            try:
+                out[str(k).strip().lower()] = int(v)
+            except (TypeError, ValueError):
+                pass
+        return out
+    except Exception:
+        return {}
+
+
 def build_mapping_for_table(spec, target_columns, dms_columns, pk_columns):
     """Reverse-map target columns to DMS CSV columns; skip DMS cols not in target.
     v2: also embeds the metadata.primary_key block (from pk_columns)."""
@@ -756,6 +817,17 @@ not_found = []   # table-list entries with no DMS folder (any case)
 skipped_duplicate = []
 seen_dsql_tables = {}  # "schema.table" -> first manifest row index that claimed it
 
+# DMS FullLoadRows sidecar (written by BuildTableList from describe_table_statistics). The
+# AUTHORITATIVE source row count per table; discovery itself can't know it. Best-effort — an
+# absent file leaves full_load_rows=None and plan_split falls back to file/byte classification
+# with a warning. Keyed by lowercased "schema.table".
+_rowcounts = load_rowcounts_sidecar(s3_client, CONFIG_PREFIX)
+if _rowcounts:
+    print(f"  Loaded DMS FullLoadRows for {len(_rowcounts)} table(s) from table_rowcounts.json")
+else:
+    print("  No table_rowcounts.json sidecar (DMS FullLoadRows); plan-split will size big "
+          "tables by S3 file count + bytes and warn per table with no row count.")
+
 for i, spec in enumerate(specs, start=1):
     dms_schema = spec['dms_schema']
     dms_table = spec['dms_table']
@@ -890,6 +962,23 @@ for i, spec in enumerate(specs, start=1):
         )
         print(f"  ✓ Config saved: {per_table_config_s3}")
 
+        # SIZE SIGNALS for plan_split (so the biggest table gets its own load-big group + bg
+        # CDC job). full_load_rows comes from the DMS FullLoadRows sidecar (authoritative);
+        # num_files/total_bytes are cheap S3 metadata (no data scanned) and let plan_split size
+        # a table even when the row count is unavailable (e.g. the sidecar is missing).
+        _lbl = f"{dsql_schema}.{dsql_table}".lower()
+        if _empty_at_discovery:
+            _flr, _nfiles, _tbytes = 0, 0, 0
+        else:
+            _flr = _rowcounts.get(_lbl)   # int or None (None -> plan_split warns + uses bytes)
+            try:
+                _nfiles, _tbytes = s3_fullload_files_and_bytes(s3_client, dms_s3_path)
+            except Exception as _se:
+                print(f"  ⚠️ could not count full-load files/bytes for {_lbl} ({_se}); "
+                      f"plan_split will rely on the row count only")
+                _nfiles, _tbytes = 0, 0
+        print(f"  Size: full_load_rows={_flr} num_files={_nfiles} total_bytes={_tbytes:,}")
+
         index_entries.append({
             "dms_schema": dms_schema,
             "dms_table": dms_table,
@@ -918,7 +1007,13 @@ for i, spec in enumerate(specs, start=1):
             # marked 'done' immediately (nothing to load) so the CDC gate opens and any CDC
             # rows arriving later are applied instead of waiting on a load that never comes.
             "empty_at_discovery": _empty_at_discovery,
-            "full_load_rows": 0 if _empty_at_discovery else None,
+            # full_load_rows: DMS FullLoadRows (authoritative) when the sidecar has it; 0 when
+            # empty-at-discovery; None when unknown (plan_split warns + classifies by size).
+            "full_load_rows": _flr,
+            # num_files / total_bytes: cheap S3 size signals so plan_split can classify a big
+            # SINGLE-FILE table (the sporting_event_ticket case) even with no row count.
+            "num_files": _nfiles,
+            "total_bytes": _tbytes,
         })
         succeeded.append(f"{dsql_schema}.{dsql_table}")
 

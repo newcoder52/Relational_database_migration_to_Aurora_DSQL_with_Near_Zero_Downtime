@@ -100,6 +100,41 @@ _CDC_COMPOSITE_ENGINES = {"pythonshell": "cdc-composite", "spark": "cdc-composit
 _CDC_ROLES = ("cdc", _CDC_COMPOSITE_ROLE)   # roles wired like the CDC job (args, engine, drivers)
 _ACTIVE_RUN_STATES = {"STARTING", "RUNNING", "STOPPING", "WAITING"}
 
+# AWS-docs-verified Glue worker types (worker-types.html). Defensive allow-list so a hand-built
+# event can't set an invalid WorkerType (resolve_task already validates the params.csv values).
+_ALLOWED_WORKER_TYPES = {"G.1X", "G.2X", "G.4X", "G.8X", "G.12X", "G.16X",
+                         "R.1X", "R.2X", "R.4X", "R.8X"}
+
+# Map a template STEM to the sizing-key PREFIX in the event. Composite fork load/validate reuse
+# the same stems ("load"/"load-big"/"validate"), so forks inherit the same sizing automatically.
+_SIZING_STEM_TO_PREFIX = {
+    "discovery": "discovery", "load": "load", "load-big": "loadBig", "validate": "validate",
+}
+
+
+def _sizing_for(event, tmpl_stem):
+    """Per-role Glue job sizing from the event's resolved settings. Returns a dict with any of
+    worker_type / num_workers / timeout_minutes / glue_version that the event supplies for this
+    role's STEM, or {} if none. The SM passes the resolved sizing fields (loadWorkerType, ...);
+    absent (older workflows) -> {} -> the template defaults stand (full backward compatibility)."""
+    pfx = _SIZING_STEM_TO_PREFIX.get(tmpl_stem)
+    if not pfx:
+        return {}
+    out = {}
+    _wt = event.get(f"{pfx}WorkerType")
+    _nw = event.get(f"{pfx}NumWorkers")
+    _tm = event.get(f"{pfx}TimeoutMinutes")
+    _gv = event.get("glueVersion")
+    if _wt:
+        out["worker_type"] = _wt
+    if _nw not in (None, ""):
+        out["num_workers"] = _nw
+    if _tm not in (None, ""):
+        out["timeout_minutes"] = _tm
+    if _gv:
+        out["glue_version"] = _gv
+    return out
+
 
 # A Python-shell CDC run that fails with one of these never got as far as the script: Glue could
 # not install or import the drivers. (The CDC script itself never starts a subprocess, so a
@@ -636,6 +671,16 @@ def handler(event, context):
             # (Everything except discovery takes --csv_null_value.)
             _nv = str(event["csv_null_value"])
             args["--csv_null_value"] = _nv if _nv != "" else "__EMPTY__"
+        if role in ("load", "load-big"):
+            # job2 driver-side parallelism tuning (how many tables load at once + the per-table
+            # driver-memory budget the auto-throttle uses). Passed as RUN defaults; absent ->
+            # job2_load uses its built-in defaults (MAX_PARALLEL_TABLES=20, 1500 MB/table).
+            _mpt = event.get("maxParallelTables")
+            if _mpt not in (None, ""):
+                args["--max_parallel_tables"] = str(_mpt)
+            _pwb = event.get("perWorkerMemBudgetMb")
+            if _pwb not in (None, ""):
+                args["--per_worker_mem_budget_mb"] = str(_pwb)
         if is_cdc:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema
@@ -757,6 +802,29 @@ def handler(event, context):
             job_kwargs["GlueVersion"] = tmpl.get("glue_version", "4.0")
             job_kwargs["WorkerType"] = tmpl.get("worker_type", "G.4X")
             job_kwargs["NumberOfWorkers"] = int(tmpl.get("number_of_workers", 10))
+
+        # SIZING OVERRIDE (speed over cost): if the event carries per-role sizing (worker type,
+        # count, timeout, Glue version), apply it to the Spark jobs so load/load-big/validate run
+        # on bigger drivers for big tables. Keyed by the template STEM (discovery/load/load-big/
+        # validate); a composite fork's load/load-big/validate reuse the same stem, so forks get
+        # the same sizing automatically. CDC roles keep their template defaults. Values were
+        # already allow-list/int validated in resolve_task; re-validate the type here defensively
+        # so a hand-built event can't set an invalid WorkerType.
+        _sz = _sizing_for(event, tmpl_stem)
+        if command_name != "pythonshell" and _sz:
+            if _sz.get("worker_type"):
+                _wt = str(_sz["worker_type"]).strip().upper().replace(" ", "")
+                if _wt not in _ALLOWED_WORKER_TYPES:
+                    raise Exception(f"Invalid worker_type {_sz['worker_type']!r} for job {name} "
+                                    f"(role {tmpl_stem}); allowed: {sorted(_ALLOWED_WORKER_TYPES)}.")
+                job_kwargs["WorkerType"] = _wt
+            if _sz.get("num_workers"):
+                job_kwargs["NumberOfWorkers"] = int(_sz["num_workers"])
+            if _sz.get("glue_version"):
+                job_kwargs["GlueVersion"] = str(_sz["glue_version"]).strip()
+        if _sz and _sz.get("timeout_minutes"):
+            # Timeout applies to Spark AND pythonshell jobs; cap at Glue's 7-day max (10080).
+            job_kwargs["Timeout"] = max(1, min(10080, int(_sz["timeout_minutes"])))
 
         _conns = _connections_for(tmpl, event)
         if _conns:

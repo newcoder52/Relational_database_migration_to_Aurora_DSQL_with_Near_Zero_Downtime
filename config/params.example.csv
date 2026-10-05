@@ -55,6 +55,10 @@ max_big_cdc_forks,8
 big_table_row_threshold,6000000
 # file_fanout_threshold: a table with >= this many LOAD part-files is also "big" (same effect).
 file_fanout_threshold,8
+# big_table_bytes_threshold: a table whose total full-load bytes >= this is also "big" (same
+#   effect). This rescues a HUGE SINGLE-FILE table (num_files=1) whose DMS row count is missing
+#   from the index, so the biggest table still gets its own load-big group + bg CDC job.
+big_table_bytes_threshold,1000000000
 # max_groups: cap on load/validate groups per task (== the pre-created CDC job pool size). Big
 #   tables each take one group; small tables bin-pack into the rest.
 max_groups,10
@@ -63,12 +67,40 @@ max_groups,10
 map_max_concurrency,6
 # max_files_in_parallel: per-loader cap on LOAD files read at once.
 max_files_in_parallel,30
+# writers_per_file: concurrent DSQL writer threads for ONE part-file. The DMS full load is often
+#   a SINGLE LOAD*.csv per table, so this is the lever that parallelises a big single-file table
+#   (default 8). Set to 1 for the old one-writer-per-file behaviour. Bounded by max_write cap.
+writers_per_file,8
 # conn_budget: DSQL connection budget shared across in-flight loaders; sets writers-per-loader.
 conn_budget,900
 # min_writers_per_loader / max_writers_per_loader: floor/ceiling for a small group's DSQL write
 #   concurrency (min <= max).
 min_writers_per_loader,100
 max_writers_per_loader,150
+
+# ---- Glue job sizing (SPEED over cost — size up, don't throttle). Worker TYPES are checked
+# against an allow-list {G.1X,G.2X,G.4X,G.8X,G.12X,G.16X,R.1X,R.2X,R.4X,R.8X}; counts 1-299;
+# timeouts 1-10080 min (Glue's 7-day max). The load runs DRIVER-SIDE, so a bigger WORKER TYPE
+# (= bigger driver) speeds a big table; worker COUNT mostly helps the CSV read. Defaults put
+# load-big + validate on G.8X (128 GB driver), load on G.4X, discovery on G.2X. ----
+glue_version,4.0
+discovery_worker_type,G.2X
+discovery_num_workers,5
+discovery_timeout_minutes,480
+load_worker_type,G.4X
+load_num_workers,10
+load_timeout_minutes,2880
+load_big_worker_type,G.8X
+load_big_num_workers,10
+load_big_timeout_minutes,2880
+validate_worker_type,G.8X
+validate_num_workers,10
+validate_timeout_minutes,2880
+# max_parallel_tables: how many tables load at once on the driver (1-40). per_worker_mem_budget_mb:
+#   per-table driver-memory budget the auto-throttle uses (the throttle never drops below a safe
+#   floor even if driver memory is unknown/misreported).
+max_parallel_tables,20
+per_worker_mem_budget_mb,1500
 
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
 # Only set it if your Glue role name differs from <project>-glue-exec-role.

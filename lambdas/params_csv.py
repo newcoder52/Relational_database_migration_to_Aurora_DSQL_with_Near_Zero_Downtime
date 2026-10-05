@@ -78,12 +78,37 @@ OPTIONAL_DEFAULTS = {
     # Planning thresholds (plan_split fan-out knobs; defaults equal the former ASL literals).
     "big_table_row_threshold": "6000000",
     "file_fanout_threshold": "8",
+    "big_table_bytes_threshold": "1000000000",
     "max_groups": "10",
     "map_max_concurrency": "6",
     "max_files_in_parallel": "30",
+    "writers_per_file": "8",
     "conn_budget": "900",
     "min_writers_per_loader": "100",
     "max_writers_per_loader": "150",
+    # Glue job SIZING (speed over cost — size up, do not throttle). worker types validated
+    # against an allow-list; counts/timeouts validated as ints. The load runs DRIVER-SIDE, so a
+    # bigger WORKER TYPE (= bigger driver) is what speeds a big table; executor COUNT only helps
+    # the CSV read. Defaults: load-big + validate on G.8X (128 GB driver) for big tables, load on
+    # G.4X (64 GB), discovery on G.2X. Timeouts raised to 48 h (max 7 days) for big tables.
+    "glue_version": "4.0",
+    "discovery_worker_type": "G.2X",
+    "discovery_num_workers": "5",
+    "discovery_timeout_minutes": "480",
+    "load_worker_type": "G.4X",
+    "load_num_workers": "10",
+    "load_timeout_minutes": "2880",
+    "load_big_worker_type": "G.8X",
+    "load_big_num_workers": "10",
+    "load_big_timeout_minutes": "2880",
+    "validate_worker_type": "G.8X",
+    "validate_num_workers": "10",
+    "validate_timeout_minutes": "2880",
+    # job2 driver-side parallelism tuning (how many tables load at once on the driver, and the
+    # per-table driver-memory budget used to auto-size that). Raised so a big driver loads many
+    # tables at once; the throttle can never silently drop to 1 (see job2_load).
+    "max_parallel_tables": "20",
+    "per_worker_mem_budget_mb": "1500",
 }
 # Setup-only keys: consumed by tools/setup.sh (Glue network connection), never in pipeline.json.
 SETUP_ONLY = ("subnet_id", "security_group_id")
@@ -101,9 +126,16 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "glue_role_arn", "glue_connection", "cdc_engine", "cdc_spark_fallback",
                  "control_schema", "cdc_validation", "cdc_validation_sample",
                  "max_composite_forks", "max_big_cdc_forks",
-                 "big_table_row_threshold", "file_fanout_threshold", "max_groups",
-                 "map_max_concurrency", "max_files_in_parallel", "conn_budget",
-                 "min_writers_per_loader", "max_writers_per_loader")
+                 "big_table_row_threshold", "file_fanout_threshold", "big_table_bytes_threshold",
+                 "max_groups", "map_max_concurrency", "max_files_in_parallel",
+                 "writers_per_file", "conn_budget",
+                 "min_writers_per_loader", "max_writers_per_loader",
+                 "glue_version",
+                 "discovery_worker_type", "discovery_num_workers", "discovery_timeout_minutes",
+                 "load_worker_type", "load_num_workers", "load_timeout_minutes",
+                 "load_big_worker_type", "load_big_num_workers", "load_big_timeout_minutes",
+                 "validate_worker_type", "validate_num_workers", "validate_timeout_minutes",
+                 "max_parallel_tables", "per_worker_mem_budget_mb")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
 
@@ -117,12 +149,28 @@ _PLANNING_INT_KEYS = (
     ("max_big_cdc_forks", 1, None),
     ("big_table_row_threshold", 1, None),
     ("file_fanout_threshold", 1, None),
+    ("big_table_bytes_threshold", 1, None),
     ("max_groups", 1, None),
     ("map_max_concurrency", 1, 40),
     ("max_files_in_parallel", 1, None),
+    ("writers_per_file", 1, None),
     ("conn_budget", 1, None),
     ("min_writers_per_loader", 1, None),
     ("max_writers_per_loader", 1, None),
+    # Job sizing counts/timeouts (worker TYPES are validated by resolve_task against an
+    # allow-list). num_workers capped at 299 (a per-job sanity cap; the real limit is the
+    # account DPU quota, raised in Service Quotas). timeouts 1..10080 min = up to Glue's 7-day
+    # max. max_parallel_tables 1..40; per_worker_mem_budget_mb >= 1.
+    ("discovery_num_workers", 1, 299),
+    ("discovery_timeout_minutes", 1, 10080),
+    ("load_num_workers", 1, 299),
+    ("load_timeout_minutes", 1, 10080),
+    ("load_big_num_workers", 1, 299),
+    ("load_big_timeout_minutes", 1, 10080),
+    ("validate_num_workers", 1, 299),
+    ("validate_timeout_minutes", 1, 10080),
+    ("max_parallel_tables", 1, 40),
+    ("per_worker_mem_budget_mb", 1, None),
 )
 
 

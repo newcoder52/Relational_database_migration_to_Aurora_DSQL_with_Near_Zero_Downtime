@@ -112,10 +112,13 @@ def _read_json(s3, bucket, key):
 
 
 def _count_load_files(s3, dms_s3_path):
-    """Count LOAD*.csv part-files under a table's DMS full-load prefix (metadata only)."""
+    """(num_files, total_bytes) for LOAD*.csv full-load part-files under a table's DMS prefix
+    (metadata only, no data scanned). total_bytes lets plan_split classify a big SINGLE-FILE
+    table even when the DMS row count is missing from the index."""
     b, p = _split_s3_uri(dms_s3_path)
     p = p.rstrip("/") + "/"
     n = 0
+    total = 0
     token = None
     while True:
         kw = {"Bucket": b, "Prefix": p}
@@ -126,11 +129,12 @@ def _count_load_files(s3, dms_s3_path):
             name = o["Key"].split("/")[-1]
             if name.upper().startswith("LOAD") and name.lower().endswith(".csv"):
                 n += 1
+                total += int(o.get("Size", 0))
         if resp.get("IsTruncated"):
             token = resp.get("NextContinuationToken")
         else:
             break
-    return n
+    return n, total
 
 
 def handler(event, context):
@@ -145,7 +149,9 @@ def handler(event, context):
         config_prefix = raw_cp.strip("/")
     big_threshold = int(event.get("big_table_row_threshold", 6_000_000))
     file_fanout_threshold = int(event.get("file_fanout_threshold", 8))
+    big_bytes_threshold = int(event.get("big_table_bytes_threshold", 1_000_000_000))
     max_files_in_parallel = int(event.get("max_files_in_parallel", 30))
+    writers_per_file = int(event.get("writers_per_file", 1))
     max_groups = int(event.get("max_groups", 10))
     conn_budget = int(event.get("conn_budget", 900))
     min_writers = int(event.get("min_writers_per_loader", 100))
@@ -185,28 +191,64 @@ def handler(event, context):
             f"selection rules, split the task, or raise max_composite_forks in params.csv "
             f"(mind Glue job/concurrent-run and DSQL connection quotas). No jobs were created.")
 
-    # Enrich each NORMAL (non-composite) entry with FullLoadRows + num_files for grouping.
-    enriched = []
-    for e in normal_entries:
-        rows = int(e.get("full_load_rows") or e.get("FullLoadRows") or 0)
-        dms_s3_path = e.get("dms_s3_path")
-        num_files = _count_load_files(s3, dms_s3_path) if dms_s3_path else 0
-        label = f"{e.get('dsql_schema')}.{e.get('dsql_table')}"
-        enriched.append({"entry": e, "label": label, "rows": rows, "num_files": num_files})
+    # Enrich each entry with FullLoadRows + num_files + total_bytes for grouping. Prefer the
+    # values discovery folded into the index (full_load_rows from the DMS sidecar; num_files/
+    # total_bytes from its S3 listing); fall back to an S3 count here if the index lacks them
+    # (older discovery). Track whether the ROW COUNT was actually known so we can WARN per table
+    # with no count and classify it by size instead of silently treating it as small (the bug
+    # that kept a 16.3M-row single-file table off the big-table path).
+    rowcount_missing = []   # labels with no known FullLoadRows (warned below)
 
-    # Enrich composite entries the same way (each becomes a one-table fork).
-    composite_enriched = []
-    for e in composite_entries:
-        rows = int(e.get("full_load_rows") or e.get("FullLoadRows") or 0)
-        dms_s3_path = e.get("dms_s3_path")
-        num_files = _count_load_files(s3, dms_s3_path) if dms_s3_path else 0
+    def _enrich(e):
         label = f"{e.get('dsql_schema')}.{e.get('dsql_table')}"
-        composite_enriched.append({"entry": e, "label": label, "rows": rows,
-                                   "num_files": num_files})
+        _raw = e.get("full_load_rows", e.get("FullLoadRows"))
+        rows_known = _raw is not None
+        try:
+            rows = int(_raw) if rows_known else 0
+        except (TypeError, ValueError):
+            rows, rows_known = 0, False
+        num_files = e.get("num_files")
+        total_bytes = e.get("total_bytes")
+        if num_files is None or total_bytes is None:
+            dms_s3_path = e.get("dms_s3_path")
+            _nf, _tb = _count_load_files(s3, dms_s3_path) if dms_s3_path else (0, 0)
+            num_files = _nf if num_files is None else int(num_files)
+            total_bytes = _tb if total_bytes is None else int(total_bytes)
+        else:
+            num_files, total_bytes = int(num_files), int(total_bytes)
+        # A non-empty table with no known row count can't be sized by rows -> warn and let the
+        # file/byte test below decide (so a big single-file table is still caught).
+        if not rows_known and not e.get("empty_at_discovery"):
+            rowcount_missing.append(label)
+        return {"entry": e, "label": label, "rows": rows, "rows_known": rows_known,
+                "num_files": num_files, "total_bytes": total_bytes}
 
-    big = [t for t in enriched
-           if t["rows"] >= big_threshold or t["num_files"] >= file_fanout_threshold]
+    enriched = [_enrich(e) for e in normal_entries]
+    composite_enriched = [_enrich(e) for e in composite_entries]
+
+    def _is_big(t):
+        # A table is "big" (own load-big group + own bg CDC job) if ANY size signal crosses a
+        # threshold: DMS FullLoadRows, LOAD part-file count, or total full-load bytes. The bytes
+        # test is what rescues a huge SINGLE-FILE table whose num_files=1 (< fanout) and whose
+        # row count may be unknown — exactly the sporting_event_ticket case.
+        return (t["rows"] >= big_threshold
+                or t["num_files"] >= file_fanout_threshold
+                or t["total_bytes"] >= big_bytes_threshold)
+
+    if rowcount_missing:
+        print(f"WARNING: {len(rowcount_missing)} table(s) have NO DMS FullLoadRows in the index "
+              f"(the master index carried no row count): {', '.join(sorted(rowcount_missing))}. "
+              f"Classifying them by S3 file count (>= {file_fanout_threshold}) and total bytes "
+              f"(>= {big_bytes_threshold:,}) instead of row count, so a big single-file table is "
+              f"not silently treated as small. Ensure BuildTableList wrote table_rowcounts.json "
+              f"(DMS describe_table_statistics) and discovery folded it into the index.")
+
+    big = [t for t in enriched if _is_big(t)]
     small = [t for t in enriched if t not in big]
+    for t in big:
+        print(f"(info) BIG table {t['label']}: rows={t['rows']:,} "
+              f"(known={t['rows_known']}) num_files={t['num_files']} "
+              f"total_bytes={t['total_bytes']:,} -> own load-big group + bg CDC job")
 
     groups = []
     gi = 0
@@ -263,13 +305,20 @@ def handler(event, context):
         rows = sum(m["rows"] for m in g["members"])
         nfiles = max((m["num_files"] for m in g["members"]), default=0)
         if g["kind"] == "big":
+            _bf = min(max_files_in_parallel, max(1, nfiles))
+            # A big group is a SINGLE big table. Total concurrent DSQL writers =
+            # files-in-flight x writers_per_file; size max_write_concurrency to cover it (>=30
+            # floor kept for backward compatibility). This is what finally parallelises a huge
+            # SINGLE-FILE table: nfiles=1 but writers_per_file>1 -> many writers on that one file.
             load_args = {
-                "--max_files_in_parallel": str(min(max_files_in_parallel, max(1, nfiles))),
-                "--max_write_concurrency": str(max(min(max_files_in_parallel, max(1, nfiles)), 30)),
+                "--max_files_in_parallel": str(_bf),
+                "--writers_per_file": str(writers_per_file),
+                "--max_write_concurrency": str(max(_bf * max(1, writers_per_file), 30)),
             }
         else:
             load_args = {
                 "--max_files_in_parallel": str(max_files_in_parallel),
+                "--writers_per_file": str(writers_per_file),
                 "--max_write_concurrency": str(writers_per_loader),
             }
         out_groups.append({
@@ -313,16 +362,19 @@ def handler(event, context):
             Body=json.dumps(fork_index_doc, indent=2).encode("utf-8"),
             ContentType="application/json")
 
-        is_big = m["rows"] >= big_threshold or m["num_files"] >= file_fanout_threshold
+        is_big = _is_big(m)
         nfiles = m["num_files"]
         if is_big:
+            _bf = min(max_files_in_parallel, max(1, nfiles))
             load_args = {
-                "--max_files_in_parallel": str(min(max_files_in_parallel, max(1, nfiles))),
-                "--max_write_concurrency": str(max(min(max_files_in_parallel, max(1, nfiles)), 30)),
+                "--max_files_in_parallel": str(_bf),
+                "--writers_per_file": str(writers_per_file),
+                "--max_write_concurrency": str(max(_bf * max(1, writers_per_file), 30)),
             }
         else:
             load_args = {
                 "--max_files_in_parallel": str(max_files_in_parallel),
+                "--writers_per_file": str(writers_per_file),
                 "--max_write_concurrency": str(writers_per_loader),
             }
         load_role = "load-big" if is_big else "load"

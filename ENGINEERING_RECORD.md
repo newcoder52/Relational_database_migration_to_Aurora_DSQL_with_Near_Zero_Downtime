@@ -288,6 +288,59 @@ One startup and one cutover state machine now serve every DMS task, started with
 Lesson: test the pipeline in a VPC **without** internet access. With internet, pip silently
 fills dependency gaps and items 1 and 2 stay hidden.
 
+### 2026-10-05 — Faster full load: concurrent writers per file, big single-file classification, bigger drivers
+
+- **Symptom (observed on a test-cluster full-load run):** a 27-table / ~32.5 M-row full load took
+  ~1,844 s (fresh) / ~2,920 s (re-run). Per-table CloudWatch
+  `[WORKER] DONE` lines showed every BIG table loading on a SINGLE thread/connection:
+  `performance_orders` 1,999,950 rows in 1,177 s = **1,699 rows/s** (= 1 writer × 3,000 rows/txn ÷
+  1.77 s/txn, an exact match); `person` 8,055,226 rows at 7,914 rows/s; `sporting_event_ticket`
+  11,024,726 rows at 7,066 rows/s. Tables DID load 20-at-a-time (`Parallel workers: 20`), so a
+  "table N/27" counter was mistaken for serial order — the slowness was **inside** each big table.
+- **Root causes (three, all evidenced):**
+  1. **One writer per file.** `job2_load.py`'s unit of write parallelism is the S3 part-file, and
+     DMS wrote each table as a **single** `LOAD00000001.csv` (serial full load) — e.g.
+     `DMS_SAMPLE/PERFORMANCE_ORDERS/LOAD00000001.csv` = 325 MB, `PERSON/` = 585 MB, both one file. So
+     one file → one worker → one `pg8000` connection → serial 3,000-row commits. `max_write_concurrency`
+     (150) and `max_files_in_parallel` (30) gave **zero** benefit for a single-file table.
+  2. **Misclassification kept the biggest table off the big-table path.** The master index had
+     `full_load_rows: null` for **all 27 tables** — `job1_discovery` never populated it (only set it to
+     0 for empty-at-discovery). `plan_split` therefore read rows=0 for every table; with each big table
+     a single file (num_files=1 < file_fanout_threshold), **everything** classified "small" → **one**
+     group, so `sporting_event_ticket` (16.3 M rows) never got its own `load-big` group or `bg` CDC job.
+  3. **Re-run tax.** The slow re-run was NOT an "upsert via ON CONFLICT" (there is **no** ON CONFLICT
+     anywhere in `job2_load.py`); it was `AUTO_REBLANK_ON_RESUME` batch-DELETE-ing each full table then
+     re-INSERTing single-threaded (logs show `♻ RESUME ... auto-reblanking whole table`).
+- **Fixes (behaviour-preserving; new settings, old behaviour available):**
+  - **`writers_per_file`** (new `params.csv` key, default 8; `1` = old serial) — splits ONE file's
+    streamed chunks across N concurrent DSQL writers, each its own connection, each committing disjoint
+    ≤3,000-row / ≤10 MiB txns. No-dup via the PK + disjoint chunks; no-loss via the unchanged
+    `rows_read == committed` gate (summed across writers under a lock). The resume commit-probe path
+    forces 1 writer. The global `_DSQL_RANGE_WRITER_SEM` is now acquired **inside** `load_one_table`
+    per writer (the file/range orchestrators no longer wrap the call), so it caps ACTUAL concurrent
+    writers and there is no nested-acquire deadlock (proved by a test at `max_write_concurrency=1`).
+  - **DMS FullLoadRows reaches the planner.** `BuildTableList` (resolve_task) writes
+    `config/_task/<t>/table_rowcounts.json` from `describe_table_statistics`; `job1_discovery` folds it
+    into the index as `full_load_rows` and also records `num_files`/`total_bytes`. `plan_split` now
+    classifies "big" by rows **OR** files **OR** `big_table_bytes_threshold` (new key, default 1 GB),
+    WARNS per table with no row count, and falls back to bytes/files — so a huge single-file table is
+    classified big even with no count.
+  - **Bigger drivers (speed over cost).** New `params.csv` sizing keys applied by `create_glue_jobs`:
+    `*_worker_type` / `*_num_workers` / `*_timeout_minutes` per role + `glue_version`,
+    `max_parallel_tables`, `per_worker_mem_budget_mb`. FAST defaults: load-big + validate on **G.8X**
+    (128 GB driver), load **G.4X**, discovery **G.2X**; timeouts 48 h (max 7 days). Worker types are
+    allow-list-validated; counts 1–299; the load is driver-side so a bigger **type** (= bigger driver)
+    is the lever (verified against the AWS Glue worker-types doc). Glue stays **4.0** (tested); 5.0 is
+    opt-in.
+  - **Table auto-throttle never silently drops to 1.** `compute_effective_workers` now holds a floor
+    (`min(base, 8)`) and keeps `base` when driver memory is unknown/misreported (a container cgroup
+    reading could spike and serialise the whole load), logging the decision.
+- **Expected speed-up (ESTIMATED until a real run measures it; read-only AWS this session):**
+  `performance_orders` ~1,699 → ~8,000–13,000 rows/s at `writers_per_file=8` (bounded by DSQL commit
+  latency + OCC on the shared PK index); the 27-table fresh wall clock (dominated by single-threaded
+  big tables) ~1,733 s → an estimated ~300–450 s. Offline tests prove the correctness invariants and a
+  >1.5× throughput win against a simulated per-commit latency; a real measured run is still pending.
+
 
 ### 2026-10-02 — processed/ copies, S3 retries, per-table manifest, cutover LOAD-file fix
 

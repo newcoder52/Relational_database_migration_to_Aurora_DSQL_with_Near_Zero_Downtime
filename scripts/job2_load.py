@@ -216,6 +216,22 @@ INTRA_TABLE_WRITERS = 4
 # single table's fan-out (see the raised default below). Overridable via Glue arg.
 MAX_FILES_IN_PARALLEL = 30
 
+# ---- INTRA-FILE WRITE CONCURRENCY (the single-file bottleneck fix) ----------------------
+# How many concurrent DSQL writer threads load ONE part-file's row stream. The DMS full load
+# is usually SERIAL (no ParallelLoadThreads), so a multi-GB table is a SINGLE LOAD*.csv -> the
+# per-file fan-out opens exactly ONE worker -> ONE pg8000 connection -> serial 3000-row chunks,
+# so MAX_WRITE_CONCURRENCY/MAX_FILES_IN_PARALLEL give ZERO speed-up for that table (measured:
+# performance_orders 1,999,950 rows at ~1,699 rows/sec = 1 writer x 3000 rows / 1.77 s/txn).
+# WRITERS_PER_FILE splits a single file's streamed chunks across N writer threads, each with its
+# OWN connection, each committing DISJOINT 3000-row chunks (no-dup via disjoint chunks + the PK
+# index; no-loss via the unchanged rows_read==total_written gate that SUMS all writers). The
+# global _DSQL_RANGE_WRITER_SEM (MAX_WRITE_CONCURRENCY) still caps TOTAL concurrent writers
+# across every file/table, so this never exceeds the DSQL connection budget.
+# DEFAULT 1 == today's exact single-threaded behaviour (opt-in; set >1 to parallelise a file).
+# Overridable via Glue arg --writers_per_file. A resume reload of a previously-incomplete file
+# (probe_all_chunks) always runs 1 writer so the sequential per-chunk commit-probe is unchanged.
+WRITERS_PER_FILE = 1
+
 # GLOBAL DSQL-writer semaphore. Caps TOTAL concurrent DSQL writers across ALL tables at
 # MAX_WRITE_CONCURRENCY regardless of how many tables are in flight, so
 # MAX_PARALLEL_TABLES x per-table-workers can never exceed the global budget. Created
@@ -451,12 +467,14 @@ def _apply_v6_arg_overrides():
     global V6_CHUNK_FANOUT_ENABLED, INTRA_TABLE_WRITERS, FORCE_V5_TABLES
     global AUTO_REBLANK_ON_RESUME, VERBOSE_CHUNKS, VERBOSE_CHUNK_EVERY
     global MAX_FILES_IN_PARALLEL   # v16
+    global WRITERS_PER_FILE   # intra-file write concurrency (single-file bottleneck fix)
     global CONFIG_PREFIX, INDEX_S3_PATH, STATUS_S3_PATH   # v16: per-group prefix override
     global DSQL_ENDPOINT, DSQL_USER, DSQL_DATABASE, REGION   # kit: connection overlay
     global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
     optional = ["write_mode", "large_table_bytes_threshold", "target_rows_per_partition",
                 "max_write_concurrency", "v6_parallel_enabled",
                 "max_files_in_parallel",   # v16
+                "writers_per_file",        # intra-file write concurrency
                 "config_prefix",           # v16: orchestrator points each group at its own prefix
                 "dsql_endpoint", "dsql_user", "dsql_database", "region",  # kit: connection overlay
                 "dsql_endpoint_candidates",   # ordered PrivateLink/public failover list (CSV)
@@ -496,6 +514,11 @@ def _apply_v6_arg_overrides():
             MAX_FILES_IN_PARALLEL = max(1, int(ov["max_files_in_parallel"]))
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid max_files_in_parallel={ov['max_files_in_parallel']!r}")
+    if "writers_per_file" in ov:
+        try:
+            WRITERS_PER_FILE = max(1, int(ov["writers_per_file"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid writers_per_file={ov['writers_per_file']!r}")
     if "config_prefix" in ov:   # v16: override the hardcoded CONFIG_PREFIX so the
         # orchestrator can give each split-group its OWN prefix (its own _manifest_index.json
         # + _load_status.json + _file_status/), letting many v16 jobs run disjoint groups
@@ -578,6 +601,7 @@ print(f"[v16] write_mode={V6_WRITE_MODE} parallel_enabled={V6_PARALLEL_ENABLED} 
       f"max_write_concurrency={MAX_WRITE_CONCURRENCY} "
       f"chunk_fanout_enabled={V6_CHUNK_FANOUT_ENABLED} "
       f"max_files_in_parallel={MAX_FILES_IN_PARALLEL} "
+      f"writers_per_file={WRITERS_PER_FILE} "
       f"intra_table_writers={INTRA_TABLE_WRITERS} "
       f"force_v5_tables={sorted(FORCE_V5_TABLES) if FORCE_V5_TABLES else '(none)'}")
 
@@ -586,9 +610,13 @@ print(f"[v16] write_mode={V6_WRITE_MODE} parallel_enabled={V6_PARALLEL_ENABLED} 
 # Capped hard at PARALLEL_HARD_CAP so a config typo can't stampede the driver. The
 # effective value is min(MAX_PARALLEL_TABLES, PARALLEL_HARD_CAP, tables-to-load), then
 # clamped by driver free memory when AUTO_THROTTLE_WORKERS is on (each concurrent table
-# buffers ~1 partition on the driver).
+# buffers ~1 partition on the driver). Both overridable via --max_parallel_tables.
 MAX_PARALLEL_TABLES = 20
-PARALLEL_HARD_CAP = 20
+# Hard cap on concurrent tables. Raised to 40 so a BIG driver (G.8X/G.12X/G.16X, 128-256 GB)
+# can load many tables at once (speed over cost); the memory throttle + per-table budget still
+# bound it to what the driver can hold. The Step Functions GroupFanOut Map and conn_budget are
+# the cross-job bounds; this is the per-job driver-thread cap.
+PARALLEL_HARD_CAP = 40
 
 # MEMORY-AWARE WORKER AUTO-THROTTLE:
 # toLocalIterator() buffers up to the largest partition PER concurrent table, so effective
@@ -596,9 +624,45 @@ PARALLEL_HARD_CAP = 20
 # a per-worker budget and take the MIN with MAX_PARALLEL_TABLES. Set AUTO_THROTTLE_WORKERS
 # =False to use MAX_PARALLEL_TABLES as-is. PER_WORKER_MEM_BUDGET_MB allows for one table's
 # largest-partition buffer + overhead (1500 MB is reasonable for multiLine ~1 GB part-files).
+# Overridable via --per_worker_mem_budget_mb.
 AUTO_THROTTLE_WORKERS = True
 PER_WORKER_MEM_BUDGET_MB = 1500
 MIN_AUTO_WORKERS = 1
+# FLOOR so the memory throttle can NEVER silently collapse the load to 1 table when driver
+# memory is unknown or MISREPORTED (the container cgroup reading can spike at startup). The
+# effective worker count is floored at min(base, MIN_PARALLEL_TABLES_FLOOR), so a bad reading
+# costs some parallelism but never serialises the whole load. 8 is a safe default for the
+# smallest supported driver (G.1X 16 GB would still want this many light tables).
+MIN_PARALLEL_TABLES_FLOOR = 8
+
+
+def _apply_sizing_arg_overrides():
+    """Overlay --max_parallel_tables / --per_worker_mem_budget_mb AFTER the table-parallelism
+    constants are defined (they are set below the first arg overlay, so these two must be applied
+    here, not in _apply_v6_arg_overrides, or the literal assignments would clobber them). Absent
+    args keep the defaults."""
+    global MAX_PARALLEL_TABLES, PER_WORKER_MEM_BUDGET_MB
+    optional = ["max_parallel_tables", "per_worker_mem_budget_mb"]
+    present = [a for a in optional if f"--{a}" in sys.argv]
+    if not present:
+        return
+    ov = getResolvedOptions(sys.argv, present)
+    if "max_parallel_tables" in ov:
+        try:
+            MAX_PARALLEL_TABLES = max(1, int(ov["max_parallel_tables"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid max_parallel_tables={ov['max_parallel_tables']!r}")
+    if "per_worker_mem_budget_mb" in ov:
+        try:
+            PER_WORKER_MEM_BUDGET_MB = max(1, int(ov["per_worker_mem_budget_mb"]))
+        except (TypeError, ValueError):
+            print(f"  ⚠️ ignoring invalid per_worker_mem_budget_mb={ov['per_worker_mem_budget_mb']!r}")
+
+
+_apply_sizing_arg_overrides()
+print(f"[sizing] max_parallel_tables={MAX_PARALLEL_TABLES} hard_cap={PARALLEL_HARD_CAP} "
+      f"per_worker_mem_budget_mb={PER_WORKER_MEM_BUDGET_MB} "
+      f"min_parallel_tables_floor={MIN_PARALLEL_TABLES_FLOOR}")
 
 # boto3 CLIENT CREATION is NOT thread-safe (client USE is). Under parallel table loading,
 # concurrent client creation can raise resolver/credential-provider races, so serialize
@@ -650,19 +714,37 @@ def driver_free_mem_mb():
 
 
 def compute_effective_workers(requested, to_load):
-    """Decide the worker count: min(requested, hard cap, tables-to-load), then, if
-    AUTO_THROTTLE_WORKERS, further cap by driver free memory / per-worker budget.
-    Never returns less than MIN_AUTO_WORKERS (>=1). Returns (workers, reason)."""
+    """Decide how many tables load CONCURRENTLY on the driver thread pool.
+
+    base = min(requested, PARALLEL_HARD_CAP, tables-to-load). If AUTO_THROTTLE_WORKERS is on we
+    further cap by driver free memory / PER_WORKER_MEM_BUDGET_MB — BUT never silently collapse to
+    1: the result is floored at min(base, MIN_PARALLEL_TABLES_FLOOR), and if free memory is
+    UNKNOWN or looks implausibly small we keep `base` (do NOT throttle on a bad reading). The old
+    behaviour silently dropped to 1 when driver_free_mem_mb() misreported on a container, serialising
+    the whole load. Returns (workers, reason) and the reason is logged by the caller.
+    """
     base = max(1, min(requested, PARALLEL_HARD_CAP, to_load or 1))
     if not AUTO_THROTTLE_WORKERS or base == 1:
-        return base, "no auto-throttle"
+        return base, f"no auto-throttle (base={base})"
+    floor = max(1, min(base, MIN_PARALLEL_TABLES_FLOOR))
     free_mb = driver_free_mem_mb()
     if not free_mb or PER_WORKER_MEM_BUDGET_MB <= 0:
-        return base, f"mem unknown ({free_mb}); using base={base}"
-    mem_cap = max(MIN_AUTO_WORKERS, free_mb // PER_WORKER_MEM_BUDGET_MB)
-    workers = max(MIN_AUTO_WORKERS, min(base, mem_cap))
-    return workers, (f"free≈{free_mb}MB / {PER_WORKER_MEM_BUDGET_MB}MB/worker "
-                     f"-> mem_cap={mem_cap}, base={base} -> {workers}")
+        # Unknown memory: do NOT throttle (the old code also kept base here, but make it explicit
+        # and loud). A bigger driver was chosen deliberately — use it.
+        return base, (f"mem UNKNOWN (free_mb={free_mb}); NOT throttling, using base={base} "
+                      f"(floor={floor})")
+    mem_cap = free_mb // PER_WORKER_MEM_BUDGET_MB
+    if mem_cap < floor:
+        # Memory says fewer than the floor. This is usually a MISREPORTED/transient reading on a
+        # big driver (e.g. cgroup current spikes at startup), which previously serialised the load.
+        # Keep the floor and say so loudly rather than silently dropping to 1.
+        workers = floor
+        return workers, (f"free≈{free_mb}MB / {PER_WORKER_MEM_BUDGET_MB}MB/table -> mem_cap="
+                         f"{mem_cap} < floor={floor}; HOLDING floor={floor} (not dropping to "
+                         f"mem_cap; raise per_worker_mem_budget_mb only if the driver really OOMs)")
+    workers = max(floor, min(base, mem_cap))
+    return workers, (f"free≈{free_mb}MB / {PER_WORKER_MEM_BUDGET_MB}MB/table -> mem_cap={mem_cap}, "
+                     f"base={base}, floor={floor} -> {workers}")
 
 
 def effective_inner_concurrency(requested):
@@ -2952,22 +3034,35 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     _wk_start = time.time()
 
     total_written = 0
+    # INTRA-FILE PARALLEL WRITERS: shared, lock-guarded counters so N writer threads can commit
+    # DISJOINT chunks of ONE file concurrently. total_written SUMS all writers (keeps the
+    # rows_read==total_written no-loss gate exact); chunk_state["size"] is a shared tuning signal
+    # (any writer may only ever SHRINK it — always safe). _probe_all forces 1 writer so the
+    # sequential resume commit-probe is unchanged.
+    _write_lock = threading.Lock()
+    # Effective intra-file writer count: 1 (serial, byte-identical to before) unless
+    # WRITERS_PER_FILE>1 AND this is NOT a resume-probe reload. Each writer holds its own
+    # connection; the global _DSQL_RANGE_WRITER_SEM still caps TOTAL writers across all files.
+    _n_writers = 1 if (probe_all_chunks or WRITERS_PER_FILE <= 1) else max(1, int(WRITERS_PER_FILE))
+
+    # Per-writer connection state. The pool-borrowed/opened primary connection is writer 0's
+    # state; extra writers open their own fresh connections (never from conn_pool, which is sized
+    # for file-level reuse). A writer's state is a dict so the (nested) insert/rebuild helpers can
+    # mutate conn/cursor/conn_started/tag without a per-thread nonlocal.
     # Borrow a long-lived connection from the per-table pool if one was provided (so files
     # reuse connections instead of a fresh TLS+IAM handshake each); else open a fresh one.
-    # A borrowed connection is returned to the pool (still open) in the finally; a
-    # self-opened one is closed there. _pooled_conn carries the age so recycle still works.
     if conn_pool is not None:
-        conn, conn_started = conn_pool.borrow()
+        _c0, _c0_started = conn_pool.borrow()
     else:
-        conn = connect_dsql()
-        conn_started = time.monotonic()
-    conn.autocommit = False
-    cursor = conn.cursor()
-    # Short, stable-per-connection tag (pg8000 has no friendly id): thread + object id.
-    _conn_tag = f"{_wk_thread}:{id(conn) & 0xffff:04x}"
+        _c0 = connect_dsql()
+        _c0_started = time.monotonic()
+    _c0.autocommit = False
+    _primary_ws = {"conn": _c0, "cursor": _c0.cursor(), "conn_started": _c0_started,
+                   "thread": _wk_thread,
+                   "tag": f"{_wk_thread}:{id(_c0) & 0xffff:04x}", "from_pool": conn_pool is not None}
     print(f"    ⇢ [WORKER] START {dsql_schema}.{dsql_table} {_range_tag} "
-          f"thread={_wk_thread} conn={_conn_tag} chunk_size={chunk_state['size']}",
-          flush=True)
+          f"thread={_wk_thread} conn={_primary_ws['tag']} chunk_size={chunk_state['size']} "
+          f"writers_per_file={_n_writers}", flush=True)
 
     # RESUME COMMIT-PROBE: when re-running a file that was previously attempted but not
     # finished (probe_all_chunks=True), probe each chunk's first-row PK before inserting; if
@@ -2981,7 +3076,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     _probe_pk = _pk_cols[0] if len(_pk_cols) == 1 else None
     _probe_cast = cast_map.get(type_categories.get(_probe_pk, 'varchar'), '%s') if _probe_pk else '%s'
 
-    def _chunk_already_committed(chunk_rows):
+    def _chunk_already_committed(ws, chunk_rows):
         """True if the chunk's FIRST row already exists in the target (a prior attempt's
         commit landed). DSQL commits are atomic per txn, so probing row[0] is sufficient.
         Returns None when it can't tell (no single PK / null pk / probe error) -> caller
@@ -2993,7 +3088,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
             return None
         pc = None
         try:
-            pc = conn.cursor()
+            pc = ws["conn"].cursor()
             pc.execute(f'SELECT 1 FROM {dsql_schema}.{dsql_table} '
                        f'WHERE "{_probe_pk}" = {_probe_cast} LIMIT 1', (pkval,))
             return pc.fetchone() is not None
@@ -3006,11 +3101,10 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
             except Exception:
                 pass
 
-    def rebuild_conn(fresh_token=False):
-        nonlocal conn, cursor, conn_started, _conn_tag
+    def rebuild_conn(ws, fresh_token=False):
         try:
-            cursor.close()
-            conn.close()
+            ws["cursor"].close()
+            ws["conn"].close()
         except Exception:
             pass
         # On a broken-pipe/connection-drop rebuild, mint a FRESH token: the cached one may be
@@ -3018,22 +3112,25 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
         # recycle passes fresh_token=False (the cached token is fine — just a new socket).
         if fresh_token:
             _invalidate_dsql_token()
-        conn = connect_dsql()
-        conn.autocommit = False
-        cursor = conn.cursor()
-        conn_started = time.monotonic()
+        ws["conn"] = connect_dsql()
+        ws["conn"].autocommit = False
+        ws["cursor"] = ws["conn"].cursor()
+        ws["conn_started"] = time.monotonic()
+        # a rebuilt connection is fresh (not from the file pool) — don't hand it back to the pool.
+        ws["from_pool"] = False
         # refresh the connection tag so [CHUNK]/[WORKER] logs reflect the NEW conn.
-        _conn_tag = f"{_wk_thread}:{id(conn) & 0xffff:04x}"
+        ws["tag"] = f"{ws['thread']}:{id(ws['conn']) & 0xffff:04x}"
 
-    def insert_one_chunk(chunk_rows):
-        """Insert one chunk in a single transaction. Handles OCC/timeout/pipe retry,
-        per-chunk timing with adaptive shrink, and connection recycling."""
-        nonlocal conn, cursor, total_written
+    def insert_one_chunk(ws, chunk_rows):
+        """Insert one chunk in a single transaction using writer-state ws. Handles OCC/timeout/
+        pipe retry, per-chunk timing with adaptive shrink, and connection recycling. Thread-safe:
+        total_written and chunk_state are mutated only under _write_lock."""
+        nonlocal total_written
 
-        if time.monotonic() - conn_started > CONN_RECYCLE_SECONDS:
+        if time.monotonic() - ws["conn_started"] > CONN_RECYCLE_SECONDS:
             print(f"    ♻ recycling DSQL connection (>{CONN_RECYCLE_SECONDS//60} min) "
-                  f"[{_range_tag} thread={_wk_thread} conn={_conn_tag}]")
-            rebuild_conn()
+                  f"[{_range_tag} thread={ws['thread']} conn={ws['tag']}]")
+            rebuild_conn(ws)
 
         stmt, params = _build_stmt_params(chunk_rows)
         pending_tail = []
@@ -3076,18 +3173,19 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
             t0 = time.monotonic()
             # RESUME NO-DUP: on a probe_all_chunks reload (previously-incomplete file),
             # skip any chunk whose rows already landed in a prior attempt (PK probe) -> no dup.
-            if probe_all_chunks and _chunk_already_committed(chunk_rows) is True:
-                total_written += len(chunk_rows)
+            if probe_all_chunks and _chunk_already_committed(ws, chunk_rows) is True:
+                with _write_lock:
+                    total_written += len(chunk_rows)
                 return pending_tail
             try:
                 if params is None:
-                    cursor.execute(stmt)          # literal mode: no bind parameters
+                    ws["cursor"].execute(stmt)          # literal mode: no bind parameters
                 else:
-                    cursor.execute(stmt, params)  # bind-param mode
-                conn.commit()
+                    ws["cursor"].execute(stmt, params)  # bind-param mode
+                ws["conn"].commit()
             except Exception as e:
                 try:
-                    conn.rollback()
+                    ws["conn"].rollback()
                 except Exception:
                     pass
 
@@ -3102,7 +3200,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                         print(f"    ✓ chunk @row {total_written} UNIQUE-violation on retry "
                               f"=> prior interrupted commit LANDED; treating as committed "
                               f"(no re-insert, no dup)")
-                        total_written += len(chunk_rows)
+                        with _write_lock:
+                            total_written += len(chunk_rows)
                         return pending_tail
                     raise Exception(
                         f"Write failed at row {total_written} for {dsql_table} "
@@ -3139,7 +3238,9 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                     print(f"    ⏱ txn-age limit hit on {len(chunk_rows)}-row chunk after "
                           f"{_failed_elapsed:.0f}s; shrinking to {new_size} and re-slicing "
                           f"(throughput-proportional; chunk_state {chunk_state['size']} -> {new_size})")
-                    chunk_state["size"] = new_size
+                    with _write_lock:
+                        if new_size < chunk_state["size"]:
+                            chunk_state["size"] = new_size
                     pending_tail = chunk_rows[new_size:] + pending_tail
                     chunk_rows = chunk_rows[:new_size]
                     stmt, params = _build_stmt_params(chunk_rows)
@@ -3175,7 +3276,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                           f"({type(e).__name__}: {e}); reconnect + retry "
                           f"{pipe_attempt}/{MAX_CHUNK_RETRIES} after {wait}s")
                     time.sleep(wait)
-                    rebuild_conn(fresh_token=True)   # drop => mint a fresh token (heals 08006)
+                    rebuild_conn(ws, fresh_token=True)   # drop => mint a fresh token (heals 08006)
                     continue
 
                 if is_transient_server_error(e):
@@ -3189,7 +3290,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                 )
 
             elapsed = time.monotonic() - t0
-            total_written += len(chunk_rows)
+            with _write_lock:
+                total_written += len(chunk_rows)
 
             # NOTE: we NEVER abort a chunk at the trigger. This runs AFTER conn.commit()
             # succeeded — the chunk is fully committed and counted above. A chunk is allowed
@@ -3204,44 +3306,117 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                 # Aim at 90% (not 100%) for margin against commit-time variance; floored at
                 # MIN_CHUNK_SIZE. One calculation from measured throughput instead of a
                 # crude halve, so we don't over-shrink a chunk that was only slightly slow.
-                new_size = max(MIN_CHUNK_SIZE,
-                               int(chunk_state["size"] * (TIME_TARGET_FRACTION * _batch_trigger) / max(elapsed, 0.001)))
-                new_size = min(new_size, chunk_state["size"] - 1)   # guarantee progress
-                new_size = max(MIN_CHUNK_SIZE, new_size)
-                print(f"    ⏱ chunk took {elapsed:.0f}s (> {_batch_trigger}s); "
-                      f"shrinking chunk size {chunk_state['size']} -> {new_size} "
-                      f"(throughput-proportional)")
-                chunk_state["size"] = new_size
+                with _write_lock:
+                    cur = chunk_state["size"]
+                    new_size = max(MIN_CHUNK_SIZE,
+                                   int(cur * (TIME_TARGET_FRACTION * _batch_trigger) / max(elapsed, 0.001)))
+                    new_size = min(new_size, cur - 1)   # guarantee progress
+                    new_size = max(MIN_CHUNK_SIZE, new_size)
+                    if new_size < cur:
+                        print(f"    ⏱ chunk took {elapsed:.0f}s (> {_batch_trigger}s); "
+                              f"shrinking chunk size {cur} -> {new_size} "
+                              f"(throughput-proportional)")
+                        chunk_state["size"] = new_size
 
             return pending_tail
 
     _load_clean = False   # set True only after the chunk loop finishes with no exception
+
+    # Thread-safe pull from the single driver chunk stream: iter_chunks() is a generator over
+    # ONE toLocalIterator; many writers must not advance it concurrently, so serialize next().
+    _iter = iter_chunks()
+    _iter_lock = threading.Lock()
+    _sentinel = object()
+
+    def _next_chunk():
+        with _iter_lock:
+            try:
+                return next(_iter)
+            except StopIteration:
+                return _sentinel
+
+    def _writer_run(ws):
+        """Pull chunks from the shared stream and insert them with this writer's connection,
+        until the stream is exhausted. The global _DSQL_RANGE_WRITER_SEM caps TOTAL concurrent
+        writers across all files/tables. Returns nothing; raises on a non-retriable error."""
+        try:
+            while True:
+                chunk = _next_chunk()
+                if chunk is _sentinel:
+                    return
+                pending = insert_one_chunk(ws, chunk)
+                while pending:
+                    pending = insert_one_chunk(ws, pending)
+                with _write_lock:
+                    _chunk_count["n"] += 1
+                    _cc = _chunk_count["n"]
+                    _tw = total_written
+                if VERBOSE_CHUNKS and (_cc % VERBOSE_CHUNK_EVERY == 0):
+                    print(f"    · [CHUNK] {dsql_schema}.{dsql_table} {_range_tag} "
+                          f"thread={ws['thread']} conn={ws['tag']} chunk#{_cc} "
+                          f"committed_rows={_tw:,}", flush=True)
+        finally:
+            # close this writer's connection unless it is the primary pooled one (handled below).
+            if not ws.get("is_primary"):
+                try:
+                    ws["cursor"].close()
+                    ws["conn"].close()
+                except Exception:
+                    pass
+
+    _primary_ws["is_primary"] = True
+    _extra_ws = []
     try:
-        for chunk in iter_chunks():
-            pending = insert_one_chunk(chunk)
-            while pending:
-                pending = insert_one_chunk(pending)
-            # count chunks and (if --verbose_chunks) log throttled per-chunk progress,
-            # 1 line every VERBOSE_CHUNK_EVERY chunks to avoid a CloudWatch firehose.
-            _chunk_count["n"] += 1
-            if VERBOSE_CHUNKS and (_chunk_count["n"] % VERBOSE_CHUNK_EVERY == 0):
-                print(f"    · [CHUNK] {dsql_schema}.{dsql_table} {_range_tag} "
-                      f"thread={_wk_thread} conn={_conn_tag} chunk#{_chunk_count['n']} "
-                      f"committed_rows={total_written:,}", flush=True)
+        if _n_writers <= 1:
+            # SERIAL (default): one writer in THIS thread — byte-identical to the prior loop.
+            with _DSQL_RANGE_WRITER_SEM:
+                _writer_run(_primary_ws)
+        else:
+            # PARALLEL: primary + (_n_writers-1) extra writers, each with its own fresh
+            # connection, all draining the one shared chunk stream. Each holds the global
+            # writer semaphore for its lifetime so TOTAL concurrent writers across every
+            # file/table never exceed MAX_WRITE_CONCURRENCY.
+            def _run_primary():
+                _primary_ws["thread"] = threading.current_thread().name
+                with _DSQL_RANGE_WRITER_SEM:
+                    _writer_run(_primary_ws)
+
+            def _run_extra():
+                _c = connect_dsql()
+                _c.autocommit = False
+                ws = {"conn": _c, "cursor": _c.cursor(), "conn_started": time.monotonic(),
+                      "thread": threading.current_thread().name,
+                      "tag": f"{threading.current_thread().name}:{id(_c) & 0xffff:04x}",
+                      "from_pool": False, "is_primary": False}
+                with _DSQL_RANGE_WRITER_SEM:
+                    _writer_run(ws)
+
+            with ThreadPoolExecutor(max_workers=_n_writers,
+                                    thread_name_prefix="filewrt") as _wp:
+                _futs = [_wp.submit(_run_primary)]
+                for _ in range(_n_writers - 1):
+                    _futs.append(_wp.submit(_run_extra))
+                _first_exc = None
+                for _f in as_completed(_futs):
+                    _e = _f.exception()
+                    if _e is not None and _first_exc is None:
+                        _first_exc = _e
+                if _first_exc is not None:
+                    raise _first_exc
         _load_clean = True   # reached only if every chunk committed with no exception
     finally:
+        # Primary connection disposal: return it to the pool ONLY on a clean finish (a
+        # connection that failed mid-file may carry an aborted txn — never hand a dirty one to
+        # the next file). Extra writers already closed their own connections in _writer_run.
         try:
-            cursor.close()
+            _primary_ws["cursor"].close()
         except Exception:
             pass
-        # Return to the pool ONLY on a clean finish. A connection that failed mid-file may
-        # carry an aborted/uncommitted transaction; do NOT hand a dirty connection to the
-        # next file — close it and let the pool open a fresh one on the next borrow.
-        if conn_pool is not None and _load_clean:
-            conn_pool.give_back(conn, conn_started)
+        if conn_pool is not None and _load_clean and _primary_ws.get("from_pool"):
+            conn_pool.give_back(_primary_ws["conn"], _primary_ws["conn_started"])
         else:
             try:
-                conn.close()
+                _primary_ws["conn"].close()
             except Exception:
                 pass
     # per-worker SUMMARY — the high-signal answer to "which connection loaded how
@@ -3249,8 +3424,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     _wk_secs = max(0.001, time.time() - _wk_start)
     print(f"    ✓ Wrote {total_written:,} rows")
     print(f"    ⇠ [WORKER] DONE {dsql_schema}.{dsql_table} {_range_tag} "
-          f"thread={_wk_thread} conn={_conn_tag} chunks={_chunk_count['n']} "
-          f"rows={total_written:,} secs={_wk_secs:.1f} "
+          f"thread={_wk_thread} conn={_primary_ws['tag']} chunks={_chunk_count['n']} "
+          f"rows={total_written:,} secs={_wk_secs:.1f} writers={_n_writers} "
           f"rows_per_sec={total_written/_wk_secs:.0f}", flush=True)
 
     # ---- Three-way validation, gate 1 (EXACT): source CSV == written ----
@@ -3745,12 +3920,12 @@ def load_one_table_parallel(s3_client, entry, config, pk_col, min_id, max_id, to
         lo, hi = rg
         is_top = (idx == _top_idx)
         ws3 = make_boto_client('s3')
-        # Global bound on TOTAL concurrent range writers across ALL tables so the outer
-        # table pool x inner range pool can't overwhelm DSQL. Held for the whole range
-        # load (its DSQL connection lifetime).
-        with _DSQL_RANGE_WRITER_SEM:
-            res = load_one_table(ws3, entry, pk_range=(pk_col, lo, hi, pk_kind, is_top),
-                                 config=config)
+        # The global writer semaphore (_DSQL_RANGE_WRITER_SEM) is acquired PER WRITER inside
+        # load_one_table now (so it caps ACTUAL concurrent DSQL writers, including this slice's
+        # intra-file writers). Do NOT also acquire it here, or a single file would hold one
+        # permit AND its writers would each need another -> double-count/deadlock on a small cap.
+        res = load_one_table(ws3, entry, pk_range=(pk_col, lo, hi, pk_kind, is_top),
+                             config=config)
         # RESUME: durably record this range as committed IMMEDIATELY after it
         # returns (its rows are committed in DSQL at this point), so a later attempt skips
         # it. Thread-safe (mark_range_done serializes its read-modify-write).
@@ -4120,9 +4295,12 @@ def load_one_table_chunked(s3_client, entry, config):
         # per-chunk PK commit-probe so already-committed chunks are skipped -> no dup), then
         # mark 'done' only after a clean commit of the whole file.
         mark_file_started(ws3, dsql_schema, dsql_table, uri)
-        with _DSQL_RANGE_WRITER_SEM:
-            res = load_one_table(ws3, entry, file_subset=[uri], config=config,
-                                 probe_all_chunks=probe_all, conn_pool=_conn_pool)
+        # The global writer semaphore is acquired PER WRITER inside load_one_table (so it caps
+        # ACTUAL concurrent DSQL writers = files-in-flight x writers_per_file). Not acquired here
+        # — otherwise a file would hold one permit while its writers each need another (deadlock
+        # on a small cap).
+        res = load_one_table(ws3, entry, file_subset=[uri], config=config,
+                             probe_all_chunks=probe_all, conn_pool=_conn_pool)
         mark_file_done(ws3, dsql_schema, dsql_table, uri, res["rows"])
         with lock:
             committed_total["n"] += res["rows"]

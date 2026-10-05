@@ -195,22 +195,43 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 | `max_big_cdc_forks` | optional | `8` | max **big** single-/no-PK tables that get their **own** CDC job (`bg` fork); each big table keeps the shared `load-big` + `validate`. Big tables **past** the cap are **not** a failure — they stay on the **main** CDC job (serial apply) with a warning. Raise it to give more big tables their own CDC job |
 | `big_table_row_threshold` | optional | `6000000` | int ≥ 1. A table with **≥ this many** full-load rows is **big** (own `load-big` group **and** its own `bg` CDC job). Lower to treat more tables as big; raise for fewer. Applies only to tasks **started after** this is published; never re-assigns a table whose CDC already started |
 | `file_fanout_threshold` | optional | `8` | int ≥ 1. A table with **≥ this many** LOAD part-files is also **big** (same effect as the row threshold). Same apply-after-publish / no-reassign rule |
+| `big_table_bytes_threshold` | optional | `1000000000` | int ≥ 1. A table whose **total full-load bytes ≥ this** is also **big**. Rescues a huge **single-file** table (num_files=1) whose DMS row count is missing from the index — so the biggest table still gets its own load-big group + bg CDC job |
 | `max_groups` | optional | `10` | int ≥ 1. Cap on load/validate groups per task (**= the pre-created CDC job pool size**); big tables each take one group, small tables bin-pack into the rest. Raise it to spread small tables across more lanes |
 | `map_max_concurrency` | optional | `6` | int **1–40**. How many groups/forks load+validate **at once** (also the `GroupFanOut` Map concurrency). Higher = faster but more concurrent Glue runs and DSQL connections |
 | `max_files_in_parallel` | optional | `30` | int ≥ 1. Per-loader cap on LOAD files read at once |
+| `writers_per_file` | optional | `8` | int ≥ 1. Concurrent DSQL writer threads for **one** part-file. The DMS full load is usually a **single** LOAD*.csv per table, so this is the lever that parallelises a big single-file table; `1` = the old one-writer-per-file behaviour. Bounded by the per-group write cap |
 | `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders; sets writers-per-loader (the planner never exceeds it) |
 | `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency. Must be **≤** `max_writers_per_loader` |
 | `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency. Must be **≥** `min_writers_per_loader` |
+| `glue_version` | optional | `4.0` | `4.0` (tested default) or `5.0` (re-test the pg8000/boto3 driver wheels on Python 3.11 first). Applied to the Spark jobs |
+| `discovery_worker_type` | optional | `G.2X` | Glue worker type for discovery. One of G.1X/G.2X/G.4X/G.8X/G.12X/G.16X/R.1X/R.2X/R.4X/R.8X (G.12X+/R.* are newer, higher startup latency — confirm Region/version) |
+| `discovery_num_workers` | optional | `5` | int 1–299. Discovery worker count |
+| `discovery_timeout_minutes` | optional | `480` | int 1–10080 (Glue 7-day max). Discovery job timeout |
+| `load_worker_type` | optional | `G.4X` | Glue worker type for the normal (small-group) load. **Bigger = bigger driver** (the load runs driver-side), which is what speeds it. Same allow-list |
+| `load_num_workers` | optional | `10` | int 1–299. Load worker count (executors mostly help the CSV read) |
+| `load_timeout_minutes` | optional | `2880` | int 1–10080. Load job timeout (48 h default) |
+| `load_big_worker_type` | optional | `G.8X` | Glue worker type for the **big-table** load (128 GB driver by default; raise to G.12X/G.16X for very large tables). Same allow-list |
+| `load_big_num_workers` | optional | `10` | int 1–299. Big-load worker count |
+| `load_big_timeout_minutes` | optional | `2880` | int 1–10080. Big-load timeout (raise toward 10080 = 7 days for very large tables) |
+| `validate_worker_type` | optional | `G.8X` | Glue worker type for validate (big-table COUNT/scan needs a big driver). Same allow-list |
+| `validate_num_workers` | optional | `10` | int 1–299. Validate worker count |
+| `validate_timeout_minutes` | optional | `2880` | int 1–10080. Validate timeout |
+| `max_parallel_tables` | optional | `20` | int 1–40. How many tables load **at once** on the driver thread pool |
+| `per_worker_mem_budget_mb` | optional | `1500` | int ≥ 1. Per-table driver-memory budget the auto-throttle uses. The throttle **never silently drops to 1** — it holds a floor even if driver memory is unknown/misreported |
 | `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default |
 | `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
 | `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
 
-Twenty-two keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Thirty-nine keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
 `control_schema`, `cdc_validation`, `cdc_validation_sample`, `max_composite_forks`,
-`max_big_cdc_forks`, `big_table_row_threshold`, `file_fanout_threshold`, `max_groups`,
-`map_max_concurrency`, `max_files_in_parallel`, `conn_budget`, `min_writers_per_loader`,
-`max_writers_per_loader`. `account_id`, `subnet_id` and
+`max_big_cdc_forks`, `big_table_row_threshold`, `file_fanout_threshold`, `big_table_bytes_threshold`,
+`max_groups`, `map_max_concurrency`, `max_files_in_parallel`, `writers_per_file`, `conn_budget`,
+`min_writers_per_loader`, `max_writers_per_loader`, `glue_version`, `discovery_worker_type`,
+`discovery_num_workers`, `discovery_timeout_minutes`, `load_worker_type`, `load_num_workers`,
+`load_timeout_minutes`, `load_big_worker_type`, `load_big_num_workers`, `load_big_timeout_minutes`,
+`validate_worker_type`, `validate_num_workers`, `validate_timeout_minutes`, `max_parallel_tables`,
+`per_worker_mem_budget_mb`. `account_id`, `subnet_id` and
 `security_group_id` are used only by setup.
 
 ---
@@ -771,10 +792,15 @@ s3://<bucket>/
 
 ### Tuning big tables and fan-out
 
-The fan-out planner (`plan_split`) is driven by eight `params.csv` settings (full rows, defaults
-and valid ranges in [§3](#3-fill-in-paramscsv)). The defaults equal the values the pipeline used
-before these were settings, so leaving them out plans exactly as before. Two rules apply to all of
-them:
+The fan-out planner (`plan_split`) and the load jobs are driven by `params.csv` settings (full rows,
+defaults and valid ranges in [§3](#3-fill-in-paramscsv)): the big-table thresholds
+(`big_table_row_threshold`, `file_fanout_threshold`, `big_table_bytes_threshold`), the grouping/
+concurrency knobs (`max_groups`, `map_max_concurrency`, `max_files_in_parallel`,
+`conn_budget`, `min`/`max_writers_per_loader`), the single-file writer lever (`writers_per_file`),
+and the job sizing (`*_worker_type` / `*_num_workers` / `*_timeout_minutes`, `glue_version`,
+`max_parallel_tables`, `per_worker_mem_budget_mb`). The planning-threshold defaults equal the values
+the pipeline used before they were settings, so leaving them out plans exactly as before. Two rules
+apply to the planning thresholds:
 
 - a change takes effect only for tasks **started after** the new `pipeline.json` is published
   (settings are read once per run, at `ResolveTask`);
@@ -786,8 +812,11 @@ them:
 What to change, and why:
 
 - **Treat more/fewer tables as "big"** (own `load-big` group + own `bg` CDC job): lower/raise
-  `big_table_row_threshold` (rows) or `file_fanout_threshold` (part-files). More big tables = more
-  always-on `bg` CDC jobs (watch `max_big_cdc_forks` and the Glue concurrent-run quota).
+  `big_table_row_threshold` (rows), `file_fanout_threshold` (part-files), or
+  `big_table_bytes_threshold` (total full-load bytes). The **bytes** test is what rescues a huge
+  **single-file** table (num_files=1) whose DMS row count is missing from the index — without it a
+  16 M-row single-file table was being planned as "small" (no `load-big`, no `bg` CDC job). More big
+  tables = more always-on `bg` CDC jobs (watch `max_big_cdc_forks` and the Glue concurrent-run quota).
 - **Spread small tables across more lanes:** raise `max_groups` (= the CDC job pool size).
 - **Go faster at the cost of more concurrency:** raise `map_max_concurrency` (1–40). Each extra
   concurrent loader uses more Glue DPU and opens more DSQL connections at once.
@@ -796,9 +825,45 @@ What to change, and why:
   The planner never exceeds `conn_budget` — if `max_writers_per_loader × map_max_concurrency`
   exceeds it, per-loader writers are squeezed below `max_writers_per_loader` (resolve warns).
 
-Mind the quotas when raising any of these: the **Glue concurrent-job-runs** quota (~30/account,
-adjustable) and **DPU** limits, and DSQL connections (10,000/cluster, 100/s). See
-[Limits](#limits).
+### Tuning for speed (worker sizes + single-file parallelism)
+
+The full load runs **driver-side**: `job2_load.py` streams each table's rows to the Glue **driver**
+(`toLocalIterator`) and writes to DSQL with `pg8000` from driver threads. Executors only parse the
+CSV read. So the levers that actually speed a load are the **driver size** (= the **worker type**,
+because Glue sizes the driver like the workers) and the **write concurrency**, not the executor
+count.
+
+- **`writers_per_file` (default 8)** — the single most important lever for a BIG table. DMS usually
+  writes one `LOAD00000001.csv` per table (a serial full load), and the per-file fan-out opens one
+  worker per file — so a multi-GB single-file table used to load with **one** DSQL connection
+  committing 3,000-row transactions serially (~1,700–2,000 rows/s). `writers_per_file` splits that
+  one file's row stream across N concurrent writers, each its own connection, each committing
+  disjoint 3,000-row chunks (no-dup via the PK + disjoint chunks; no-loss via the unchanged
+  `rows_read == committed` gate). Set `1` for the old one-writer-per-file behaviour.
+- **Worker types** — `load_big_worker_type`/`validate_worker_type` default to **G.8X** (128 GB
+  driver) for big tables, `load_worker_type` to **G.4X** (64 GB), `discovery_worker_type` to
+  **G.2X**. For very large tables raise to **G.12X / G.16X** (192 / 256 GB) — newer types with
+  higher startup latency, so confirm they exist in your Region and Glue version. Counts
+  (`*_num_workers`) mostly help the CSV read; raising the **type** helps the writes.
+- **`max_parallel_tables` (default 20)** — how many tables load **at once** on the driver. The
+  memory auto-throttle sizes this by driver free memory / `per_worker_mem_budget_mb` (default 1500),
+  but it **never silently drops to 1** when the container memory reading is unknown or misreported
+  — it holds a floor and logs the decision. On a bigger driver, more tables load concurrently.
+- **Timeouts** — `load_timeout_minutes`/`load_big_timeout_minutes`/`validate_timeout_minutes`
+  default to **2880** (48 h); raise toward **10080** (Glue's 7-day maximum) for very large tables.
+- **`glue_version` (default 4.0)** — the scripts and driver wheels are tested on Glue 4.0. `5.0` is
+  accepted but re-test the `pg8000`/`boto3` wheels on its Python 3.11 first.
+
+Estimating load time for a table: `seconds ≈ rows ÷ (writers_per_file × rows_per_txn ÷ sec_per_txn)`,
+where `rows_per_txn ≤ 3000` (DSQL cap, smaller for wide/LOB rows) and `sec_per_txn` is the measured
+per-commit latency (≈0.4 s for narrow rows, ≈1.8 s for wide ones in the test cluster). E.g. a 16 M-row
+narrow table at `writers_per_file=8`: 16e6 ÷ (8 × 3000 ÷ 0.4) ≈ 270 s, versus ≈2 h single-threaded.
+
+Mind the quotas when raising any of these: the **Glue concurrent-job-runs** quota (default
+**2,000/account**, adjustable), the **max task DPUs/account** (us-east-1 and us-east-2 = **1,000**,
+adjustable — raise it in Service Quotas before a big migration), and DSQL connections (10,000/cluster,
+100/s). A G.8X run = 8 DPU/node, so `load_big_num_workers × 8 + driver` must fit the DPU budget across
+all concurrent groups. See [Limits](#limits).
 
 ### Limits
 
@@ -806,17 +871,19 @@ adjustable) and **DPU** limits, and DSQL connections (10,000/cluster, 100/s). Se
   `cdc_control` uses one).
 - **Task name:** letters, digits and hyphens, no leading/trailing hyphen, roughly under 50 chars (it
   becomes the S3 folder and Glue job-name stem).
-- **Fleet concurrency:** 5 tasks start at a time; one startup fans out up to 6 groups at once, so a
-  single task can ask for up to 6 × 20 = 120 G.8X workers on its big groups — check your Glue
-  concurrent-run and DPU quotas before a large wave. Each load run also opens up to 150 DSQL
-  connections (`max_write_concurrency`).
+- **Fleet concurrency:** 5 tasks start at a time; one startup fans out up to `map_max_concurrency`
+  (default 6) groups at once, so a single task can ask for up to 6 × `load_big_num_workers` (default
+  10) G.8X workers on its big groups ≈ 60 nodes × 8 DPU ≈ 480 DPU — check the **max task DPUs/account**
+  quota (us-east-1/us-east-2 default **1,000**, adjustable) and the **Glue concurrent-job-runs**
+  quota (default **2,000/account**, adjustable) before a large wave. Each load run also opens up to
+  `max_write_concurrency` DSQL connections.
 - **Always-on CDC jobs per task:** each task runs **1 main CDC job + up to `max_composite_forks`
   `ck` CDC jobs + up to `max_big_cdc_forks` `bg` CDC jobs** (defaults 8 + 8, so up to 17 CDC runs for
   one task), each holding its own DSQL connections. These run **concurrently** with the task's
   load/validate runs and with every other task — all against the **AWS Glue concurrent-job-runs
-  quota** (default ~30 per account, adjustable) and the DSQL connection limits (cluster 10,000, rate
-  100/s). `plan_split` warns when a task's CDC count is a large share of the Glue quota; raise the
-  Glue quota (and watch DSQL connections) before fanning out many tasks or many forks at once.
+  quota** (default 2,000 per account, adjustable) and the DSQL connection limits (cluster 10,000, rate
+  100/s). `plan_split` warns when a task's CDC count is a large share of the quota; raise the Glue
+  quota (and watch DSQL connections) before fanning out many tasks or many forks at once.
 - **Fleet size:** one fleet execution handles up to a few hundred tasks (the Map's results stay under
   Step Functions' 256 KB state limit to roughly 400 tasks). Split bigger lists.
 - **CDC runtime:** a CDC Glue run stops after 7 days (the 10080-minute Glue maximum) — restart it by
@@ -824,13 +891,23 @@ adjustable) and **DPU** limits, and DSQL connections (10,000/cluster, 100/s). Se
 
 ### Per-task Glue job sizes
 
-The load/discovery/validate templates each allow 10 concurrent runs; the CDC template allows 1:
+The load/discovery/validate templates each allow 10 concurrent runs; the CDC template allows 1.
+These are the **default** sizes — every worker type, count and timeout is a `params.csv` setting
+(see [§3](#3-fill-in-paramscsv) and [Tuning for speed](#tuning-for-speed-worker-sizes--single-file-parallelism)),
+so you can size up for a big migration without editing templates:
 
-| Job | Workers | | Job | Workers |
-|---|---|---|---|---|
-| discovery | 5 × G.2X | | validate | 10 × G.4X |
-| load | 10 × G.4X | | CDC | 1 DPU (Python shell) or 2 × G.1X (Spark) |
-| load-big | 20 × G.8X | | | |
+| Job | Default size | Timeout | Setting keys |
+|---|---|---|---|
+| discovery | 5 × G.2X | 480 min | `discovery_worker_type` / `discovery_num_workers` / `discovery_timeout_minutes` |
+| load | 10 × G.4X | 2880 min | `load_worker_type` / `load_num_workers` / `load_timeout_minutes` |
+| load-big | 10 × G.8X | 2880 min | `load_big_worker_type` / `load_big_num_workers` / `load_big_timeout_minutes` |
+| validate | 10 × G.8X | 2880 min | `validate_worker_type` / `validate_num_workers` / `validate_timeout_minutes` |
+| CDC | 1 DPU (Python shell) or 2 × G.1X (Spark) | 10080 min | (fixed) |
+
+The load runs driver-side, so a bigger worker **type** (= bigger driver) is what speeds a big
+table; `writers_per_file` (default 8) parallelises a single big part-file. Allowed worker types:
+G.1X, G.2X, G.4X, G.8X, G.12X, G.16X, R.1X, R.2X, R.4X, R.8X (G.12X+ and R.* are newer, higher
+startup latency — confirm Region/Glue-version availability).
 
 <details>
 <summary>What each per-task state-machine step runs (what the fleet runs per task)</summary>
