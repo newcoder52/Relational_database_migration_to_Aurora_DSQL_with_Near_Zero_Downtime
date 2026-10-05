@@ -85,6 +85,7 @@ cp config/params.example.csv params.csv
 | `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders |
 | `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency; ≤ max_writers_per_loader |
 | `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency; ≥ min_writers_per_loader |
+| `validate_rows_per_range` | optional | `10000` | int ≥ 1. Rows per key-range for job3 validation (shared + composite ck-validate forks); lowered so a range returns under DSQL's 300 s + the client read timeout on big tables; a too-big range auto re-splits |
 | `glue_version` | optional | `4.0` | `4.0` (tested) or `5.0` (re-test drivers first); applied to the Spark jobs |
 | `discovery_worker_type` | optional | `G.2X` | Glue worker type for discovery (allow-list G.1X–G.16X/R.1X–R.8X) |
 | `discovery_num_workers` | optional | `5` | int 1–299 |
@@ -406,6 +407,7 @@ is rejected at run time.
 | `conn_budget` | `conn_budget` | `900` |
 | `min_writers_per_loader` | `min_writers_per_loader` | `100` |
 | `max_writers_per_loader` | `max_writers_per_loader` | `150` |
+| `validate_rows_per_range` | `validate_rows_per_range` | `10000` |
 | `glue_version` | `glue_version` | `4.0` |
 | `discovery_worker_type` | `discovery_worker_type` | `G.2X` |
 | `discovery_num_workers` | `discovery_num_workers` | `5` |
@@ -453,6 +455,7 @@ cfg = {
     "conn_budget": 900,
     "min_writers_per_loader": 100,
     "max_writers_per_loader": 150,
+    "validate_rows_per_range": 10000,
     "glue_version": "4.0",
     "discovery_worker_type": "G.2X",
     "discovery_num_workers": 5,

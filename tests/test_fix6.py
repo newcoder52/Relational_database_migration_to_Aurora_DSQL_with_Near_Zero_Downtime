@@ -197,9 +197,11 @@ def _v1_namespace(target_count):
 
 
 def _v1_decide(empty_at_discovery, source_present, target_count):
-    """Reproduce the V1 decision using the REAL extracted helpers (split_s3,
-    s3_prefix_has_objects, target_range_summary) — this mirrors the block in
-    validate_one_table without needing Spark."""
+    """Reproduce the V1 + B7-residual decision using the REAL extracted helpers (split_s3,
+    s3_prefix_has_objects, target_range_summary) — mirrors the block in validate_one_table
+    without needing Spark. B7-residual: a missing source folder + 0 target rows is a PASS on
+    EVERY path, flag or not; a missing folder + non-empty target is a mismatch when discovery
+    knew the table was empty, else a clear error."""
     ns = _v1_namespace(target_count)
     s3 = _FakeS3(source_present)
     dms_s3_path = "s3://bucket/DMS_SAMPLE/TICKET_PURCHASE_HIST"
@@ -209,8 +211,10 @@ def _v1_decide(empty_at_discovery, source_present, target_count):
         return ("would_read_s3", None)
     conn = ns["connect_dsql"](autocommit=True)
     tgt_cnt, _ = ns["target_range_summary"](conn, "dms_sample", "t", None, [])
+    if int(tgt_cnt) == 0:
+        return ("match", 0)            # 0 source + 0 target -> trivially valid on every path
     if empty_at_discovery:
-        return ("match", 0) if int(tgt_cnt) == 0 else ("mismatch", int(tgt_cnt))
+        return ("mismatch", int(tgt_cnt))
     return ("error", None)
 
 
@@ -220,8 +224,13 @@ def test_v1_empty_source():
     r = _v1_decide(True, False, 5)
     check(r[0] == "mismatch" and r[1] == 5,
           "V1: empty source + target has rows -> FAIL (names the target row count)")
-    check(_v1_decide(False, False, 0)[0] == "error",
-          "V1: missing folder but NOT marked empty-at-discovery -> clear error (not a pass)")
+    # B7-residual: a 0-row source with a 0-row target PASSES even when discovery did NOT flag
+    # empty-at-discovery (the empty-composite case) — on EVERY validate path.
+    check(_v1_decide(False, False, 0) == ("match", 0),
+          "B7-residual: missing folder + 0 target -> PASS even without the empty-at-discovery flag")
+    # ...but a missing folder with a NON-empty target and no flag is still a clear error.
+    check(_v1_decide(False, False, 7)[0] == "error",
+          "B7-residual: missing folder + non-empty target + no flag -> clear error (not a pass)")
     check(_v1_decide(True, True, 0)[0] == "would_read_s3",
           "V1: when source files ARE present, the normal read path runs")
 

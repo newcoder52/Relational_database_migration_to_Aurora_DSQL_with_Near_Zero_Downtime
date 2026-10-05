@@ -288,6 +288,64 @@ One startup and one cutover state machine now serve every DMS task, started with
 Lesson: test the pipeline in a VPC **without** internet access. With internet, pip silently
 fills dependency gaps and items 1 and 2 stay hidden.
 
+### 2026-10-05 — Composite reblank-on-resume, big-table validation client timeout, empty-composite validation, table list from live selection
+
+A mixed real-AWS run (big + composite + no-PK + empty tables in one task, re-run onto populated
+targets) surfaced four defects. All are fixed in the repo with offline tests (`tests/test_e2e_fixes.py`).
+
+- **Composite-PK reblank-on-resume broke on DSQL.** When a composite-key table was reloaded on
+  resume (target non-empty, previously attempted), the whole-table auto-reblank paged its batched
+  `DELETE` by a single column (`pk_col=None` for a composite table, so it fell back to the first
+  key column). A composite table's first key column is **not** unique, so one window of a few
+  thousand distinct first-column values could match far more than DSQL's ~3,000-row per-transaction
+  cap in a single `DELETE`, failing with `54000: transaction row limit exceeded` — a composite
+  table could never be reloaded on resume.
+  - **Fix:** page the reblank by the **full key tuple**. A new `blank_whole_table_composite` selects
+    the next `batch` whole-key tuples (`SELECT "k1","k2",… ORDER BY "k1","k2",… LIMIT batch`) and
+    deletes exactly those rows with an OR-of-ANDs on the full key using bound parameters
+    (`WHERE ("k1"=%s AND "k2"=%s …) OR …`). N selected tuples delete N rows, so every transaction is
+    ≤ batch (≤ 3,000) rows regardless of how skewed any one column is. The portable OR-of-ANDs form
+    is used rather than a row-value `IN (VALUES …)` because DSQL's support for multi-column
+    row-value `IN` could not be verified offline; the OR-of-ANDs is the same per-key predicate the
+    composite CDC job already uses, batched. `blank_whole_table` now takes the full `pk_cols` list
+    and delegates to the composite helper for a multi-column key; the single-column PK path is
+    unchanged (one unique value per row, always ≤ batch). The no-PK path (paging by a possibly-
+    duplicated column) gained an **adaptive shrink**: on a row/size-limit error it halves the batch
+    and retries down to a single value, and fails with a clear message if one value alone exceeds
+    the per-transaction cap. All three `assert_empty_or_register` call sites now pass `pk_cols`.
+- **Big-table validation hit a client-side read timeout.** On 8M- and 16M-row tables the per-range
+  validation query raised `The read operation timed out` — a **client-side** pg8000 socket read
+  timeout, not the server's 300s limit. Root cause: pg8000's connect `timeout=` sets the socket
+  timeout for **every** read on the connection, and validation reused the small (10s) endpoint-probe
+  value, so a range query that took longer than 10s to respond timed out at the client before the
+  server's statement timeout or DSQL's 300s cap could fire — defeating the existing auto re-split.
+  - **Fix:** set the validation connection's socket read timeout **above** the server statement
+    timeout (statement_timeout 240s → socket read 300s) so the server's deterministic timeout fires
+    first; treat a client read timeout (socket timeout / "read operation timed out") as a **re-split
+    trigger** (bounded by the existing max re-split depth), not a fatal error; and lower the default
+    rows-per-range to **10000** (a range that validated fine at 10000 but client-timed-out at 50000
+    on the largest tables). `validate_rows_per_range` is now a `params.csv` setting (default 10000)
+    wired through `resolve_task` → `startup.asl.json` → the validate job args **and** every composite
+    `ck-validate` fork job, like the other sizing/planning keys.
+- **An empty composite table still failed validation.** The empty-source PASS depended on discovery
+  flagging the table empty-at-discovery; an empty composite table could reach validation without that
+  flag and error instead of passing.
+  - **Fix:** key the empty-source PASS on the **target count**: a missing DMS full-load folder with a
+    0-row DSQL target is a trivially-valid `0 == 0` match on **every** validate path (shared, composite
+    ranging, and `ck` fork validate), whether or not discovery set the flag. A missing folder with a
+    **non-empty** target is still a mismatch when discovery knew the source was empty, and a clear
+    error otherwise — never a silent pass.
+- **A removed table still appeared in the auto-built table list.** A table dropped from the DMS task's
+  selection rules still showed up in the manifest/discovery index, because `describe_table_statistics`
+  keeps a table's stats from a prior run after it is removed from the selection, and the table list was
+  built from those stats without cross-checking the current rules.
+  - **Fix:** `BuildTableList` now cross-checks every reported table against the task's **current**
+    selection rules (`_selection_includes`, honouring include/exclude order with wildcard patterns). A
+    reported table not selected by the live rules is **ignored** — never loaded, validated, CDC-applied
+    or placed in the manifest/discovery index — with a WARNING naming it and suggesting the
+    `aws s3 rm s3://…/<schema>/<table>/ --recursive` to delete any stale S3 folder. A **selected** table
+    with 0 rows is still included (loaded empty), unchanged.
+
 ### 2026-10-05 — Faster full load: concurrent writers per file, big single-file classification, bigger drivers
 
 - **Symptom (observed on a test-cluster full-load run):** a 27-table / ~32.5 M-row full load took

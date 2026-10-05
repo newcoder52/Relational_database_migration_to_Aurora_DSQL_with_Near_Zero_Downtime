@@ -77,6 +77,11 @@ conn_budget,900
 #   concurrency (min <= max).
 min_writers_per_loader,100
 max_writers_per_loader,150
+# validate_rows_per_range: rows per key-range for job3 validation (shared validate job AND every
+# composite ck-validate fork). Lowered default so a per-range per-column aggregate returns under
+# DSQL's 300s txn-age limit AND the client read timeout on very large/wide tables; a range that
+# still times out is auto re-split smaller. Raise it for narrow tables to validate in fewer ranges.
+validate_rows_per_range,10000
 
 # ---- Glue job sizing (SPEED over cost — size up, don't throttle). Worker TYPES are checked
 # against an allow-list {G.1X,G.2X,G.4X,G.8X,G.12X,G.16X,R.1X,R.2X,R.4X,R.8X}; counts 1-299;

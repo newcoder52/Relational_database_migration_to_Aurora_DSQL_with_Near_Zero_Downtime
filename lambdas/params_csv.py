@@ -95,6 +95,11 @@ OPTIONAL_DEFAULTS = {
     "conn_budget": "900",
     "min_writers_per_loader": "100",
     "max_writers_per_loader": "150",
+    # Validation range size: rows per key-range for job3's per-column aggregate validation.
+    # Lowered default (10000) so each range query returns under DSQL's 300s txn-age limit AND
+    # the client socket read timeout on very large/wide tables; a range that still times out is
+    # auto re-split smaller. Raise it for narrow tables to validate faster. (B14.)
+    "validate_rows_per_range": "10000",
     # Glue job SIZING (speed over cost — size up, do not throttle). worker types validated
     # against an allow-list; counts/timeouts validated as ints. The load runs DRIVER-SIDE, so a
     # bigger WORKER TYPE (= bigger driver) is what speeds a big table; executor COUNT only helps
@@ -166,6 +171,7 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "max_groups", "map_max_concurrency", "max_files_in_parallel",
                  "writers_per_file", "conn_budget",
                  "min_writers_per_loader", "max_writers_per_loader",
+                 "validate_rows_per_range",
                  "glue_version",
                  "discovery_worker_type", "discovery_num_workers", "discovery_timeout_minutes",
                  "load_worker_type", "load_num_workers", "load_timeout_minutes",
@@ -215,6 +221,7 @@ _PLANNING_INT_KEYS = (
     ("conn_budget", 1, None),
     ("min_writers_per_loader", 1, None),
     ("max_writers_per_loader", 1, None),
+    ("validate_rows_per_range", 1, None),
     # Job sizing counts/timeouts (worker TYPES are validated by resolve_task against an
     # allow-list). num_workers capped at 299 (a per-job sanity cap; the real limit is the
     # account DPU quota, raised in Service Quotas). timeouts 1..10080 min = up to Glue's 7-day

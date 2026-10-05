@@ -98,16 +98,31 @@ REGION = 'us-east-1'
 # ---- CUSTOMER-TUNABLE KNOBS -------------------------------------------------
 # Rows per validation range. Bigger = fewer, larger queries (watch the 300s DSQL txn
 # limit); smaller = more parallelism, more round-trips. Ranges are index-usable on the PK.
-# V2: lowered from 250000 to 50000 so a single per-range per-column aggregate stays well under
-# DSQL's hard 300s transaction-age limit even on wide, large tables (the earlier real test hit
-# 303s at 250k on a 16.3M-row table). Each range query runs in its own short autocommit txn and
-# is additionally bounded by VALIDATE_STATEMENT_TIMEOUT_MS; a range that still times out is
-# auto re-split smaller and retried (see validate_one_table).
-VALIDATE_ROWS_PER_RANGE = 50000
+# V2/B14: lowered to 10000. The default must size each per-range per-column aggregate so it
+# returns WELL under both DSQL's hard 300s transaction-age limit AND the client socket read
+# timeout. Real-E2E evidence: on a 16.3M-row / 8M-row table, validation PASSED at 10000 rows
+# per range but a 50000 default raised a CLIENT-side pg8000 socket read timeout ("The read
+# operation timed out") before the server could respond — so 50000 is unsafe as a default for
+# very large/wide tables. 10000 keeps a wide margin; operators with narrow tables can raise it
+# via the params.csv `validate_rows_per_range` setting (wired through to every validate job,
+# incl. the composite ck forks). A range that still times out is auto re-split smaller and
+# retried (see validate_one_table / target_range_resplit), and a client read timeout is now
+# ALSO treated as a re-split trigger (is_txn_age_error), not a fatal error.
+VALIDATE_ROWS_PER_RANGE = 10000
 # V2: per-statement timeout (ms) set on every DSQL validation connection, kept comfortably
 # below DSQL's 300s transaction-age limit so a too-big range fails FAST and deterministically
 # (so it can be re-split) instead of burning ~300s and erroring the table.
 VALIDATE_STATEMENT_TIMEOUT_MS = 240000
+# B14: client-side socket READ timeout (seconds) for validation query results. pg8000's
+# connect `timeout=` sets the socket timeout for the WHOLE connection — including every
+# subsequent read — not just the initial connect. If that stays at the small connect-probe
+# value (10s), a per-range aggregate on a large/wide table that takes longer than 10s to
+# return its first bytes raises a CLIENT-side "The read operation timed out" BEFORE the server
+# can enforce statement_timeout/the 300s cap, so the existing auto re-split never gets a chance.
+# Set the read timeout ABOVE the server statement_timeout (+ a cushion) so the SERVER's 57014
+# fires first and the re-split kicks in deterministically. Still finite so a truly hung socket
+# eventually errors (and that error is itself treated as a re-split trigger, bounded).
+VALIDATE_SOCKET_READ_TIMEOUT = int(VALIDATE_STATEMENT_TIMEOUT_MS / 1000) + 60   # 300s
 # V2: how many times a single range may be re-split (halved / sub-bucketed) and retried after a
 # transaction-age / statement-timeout error before giving up on that range.
 VALIDATE_MAX_RESPLIT_DEPTH = 6
@@ -373,6 +388,21 @@ def _make_dsql_conn(host, autocommit=True):
                           password=tok, ssl_context=ssl.create_default_context(),
                           timeout=DSQL_CANDIDATE_CONNECT_TIMEOUT)
     conn.autocommit = autocommit
+    # B14: pg8000's connect `timeout=` sets the socket timeout for EVERY read on this
+    # connection, not just the initial connect. Leaving it at the 10s connect-probe value makes
+    # a per-range aggregate on a large table raise a CLIENT-side "read operation timed out"
+    # before the SERVER can enforce statement_timeout / the 300s cap, defeating the auto
+    # re-split. Raise the socket read timeout ABOVE the server statement_timeout (+ cushion) so
+    # the server's deterministic 57014 fires first; keep it finite so a genuinely hung socket
+    # still errors (and that error is treated as a re-split trigger). Best-effort: the socket
+    # lives at conn._c._usock (dbapi wrapper) or conn._usock (core); ignore if the internals
+    # differ in a future pg8000.
+    try:
+        _usock = getattr(getattr(conn, "_c", None), "_usock", None) or getattr(conn, "_usock", None)
+        if _usock is not None:
+            _usock.settimeout(float(VALIDATE_SOCKET_READ_TIMEOUT))
+    except Exception:
+        pass
     # V2: bound every statement well under DSQL's 300s transaction-age limit so a too-large
     # range query fails fast and deterministically (then gets re-split) instead of running
     # ~300s and raising 54000. Best-effort: ignore if the server rejects the GUC.
@@ -891,9 +921,20 @@ def _target_query(dsql_schema, dsql_table, pred, metrics):
 # V2: keep every validation query under DSQL's 300s transaction-age limit
 # =============================================================================
 def is_txn_age_error(exc):
-    """True if an exception is DSQL's transaction-age limit (SQLSTATE 54000) or a
-    statement_timeout (57014) — the two ways a too-large validation query fails. Matches on
-    SQLSTATE where pg8000 exposes it and on the message text otherwise."""
+    """True if an exception means a per-range query was TOO BIG to complete and should be
+    re-split and retried (bounded by VALIDATE_MAX_RESPLIT_DEPTH). Covers:
+      * DSQL's transaction-age limit (SQLSTATE 54000) and statement_timeout (57014) — the
+        server-side ways a too-large validation query fails;
+      * B14: a CLIENT-side socket READ timeout ("The read operation timed out" / socket.timeout
+        / "timed out") — on a very large/wide table the range query can out-run the client
+        socket read timeout. Treating it as a re-split trigger (not fatal) lets the same
+        halving retry shrink the range until it returns in time. The socket read timeout is now
+        set ABOVE the server statement_timeout (see _make_dsql_conn) so normally the server's
+        57014 fires first; this is the belt-and-suspenders backstop if a read still stalls.
+    Matches on SQLSTATE where pg8000 exposes it and on the message/exception type otherwise."""
+    import socket as _socket
+    if isinstance(exc, _socket.timeout):
+        return True
     s = ""
     try:
         a0 = exc.args[0] if getattr(exc, "args", None) else None
@@ -909,7 +950,9 @@ def is_txn_age_error(exc):
     s = s.lower()
     return ("transaction age limit" in s or "54000" in s
             or "statement timeout" in s or "statement_timeout" in s
-            or "canceling statement due to statement timeout" in s or "57014" in s)
+            or "canceling statement due to statement timeout" in s or "57014" in s
+            or "read operation timed out" in s or "timed out" in s
+            or "timeout" in s)
 
 
 def combine_metric(check, a, b):
@@ -1083,14 +1126,19 @@ def validate_one_table(s3, entry):
     if not target_types:
         return {"table": label, "status": "error", "reason": "target table not found in DSQL"}
 
-    # ---- V1: empty-source table (no DMS S3 folder) ----
+    # ---- V1 + B7-residual: empty-source table (no DMS S3 folder) ----
     # A 0-row source table produces NO DMS full-load folder, so reading it with Spark raises
-    # "Path does not exist". Detect the missing folder up front: if discovery recorded this
-    # table as empty-at-discovery (or 0 full-load rows), treat the source as 0 rows WITHOUT
-    # reading S3 and just compare the DSQL target count — 0 target rows = PASS (empty source,
-    # empty target), >0 = a real mismatch (rows in the target that are not in the empty source).
-    # A table discovery did NOT mark empty but whose folder is missing is a genuine problem and
-    # still surfaces as a clear error (not a silent pass).
+    # "Path does not exist". When the source folder is missing we compare the DSQL target COUNT:
+    #   * target == 0  -> PASS on EVERY path (shared validate, ck fork validate, composite
+    #     ranging). Both sides are empty (0 == 0), which is trivially valid. This holds whether
+    #     or not discovery flagged the table empty-at-discovery: a missing DMS full-load folder
+    #     means DMS wrote no full-load rows, and 0 target rows means they match. (B7-residual:
+    #     an empty COMPOSITE table could reach here without discovery's empty-at-discovery flag;
+    #     keying the PASS on the target count instead of the flag makes it pass on every path.)
+    #   * target > 0 and discovery marked it empty-at-discovery -> real mismatch (FAIL): the
+    #     source is known-empty but the target has rows.
+    #   * target > 0 and discovery did NOT mark it empty -> genuine ambiguity (missing folder for
+    #     an unknown reason while the target has rows) -> clear error, not a silent pass.
     _empty_at_discovery = bool(meta.get("empty_at_discovery")) or (meta.get("full_load_rows") == 0)
     _src_bucket, _src_prefix = split_s3(dms_s3_path) if dms_s3_path else ("", "")
     _source_present = bool(dms_s3_path) and s3_prefix_has_objects(s3, _src_bucket, _src_prefix)
@@ -1103,14 +1151,18 @@ def validate_one_table(s3, entry):
                 conn.close()
             except Exception:
                 pass
+        if int(tgt_cnt) == 0:
+            # 0 source rows (no DMS folder) and 0 target rows: PASS on every path, flag or not.
+            _why = ("empty source table (no DMS full-load folder) and empty DSQL target: "
+                    "0 == 0, PASS")
+            if not _empty_at_discovery:
+                _why += (" (discovery did not flag empty-at-discovery, but both sides are "
+                         "empty so this is a trivially-valid 0==0 match)")
+            return {"table": label, "status": "match", "ranges": 0,
+                    "source_rows": 0, "target_rows": 0, "checksum_mode": CHECKSUM_MODE,
+                    "columns_compared": 0, "columns_differing": [], "mismatches": [],
+                    "mismatch_count": 0, "notes": [_why]}
         if _empty_at_discovery:
-            if int(tgt_cnt) == 0:
-                return {"table": label, "status": "match", "ranges": 0,
-                        "source_rows": 0, "target_rows": 0, "checksum_mode": CHECKSUM_MODE,
-                        "columns_compared": 0, "columns_differing": [], "mismatches": [],
-                        "mismatch_count": 0,
-                        "notes": ["empty source table (no DMS full-load folder) and empty "
-                                  "DSQL target: 0 == 0, PASS"]}
             return {"table": label, "status": "mismatch", "ranges": 1,
                     "source_rows": 0, "target_rows": int(tgt_cnt), "checksum_mode": CHECKSUM_MODE,
                     "columns_compared": 0, "columns_differing": [],
@@ -1120,9 +1172,10 @@ def validate_one_table(s3, entry):
                     "notes": ["empty source table (no DMS full-load folder) but the DSQL target "
                               f"has {int(tgt_cnt)} row(s)"]}
         return {"table": label, "status": "error",
-                "reason": f"no DMS full-load files under {dms_s3_path} and discovery did NOT "
-                          f"mark this table empty-at-discovery; cannot validate (is the DMS "
-                          f"folder/path correct?)"}
+                "reason": f"no DMS full-load files under {dms_s3_path} and the DSQL target has "
+                          f"{int(tgt_cnt)} row(s), and discovery did NOT mark this table "
+                          f"empty-at-discovery; cannot validate (is the DMS folder/path "
+                          f"correct?)"}
 
     # ---- SOURCE: read, rename DMS columns to their target names, THEN transform ----
     # Same order as the load: the per-type conversions are keyed by TARGET column name, so

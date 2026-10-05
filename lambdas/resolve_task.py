@@ -268,6 +268,9 @@ SETTINGS_DEFAULTS = {
     "conn_budget": 900,                   # DSQL connection budget shared across in-flight loaders
     "min_writers_per_loader": 100,        # floor for a small group's --max_write_concurrency
     "max_writers_per_loader": 150,        # ceiling for a small group's --max_write_concurrency
+    "validate_rows_per_range": 10000,     # job3 rows per validation key-range (B14: lowered so a
+                                          # range query returns under DSQL's 300s + the client
+                                          # read timeout on big tables; a too-big range re-splits)
     # ── GLUE JOB SIZING (speed over cost — size up; create_glue_jobs applies these to the job
     # definitions). Worker TYPES validated against an allow-list; counts/timeouts are ints.
     # The load is DRIVER-SIDE so a bigger WORKER TYPE (=bigger driver) is the lever; defaults
@@ -481,6 +484,7 @@ def _validate_settings(cfg, warnings):
     conn_budget = _pos_int("conn_budget")
     min_w = _pos_int("min_writers_per_loader")
     max_w = _pos_int("max_writers_per_loader")
+    _pos_int("validate_rows_per_range")
     if min_w > max_w:
         raise SettingsError(f"pipeline.json 'min_writers_per_loader' ({min_w}) must be <= "
                             f"'max_writers_per_loader' ({max_w}).")
@@ -898,6 +902,7 @@ def handler_shared(event, context):
         "connBudget": cfg["conn_budget"],
         "minWritersPerLoader": cfg["min_writers_per_loader"],
         "maxWritersPerLoader": cfg["max_writers_per_loader"],
+        "validateRowsPerRange": cfg["validate_rows_per_range"],
         "glueVersion": cfg["glue_version"],
         "discoveryWorkerType": cfg["discovery_worker_type"],
         "discoveryNumWorkers": cfg["discovery_num_workers"],
@@ -1024,6 +1029,35 @@ def _locator_matches(locator, schema, table, is_table_rule):
         if tp is not None and not _wildcard_to_regex(tp).match(table or ""):
             return False
     return True
+
+
+def _selection_includes(rules, src_schema, src_table):
+    """B16: is this SOURCE (schema, table) currently SELECTED by the task's selection rules?
+
+    DMS evaluates selection rules in order; a matching 'include' selects the object and a
+    matching 'exclude' removes it, with later matching rules overriding earlier ones (last
+    match wins). We mirror that: start not-selected, and for every SELECTION rule whose
+    object-locator matches (schema-name + table-name wildcard patterns), set selected to True
+    for 'include' and False for 'exclude'. A table with no matching selection rule is NOT
+    selected.
+
+    Used to drop tables that DMS still REPORTS in describe_table_statistics (stats linger from a
+    prior run) but that are no longer in the task's CURRENT selection — so a table removed from
+    the task, with only a leftover S3 folder, is never loaded/validated/CDC-applied."""
+    selected = False
+    for r in rules:
+        if (r.get("rule-type") or "").lower() != "selection":
+            continue
+        loc = r.get("object-locator") or {}
+        sp = loc.get("schema-name")
+        tp = loc.get("table-name")
+        if sp is not None and not _wildcard_to_regex(sp).match(src_schema or ""):
+            continue
+        if tp is not None and not _wildcard_to_regex(tp).match(src_table or ""):
+            continue
+        action = (r.get("rule-action") or "include").lower()
+        selected = (action == "include")
+    return selected
 
 
 def _apply_one_transform(action, value, name):
@@ -1192,6 +1226,8 @@ def handler_build_table_list(event, context):
             f"selection rules.")
 
     errored, rows, seen = [], [], set()
+    ignored_unselected = []   # B16: (folder_schema, folder_table) reported by DMS but NOT in the
+                              # task's CURRENT selection (leftover stats/S3 from a prior run)
     rowcounts = {}   # lowercased "<folder_schema>.<folder_table>" -> DMS FullLoadRows (int)
     for st in stats:
         src_schema = str(st.get("SchemaName") or "").strip()
@@ -1199,6 +1235,19 @@ def handler_build_table_list(event, context):
         state = st.get("TableState")
         if not src_schema or not src_table:
             continue   # DMS sometimes reports aggregate/control rows with no name; skip them
+        # B16: ignore any table DMS still REPORTS but that the task's CURRENT selection rules do
+        # NOT select. describe_table_statistics keeps rows from prior runs even after a table is
+        # removed from the selection, and a leftover S3 full-load folder for that table must
+        # never be loaded/validated/CDC-applied. Compute the FOLDER name for the warning + the
+        # suggested cleanup command, then skip it (before the error-state gate, so a stale/
+        # errored lingering table doesn't fail the whole build either).
+        if not _selection_includes(rules, src_schema, src_table):
+            try:
+                _fs, _ft = _transform_names(rules, src_schema, src_table, task_arn)
+            except TableListError:
+                _fs, _ft = src_schema, src_table
+            ignored_unselected.append((_fs or src_schema, _ft or src_table))
+            continue
         if _is_error_table_state(state):
             errored.append(f"{src_schema}.{src_table} (state={state!r}) — {_table_state_advice(state)}")
             continue
@@ -1229,6 +1278,24 @@ def handler_build_table_list(event, context):
             f"table list was not built and no Glue jobs were created. Only 'Table completed' means "
             f"a table's full load has finished. Per table (state and what to do):\n  - "
             + "\n  - ".join(sorted(errored)))
+
+    # B16: WARN about every table DMS still reported but that the task's CURRENT selection does
+    # NOT include (a leftover from a prior run). These are IGNORED — never loaded, validated or
+    # CDC-applied, and never in the manifest/discovery index — but a leftover S3 full-load folder
+    # for one would waste storage, so name each and suggest the cleanup command. (cdc_root is the
+    # DMS endpoint's BucketFolder; "." = flat root, so the folder is s3://bucket/<schema>/<table>/.)
+    if ignored_unselected:
+        _root = str(event.get("cdc_root") or "").strip()
+        _base = "" if _root in ("", ".") else _root.strip("/") + "/"
+        for _fs, _ft in sorted(set(ignored_unselected)):
+            _folder = f"s3://{bucket}/{_base}{_fs}/{_ft}/"
+            _w = (f"table {_fs}.{_ft} is reported by DMS describe_table_statistics but is NOT in "
+                  f"the task's current selection rules — IGNORING it (not loaded, validated or "
+                  f"CDC-applied). This is a leftover from a prior run. If a stale S3 full-load "
+                  f"folder exists for it, remove it: aws s3 rm {_folder} --recursive")
+            warnings.append(_w)
+            print(f"(warn) build_table_list: {_w}")
+
     if not rows:
         raise TableListError(
             f"DMS task {task_arn} loaded no tables with a usable schema/table name. Check the "
@@ -1274,11 +1341,15 @@ def handler_build_table_list(event, context):
 
     print(f"(info) build_table_list: task {task_arn} -> {len(rows)} table(s) in "
           f"{len(distinct_schemas)} schema(s) {distinct_schemas}; wrote s3://{bucket}/{manifest_key} "
-          f"and FullLoadRows for {len(rowcounts)} table(s) -> s3://{bucket}/{rowcounts_key}")
+          f"and FullLoadRows for {len(rowcounts)} table(s) -> s3://{bucket}/{rowcounts_key}"
+          + (f"; IGNORED {len(set(ignored_unselected))} table(s) not in the current selection"
+             if ignored_unselected else ""))
     return {"ok": True, "count": len(rows), "distinctSchemas": distinct_schemas,
             "manifestKey": manifest_key, "sourceKey": source_key,
             "rowcountsKey": rowcounts_key, "rowcountsCount": len(rowcounts),
-            "replacedExisting": bool(replaced), "warnings": warnings}
+            "replacedExisting": bool(replaced),
+            "ignoredUnselected": sorted(f"{s}.{t}" for s, t in set(ignored_unselected)),
+            "warnings": warnings}
 
 
 def _object_exists(s3, bucket, key):

@@ -681,6 +681,15 @@ def handler(event, context):
             _pwb = event.get("perWorkerMemBudgetMb")
             if _pwb not in (None, ""):
                 args["--per_worker_mem_budget_mb"] = str(_pwb)
+        if role in ("validate", "ck-validate"):
+            # B14: rows per validation key-range. The shared validate job AND every composite
+            # ck-validate fork read it so a too-big range (which raised a client read timeout on
+            # 8M/16.3M-row tables at the old 50k default) is sized down to a value that returns
+            # within DSQL's limits; a range that still times out is auto re-split. Absent ->
+            # job3_validate uses its built-in default (10000).
+            _vrr = event.get("validateRowsPerRange")
+            if _vrr not in (None, ""):
+                args["--validate_rows_per_range"] = str(_vrr)
         if is_cdc:
             args["--cdc_root"] = cdc_root
             args["--control_schema"] = control_schema

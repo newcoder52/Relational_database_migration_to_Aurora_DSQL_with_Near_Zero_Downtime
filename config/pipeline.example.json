@@ -24,6 +24,7 @@
   "conn_budget": 900,
   "min_writers_per_loader": 100,
   "max_writers_per_loader": 150,
+  "validate_rows_per_range": 10000,
   "glue_version": "4.0",
   "discovery_worker_type": "G.2X",
   "discovery_num_workers": 5,

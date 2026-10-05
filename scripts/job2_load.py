@@ -1079,6 +1079,36 @@ def is_txn_timeout(exc):
         return True
     return False
 
+
+def is_dsql_txn_too_large(exc):
+    """True if this looks like DSQL's per-transaction ROW/SIZE cap being exceeded — the
+    ~3,000 row-modifications and ~10 MiB write limits (both SQLSTATE 54000, distinct from the
+    300s transaction-AGE limit handled by is_txn_timeout). A batched DELETE/INSERT that trips
+    this is retriable by HALVING the batch and retrying (an adaptive shrink), so classifying it
+    lets the whole-table reblank and keyless-reload paths recover instead of failing the table.
+
+    DSQL reports these as e.g. '54000: transaction row limit exceeded' /
+    'transaction too large'. We match on the row/size wording (and 54000 WITHOUT the
+    age/duration wording is_txn_timeout already claims) so an age-limit error is NOT also
+    treated as a size error."""
+    code = None
+    try:
+        payload = exc.args[0]
+        if isinstance(payload, dict):
+            code = payload.get("C") or payload.get("code")
+    except Exception:
+        pass
+    msg = str(exc).lower()
+    # Explicit row/size wording is decisive regardless of SQLSTATE.
+    if ("transaction row limit" in msg or "row limit exceeded" in msg
+            or "transaction too large" in msg or "too many rows" in msg
+            or ("transaction" in msg and "size" in msg and "limit" in msg)):
+        return True
+    # A bare 54000 that is NOT the age/duration/timeout limit is the row/size cap.
+    if (code == "54000" or "54000" in msg) and not is_txn_timeout(exc):
+        return True
+    return False
+
 # TIME safeguard (DSQL 5-min / 300s transaction limit)
 # Slow-batch shrink TRIGGER, under the DSQL 5-min (300s) txn-age hard limit. NOT a cutoff —
 # the txn already committed; exceeding it just shrinks the NEXT chunk. So we run it close to
@@ -1938,38 +1968,62 @@ def assert_not_cdc_layout(df, dsql_schema, dsql_table):
             f"pathGlobFilter='LOAD*.csv' / _is_full_load_key) and re-run.")
 
 
-def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=None):
+def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=None,
+                      pk_cols=None):
     """V8 CROSS-ATTEMPT RESUME: blank an ENTIRE target table in DSQL-limit-safe batches
-    (DSQL has no TRUNCATE; ~3000 rows / 5-min per txn). Deletes ALL rows by repeatedly
-    removing a bounded window and committing each batch, so a large partially-loaded
-    table can be cleared without blowing the per-transaction limits.
+    (DSQL has no TRUNCATE; ~3000 rows / 10 MiB / 5-min per txn). Deletes ALL rows by
+    repeatedly removing a bounded window and committing each batch, so a large partially-
+    loaded table can be cleared without blowing the per-transaction limits.
 
-    Method: DELETE the rows whose key is in the next `batch`-sized ORDER BY window
-    (DELETE ... WHERE col IN (SELECT col ... ORDER BY col LIMIT batch)). With a single-
-    column PK we page by it (index-usable, unique). Without one we page by `any_col`
-    (a non-key column also works: each pass deletes the rows sharing the <= batch key
-    values selected, so a pass may delete slightly more than `batch` on duplicate values,
-    but it stays bounded to that key set and the loop terminates when COUNT hits 0). DSQL
-    has NO ctid, so we never use it. Returns total rows deleted.
+    KEY SELECTION (B15 fix):
+      * COMPOSITE PK (pk_cols has >= 2 columns): page by the FULL key tuple — delegate to
+        blank_whole_table_composite, which selects the next `batch` whole-key tuples
+        (ORDER BY all key columns) and deletes exactly those rows via an OR-of-ANDs on the
+        full key, so every txn stays <= batch rows. The OLD code passed pk_col=None here and
+        paged by any_col = the first (non-unique) key column; a single pass then deleted every
+        row sharing that column's value, which on a composite table can be far more than 3,000
+        rows -> DSQL 54000 'transaction row limit exceeded' and the table could never be
+        reloaded on resume.
+      * SINGLE-column PK (pk_col): page by it (index-usable, unique) — one key value == one row.
+      * NO PK (any_col, no pk_col/pk_cols): page by `any_col` (ORDER BY col LIMIT batch). A
+        non-key column still terminates, but a pass deletes ALL rows sharing the <= batch
+        DISTINCT values selected, so a value with many duplicates can exceed the per-txn cap.
+        ADAPTIVE SHRINK: on a DSQL row/size-limit error (54000 'transaction too large') the
+        batch is HALVED and the pass retried, down to a single key value; if ONE value still
+        has > DSQL_MAX_ROWS_PER_TXN rows we fail with a clear message (that single value cannot
+        be deleted in one DSQL transaction — the table needs a surrogate key or drop+recreate).
+
+    DSQL has NO ctid, so we never use it. Returns total rows deleted.
 
     SAFETY: caller (assert_empty_or_register under AUTO_REBLANK_ON_RESUME) only invokes
     this for a table THIS pipeline previously attempted; it never runs against an
     untouched customer table. Idempotent: re-running finds fewer/zero rows. Retries
     OCC/XX000/pipe per batch (bounded)."""
+    # Composite PK -> page by the full key tuple (never by one non-unique column).
+    _pkc = [c for c in (pk_cols or []) if c]
+    if len(_pkc) >= 2:
+        return blank_whole_table_composite(dsql_schema, dsql_table, _pkc, batch=batch)
+
     batch = max(MIN_CHUNK_SIZE, min(int(batch), DSQL_MAX_ROWS_PER_TXN))
-    key = pk_col or any_col
+    key = pk_col or (_pkc[0] if _pkc else None) or any_col
     if not key:
         raise Exception(
             f"blank_whole_table [{dsql_schema}.{dsql_table}]: no column to page by "
-            f"(need pk_col or any_col). Cannot safely batch-delete — refuse rather than "
-            f"risk an unbounded DELETE exceeding the DSQL per-transaction limit.")
+            f"(need pk_col, pk_cols or any_col). Cannot safely batch-delete — refuse rather "
+            f"than risk an unbounded DELETE exceeding the DSQL per-transaction limit.")
     col = f'"{key}"'
+    # A single-column PK pages one unique value per row, so a window of <= batch key values is
+    # exactly <= batch rows and can never trip the row cap. A NO-PK table pages by a possibly-
+    # duplicated column, so a window can delete more rows than key values -> allow adaptive
+    # shrink on the row/size cap only in that case.
+    _unique_key = bool(pk_col) or (len(_pkc) == 1)
     conn = connect_dsql()
     conn.autocommit = False
     total = 0
     try:
         while True:
             occ_attempt = server_attempt = pipe_attempt = 0
+            cur_batch = batch
             while True:
                 try:
                     c = conn.cursor()
@@ -1977,7 +2031,7 @@ def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=
                         c.execute(
                             f'DELETE FROM {dsql_schema}.{dsql_table} '
                             f'WHERE {col} IN (SELECT {col} FROM {dsql_schema}.{dsql_table} '
-                            f'ORDER BY {col} LIMIT {int(batch)})')
+                            f'ORDER BY {col} LIMIT {int(cur_batch)})')
                         deleted = c.rowcount or 0
                         conn.commit()
                     finally:
@@ -1991,6 +2045,143 @@ def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=
                         conn.rollback()
                     except Exception:
                         pass
+                    # ADAPTIVE SHRINK (no-PK path): the window of <= cur_batch DISTINCT values
+                    # held more than the DSQL per-txn row/size cap (duplicate-heavy column).
+                    # Halve the window and retry; a window of 1 that STILL trips the cap means
+                    # one key value alone exceeds the cap -> unrecoverable here, fail clearly.
+                    if (not _unique_key) and is_dsql_txn_too_large(e):
+                        if int(cur_batch) <= 1:
+                            raise Exception(
+                                f"blank_whole_table [{dsql_schema}.{dsql_table}]: a SINGLE "
+                                f"value of the paging column '{key}' maps to more rows than "
+                                f"DSQL's per-transaction limit (~{DSQL_MAX_ROWS_PER_TXN} rows "
+                                f"/ 10 MiB), so this no-PK table cannot be batch-deleted by "
+                                f"'{key}'. Add a unique/primary key (or a more selective "
+                                f"column) to page by, or DROP and recreate the target. "
+                                f"Underlying error: {e}")
+                        cur_batch = max(1, int(cur_batch) // 2)
+                        print(f"    ↪ reblank {dsql_schema}.{dsql_table}: DSQL txn too large "
+                              f"on a '{key}' window -> halving batch to {cur_batch} and "
+                              f"retrying")
+                        continue
+                    if is_occ_conflict(e) and occ_attempt < OCC_MAX_RETRIES:
+                        occ_attempt += 1
+                        time.sleep(occ_backoff_seconds(occ_attempt))
+                        continue
+                    if is_transient_server_error(e) and server_attempt < SERVER_MAX_RETRIES:
+                        server_attempt += 1
+                        time.sleep(server_backoff_seconds(server_attempt))
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = connect_dsql()
+                        conn.autocommit = False
+                        continue
+                    if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
+                        pipe_attempt += 1
+                        time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        _invalidate_dsql_token()   # drop => fresh token (heals 08006)
+                        conn = connect_dsql()
+                        conn.autocommit = False
+                        continue
+                    raise
+            total += deleted
+            if deleted == 0:
+                break
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return total
+
+
+def blank_whole_table_composite(dsql_schema, dsql_table, key_cols, batch=2000):
+    """B15: blank an ENTIRE composite-PK target table in DSQL-limit-safe batches, paging by
+    the FULL key tuple so each transaction deletes EXACTLY the <= batch rows it selected
+    (never every row sharing one non-unique column's value).
+
+    Per pass:
+      1. SELECT the next `batch` whole-key tuples ordered by every key column
+         (SELECT "k1","k2",... FROM t ORDER BY "k1","k2",... LIMIT batch). Each tuple is a
+         full primary key -> identifies exactly one row.
+      2. DELETE exactly those rows with an OR-of-ANDs on the full key:
+         DELETE FROM t WHERE ("k1"=%s AND "k2"=%s ...) OR (...) OR ...   (pg8000 %s binds,
+         so values of any type are passed safely with no literal-escaping).
+      So N selected tuples delete N rows -> every txn is <= batch (<= DSQL_MAX_ROWS_PER_TXN)
+      rows regardless of how skewed any single column is.
+
+    PORTABLE form: a VALUES/row-value IN ((a,b) IN (VALUES ...)) would be terser, but DSQL's
+    support for multi-column row-value IN is not something this code can verify offline, so we
+    use the always-supported OR-of-ANDs on the full key (the same per-key WHERE the composite
+    CDC job uses, batched). Returns total rows deleted. Retries OCC/XX000/pipe per batch; on a
+    DSQL row/size-limit error (54000) the batch is halved and retried (down to 1 tuple)."""
+    key_cols = [c for c in (key_cols or []) if c]
+    if len(key_cols) < 2:
+        raise Exception(
+            f"blank_whole_table_composite [{dsql_schema}.{dsql_table}]: expected a composite "
+            f"(>=2 column) key, got {key_cols!r}.")
+    batch = max(MIN_CHUNK_SIZE, min(int(batch), DSQL_MAX_ROWS_PER_TXN))
+    quoted = ", ".join(f'"{c}"' for c in key_cols)
+    conn = connect_dsql()
+    conn.autocommit = False
+    total = 0
+    try:
+        while True:
+            occ_attempt = server_attempt = pipe_attempt = 0
+            cur_batch = batch
+            while True:
+                try:
+                    c = conn.cursor()
+                    try:
+                        # (1) next window of whole-key tuples (ORDER BY the full key).
+                        c.execute(
+                            f'SELECT {quoted} FROM {dsql_schema}.{dsql_table} '
+                            f'ORDER BY {quoted} LIMIT {int(cur_batch)}')
+                        tuples = c.fetchall() or []
+                        if not tuples:
+                            deleted = 0
+                            conn.commit()
+                            break
+                        # (2) delete EXACTLY those tuples: OR-of-ANDs on the full key, bound
+                        # params (%s) so every value type is passed safely.
+                        one_key = "(" + " AND ".join(f'"{k}" = %s' for k in key_cols) + ")"
+                        where = " OR ".join([one_key] * len(tuples))
+                        params = [v for row in tuples for v in row]
+                        c.execute(
+                            f'DELETE FROM {dsql_schema}.{dsql_table} WHERE {where}', params)
+                        deleted = c.rowcount or 0
+                        conn.commit()
+                    finally:
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
+                    break
+                except Exception as e:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    # ADAPTIVE SHRINK: a window of cur_batch whole-key tuples is cur_batch rows,
+                    # so this should not trip the ROW cap; but a very wide composite row could
+                    # still trip the 10 MiB SIZE cap. Halve and retry down to a single tuple.
+                    if is_dsql_txn_too_large(e):
+                        if int(cur_batch) <= 1:
+                            raise Exception(
+                                f"blank_whole_table_composite [{dsql_schema}.{dsql_table}]: a "
+                                f"single row exceeds DSQL's per-transaction size limit "
+                                f"(~10 MiB) even deleted alone. DROP and recreate the target "
+                                f"instead. Underlying error: {e}")
+                        cur_batch = max(1, int(cur_batch) // 2)
+                        print(f"    ↪ composite reblank {dsql_schema}.{dsql_table}: DSQL txn "
+                              f"too large -> halving batch to {cur_batch} and retrying")
+                        continue
                     if is_occ_conflict(e) and occ_attempt < OCC_MAX_RETRIES:
                         occ_attempt += 1
                         time.sleep(occ_backoff_seconds(occ_attempt))
@@ -2029,7 +2220,7 @@ def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=
 
 
 def assert_empty_or_register(dsql_schema, dsql_table, resume_ok=False, pk_col=None,
-                             any_col=None):
+                             any_col=None, pk_cols=None):
     """EMPTY-TARGET SAFETY BARRIER — the ONE place the whole-table empty check lives.
 
     Verifies the target table is empty in DSQL and records it as empty-verified for
@@ -2069,12 +2260,15 @@ def assert_empty_or_register(dsql_schema, dsql_table, resume_ok=False, pk_col=No
         # gate brings the table to EXACTLY the source count. NEVER runs for a table without
         # a prior marker (resume_ok=False), so pre-existing customer data is never deleted.
         if resume_ok and AUTO_REBLANK_ON_RESUME:
+            _is_composite = len([c for c in (pk_cols or []) if c]) >= 2
             print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: target non-empty AND "
                   f"previously-attempted by this pipeline -> auto-reblanking whole table "
                   f"(batched DELETE) then reloading from scratch (no-dup/no-loss via "
-                  f"source-count gate). pk_col={pk_col!r}")
+                  f"source-count gate). pk_col={pk_col!r} "
+                  f"pk_cols={[c for c in (pk_cols or []) if c] or None!r}"
+                  + (" [composite: paging by the FULL key tuple]" if _is_composite else ""))
             removed = blank_whole_table(dsql_schema, dsql_table, pk_col=pk_col,
-                                        any_col=any_col)
+                                        any_col=any_col, pk_cols=pk_cols)
             print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: cleared {removed:,} prior "
                   f"row(s); table now empty for a clean reload")
             # Re-verify empty after the reblank before registering (defensive).
@@ -2890,7 +3084,8 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
         _v5_any = target_columns[0] if target_columns else None
         assert_empty_or_register(dsql_schema, dsql_table,
                                  resume_ok=_resume_ok_for(dsql_schema, dsql_table),
-                                 pk_col=_v5_pk, any_col=_v5_any)
+                                 pk_col=_v5_pk, any_col=_v5_any,
+                                 pk_cols=_v5_pk_cols)
 
     # ---- STREAM rows from Spark (bounded driver memory) ----
     row_iter = df.toLocalIterator()
@@ -3881,7 +4076,8 @@ def load_one_table_parallel(s3_client, entry, config, pk_col, min_id, max_id, to
         assert_empty_or_register(dsql_schema, dsql_table,
                                  resume_ok=_resume_ok_for(dsql_schema, dsql_table),
                                  pk_col=pk_col,
-                                 any_col=(target_columns[0] if target_columns else None))
+                                 any_col=(target_columns[0] if target_columns else None),
+                                 pk_cols=([pk_col] if pk_col else None))
 
     # Plan ranges with the KIND-appropriate planner (all return half-open [lo,hi)).
     if pk_kind == "uuid":
@@ -4190,7 +4386,8 @@ def load_one_table_chunked(s3_client, entry, config):
         assert_empty_or_register(dsql_schema, dsql_table,
                                  resume_ok=resume_ok,
                                  pk_col=(_pk_cols[0] if has_single_pk else None),
-                                 any_col=(target_columns[0] if target_columns else None))
+                                 any_col=(target_columns[0] if target_columns else None),
+                                 pk_cols=_pk_cols)
         done_map, started_set, prior_done_rows = {}, set(), 0
 
     # Decide, per file, what to do.
