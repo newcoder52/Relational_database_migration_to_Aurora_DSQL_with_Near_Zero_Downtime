@@ -353,6 +353,13 @@ CDC_DRIFT_CHECK_MINUTES = 30     # G9: minutes between live-count-vs-expected ch
 CDC_DRIFT_TOLERANCE = 0.0        # G9: allowed |live − expected| row difference before firing
 CDC_DRIFT_ACTION = "warn"        # G9: "warn" (log+metric+audit) or "block" (also set 'blocked')
 _DRIFT_LAST_RUN = {}             # G9: per-table monotonic clock of the last drift check (throttle)
+# G9 DRIFT BASELINE: per-table full-load row count harvested from each _load_status.json's
+# "rows" field (same source Job 2 writes). The drift expectation is
+# full_load_rows + inserts_applied − deletes_applied; without the full-load baseline the
+# expectation omits every row the full load inserted and drift fires a FALSE +N alarm (B/G9).
+# cdc_status.full_load_rows is seeded from this map once (idempotent) by process_table so the
+# expectation is correct and persists. Merged newest-wins alongside the status map.
+_FULL_LOAD_ROWS = {}             # {label: int full-load row count from _load_status.json}
 # EASE-GUARDRAILS: master mode + per-guard WARN/block knobs. In "warn" (default) a soft guard
 # NEVER blocks a table for its own bookkeeping — it logs a WARNING + a DsqlGuardWarn metric and
 # keeps applying. "strict" restores the fail-closed (block) behaviour. The HARD G6 mass-delete
@@ -1521,6 +1528,25 @@ def _advance_cdc_counters(cur, label, n_insert, n_delete):
         (int(n_insert or 0), int(n_delete or 0), label))
 
 
+def _seed_full_load_rows_cur(cur, label):
+    """G9 DRIFT BASELINE: write cdc_status.full_load_rows = the table's full-load row count
+    (from _load_status.json, harvested into _FULL_LOAD_ROWS) IF it is still unset (NULL).
+
+    Without this the drift expectation (full_load_rows + inserts − deletes) omits every row the
+    full load inserted, so the FIRST drift check fires a false '+<full_load_rows>' alarm
+    (the composite name_data run logged delta +6,955 == its 6,955-row full load). Idempotent:
+    only sets a NULL -> never clobbers a real value, so re-running is safe and it never
+    double-counts. Writes only when we actually know the baseline (label present in
+    _FULL_LOAD_ROWS). Runs in the caller's txn (the one-time ensure_status_row op)."""
+    baseline = _FULL_LOAD_ROWS.get(label)
+    if baseline is None:
+        return
+    cur.execute(
+        f'UPDATE {CONTROL_SCHEMA}.cdc_status '
+        f'SET full_load_rows = %s WHERE table_name = %s AND full_load_rows IS NULL',
+        (int(baseline), label))
+
+
 def _maybe_run_drift_check(conn_holder, label, dsql_schema, dsql_table):
     """G9 drift detector, run periodically (every CDC_DRIFT_CHECK_MINUTES) per table. Reads the
     live DSQL count and the tracked expectation (full_load_rows + inserts_applied −
@@ -2279,10 +2305,22 @@ def load_table_config(entry):
 
 
 def _read_load_status_doc(bucket, key):
-    """Read ONE _load_status.json -> (last_modified, {label: status}). Raises on any error."""
+    """Read ONE _load_status.json -> (last_modified, {label: status}). Raises on any error.
+
+    SIDE EFFECT (G9): also harvests each table's full-load "rows" count into the module-level
+    _FULL_LOAD_ROWS map so the drift baseline (full_load_rows) can be seeded. Caller merges
+    files oldest-first, so a later file's row count overwrites an earlier one (newest wins),
+    matching the status merge. A missing/non-numeric "rows" is skipped (leaves any prior value)."""
     obj = s3.get_object(Bucket=bucket, Key=key)
     doc = json.loads(obj['Body'].read().decode('utf-8'))
     tables = doc.get('tables', {}) if isinstance(doc, dict) else {}
+    for k, v in tables.items():
+        rows = (v or {}).get('rows')
+        if rows is not None:
+            try:
+                _FULL_LOAD_ROWS[k] = int(rows)
+            except (TypeError, ValueError):
+                pass
     return obj.get('LastModified'), {k: (v or {}).get('status') for k, v in tables.items()}
 
 
@@ -4666,6 +4704,7 @@ def process_table(ctx, load_status_map=None):
         # full control-op retry set.
         def _ensure_row(c):
             ensure_status_row_cur(c, label)
+            _seed_full_load_rows_cur(c, label)   # G9: seed the drift baseline (idempotent)
             conn_holder[0].commit()
         run_control_op(conn_holder, label, _ensure_row, "ensure_status_row")
 
