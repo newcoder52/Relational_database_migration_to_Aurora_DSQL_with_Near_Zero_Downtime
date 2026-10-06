@@ -135,3 +135,108 @@ test_iam_policies 158 · test_planning_settings 58/58
 
 Non-runtime: `RUNBOOK.md`, `docs/MANUAL_SETUP.md`, `docs/IAM_POLICY_NOTES.md` (new),
 `config/params.example.csv`, `config/pipeline.example.json`, `tests/*`.
+
+---
+
+<!-- B23 fix (rebased on top of the ease-guardrails + B22 fix) -->
+
+# RESULT — fix B23 (`ForkCdcStartNotConfirmed` is a false failure for every fork)
+
+**Base commit:** `cbb85014722379e4319c05df45e212accdb105be` was HEAD when this fix started
+(verified with `git ls-remote`); the concurrent **ease-guardrails + B22** fix landed meanwhile, so
+this fix was rebased onto `d1bd703483a45bb2929e661f67ab82a8ac0de8c1` (both sides kept).
+**Fix commit (runtime + tests + RUNBOOK):** `__FIX_SHA__`
+
+---
+
+## Root cause (confirmed by reading the code)
+
+The startup state machine confirms a CDC run started by polling for a marker in S3. For the
+**forks** it polled the wrong prefix:
+
+- `stepfunctions/startup.asl.json` → `StartForkCdcMap/CheckForkStarted` polled the **task-level**
+  key `config/_task/<suffix>/_cdc_started/<exec>-ck-<slug>.json`.
+- But the same Map starts each fork's CDC job with `--config_prefix` = the **fork** prefix
+  (`plan_split` emits `s3://<bucket>/<task cp>/_orchestrator/ck-<slug>/` for ck forks and
+  `.../_orchestrator/bg-<slug>/` for bg forks).
+- `glue_cdc_composite.py` / `glue_cdc_continuous.py` → `write_started_marker()` writes
+  `<CONFIG_PREFIX>_cdc_started/<token>.json`, i.e. under the **fork** prefix.
+
+So the workflow polled `config/_task/<suffix>/_cdc_started/…` while the fork wrote
+`…/_orchestrator/ck-<slug>/_cdc_started/…`. They never matched; the Map iteration waited its full
+45-min budget (90 × 30 s) and raised `ForkCdcStartNotConfirmed`, **while the fork CDC job was
+actually RUNNING and applying changes.** The main CDC job is unaffected (its `--config_prefix` IS
+the task prefix, so its poll matches).
+
+**Both fork kinds are affected.** `StartForkCdcMap` iterates all of `$.plan.forks` — composite
+(`ck`, `glue_cdc_composite.py`) and big-table (`bg`, `glue_cdc_continuous.py`) — through the same
+`CheckForkStarted`, so bg forks had the identical mismatch. Confirmed by `tests/test_marker_paths.py`
+(ck and bg both exercised against the real `plan_split` output and the real ASL templates).
+
+---
+
+## Fix (robust; what was chosen and why)
+
+**1 — Preferred: the workflow polls the fork's OWN prefix.** ASL intrinsics can't strip an
+arbitrary `s3://bucket/` cleanly, so `lambdas/plan_split.py` now emits **`config_prefix_key`** for
+every fork — the bare S3 key of that fork's `config_prefix` with the trailing slash (ck:
+`<task cp>/_orchestrator/ck-<slug>/`; bg: derived from the fork's `config_prefix` via
+`_split_s3_uri`). `startup.asl.json` passes `config_prefix_key` into the Map item and
+`CheckForkStarted` builds the poll key as
+`States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug)` —
+exactly where the fork CDC script writes it. (The `-ck-` token is self-consistent: the ASL passes
+the same `<exec>-ck-<slug>` string as `--startup_execution`, so write and poll use one token for
+both ck and bg forks.)
+
+**2 — Belt-and-suspenders: the CDC scripts also write a TASK-level copy.** When `--cdc_owners_key`
+is present (it is baked into every fork CDC job as a default argument by `create_glue_jobs`, =
+`config/_task/<suffix>/_jobs.json`), `write_started_marker()` writes a **second** copy of the
+marker under the task-level `_cdc_started/` (derived from `cdc_owners_key`'s dirname). This means
+an **older/unpatched** workflow — one still polling the task-level key — also confirms. The main
+CDC run writes only once (its `CONFIG_PREFIX` already is the task prefix). Done in both
+`glue_cdc_composite.py` and `glue_cdc_continuous.py`.
+
+**3 — `_latest.json` LastModified fallback: deliberately NOT added.** It was marked optional
+("only if it's simple"). It isn't simpler than the two fixes above (it needs an extra Map state
+plus a HEAD/timestamp compare that ASL does awkwardly), and the exact-token poll under the fork's
+own prefix is already deterministic and covered by the task-level dual-write for old workflows.
+Skipping it keeps the change minimal.
+
+### After the fix, what the error means
+`ForkCdcStartNotConfirmed` now only fires when a fork CDC run genuinely did not reach its poll
+loop within 45 min. RUNBOOK §8 and `~/Downloads/review3d/fix-b23/OPERATOR_CHECK.md` explain how to
+tell the (now impossible) false alarm from a real failure and that **re-triggering the fleet is
+not needed** when the fork run is RUNNING (the task is past full load; cutover finds the fork jobs
+by tag).
+
+---
+
+## Tests
+
+`tests/test_marker_paths.py` (new). For MAIN, one CK fork and one BG fork it builds the real plan
+with the real `plan_split`, derives the exact S3 Prefix each confirmation state polls by evaluating
+the real ASL `States.Format(...)` against the args the Map/StartCdcJob passes, derives the keys
+`write_started_marker()` writes from the same args, and asserts the polled key is one the script
+writes. Includes:
+- a **negative** test that reconstructs the pre-fix task-level poll and proves it did NOT match a
+  fork marker (today's bug) — fails if anyone reverts the ASL to the task-level prefix;
+- a **positive** test that the fixed fork-prefix poll matches;
+- a **back-compat** test that the task-level dual-write makes the old task-level poll match too.
+
+All suites green (2nd fresh clone verified):
+`test_asl_paths, test_asl_payload_contract, test_marker_paths, test_guardrails, test_e2e_fixes,
+test_b17_b13, test_b18_validate_throughput, test_docs_params, test_fix6, test_existing_roles,
+test_planning_settings`.
+
+---
+
+## Runtime files changed
+```
+lambdas/plan_split.py            (emit config_prefix_key for ck + bg forks)
+scripts/glue_cdc_composite.py    (task-level dual-write of start marker; _task_marker_prefix_key)
+scripts/glue_cdc_continuous.py   (same, covers main + bg forks)
+stepfunctions/startup.asl.json   (CheckForkStarted polls the fork's own config_prefix_key)
+```
+Non-runtime: `RUNBOOK.md` (§8 `ForkCdcStartNotConfirmed` row), `tests/test_marker_paths.py`.
+`glue-templates/`: none. No IAM change (the fork CDC jobs already write the fork prefix today, and
+the Glue role already has task-prefix write access used by the main CDC marker).

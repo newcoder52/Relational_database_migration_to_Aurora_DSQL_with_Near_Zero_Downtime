@@ -37,6 +37,7 @@ Returns: { "groups": [ { "group_index", "config_prefix", "kind", "is_fork", "tab
             "rows", "num_files", "load_args": {...}, "loadJobName", "loadBigJobName",
             "validateJobName" } , ... ],
            "forks": [ { "kind":"ck"|"bg", "fork_slug", "fork_table", "config_prefix",
+                        "config_prefix_key",
                         "cdcJobName", (ck:) "loadJobName","validateJobName","loadRole" }, ... ],
            "cdcOwners": { "<schema.table>": "main"|"ck-<slug>"|"bg-<slug>" },
            "group_count", "fork_count", "bgOverflow", "warnings", "state_key" }
@@ -384,6 +385,12 @@ def handler(event, context):
             "fork_hash": h8,
             "fork_table": m["label"],
             "config_prefix": f"s3://{bucket}/{fork_prefix}/",
+            # B23: the BARE S3 key (no "s3://bucket/", trailing slash) of this fork's own
+            # config_prefix. The startup state machine polls the fork's start marker under THIS
+            # key (<config_prefix_key>_cdc_started/<token>.json) — the same prefix the fork's CDC
+            # script writes it to. ASL intrinsics can't strip an arbitrary bucket cleanly, so we
+            # emit the bare key here.
+            "config_prefix_key": f"{fork_prefix}/",
             "rows": m["rows"],
             "num_files": nfiles,
             "load_args": load_args,
@@ -445,6 +452,10 @@ def handler(event, context):
             "fork_hash": h8,
             "fork_table": m["label"],
             "config_prefix": cdc_cp,
+            # B23: bare S3 key (no "s3://bucket/", trailing slash) of this bg fork's own
+            # config_prefix, so the state machine polls the start marker under the SAME prefix
+            # the bg CDC script (glue_cdc_continuous.py) writes it to. cdc_cp is a full s3:// URI.
+            "config_prefix_key": _split_s3_uri(cdc_cp)[1].rstrip("/") + "/",
             "rows": m["rows"],
             "num_files": m["num_files"],
             "cdcJobName": _fork_job_name(project, task_suffix, slug, h8, "cdc", infix=_BIG_FORK_INFIX),

@@ -1463,13 +1463,14 @@
     },
     "StartForkCdcMap": {
       "Type": "Map",
-      "Comment": "Start EACH composite fork's CDC job (ck-<slug>-cdc) next to the main CDC job, and confirm each wrote its own start marker (_cdc_started/<exec>-ck-<slug>.json). Empty $.plan.forks (no composite tables) -> no iterations, straight to TaskSucceeded. Any fork that does not confirm -> ForkCdcStartNotConfirmed.",
+      "Comment": "Start EACH composite (ck) and big-table (bg) fork's CDC job next to the main CDC job, and confirm each wrote its own start marker under the fork's OWN config_prefix (<config_prefix_key>_cdc_started/<exec>-ck-<slug>.json). Empty $.plan.forks (no fork tables) -> no iterations, straight to TaskSucceeded. Any fork that does not confirm -> ForkCdcStartNotConfirmed. B23: the marker is polled under the fork prefix (where the fork CDC script writes it), not the task-level _cdc_started/.",
       "ItemsPath": "$.plan.forks",
       "MaxConcurrency": 4,
       "Parameters": {
         "fork_slug.$": "$$.Map.Item.Value.fork_slug",
         "cdcJobName.$": "$$.Map.Item.Value.cdcJobName",
         "config_prefix.$": "$$.Map.Item.Value.config_prefix",
+        "config_prefix_key.$": "$$.Map.Item.Value.config_prefix_key",
         "taskArn.$": "$.taskArn",
         "cdcRoot.$": "$.resolved.cdcRoot",
         "timestampColumnName.$": "$.resolved.timestampColumnName",
@@ -1534,10 +1535,10 @@
           "CheckForkStarted": {
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
-            "Comment": "Confirm this fork's CDC run reached its poll loop: config/_task/<task>/_cdc_started/<exec>-ck-<slug>.json.",
+            "Comment": "B23: confirm this fork's CDC run reached its poll loop by polling the marker under the fork's OWN config_prefix (<config_prefix_key>_cdc_started/<exec>-ck-<slug>.json) — the SAME prefix the fork CDC script writes it to (its CONFIG_PREFIX is the fork prefix). The old check polled the TASK-level _cdc_started/, which the fork never writes, so every fork fell to ForkCdcStartNotConfirmed after 45 min while the fork CDC job was actually running.",
             "Parameters": {
               "Bucket": "<<BUCKET>>",
-              "Prefix.$": "States.Format('config/_task/{}/_cdc_started/{}-ck-{}.json', $.taskSuffix, $.execName, $.fork_slug)"
+              "Prefix.$": "States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug)"
             },
             "ResultSelector": {
               "keyCount.$": "$.KeyCount"
@@ -1611,7 +1612,7 @@
           "ForkCdcNotConfirmed": {
             "Type": "Fail",
             "Error": "ForkCdcStartNotConfirmed",
-            "Cause": "A composite fork's CDC run did not start/confirm within the budget. The main CDC job is running; investigate the fork CDC job before cutover."
+            "Cause": "A fork's CDC run did not start/confirm within the 45-min budget. The main CDC job is running; investigate this fork CDC job before cutover. Its start marker is written under the fork's OWN prefix (<fork config_prefix>_cdc_started/<exec>-ck-<slug>.json), e.g. .../_orchestrator/ck-<slug>/_cdc_started/, NOT the task-level _cdc_started/. Confirm the fork CDC job run is RUNNING in Glue; if it is, the task is fine (full load is done) and the fleet does NOT need re-triggering — cutover finds the fork jobs by tag."
           }
         }
       },

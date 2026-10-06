@@ -50,3 +50,42 @@ All suites green (fresh clone, offline): test_asl_paths (165), test_asl_payload_
 test_b17_b13 (24), test_b18_validate_throughput (27), test_docs_params (PASS), test_e2e_fixes (80),
 test_ease_guardrails (86), test_existing_roles (66), test_fix6 (51), test_guardrails (80),
 test_iam_policies (158), test_planning_settings (58/58).
+
+================================================================================================
+
+Task: fix B23 — startup `ForkCdcStartNotConfirmed` was a FALSE failure for every composite (ck)
+and big-table (bg) CDC fork. The workflow polled the start marker at the TASK-level key
+config/_task/<suffix>/_cdc_started/<exec>-ck-<slug>.json, but each fork CDC job runs with
+--config_prefix = its FORK prefix (.../_orchestrator/ck-<slug>/ or .../_orchestrator/bg-<slug>/)
+and write_started_marker() writes under <CONFIG_PREFIX>_cdc_started/. The poll never matched, the
+Map waited 45 min and failed, while the fork CDC job was actually RUNNING. Main CDC was fine (its
+config_prefix IS the task prefix).
+
+Fix:
+- plan_split.py now emits config_prefix_key (bare S3 key, trailing slash) for every ck and bg fork.
+- startup.asl.json CheckForkStarted now polls the fork's OWN prefix:
+  States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug).
+- Both CDC scripts (glue_cdc_composite.py, glue_cdc_continuous.py) ALSO write a second copy of the
+  start marker at the task level when --cdc_owners_key is present (its dirname is the task prefix),
+  so older/unpatched workflows confirm too. Main run still writes once.
+- Optional _latest.json LastModified fallback: deliberately not added (not simpler; the two fixes
+  above are deterministic and cover back-compat).
+
+Both fork kinds confirmed affected and fixed (ck + bg exercised in the new test).
+
+Base commit: cbb85014722379e4319c05df45e212accdb105be (HEAD when started); rebased onto
+             d1bd703483a45bb2929e661f67ab82a8ac0de8c1 (ease-guardrails + B22 landed meanwhile)
+Fix commit:  __FIX_SHA__
+
+Runtime files changed:
+  lambdas/plan_split.py
+  scripts/glue_cdc_composite.py
+  scripts/glue_cdc_continuous.py
+  stepfunctions/startup.asl.json
+  (glue-templates/: none; iam/: none)
+
+Non-runtime: RUNBOOK.md (§8 ForkCdcStartNotConfirmed row), tests/test_marker_paths.py
+
+All suites green (verified in a 2nd fresh clone): test_asl_paths, test_asl_payload_contract,
+test_marker_paths, test_guardrails, test_e2e_fixes, test_b17_b13, test_b18_validate_throughput,
+test_docs_params, test_fix6, test_existing_roles, test_planning_settings.

@@ -4841,12 +4841,35 @@ def _start_token():
     return _run_arg("startup_execution") or _run_arg("JOB_RUN_ID")
 
 
+def _task_marker_prefix_key():
+    """B23: the TASK-level config prefix (bare S3 key, trailing slash) for the second start-marker
+    copy, derived from --cdc_owners_key's dirname. cdc_owners_key is the task registry key
+    config/_task/<suffix>/_jobs.json (bare key or s3:// URI); its dirname is config/_task/<suffix>/.
+    Returns None when cdc_owners_key is absent (a top-level/main run needs no second copy — its
+    CONFIG_PREFIX already IS the task prefix)."""
+    _ok = CDC_OWNERS_KEY
+    if not _ok:
+        return None
+    _ok = str(_ok)
+    if _ok.startswith("s3://"):
+        _ok = _ok[len("s3://"):].partition("/")[2]
+    _ok = _ok.lstrip("/")
+    _dir = _ok.rsplit("/", 1)[0] if "/" in _ok else ""
+    return (_dir + "/") if _dir else ""
+
+
 def write_started_marker():
     """Tell the startup workflow this run really started: written once, when the run reaches
     its poll loop (drivers installed, DSQL reachable, control tables and manifest loaded).
     Key: <CONFIG_PREFIX>_cdc_started/<start token>.json (+ _latest.json). The workflow waits for
     it before reporting success. Never raises: a failed write only means the workflow reports
-    CdcStartNotConfirmed while this run keeps applying changes."""
+    CdcStartNotConfirmed while this run keeps applying changes.
+
+    B23: a FORK run's CONFIG_PREFIX is the fork prefix (.../_orchestrator/ck-<slug>/), so the
+    marker lands there. The fixed workflow polls exactly that prefix. But to also confirm start
+    for OLDER (unpatched) workflows — which polled the TASK-level config/_task/<suffix>/_cdc_started/
+    — write a SECOND copy there whenever --cdc_owners_key is present (its dirname is the task
+    prefix). A top-level/main run writes only once (its CONFIG_PREFIX already IS the task prefix)."""
     try:
         if not str(CONFIG_PREFIX).startswith("s3://"):
             print(f"  (start marker skipped: CONFIG_PREFIX {CONFIG_PREFIX!r} is not an s3:// path)", flush=True)
@@ -4857,14 +4880,24 @@ def write_started_marker():
                            "started_at": utc_now_iso(),
                            "config_prefix": CONFIG_PREFIX, "dms_task_arn": DMS_TASK_ARN,
                            "control_schema": CONTROL_SCHEMA, "cdc_job_kind": "composite"}, indent=1).encode("utf-8")
-        _keys = [_key + "_cdc_started/_latest.json"]
-        if _rid:
-            _keys.insert(0, _key + f"_cdc_started/{_rid}.json")
+        # Prefixes to write the marker under: the run's own CONFIG_PREFIX, plus (for a fork) the
+        # TASK-level prefix derived from --cdc_owners_key so an older workflow still confirms.
+        _marker_prefixes = [_key]
+        _task_key = _task_marker_prefix_key()
+        if _task_key and _task_key != _key:
+            _marker_prefixes.append(_task_key)
+        _keys = []
+        for _pfx in _marker_prefixes:
+            if _rid:
+                _keys.append(_pfx + f"_cdc_started/{_rid}.json")
+            _keys.append(_pfx + "_cdc_started/_latest.json")
         for _k in _keys:
             _s3_retry(lambda _k=_k: s3.put_object(Bucket=_bkt, Key=_k, Body=_doc,
                                                   ContentType="application/json"),
                       f"write {_k}")
-        print(f"  [startup] start marker written: s3://{_bkt}/{_keys[0]}", flush=True)
+        print(f"  [startup] start marker written: s3://{_bkt}/{_keys[0]}"
+              + (f" (+ task-level copy under {_task_key}_cdc_started/)" if len(_marker_prefixes) > 1 else ""),
+              flush=True)
     except Exception as _e:
         print(f"  ⚠️ start marker not written (non-fatal; CDC keeps running): {_e}", flush=True)
 
