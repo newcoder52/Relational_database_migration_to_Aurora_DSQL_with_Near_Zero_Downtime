@@ -1,31 +1,52 @@
-DONE
+Task: make the data-safety guardrails (added in 8825b41) never break a normal run, and fix B22
+(IAM MalformedPolicyDocument on setup).
 
-Task: fix B20 (cutover DeleteGlueJobs can't resolve the account id -> GlueJobsNotDeleted) and B21
-(composite CDC run slow to stop times the 300s delete Lambda out), both still present on current
-main.
+B22: iam/glue.json had a "_comment" INSIDE a Policy Statement (plus three doc-level "_comment"
+keys); IAM rejects put-role-policy with MalformedPolicyDocument, so every setup failed. Removed
+them (explanations moved to docs/IAM_POLICY_NOTES.md); tools/setup.sh split_iam and the
+MANUAL_SETUP fill-in step now strip any non-IAM key from TrustPolicy/Policy/VpcPolicy (and their
+Statements) before put-role-policy as a backstop. New tests/test_iam_policies.py asserts every
+Statement in iam/*.json carries only valid IAM keys and that both strip backstops work.
 
-B20: cutover DeleteGlueJobs now passes account_id (+ dms_task_arn), and create_glue_jobs
-_account_id falls back to the Lambda's own context ARN then STS, so delete/list_fork_cdc can never
-fail to resolve the account again. Extended the ASL payload-contract test with an INPUT-side check
-(ASL Parameters keys superset the keys each Lambda mode requires), with a B20 negative regression,
-and audited all 4 state machines for the same class of gap (none other found).
+Ease guardrails (principle: a guard may only STOP a destructive action; it must NEVER fail a run
+for its own bookkeeping — a missing permission, missing control table, a lock it can't take, or a
+check it can't compute):
+- New master setting guardrails_mode = warn (default) | strict, plumbed params.csv -> pipeline.json
+  -> resolve_task -> create_glue_jobs -> load/validate/CDC job args, with per-guard knobs
+  cdc_file_order_action (G8), cdc_nopk_overmatch_action (G7), validate_count_check /
+  cutover_count_check (G10). strict restores fail-closed.
+- HARD G1/G4/G6 still refuse the destructive op (and only that op; the per-table loop keeps the run
+  going). SOFT G2/G3/G5/G7/G8/G9/G10 warn + continue by default; each guard call is wrapped so an
+  exception can't raise into the main path.
+- G2 missing states:DescribeExecution no longer fails a reblank; G3 warns+proceeds on a bookkeeping
+  lock failure and skips only on a live holder; G7/G8 warn+apply; G10 mismatch is a WARNING and
+  validate/cutover still pass. All reversible via guardrails_mode=strict or the per-guard setting.
+- New control bookkeeping (cdc_control_lock, audit_log, cdc_status counters) is add-if-missing (no
+  DEFAULT-on-ALTER, B17-safe); a create/upgrade failure warns and continues.
+- Shared CDC helpers (incl. new guard_action_blocks / emit_guard_warn_metric) stay byte-identical
+  across the continuous + composite engines.
 
-B21: _wait_runs_stopped is bounded by context.get_remaining_time_in_millis() and delete mode
-returns still-stopping jobs under "pending" (force-stopped, not deleted); cutover.asl.json loops
-DeleteGlueJobs (Wait -> delete) up to a ~60-min budget, then ends in GlueJobsNotDeleted naming the
-jobs. glue_cdc_composite.py reacts to a stop promptly (interruptible wait + SIGTERM handler); the
-root cause of the slow stop (a 30s uninterruptible poll sleep) is documented.
-
-Base commit: 0d7d2d86dda7c97ae893c366781fd3980f4d4deb (docs-only above 8825b41)
-Fix commit:  6c5c4f74aee970f5f2841a66247b4adb068df988
+Base commit: cbb85014722379e4319c05df45e212accdb105be (git ls-remote main HEAD)
+Fix commit:  1d3ed4c98be6aa4b74d56e02b0095d3501a09f63
 
 Runtime files changed:
-  lambdas/create_glue_jobs.py
+  scripts/job2_load.py
+  scripts/glue_cdc_continuous.py
   scripts/glue_cdc_composite.py
-  stepfunctions/cutover.asl.json
+  scripts/job3_validate.py
+  lambdas/params_csv.py
+  lambdas/resolve_task.py
+  lambdas/create_glue_jobs.py
+  stepfunctions/startup.asl.json
+  iam/glue.json, iam/lambda.json, iam/stepfunctions.json
+  tools/setup.sh
   (glue-templates/: none)
 
-Non-runtime: RUNBOOK.md, tests/test_asl_payload_contract.py, tests/test_e2e_fixes.py
+Non-runtime: RUNBOOK.md, docs/MANUAL_SETUP.md, docs/IAM_POLICY_NOTES.md (new),
+config/params.example.csv, config/pipeline.example.json, tests/test_guardrails.py,
+tests/test_ease_guardrails.py (new), tests/test_iam_policies.py (new).
 
-All required suites green: test_asl_paths, test_asl_payload_contract, test_guardrails,
-test_e2e_fixes, test_b17_b13, test_b18_validate_throughput, test_docs_params, test_fix6.
+All suites green (fresh clone, offline): test_asl_paths (165), test_asl_payload_contract (165),
+test_b17_b13 (24), test_b18_validate_throughput (27), test_docs_params (PASS), test_e2e_fixes (80),
+test_ease_guardrails (86), test_existing_roles (66), test_fix6 (51), test_guardrails (80),
+test_iam_policies (158), test_planning_settings (58/58).

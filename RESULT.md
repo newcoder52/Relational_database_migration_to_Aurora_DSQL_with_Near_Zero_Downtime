@@ -1,122 +1,137 @@
-# RESULT — fix B20 (cutover can't delete Glue jobs) + B21 (composite CDC slow to stop times out the delete Lambda)
+# RESULT — ease the G1–G10 guardrails (never fail a normal run) + fix B22 (IAM MalformedPolicyDocument)
 
-**Commit base:** main HEAD `0d7d2d86dda7c97ae893c366781fd3980f4d4deb` (one docs-only commit above
-`8825b41`, verified with `git ls-remote`; built on the actual HEAD).
-**Fix commit (runtime + tests + RUNBOOK):** `6c5c4f74aee970f5f2841a66247b4adb068df988`.
+**Commit base:** main HEAD `cbb85014722379e4319c05df45e212accdb105be` (verified with
+`git ls-remote`; built on the actual HEAD).
+**Fix commit (runtime + tests + docs):** `1d3ed4c98be6aa4b74d56e02b0095d3501a09f63`.
 
-Both bugs were found on real AWS at `5e4adf8` and are still present on `0d7d2d8` — the cutover SM
-`DeleteGlueJobs` payload and `create_glue_jobs` delete-mode on current main are byte-for-byte the
-same code path that failed.
+Guiding principle (USER DECISION — "the guardrails are causing issues, ease up and make sure the
+scripts do not fail"): **a guardrail may only ever STOP a destructive action** (deleting or
+emptying target rows). It must **never fail a load, validate, CDC or cutover run** because of its
+own bookkeeping — a missing permission, a missing control table, a lock it can't take, or a check
+it can't compute. A new master setting `guardrails_mode = warn | strict` (default `warn`) toggles
+fail-closed for operators who want it.
 
 ---
 
-## B20 (HIGH) — cutover `DeleteGlueJobs` can't resolve the account id
+## B22 (deploy blocker, found on real AWS) — `_comment` inside IAM Statement objects
 
-**Root cause.** `cutover.asl.json`'s `DeleteGlueJobs` passed only
-`{mode, bucket, project, taskSuffix}`. `create_glue_jobs` delete mode calls `_account_id(event)`,
-which read only `event["account_id"]` or field 4 of `event["dms_task_arn"]`. It got neither, so
-`_account_id` returned `""` and the handler raised `delete: cannot resolve account id to read job
-tags.` (the account id is needed to build Glue job ARNs for the `get_tags` lookup that selects the
-task's jobs by exact tag). Cutover therefore ended in `GlueJobsNotDeleted` with the migration cut
-over but the Glue jobs orphaned.
-
-**Fix.**
-1. `stepfunctions/cutover.asl.json` — `DeleteGlueJobs` now also passes
-   `"dms_task_arn.$": "$.taskArn"` (the cutover start input always carries `taskArn`) and
-   `"account_id.$": "$.resolved.accountId"` (cutover-mode `resolve_task` emits `accountId`), plus
-   `region.$`/`configPrefix.$` so the delete uses the same account + registry key as the earlier
-   `ListForkCdcJobs`.
-2. `lambdas/create_glue_jobs.py` — `_account_id(event, context)` now derives the account from, in
-   order: `event["account_id"]` → field 4 of `event["dms_task_arn"]` → **field 4 of the Lambda's
-   own `context.invoked_function_arn`** → **`sts:GetCallerIdentity`** (cached). The Lambda runs in
-   the pipeline account that owns the Glue jobs, so the context ARN is always correct and needs no
-   extra IAM; STS is the final backstop. This makes delete / `list_fork_cdc` (and the
-   create/ensure/fallback registry+tagging path, which also needs `account_id`) unable to fail on
-   a missing account id ever again. The `ensure_fork_jobs` tag-apply block now reuses the single
-   resolved `account_id` instead of re-reading only the event.
-
-## B21 (medium) — composite CDC run slow to stop times out the delete Lambda
-
-**Root cause.** `_wait_runs_stopped` in `create_glue_jobs.py` waited `30 × 10 s = 300 s` for a
-job's run to leave an active state before deleting it — exactly the delete Lambda's 300 s timeout.
-A composite (`ck-*`) CDC run that was slow to stop kept the wait going until `Sandbox.Timedout`
-killed the Lambda. **Why the composite run was slow (documented):** `glue_cdc_composite.py`'s poll
-loop slept `POLL_INTERVAL` (default 30 s) between cycles with a bare, uninterruptible
-`time.sleep(POLL_INTERVAL)` — the single longest interval in which the job could not react to a
-stop. The per-file/per-chunk apply path is already short and checkpointed, so the idle poll gap was
-the slow part.
+**Root cause.** `iam/glue.json` carried a `"_comment"` key **inside** a `Policy` Statement
+(`StatesDescribeExecutionForBlankGuard`). IAM validates every policy document against a fixed
+schema and rejects any unknown key with `MalformedPolicyDocument`, so `aws iam put-role-policy`
+failed and **every setup failed**. The three files also carried a document-level `"_comment"`
+(sibling of `RoleName`); those are never sent to IAM, but B22 asks for the explanations to live in
+docs, so they were removed too.
 
 **Fix.**
-1. `lambdas/create_glue_jobs.py` — `_wait_runs_stopped(..., context)` is now bounded by
-   `context.get_remaining_time_in_millis()` minus a 30 s margin and returns `True`/`False` (was
-   `None`). Delete mode: if the wait returns `False` (run still active near the time budget), it
-   issues a best-effort `batch_stop_job_run` for every STARTING/RUNNING run (`_best_effort_stop_runs`)
-   and returns that job under a new **`pending`** list WITHOUT deleting it. The registry is cleared
-   only when nothing is pending/failed, so a re-looped delete still finds the pending jobs. No
-   Lambda call can exceed its own timeout anymore. With `context=None` (unit tests) the static
-   `attempts × delay` budget is used unchanged.
-2. `stepfunctions/cutover.asl.json` — a bounded loop: `InitDeleteLoop` → `DeleteGlueJobs` →
-   `AllGlueJobsDeleted`. A hard `failed` → `GlueJobsNotDeletedList`; a `pending[0]` → `IncrDeleteLoop`
-   → `DeleteBudgetLeft` (counter `< 120`) → `WaitDeleteRetry` (10 s) → `DeleteGlueJobs`; nothing
-   pending/failed → `CutoverSucceeded`. Past the ~60-min budget it ends in `GlueJobsNotDeleted`
-   (`GlueJobsPendingTimedOut`) naming the still-pending jobs.
-3. `scripts/glue_cdc_composite.py` — faster exit on stop (cheap, as the report asked): the
-   inter-cycle wait is now `_stop_event.wait(POLL_INTERVAL)` (interruptible) instead of
-   `time.sleep`, a `SIGTERM` handler sets `_stop_event` (Glue stops a job with SIGTERM), and the
-   main loop condition / wait return both break promptly when a stop is signalled. `StopCdcRun` /
-   `StopForkCdcRuns` already issue `batch_stop_job_run` for STARTING/RUNNING runs (verified in
-   `lambdas/stop_cdc_run.py`); the delete Lambda now also force-stops as a backstop.
+1. Removed the one statement-level `_comment` (the actual blocker) and the three top-level
+   `_comment` keys. Surgical line-removal only — array formatting preserved, all three files are
+   still valid JSON, zero `_comment` tokens remain. The explanations now live in
+   `docs/IAM_POLICY_NOTES.md` (one section per role, including why the Glue role grants
+   `states:DescribeExecution`).
+2. **Backstop.** `tools/setup.sh` `split_iam` and the `docs/MANUAL_SETUP.md` fill-in step now
+   `strip_policy()` each `TrustPolicy`/`Policy`/`VpcPolicy` before `put-role-policy`: only
+   `Version/Id/Statement` survive at the document level and only
+   `Sid/Effect/Action/NotAction/Resource/NotResource/Principal/NotPrincipal/Condition` inside a
+   Statement. A hand-edited file that re-adds a `_comment` still deploys. The manage_iam=false
+   `iam-out/` writer reads the stripped `.policy.filled.json`, so it is covered too. Added a
+   `MalformedPolicyDocument` warning to the MANUAL_SETUP console-alternative.
+3. **Static test** `tests/test_iam_policies.py` (158 checks): every Statement in `iam/*.json` has
+   only valid IAM keys, no `_comment` anywhere, and the SHIPPED `strip_policy` in both setup.sh and
+   MANUAL_SETUP drops a stray statement- and document-level `_comment` while keeping the valid keys.
 
-## Input-side payload-contract check (the class of bug B20 is)
+**Verified end to end:** the existing `tests/test_existing_roles.py` runs the real `setup.sh`
+against the fake AWS CLI and still makes zero/correct IAM calls; a manual exercise that dirtied
+`iam/glue.json` with a `_comment` confirmed the shipped strip removed it from the filled policy
+(7 statements kept).
 
-Extended `tests/test_asl_payload_contract.py` with an **INPUT-side** audit mirroring the existing
-output-side one: for every Lambda-invoking state in all 4 state machines, the ASL
-`Parameters.Payload` keys must be a **superset** of the keys that Lambda's mode *requires* from its
-event (read as `event["x"]`, or `event.get("x")` with no safe fallback). Requirements are a
-declarative `MODE_REQUIRED_INPUT` spec, with an "any-of" form for the account-id class
-(`account_id` OR `dms_task_arn`). Includes:
-- `test_input_payload_contract_all_state_machines` — audits every state (14+).
-- `test_b20_delete_payload_passes_account_resolution` — positive (today's fixed payload passes) **and
-  negative** (the pre-fix `{mode,bucket,project,taskSuffix}` payload FAILS the account requirement,
-  proving the check catches today's bug).
-- `test_input_contract_spec_matches_lambda_source` — drift guard: every declared single-key
-  requirement is actually read as `event["key"]` in the mapped Lambda source.
+---
 
-No other input-side gap was found across the 4 state machines: every other Lambda-invoking state
-already passes every key its mode requires (audit is green).
+## Easing the guardrails — before → after
 
-## Tests (all offline, no AWS / Spark / network)
+`guardrails_mode = warn` (default) | `strict`. In `warn`, HARD guards (G1/G4/G6) still refuse a
+genuinely destructive action (and only that one action — the per-table CONTINUE-ON-FAILURE loop
+keeps the rest of the run going); every other guard is advisory (WARNING + `DsqlGuardWarn` /
+`DsqlRowDrift` metric + `cdc_control.audit_log` row). Each guard call is wrapped so an exception
+(permission denied, DSQL error, missing table, S3 read error) is logged and treated as "passed",
+never raised into the main path. `strict` restores the original fail-closed behaviour; per-guard
+settings still override.
 
-- `tests/test_e2e_fixes.py` — new B20/B21 Lambda-behaviour tests with a **fake Glue where a run
-  takes N `get_job_runs` calls to stop**: `_account_id` resolves from event / `dms_task_arn` /
-  context ARN / STS; `_wait_runs_stopped` returns promptly (never 100×10 s) when the time budget is
-  tight; delete returns both slow jobs under `pending` and never calls `delete_job` on a running
-  job (invariant asserted by the fake), then a second pass with a full budget deletes them →
-  nothing pending → the ASL loop terminates at `CutoverSucceeded`; plus a static check of the
-  cutover loop shape.
-- `tests/test_asl_payload_contract.py` — the input-side contract above (also exercised by
-  `test_asl_paths`, which imports it).
+| Guard | Before (fail-closed) | After — `warn` default | `strict` | Default |
+|---|---|---|---|---|
+| **G1** (HARD) | Refuse a blank once CDC started; fail-closed if markers unreadable | **Unchanged** — refuses the blank only (run continues) | same | — |
+| **G4** (HARD) | Refuse a blank of a table this task didn't load / count > expected×margin | **Unchanged** — refuses the blank only | same | — |
+| **G6** (HARD) | Block a CDC file deleting > fraction AND > rows | **Unchanged** — blocks that one table | same | fraction `0.5`, rows `100000` |
+| **G2** (soft) | **Refuse** a no-workflow blank unless `--allow_manual_destructive` | **Allow + loud WARNING + audit** (a missing `states:DescribeExecution` / unconfirmable execution no longer fails the run); RUNNING execution or the flag still blank. G1/G4 still apply | Refuse (as before) | `warn` |
+| **G3** (soft) | **Fail-closed** on any failed lock acquire | WARN + proceed when the lock can't be taken for a bookkeeping reason; skip ONLY when **another live holder** clearly owns it | Refuse on any failed acquire | `warn` |
+| **G5** (soft) | Best-effort audit before every op | Unchanged (best-effort; never fails the action) | same | always on |
+| **G7** (soft) | **Block** a no-PK content-DELETE over-match | WARN + apply (G6 is the real volume cap); purge-exactness tripwire still HARD | Block | `cdc_nopk_overmatch_action=warn` |
+| **G8** (soft) | **Block** on order/gap/new-`LOAD`-after-CDC | WARN + metric, keep applying in order; the LOAD-list read is wrapped so it can't raise | Block | `cdc_file_order_action=warn` |
+| **G9** (soft) | WARN + metric + audit, optional block | Unchanged default (warn); wrapped so it can't raise | `cdc_drift_action=block` | `cdc_drift_action=warn` |
+| **G10** (soft) | **Fail** validate / refuse cutover on DSQL ≠ DMS `FullLoadRows (+I−D)` | WARN; validate still PASSES / cutover proceeds (DMS counts can legitimately differ) | `validate_count_check=strict` / `cutover_count_check=strict` | `warn` |
 
-**All required suites green (exit 0):**
-`test_asl_paths`, `test_asl_payload_contract` (165), `test_guardrails` (78), `test_e2e_fixes` (80),
-`test_b17_b13` (24), `test_b18_validate_throughput` (27), `test_docs_params`, `test_fix6` (51).
-Also green: `test_planning_settings`, `test_existing_roles` (66).
+### Control bookkeeping is add-if-missing and non-fatal (item 4 / B17)
 
-## Docs
+`cdc_control.cdc_control_lock`, `cdc_control.audit_log`, and the `cdc_status` counters
+(`full_load_rows`, `inserts_applied`, `deletes_applied`, `allow_mass_delete`) are all
+`CREATE TABLE IF NOT EXISTS` + `ADD COLUMN` with **no** `DEFAULT` (DSQL rejects `DEFAULT`-on-ALTER
+at parse time, SQLSTATE 0A000), so they work on a pre-existing older `cdc_control`. If the
+create/upgrade fails, the CDC job now **warns and continues** (the guards that write them are
+best-effort).
 
-`RUNBOOK.md` §7 (cutover outcomes), §8 (recovery) and the state-machine reference table now describe
-the delete loop / `pending` behaviour and the account-id payload, and state that `GlueJobsNotDeleted`
-now self-heals a slow composite CDC stop (force-stop + retry); the only hand step left is the
-last-resort "if it keeps failing" one. No advice to work around B20/B21 by hand remains as the
-primary path.
+### Settings (plumbed params.csv → pipeline.json → resolve_task → create_glue_jobs → job args)
 
-## Runtime files changed (scripts/, lambdas/, stepfunctions/, glue-templates/)
-- `lambdas/create_glue_jobs.py` — B20 `_account_id` context/STS fallback; B21 bounded
-  `_wait_runs_stopped` + `_best_effort_stop_runs` + delete-mode `pending`.
-- `scripts/glue_cdc_composite.py` — B21 interruptible inter-cycle wait + SIGTERM handler (faster
-  stop).
-- `stepfunctions/cutover.asl.json` — B20 `DeleteGlueJobs` payload (account_id + dms_task_arn); B21
-  bounded delete loop.
-- `glue-templates/` — **no change** (no runtime behaviour there needed changing).
+`guardrails_mode` (warn|strict), `cdc_file_order_action` (warn|block), `cdc_nopk_overmatch_action`
+(warn|block), `validate_count_check` (warn|strict), `cutover_count_check` (warn|strict). All
+default to the safe/non-failing value; all documented in RUNBOOK §3 and the "Safety guardrails"
+section, and in `docs/MANUAL_SETUP.md` §3c. `guardrails_mode=strict` implies `block`/`strict` for
+the per-guard knobs unless they are set explicitly.
 
-Non-runtime: `RUNBOOK.md`, `tests/test_asl_payload_contract.py`, `tests/test_e2e_fixes.py`.
+---
+
+## Tests
+
+- **New** `tests/test_iam_policies.py` (158) — B22 static validity + both strip backstops.
+- **New** `tests/test_ease_guardrails.py` (86) — plumbing of `guardrails_mode` end to end; each
+  SOFT guard with an injected failure continues + warns (G2 missing `states:DescribeExecution`,
+  G3 connect/lock failure, G8 LOAD-list read wrapped, G9 never raises); HARD guards (G1/G4) still
+  refuse only the destructive op in both modes; `take_table_lock` contended-vs-bookkeeping flag;
+  CDC `guard_action_blocks` mapping + warn-wiring byte-identical in both engines;
+  `guardrails_mode=strict` restores fail-closed; and a full happy-path
+  load → validate → CDC → cutover simulation with **no guard firing and no**
+  `states:DescribeExecution` **permission** succeeds.
+- **Updated** `tests/test_guardrails.py` (80) — G2 is now warn-allows-by-default with a strict
+  refusal variant; shared-helper byte-identity list extended with the two new helpers.
+
+All suites green (fresh clone, offline):
+
+```
+test_asl_paths 165 · test_asl_payload_contract 165 · test_b17_b13 24 ·
+test_b18_validate_throughput 27 · test_docs_params PASS · test_e2e_fixes 80 ·
+test_ease_guardrails 86 · test_existing_roles 66 · test_fix6 51 · test_guardrails 80 ·
+test_iam_policies 158 · test_planning_settings 58/58
+```
+
+---
+
+## Exact runtime files changed
+
+- `scripts/job2_load.py` — `GUARDRAILS_MODE`; G2 warn-by-default + strict in `assert_blank_allowed`;
+  G3 `take_table_lock` 3-tuple (`contended`) + warn/strict/contended branching on both reblank paths.
+- `scripts/glue_cdc_continuous.py`, `scripts/glue_cdc_composite.py` — `GUARDRAILS_MODE`,
+  `CDC_FILE_ORDER_ACTION`, `CDC_NOPK_OVERMATCH_ACTION` globals + overlay; shared
+  `guard_action_blocks` + `emit_guard_warn_metric`; G7/G8 warn-vs-block wiring; G8 LOAD-list read
+  wrapped; audit_log/counter creation made non-fatal (warn + continue). Shared helpers stay
+  byte-identical between the two engines.
+- `scripts/job3_validate.py` — `VALIDATE_COUNT_CHECK` / `GUARDRAILS_MODE`; G10 mismatch is a
+  WARNING by default, fails only under strict.
+- `lambdas/params_csv.py`, `lambdas/resolve_task.py`, `lambdas/create_glue_jobs.py` — new settings
+  defaults, enum validation, payload fields, and `--guardrails_mode` / per-guard args wired to the
+  load, validate and CDC jobs.
+- `stepfunctions/startup.asl.json` — the five new keys produced into `$.resolved` and passed to
+  both `CreateGlueJobs` blocks.
+- `iam/glue.json`, `iam/lambda.json`, `iam/stepfunctions.json` — removed the `_comment` keys (B22).
+- `tools/setup.sh` — `split_iam` strip-unknown-keys backstop (B22).
+- `glue-templates/` — none.
+
+Non-runtime: `RUNBOOK.md`, `docs/MANUAL_SETUP.md`, `docs/IAM_POLICY_NOTES.md` (new),
+`config/params.example.csv`, `config/pipeline.example.json`, `tests/*`.
