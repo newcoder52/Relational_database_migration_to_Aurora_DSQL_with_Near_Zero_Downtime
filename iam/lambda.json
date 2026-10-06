@@ -1,6 +1,5 @@
 {
   "RoleName": "<<PROJECT>>-lambda-exec-role",
-  "_comment": "Shared execution role for ALL 8 Lambdas (resolve-task, driver-discovery, plan-split, create-glue-jobs, stop-cdc-run, drain-check, drop-tags, preflight-tasks). Union of the former lambda-exec-role and preflight-tasks-role policies, deduped. The former preflight statements are strict subsets of the broader lambda statements they merged into: ReadSettingsTaskListsAndFolders (s3:GetObject/ListBucket) and PublishPipelineSettingsFromParamsCsv (s3:PutObject on config/pipeline.json(.*)) are covered by the S3 block below (GetObject/PutObject on <<BUCKET>>/* + ListBucket on the bucket); the preflight DMS describe set is a subset of DmsDescribe; the preflight states List/Describe (the 4 named machines + startup/cutover executions) are subsets of the <<PROJECT>>-* / <<PROJECT>>-*:* blocks below. No new wildcards were introduced. setup.sh attaches AWSLambdaVPCAccessExecutionRole to this role when a VPC is used (as before).",
   "TrustPolicy": {
     "Version": "2012-10-17",
     "Statement": [

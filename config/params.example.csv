@@ -52,6 +52,21 @@ cdc_max_delete_rows,100000
 cdc_drift_check_minutes,30
 cdc_drift_tolerance,0
 cdc_drift_action,warn
+# guardrails_mode (master switch): warn (default) | strict. In warn, a guardrail may STOP a
+#   destructive action (G1 blank-after-CDC, G4 blank sanity, G6 mass delete) but NEVER fails a run
+#   for its own bookkeeping — a missing permission (e.g. states:DescribeExecution), a missing control
+#   table, a lock it can't take, or a check it can't compute degrades to a WARNING and the run keeps
+#   going. strict restores fail-closed behaviour. The per-guard keys below still override.
+guardrails_mode,warn
+# cdc_file_order_action (G8 order/gap/new-LOAD-after-CDC): warn (default; log + metric, keep going)
+#   | block (set the table blocked). cdc_nopk_overmatch_action (G7 no-PK over-match): warn | block.
+cdc_file_order_action,warn
+cdc_nopk_overmatch_action,warn
+# validate_count_check / cutover_count_check (G10): warn (default; a DSQL-vs-DMS FullLoadRows
+#   mismatch logs a WARNING but validation/cutover still passes — DMS counts can legitimately
+#   differ) | strict (mismatch fails validate / cutover refuses with CountMismatch).
+validate_count_check,warn
+cutover_count_check,warn
 # max_composite_forks: max composite-PK tables that may be forked out of ONE task. Each composite
 # table runs its own always-on CDC job (plus its own load/validate jobs), so this caps the always-
 # on Glue jobs and DSQL connections per task. Startup fails early (naming the tables) if exceeded.

@@ -203,6 +203,12 @@ GLUE_API_TIMEOUT = 5
 # no-op (validate falls back to the S3 comparison only). See WHAT_IF.md / RUNBOOK.
 DMS_TASK_ARN = None
 COUNT_MISMATCH_TOLERANCE = 0
+# EASE-GUARDRAILS: the G10 count check is WARN by default — a DSQL-vs-DMS FullLoadRows mismatch
+# is reported (a note + a non-fatal warning), but validation still PASSES, because DMS counts can
+# legitimately differ (e.g. the source changed during the full load). validate_count_check=strict
+# (or guardrails_mode=strict) makes the mismatch FAIL the table (today's behaviour).
+VALIDATE_COUNT_CHECK = "warn"    # "warn" | "strict"
+GUARDRAILS_MODE = "warn"         # "warn" | "strict" (strict implies validate_count_check=strict)
 
 # =============================================================================
 # OPTIONAL GLUE ARG OVERLAY  (orchestrator wiring — mirrors v16's _apply_v6_arg_overrides)
@@ -227,13 +233,15 @@ def _apply_job3_arg_overrides():
     global VALIDATE_PARALLELISM, CONN_BUDGET, VALIDATE_HASH
     global VALIDATE_TARGET_SECONDS_PER_RANGE
     global DMS_TASK_ARN, COUNT_MISMATCH_TOLERANCE
+    global VALIDATE_COUNT_CHECK, GUARDRAILS_MODE
     optional = ["config_prefix", "index_s3_key", "dsql_endpoint", "dsql_user",
                 "dsql_database", "region", "dsql_endpoint_candidates",
                 "checksum_mode", "max_parallel_tables", "validate_rows_per_range",
                 "max_query_concurrency", "require_full_load_done", "csv_null_value",
                 "validate_parallelism", "conn_budget", "validate_hash",
                 "validate_target_seconds_per_range",
-                "dms_task_arn", "count_mismatch_tolerance"]
+                "dms_task_arn", "count_mismatch_tolerance",
+                "validate_count_check", "guardrails_mode"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -314,6 +322,26 @@ def _apply_job3_arg_overrides():
             COUNT_MISMATCH_TOLERANCE = max(0, int(ov["count_mismatch_tolerance"]))
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid count_mismatch_tolerance={ov['count_mismatch_tolerance']!r}")
+    if "guardrails_mode" in ov and str(ov.get("guardrails_mode") or "").strip():
+        _gm = str(ov["guardrails_mode"]).strip().lower()
+        if _gm in ("warn", "strict"):
+            GUARDRAILS_MODE = _gm
+            if _gm == "strict":
+                VALIDATE_COUNT_CHECK = "strict"   # strict implies a strict G10 (explicit key wins)
+            print(f"  ↪ GUARDRAILS_MODE -> {GUARDRAILS_MODE}")
+        else:
+            print(f"  ⚠️ ignoring invalid guardrails_mode={ov['guardrails_mode']!r} (warn|strict)")
+    if "validate_count_check" in ov and str(ov.get("validate_count_check") or "").strip():
+        _vcc = str(ov["validate_count_check"]).strip().lower()
+        if _vcc in ("warn", "strict"):
+            VALIDATE_COUNT_CHECK = _vcc
+            print(f"  ↪ VALIDATE_COUNT_CHECK -> {VALIDATE_COUNT_CHECK} "
+                  f"(G10: a DSQL-vs-DMS FullLoadRows mismatch "
+                  + ("FAILS the table)" if _vcc == "strict" else "is a WARNING; validate still "
+                     "passes)"))
+        else:
+            print(f"  ⚠️ ignoring invalid validate_count_check={ov['validate_count_check']!r} "
+                  f"(warn|strict)")
 
 
 _apply_job3_arg_overrides()
@@ -1680,10 +1708,20 @@ def validate_one_table(s3, entry):
             notes.append(f"G10 DMS FullLoadRows check: DSQL={tgt_total:,} vs FullLoadRows="
                          f"{_flr:,} ({'OK' if _ok10 else 'MISMATCH'})")
             if not _ok10:
-                status = "mismatch"
-                mismatches.append({"range": ["whole table"], "type": "DMS_COUNT_DIFF",
-                                   "source": _exp10, "target": tgt_total, "detail": _why10})
-                print(f"    ❌ G10 [{label}]: {_why10}")
+                if VALIDATE_COUNT_CHECK == "strict":
+                    # STRICT: the mismatch FAILS the table (today's behaviour).
+                    status = "mismatch"
+                    mismatches.append({"range": ["whole table"], "type": "DMS_COUNT_DIFF",
+                                       "source": _exp10, "target": tgt_total, "detail": _why10})
+                    print(f"    ❌ G10 [{label}]: {_why10}")
+                else:
+                    # WARN (default): record a note + a non-fatal warning; validation still
+                    # PASSES. DMS FullLoadRows can legitimately differ from the live DSQL count
+                    # (e.g. the source changed during the full load). Set
+                    # validate_count_check=strict (or guardrails_mode=strict) to FAIL on it.
+                    notes.append(f"G10 WARNING (validate_count_check=warn): {_why10}")
+                    print(f"    ⚠️  G10 [{label}]: {_why10} (guardrails_mode=warn — WARNING, "
+                          f"validation still PASSES; set validate_count_check=strict to fail)")
     return {
         "table": label, "status": status, "ranges": len(ranges),
         "source_rows": src_total, "target_rows": tgt_total,

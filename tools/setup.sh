@@ -300,10 +300,30 @@ doc = json.loads(raw)                       # also validates JSON
 override = os.environ.get("P_ROLE_NAME_OVERRIDE", "").strip()
 role = override if override else doc["RoleName"]
 base = os.path.splitext(os.path.basename(src))[0]
+# B22 BACKSTOP: strip any key that IAM would reject with MalformedPolicyDocument. IAM only
+# accepts Version/Id/Statement at the document level and Sid/Effect/Action/NotAction/Resource/
+# NotResource/Principal/NotPrincipal/Condition inside a Statement. A stray "_comment" (or any
+# other extra key) inside a policy document makes put-role-policy fail. The shipped iam/*.json
+# are already clean (explanations live in docs/IAM_POLICY_NOTES.md); this strip guarantees a
+# hand-edited file that re-adds a comment still deploys. Never raises — it only drops keys.
+_DOC_OK = {"Version", "Id", "Statement"}
+_STMT_OK = {"Sid", "Effect", "Action", "NotAction", "Resource", "NotResource",
+            "Principal", "NotPrincipal", "Condition"}
+def strip_policy(pol):
+    if not isinstance(pol, dict):
+        return pol
+    out = {k: v for k, v in pol.items() if k in _DOC_OK}
+    stmts = out.get("Statement")
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    if isinstance(stmts, list):
+        out["Statement"] = [{k: v for k, v in st.items() if k in _STMT_OK}
+                            if isinstance(st, dict) else st for st in stmts]
+    return out
 def dump(obj, suffix):
     path = os.path.join(outdir, "%s.%s.filled.json" % (base, suffix))
     with open(path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(obj, indent=2) + "\n")
+        f.write(json.dumps(strip_policy(obj), indent=2) + "\n")
 dump(doc["TrustPolicy"], "trust")
 dump(doc["Policy"], "policy")
 have_vpc = 1 if doc.get("VpcPolicy") else 0

@@ -1,6 +1,5 @@
 {
   "RoleName": "<<PROJECT>>-glue-exec-role",
-  "_comment": "Glue job execution role (all Glue jobs: discovery, load, validate, CDC). TrustPolicy + Policy are always applied by tools/setup.sh. VpcPolicy is applied as a SEPARATE inline policy (name 'glue-vpc') ONLY when a Glue network connection is configured (subnet_id + security_group_id set, i.e. glue_connection != \"\").",
   "TrustPolicy": {
     "Version": "2012-10-17",
     "Statement": [
@@ -41,7 +40,6 @@
       },
       {
         "Sid": "StatesDescribeExecutionForBlankGuard",
-        "_comment": "G2 safety guardrail: the load job (job2_load) refuses a whole-table/range blank unless --startup_execution's Step Functions execution is RUNNING (states:DescribeExecution). Without this the blank path fails closed (safe), so a customer-managed Glue policy MUST also grant this for the guardrail to allow a legitimate workflow-driven reblank.",
         "Effect": "Allow",
         "Action": ["states:DescribeExecution"],
         "Resource": ["*"]

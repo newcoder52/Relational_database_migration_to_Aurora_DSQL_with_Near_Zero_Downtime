@@ -1,6 +1,5 @@
 {
   "RoleName": "<<PROJECT>>-sfn-exec-role",
-  "_comment": "Shared execution role for ALL 4 state machines (startup, cutover, fleet-startup, fleet-cutover). Union of the former sfn-exec-role, fleet-startup-role and fleet-cutover-role policies, deduped. The former fleet InvokePreflightLambda (lambda:InvokeFunction on function:<<PROJECT>>-preflight-tasks) is a strict subset of InvokeLambdas (function:<<PROJECT>>-*). The two fleet StartExecution/DescribeExecution statements are merged into StartAndVerifyChildren below, scoped to exactly the two child machines the fleets launch (<<PROJECT>>-startup and <<PROJECT>>-cutover) and their executions — no <<PROJECT>>-* wildcard was introduced for states:*. TrustPolicy adds the aws:SourceAccount condition that the former fleet roles carried; the former sfn-exec-role trust had no condition, so this is a tightening (same account only), not a loosening.",
   "TrustPolicy": {
     "Version": "2012-10-17",
     "Statement": [

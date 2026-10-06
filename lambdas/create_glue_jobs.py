@@ -788,6 +788,12 @@ def handler(event, context):
             _pwb = event.get("perWorkerMemBudgetMb")
             if _pwb not in (None, ""):
                 args["--per_worker_mem_budget_mb"] = str(_pwb)
+            # ease-guardrails: the load job's blank guards (G1/G2/G3/G4/G5) read guardrails_mode.
+            # Absent (older workflows) -> job2_load defaults to warn (never fails a run for its
+            # own bookkeeping; still refuses a genuinely destructive blank via G1/G4).
+            _gm = event.get("guardrails_mode")
+            if _gm not in (None, ""):
+                args["--guardrails_mode"] = str(_gm)
         if role in ("validate", "ck-validate"):
             # B14: rows per validation key-range. The shared validate job AND every composite
             # ck-validate fork read it so a too-big range (which raised a client read timeout on
@@ -820,6 +826,16 @@ def handler(event, context):
             _cmt = event.get("cdc_drift_tolerance")
             if _cmt is not None and str(_cmt).strip() != "":
                 args["--count_mismatch_tolerance"] = str(_cmt)
+            # ease-guardrails: G10 validate count check is WARN by default (a DSQL-vs-DMS
+            # FullLoadRows mismatch logs a WARNING; validation still passes — DMS counts can
+            # legitimately differ). validate_count_check=strict (or guardrails_mode=strict)
+            # makes the mismatch FAIL. Absent -> job3_validate defaults to warn.
+            _vcc = event.get("validate_count_check")
+            if _vcc not in (None, ""):
+                args["--validate_count_check"] = str(_vcc)
+            _gm_v = event.get("guardrails_mode")
+            if _gm_v not in (None, ""):
+                args["--guardrails_mode"] = str(_gm_v)
             # (both B18 throughput controls and the G10 DMS cross-check are set on validate)
         if is_cdc:
             args["--cdc_root"] = cdc_root
@@ -845,7 +861,12 @@ def handler(event, context):
                              ("cdc_max_delete_rows", "--cdc_max_delete_rows"),
                              ("cdc_drift_check_minutes", "--cdc_drift_check_minutes"),
                              ("cdc_drift_tolerance", "--cdc_drift_tolerance"),
-                             ("cdc_drift_action", "--cdc_drift_action")):
+                             ("cdc_drift_action", "--cdc_drift_action"),
+                             # ease-guardrails: master mode + G8/G7 per-guard actions. Absent
+                             # (older workflows) -> the CDC script's warn-by-default applies.
+                             ("guardrails_mode", "--guardrails_mode"),
+                             ("cdc_file_order_action", "--cdc_file_order_action"),
+                             ("cdc_nopk_overmatch_action", "--cdc_nopk_overmatch_action")):
                 _v = event.get(_ek)
                 if _v is not None and str(_v).strip() != "":
                     args[_ak] = str(_v)

@@ -186,8 +186,24 @@ left = re.findall(r"<<[^>]*>>", raw)
 if left: sys.exit("STOP: placeholder(s) left in %s: %s" % (src, ", ".join(sorted(set(left)))))
 doc = json.loads(raw)
 base = os.path.splitext(os.path.basename(src))[0]   # glue | lambda | stepfunctions
+# B22 backstop: drop any key IAM would reject (only Version/Id/Statement at doc level and
+# Sid/Effect/Action/NotAction/Resource/NotResource/Principal/NotPrincipal/Condition in a
+# Statement). The shipped files are already clean (notes live in docs/IAM_POLICY_NOTES.md);
+# this keeps a hand-edited file with a stray "_comment" deployable.
+_DOC_OK = {"Version", "Id", "Statement"}
+_STMT_OK = {"Sid", "Effect", "Action", "NotAction", "Resource", "NotResource",
+            "Principal", "NotPrincipal", "Condition"}
+def strip_policy(pol):
+    if not isinstance(pol, dict): return pol
+    out = {k: v for k, v in pol.items() if k in _DOC_OK}
+    sts = out.get("Statement")
+    if isinstance(sts, dict): sts = [sts]
+    if isinstance(sts, list):
+        out["Statement"] = [{k: v for k, v in st.items() if k in _STMT_OK}
+                            if isinstance(st, dict) else st for st in sts]
+    return out
 def dump(obj, suffix):
-    open("iam/%s.%s.filled.json" % (base, suffix), "w", encoding="utf-8").write(json.dumps(obj, indent=2) + "\n")
+    open("iam/%s.%s.filled.json" % (base, suffix), "w", encoding="utf-8").write(json.dumps(strip_policy(obj), indent=2) + "\n")
 dump(doc["TrustPolicy"], "trust"); dump(doc["Policy"], "policy")
 if doc.get("VpcPolicy"): dump(doc["VpcPolicy"], "vpc")
 print("ROLE=%s" % doc["RoleName"])
@@ -218,7 +234,10 @@ name the role exactly `<project>-glue-exec-role` / `<project>-lambda-exec-role` 
 `<project>-sfn-exec-role`; then **Add inline policy → JSON**, paste the file's **`Policy`** block, and
 name the inline policy the same as the role. For the Glue role in a VPC, add a second inline policy
 named `glue-vpc` with the file's **`VpcPolicy`** block. (The split is only needed because trust and
-permission policies go in different console fields.)
+permission policies go in different console fields.) Paste only the policy objects as shown — do
+not add `_comment` or any other key inside a `Statement` or inside `TrustPolicy`/`Policy`/
+`VpcPolicy`; IAM rejects unknown keys with `MalformedPolicyDocument` (see
+`docs/IAM_POLICY_NOTES.md` for what each statement is for).
 
 **Verify:** `for r in glue-exec lambda-exec sfn-exec; do aws iam get-role --role-name "$PROJECT-$r-role" --query Role.RoleName --output text 2>/dev/null || echo "MISSING: $PROJECT-$r-role"; done`
 
@@ -408,6 +427,11 @@ is rejected at run time.
 | `cdc_drift_check_minutes` | `cdc_drift_check_minutes` | `30` | CDC | `create_glue_jobs` `--cdc_drift_check_minutes`; CDC jobs (G9, periodic) |
 | `cdc_drift_tolerance` | `cdc_drift_tolerance` | `0` | CDC | `create_glue_jobs` `--cdc_drift_tolerance` (+validate `--count_mismatch_tolerance`); CDC jobs (G9) |
 | `cdc_drift_action` | `cdc_drift_action` | `warn` | CDC | `create_glue_jobs` `--cdc_drift_action`; CDC jobs (G9) |
+| `guardrails_mode` | `guardrails_mode` | `warn` | Load, Validate, CDC | `create_glue_jobs` `--guardrails_mode`; `job2_load`/`job3_validate`/CDC jobs (master switch for all guards) |
+| `cdc_file_order_action` | `cdc_file_order_action` | `warn` | CDC | `create_glue_jobs` `--cdc_file_order_action`; CDC jobs (G8) |
+| `cdc_nopk_overmatch_action` | `cdc_nopk_overmatch_action` | `warn` | CDC | `create_glue_jobs` `--cdc_nopk_overmatch_action`; CDC jobs (G7) |
+| `validate_count_check` | `validate_count_check` | `warn` | Validate | `create_glue_jobs` `--validate_count_check`; `job3_validate` (G10) |
+| `cutover_count_check` | `cutover_count_check` | `warn` | Cutover | cutover count equation via resolve_task (G10) |
 | `max_composite_forks` | `max_composite_forks` | `8` | Planning | `plan_split` (fork gate) |
 | `max_big_cdc_forks` | `max_big_cdc_forks` | `8` | Planning | `plan_split` (big-CDC fork cap) |
 | `big_table_row_threshold` | `big_table_row_threshold` | `6000000` | Planning | `plan_split` (big-table classification) |
@@ -464,6 +488,11 @@ cfg = {
     "cdc_drift_check_minutes": 30,
     "cdc_drift_tolerance": 0,
     "cdc_drift_action": "warn",
+    "guardrails_mode": "warn",
+    "cdc_file_order_action": "warn",
+    "cdc_nopk_overmatch_action": "warn",
+    "validate_count_check": "warn",
+    "cutover_count_check": "warn",
     "max_composite_forks": 8,
     "max_big_cdc_forks": 8,
     "big_table_row_threshold": 6000000,

@@ -258,6 +258,14 @@ SETTINGS_DEFAULTS = {
     "cdc_drift_check_minutes": 30,
     "cdc_drift_tolerance": 0,
     "cdc_drift_action": "warn",
+    # ── EASE-GUARDRAILS: master mode + per-guard WARN/strict knobs. Passed to the load,
+    # validate and CDC jobs so a guardrail never fails a run for its own bookkeeping unless the
+    # operator opts into strict. See RUNBOOK "Safety guardrails".
+    "guardrails_mode": "warn",             # warn (default) | strict
+    "cdc_file_order_action": "warn",       # G8: warn | block
+    "cdc_nopk_overmatch_action": "warn",   # G7: warn | block
+    "validate_count_check": "warn",        # G10 validate: warn | strict
+    "cutover_count_check": "warn",         # G10 cutover: warn | strict
     # Max composite-PK tables that may be forked out of ONE task (each gets its own always-on
     # CDC job). plan_split fails early if a task exceeds this. See DESIGN_FORK.md §6.
     "max_composite_forks": 8,
@@ -478,6 +486,19 @@ def _validate_settings(cfg, warnings):
         raise SettingsError(f"pipeline.json 'cdc_drift_action' must be 'warn' or 'block' "
                             f"(got {cfg['cdc_drift_action']!r}).")
     cfg["cdc_drift_action"] = _da.strip().lower()
+    # Ease-guardrails enum keys. Each is a small closed set; fail-closed on a typo so a mode
+    # can't be silently mis-set.
+    def _enum(key, allowed):
+        v = cfg.get(key)
+        if not isinstance(v, str) or v.strip().lower() not in allowed:
+            raise SettingsError(f"pipeline.json '{key}' must be one of {allowed} "
+                                f"(got {cfg.get(key)!r}).")
+        cfg[key] = v.strip().lower()
+    _enum("guardrails_mode", ("warn", "strict"))
+    _enum("cdc_file_order_action", ("warn", "block"))
+    _enum("cdc_nopk_overmatch_action", ("warn", "block"))
+    _enum("validate_count_check", ("warn", "strict"))
+    _enum("cutover_count_check", ("warn", "strict"))
     conn = cfg.get("glue_connection") or ""
     if isinstance(conn, list):
         conn = ",".join(str(c).strip() for c in conn if str(c).strip())
@@ -961,6 +982,11 @@ def handler_shared(event, context):
         "cdcDriftCheckMinutes": cfg["cdc_drift_check_minutes"],
         "cdcDriftTolerance": cfg["cdc_drift_tolerance"],
         "cdcDriftAction": cfg["cdc_drift_action"],
+        "guardrailsMode": cfg["guardrails_mode"],
+        "cdcFileOrderAction": cfg["cdc_file_order_action"],
+        "cdcNopkOvermatchAction": cfg["cdc_nopk_overmatch_action"],
+        "validateCountCheck": cfg["validate_count_check"],
+        "cutoverCountCheck": cfg["cutover_count_check"],
         "jobNames": jobs,
         "cdcJobName": jobs["cdc"],
         "maxCompositeForks": cfg["max_composite_forks"],

@@ -171,6 +171,10 @@ BLANK_GUARD_ENABLED = True               # master switch for G1/G2/G4 (lock G3 i
 BLANK_EXPECTED_MARGIN = 0.05             # G4: refuse a blank if count > expected*(1+margin)
 LOCK_HEARTBEAT_TIMEOUT_SECONDS = 1800    # G3: a lock older than this is stale and may be taken
 _HELD_TABLE_LOCKS = set()                # G3: tables this run currently holds a lock for
+GUARDRAILS_MODE = "warn"                 # master mode: "warn" (never fail a run for a guard's own
+                                         # bookkeeping) or "strict" (restore fail-closed). HARD
+                                         # guards (G1/G4) refuse a destructive blank in BOTH modes;
+                                         # G2/G3/G5 are soft (warn+continue) in warn mode.
 
 GLUE_API_TIMEOUT = 5
 
@@ -498,6 +502,7 @@ def _apply_v6_arg_overrides():
     global DSQL_ENDPOINT_CANDIDATES   # kit: PrivateLink/public failover list
     global CONTROL_SCHEMA, STARTUP_EXECUTION, STARTUP_EXECUTION_ARN
     global BLANK_GUARD_ENABLED, BLANK_EXPECTED_MARGIN, ALLOW_MANUAL_DESTRUCTIVE
+    global GUARDRAILS_MODE
     optional = ["write_mode", "large_table_bytes_threshold", "target_rows_per_partition",
                 "max_write_concurrency", "v6_parallel_enabled",
                 "max_files_in_parallel",   # v16
@@ -509,6 +514,7 @@ def _apply_v6_arg_overrides():
                 "auto_reblank_on_resume", "per_table_write_concurrency",
                 "control_schema", "startup_execution", "startup_execution_arn",
                 "blank_guard_enabled", "blank_expected_margin", "allow_manual_destructive",
+                "guardrails_mode",
                 "verbose_chunks", "verbose_chunk_every", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
@@ -623,6 +629,16 @@ def _apply_v6_arg_overrides():
     if "blank_guard_enabled" in ov:
         BLANK_GUARD_ENABLED = str(ov["blank_guard_enabled"]).strip().lower() in ("true", "1", "yes")
         print(f"  ↪ BLANK_GUARD_ENABLED overridden -> {BLANK_GUARD_ENABLED}")
+    if "guardrails_mode" in ov and str(ov["guardrails_mode"]).strip():
+        _gm = str(ov["guardrails_mode"]).strip().lower()
+        if _gm in ("warn", "strict"):
+            GUARDRAILS_MODE = _gm
+            print(f"  ↪ GUARDRAILS_MODE -> {GUARDRAILS_MODE}"
+                  + ("" if _gm == "warn" else " (fail-closed: G2/G3 refuse a blank they can't "
+                     "clear instead of warning)"))
+        else:
+            print(f"  ⚠️ ignoring invalid guardrails_mode={ov['guardrails_mode']!r} "
+                  f"(keeping {GUARDRAILS_MODE})")
     if "blank_expected_margin" in ov:
         try:
             BLANK_EXPECTED_MARGIN = max(0.0, float(ov["blank_expected_margin"]))
@@ -2231,17 +2247,23 @@ def _run_arg_load(name):
 
 def take_table_lock(dsql_schema, dsql_table):
     """G3 (I/O): take a per-table write lock in cdc_control.cdc_control_lock via a conditional
-    INSERT (OCC). Returns (acquired, holder_or_reason). A second concurrent run for the same
-    table does NOT acquire. A STALE lock (heartbeat older than LOCK_HEARTBEAT_TIMEOUT_SECONDS)
-    may be taken over. Creates the lock table if absent. On any error returns (False, reason):
-    the LOAD caller treats a failed acquire as fail-closed (refuse)."""
+    INSERT (OCC). Returns (acquired, holder_or_reason, contended):
+      acquired  True if this run now holds the lock.
+      contended True ONLY when the acquire failed because ANOTHER LIVE run clearly holds the
+                lock (a fresh, non-stale holder, or a lost race for an un-held/stale slot) —
+                i.e. a real second writer. False for a bookkeeping failure (can't connect, can't
+                create the lock table, any other error) where the guard simply could not take
+                the lock. The caller uses this to decide: a live contender SKIPS the table; a
+                bookkeeping failure in guardrails_mode=warn PROCEEDS with a warning (the guard
+                must not fail a run just because it couldn't take its own lock).
+    A STALE lock (heartbeat older than LOCK_HEARTBEAT_TIMEOUT_SECONDS) may be taken over."""
     label = f"{dsql_schema}.{dsql_table}"
     owner = f"{_run_arg_load('JOB_NAME') or 'load'}:{_run_arg_load('JOB_RUN_ID') or 'local'}"
     now = utc_now_iso()
     try:
         conn, cur = _control_cur()
     except Exception as e:
-        return False, f"could not connect to take the table lock ({e})"
+        return False, f"could not connect to take the table lock ({e})", False
     try:
         cur.execute(f"CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA}")
         cur.execute(f"""
@@ -2264,10 +2286,11 @@ def take_table_lock(dsql_schema, dsql_table):
                     f"UPDATE {CONTROL_SCHEMA}.cdc_control_lock SET heartbeat = %s WHERE "
                     f"table_name = %s", (now, label))
                 _HELD_TABLE_LOCKS.add(label)
-                return True, owner
+                return True, owner, False
             stale = _lock_is_stale(row[1])
             if not stale:
-                return False, f"locked by {held_owner} (another load/run is working this table)"
+                # A live, non-stale holder: a genuine second writer. CONTENDED.
+                return False, f"locked by {held_owner} (another load/run is working this table)", True
             # Stale -> take it over (owner-scoped UPDATE).
             cur.execute(
                 f"UPDATE {CONTROL_SCHEMA}.cdc_control_lock SET owner = %s, heartbeat = %s, "
@@ -2279,8 +2302,9 @@ def take_table_lock(dsql_schema, dsql_table):
             r2 = cur.fetchone()
             if r2 and r2[0] == owner:
                 _HELD_TABLE_LOCKS.add(label)
-                return True, owner
-            return False, f"lost a race to take over the stale lock on {label}"
+                return True, owner, False
+            # Someone else won the takeover race — a live contender.
+            return False, f"lost a race to take over the stale lock on {label}", True
         # No row -> conditional INSERT (a concurrent INSERT loses on the PK unique violation).
         try:
             cur.execute(
@@ -2289,11 +2313,14 @@ def take_table_lock(dsql_schema, dsql_table):
                 f"VALUES (%s, %s, %s, %s, %s)",
                 (label, owner, now, now, now))
             _HELD_TABLE_LOCKS.add(label)
-            return True, owner
+            return True, owner, False
         except Exception as e:
-            return False, f"another run won the lock insert ({e})"
+            # Lost the INSERT race on the PK — another run inserted first. A live contender.
+            return False, f"another run won the lock insert ({e})", True
     except Exception as e:
-        return False, f"table-lock error ({e})"
+        # A bookkeeping failure (e.g. the lock table could not be created, a transient control
+        # error): NOT a live contender. In warn mode the caller proceeds; in strict it refuses.
+        return False, f"table-lock error ({e})", False
     finally:
         try:
             cur.close(); conn.close()
@@ -2343,21 +2370,35 @@ def release_table_lock(dsql_schema, dsql_table):
 def assert_blank_allowed(dsql_schema, dsql_table, current_count, expected_count,
                          previously_attempted, action):
     """The ONE gate every whole-table / range blank passes through. A manual (hand/console)
-    load/validate may still WRITE — this gates ONLY the destructive blank. Enforces:
-      G1  no blank once CDC has started (own override: --blank_guard_enabled false);
-      G2  a blank in a run NO workflow started is REFUSED unless --allow_manual_destructive=true
-          (then: audit "manual override" + a loud WARNING; G1 and G4 still apply). A RUNNING
-          workflow execution blanks without the flag;
+    load/validate may still WRITE — this gates ONLY the destructive blank.
+
+    HARD guards (refuse the blank in BOTH guardrails modes; they only ever STOP a destructive op):
+      G1  no blank once CDC has started. If CDC can't be checked at all (unreadable marker), the
+          blank is refused fail-closed — but ONLY the blank: the caller logs it and the rest of
+          the run (other tables, non-destructive work) continues.
       G4  blank sanity (prior attempt + count vs expected × margin).
-    Writes a G5 audit_log row BEFORE acting (and on refusal). Raises to REFUSE; returns None to
-    allow. Fully disabled only by --blank_guard_enabled false (documented, explicit)."""
+
+    SOFT guard (never fails a run for its own bookkeeping in the default warn mode):
+      G2  "is a workflow driving this run?" A RUNNING workflow execution blanks. A MANUAL run
+          may blank with --allow_manual_destructive=true (audited "manual override" + loud WARN).
+          Otherwise:
+            * guardrails_mode=warn (default): the blank is ALLOWED with a loud WARNING + an audit
+              row — a guard must not fail a legitimate reblank for its own bookkeeping (e.g. a
+              missing states:DescribeExecution permission, or a startup_execution that can't be
+              described). G1 and G4 still fully apply.
+            * guardrails_mode=strict: the blank is REFUSED (today's fail-closed behaviour).
+
+    G5 writes an audit_log row BEFORE acting (and on every refusal). Raises to REFUSE; returns
+    None to allow. Fully disabled only by --blank_guard_enabled false (documented, explicit)."""
     label = f"{dsql_schema}.{dsql_table}"
+    strict = (GUARDRAILS_MODE == "strict")
     if not BLANK_GUARD_ENABLED:
         write_load_audit(dsql_schema, dsql_table, action, current_count, None,
                          "BLANK_GUARD_ENABLED=false (guard explicitly disabled by operator)")
         return
-    # G1 — CDC started? (applies to workflow AND manual runs; its own override is the master
-    # --blank_guard_enabled false, handled above.)
+    # G1 (HARD) — CDC started? Refuses in both modes (a reblank after CDC wipes applied deltas).
+    # _cdc_has_started is fail-closed: an unreadable marker returns started=True, so an
+    # undecidable G1 still refuses the blank (but only the blank — the caller keeps the run going).
     started, how = _cdc_has_started(dsql_schema, dsql_table)
     if started:
         reason = (f"CDC has started for {label} ({how}). Refusing to blank — a reblank now would "
@@ -2366,21 +2407,12 @@ def assert_blank_allowed(dsql_schema, dsql_table, current_count, expected_count,
         write_load_audit(dsql_schema, dsql_table, action + "_refused_cdc_started",
                          current_count, 0, reason)
         raise Exception(f"BLANK GUARD G1 [{label}]: {reason}")
-    # G2 — is a workflow driving this run? A manual run may WRITE, but a destructive blank in a
-    # manual run needs the explicit --allow_manual_destructive flag.
+    # G2 (SOFT) — is a workflow driving this run?
     state, how2 = _workflow_execution_running()
     if state == "running":
         _g2_note = how2
-    else:
-        if not ALLOW_MANUAL_DESTRUCTIVE:
-            reason = (f"{how2} A destructive blank is only automatic from a RUNNING workflow "
-                      f"execution. To blank from a MANUAL run, re-run with "
-                      f"--allow_manual_destructive=true (G1 no-CDC-started and G4 count sanity "
-                      f"still apply). See RUNBOOK 'Safety guardrails' / 'Manual runs'.")
-            write_load_audit(dsql_schema, dsql_table, action + "_refused_manual_no_flag",
-                             current_count, 0, reason)
-            raise Exception(f"BLANK GUARD G2 [{label}]: {reason}")
-        # Flag set: permit the manual blank. Audit "manual override" FIRST + loud WARNING.
+    elif ALLOW_MANUAL_DESTRUCTIVE:
+        # Explicit operator override: permit the manual blank. Audit "manual override" + loud WARN.
         _g2_note = f"manual override (--allow_manual_destructive=true); {how2}"
         write_load_audit(dsql_schema, dsql_table, action + "_manual_override",
                          current_count, None, "manual override")
@@ -2388,7 +2420,32 @@ def assert_blank_allowed(dsql_schema, dsql_table, current_count, expected_count,
               f"MANUAL run because --allow_manual_destructive=true. {how2} G1 (no CDC started) "
               f"and G4 (count sanity) still apply. This WILL delete rows — ensure this is "
               f"intended.", flush=True)
-    # G4 — blank sanity (prior attempt + count vs expected × margin).
+    elif strict:
+        # STRICT: fail-closed exactly as before — a blank is only automatic from a RUNNING
+        # workflow or with the manual flag.
+        reason = (f"{how2} A destructive blank is only automatic from a RUNNING workflow "
+                  f"execution. To blank from a MANUAL run, re-run with "
+                  f"--allow_manual_destructive=true (G1 no-CDC-started and G4 count sanity "
+                  f"still apply). See RUNBOOK 'Safety guardrails' / 'Manual runs'.")
+        write_load_audit(dsql_schema, dsql_table, action + "_refused_manual_no_flag",
+                         current_count, 0, reason)
+        raise Exception(f"BLANK GUARD G2 [{label}]: {reason}")
+    else:
+        # WARN (default): G2 must NOT fail a legitimate workflow-driven reblank for its own
+        # bookkeeping (a missing states:DescribeExecution permission, or an execution it can't
+        # describe). Allow the blank, warn loudly, audit it. G1 (above) and G4 (below) remain the
+        # real protection against data loss. If --startup_execution was passed we say so (this is
+        # almost certainly a workflow run whose execution we simply couldn't confirm).
+        _hint = ("a workflow execution was passed but could not be confirmed RUNNING"
+                 if STARTUP_EXECUTION else "no workflow execution and no "
+                 "--allow_manual_destructive flag")
+        _g2_note = f"G2 warn (guardrails_mode=warn): {how2}"
+        write_load_audit(dsql_schema, dsql_table, action + "_g2_warn_allowed",
+                         current_count, None, f"G2 warn: {how2}")
+        print(f"  ⚠️  G2 [{label}]: {how2} Proceeding anyway (guardrails_mode=warn, {_hint}); "
+              f"G1 (no CDC started) and G4 (count sanity) still apply. Set guardrails_mode=strict "
+              f"to refuse a non-workflow blank. See RUNBOOK 'Safety guardrails'.", flush=True)
+    # G4 (HARD) — blank sanity (prior attempt + count vs expected × margin). Refuses in both modes.
     ok, why = guard_blank_count_sane(current_count, expected_count, previously_attempted,
                                      BLANK_EXPECTED_MARGIN)
     if not ok:
@@ -2703,17 +2760,39 @@ def assert_empty_or_register(dsql_schema, dsql_table, resume_ok=False, pk_col=No
             assert_blank_allowed(dsql_schema, dsql_table, _cnt_before, expected_count,
                                  previously_attempted=bool(resume_ok),
                                  action="auto_reblank_on_resume")
-            # ── G3 TABLE LOCK: only one run may blank+reload a table. A second concurrent run
-            # fails closed here (load side). Released after the reblank+register.
-            _locked, _lk = take_table_lock(dsql_schema, dsql_table)
+            # ── G3 TABLE LOCK (SOFT): only one run should blank+reload a table. Behaviour:
+            #   * acquired            -> proceed, release after the reblank+register.
+            #   * ANOTHER LIVE holder -> skip the reblank (raise) in BOTH modes: a genuine second
+            #                            writer must not be stomped (prevents dup/loss).
+            #   * can't take the lock for a bookkeeping reason (no connection, lock table can't
+            #     be created, control error):
+            #        warn mode   -> WARN and PROCEED (the guard must not fail a load just because
+            #                       it couldn't take its own lock; G1/G4 already gate data loss);
+            #        strict mode -> refuse (today's fail-closed behaviour).
+            _locked, _lk, _contended = take_table_lock(dsql_schema, dsql_table)
             if not _locked:
-                write_load_audit(dsql_schema, dsql_table, "auto_reblank_lock_refused",
-                                 _cnt_before, 0, f"could not take table lock: {_lk}")
-                raise Exception(
-                    f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk}. Another load run holds "
-                    f"this table's lock; refusing a concurrent reblank+reload (would risk "
-                    f"duplicates or wiping the other run's rows). Let the other run finish, or "
-                    f"clear a stale lock in {CONTROL_SCHEMA}.cdc_control_lock.")
+                if _contended:
+                    write_load_audit(dsql_schema, dsql_table, "auto_reblank_lock_contended",
+                                     _cnt_before, 0, f"another live holder: {_lk}")
+                    raise Exception(
+                        f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk}. Another load run "
+                        f"holds this table's lock; refusing a concurrent reblank+reload (would "
+                        f"risk duplicates or wiping the other run's rows). Let the other run "
+                        f"finish, or clear a stale lock in {CONTROL_SCHEMA}.cdc_control_lock.")
+                if GUARDRAILS_MODE == "strict":
+                    write_load_audit(dsql_schema, dsql_table, "auto_reblank_lock_refused_strict",
+                                     _cnt_before, 0, f"could not take table lock: {_lk}")
+                    raise Exception(
+                        f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk} "
+                        f"(guardrails_mode=strict). Set guardrails_mode=warn to proceed when the "
+                        f"lock can't be taken for a bookkeeping reason.")
+                # warn mode: the lock itself failed (not a live contender). Proceed with a warning.
+                write_load_audit(dsql_schema, dsql_table, "auto_reblank_lock_unavailable_warn",
+                                 _cnt_before, 0, f"lock unavailable (bookkeeping): {_lk}")
+                print(f"  ⚠️  G3 [{dsql_schema}.{dsql_table}]: could not take the per-table lock "
+                      f"({_lk}); proceeding anyway (guardrails_mode=warn — the lock is bookkeeping, "
+                      f"not a data-loss gate; G1/G4 still apply). No other live holder was "
+                      f"detected.", flush=True)
             try:
                 print(f"  ♻ RESUME [{dsql_schema}.{dsql_table}]: target non-empty AND "
                       f"previously-attempted by this pipeline -> auto-reblanking whole table "
@@ -4881,13 +4960,27 @@ def load_one_table_chunked(s3_client, entry, config):
         _cnt_before = _count_rows_for_guard(dsql_schema, dsql_table)
         assert_blank_allowed(dsql_schema, dsql_table, _cnt_before, None,
                              previously_attempted=True, action="nopk_midfile_reblank")
-        _locked, _lk = take_table_lock(dsql_schema, dsql_table)
+        _locked, _lk, _contended = take_table_lock(dsql_schema, dsql_table)
         if not _locked:
-            write_load_audit(dsql_schema, dsql_table, "nopk_midfile_reblank_lock_refused",
-                             _cnt_before, 0, f"could not take table lock: {_lk}")
-            raise Exception(
-                f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk}. Another load run holds "
-                f"this table's lock; refusing a concurrent no-PK reblank+reload.")
+            if _contended:
+                write_load_audit(dsql_schema, dsql_table, "nopk_midfile_reblank_lock_contended",
+                                 _cnt_before, 0, f"another live holder: {_lk}")
+                raise Exception(
+                    f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk}. Another load run holds "
+                    f"this table's lock; refusing a concurrent no-PK reblank+reload.")
+            if GUARDRAILS_MODE == "strict":
+                write_load_audit(dsql_schema, dsql_table,
+                                 "nopk_midfile_reblank_lock_refused_strict",
+                                 _cnt_before, 0, f"could not take table lock: {_lk}")
+                raise Exception(
+                    f"BLANK GUARD G3 [{dsql_schema}.{dsql_table}]: {_lk} "
+                    f"(guardrails_mode=strict).")
+            write_load_audit(dsql_schema, dsql_table,
+                             "nopk_midfile_reblank_lock_unavailable_warn",
+                             _cnt_before, 0, f"lock unavailable (bookkeeping): {_lk}")
+            print(f"  ⚠️  G3 [{dsql_schema}.{dsql_table}]: could not take the per-table lock "
+                  f"({_lk}); proceeding (guardrails_mode=warn). No other live holder detected.",
+                  flush=True)
         try:
             blank_whole_table(dsql_schema, dsql_table,
                               pk_col=None,

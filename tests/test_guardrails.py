@@ -73,7 +73,8 @@ def test_shared_helpers_byte_identical():
     names = _PURE_CDC + ["_ensure_cdc_status_guardrail_columns", "write_audit_log",
                          "emit_drift_metric", "_read_count_and_allow", "_audit_destructive",
                          "_nopk_delete_precision_check", "list_load_files",
-                         "_set_blocked_status", "_advance_cdc_counters", "_maybe_run_drift_check"]
+                         "_set_blocked_status", "_advance_cdc_counters", "_maybe_run_drift_check",
+                         "guard_action_blocks", "emit_guard_warn_metric"]
 
     def grab(p):
         src = open(os.path.join(REPO, p)).read()
@@ -284,6 +285,7 @@ def _load_blank_guard(ov):
         "BLANK_GUARD_ENABLED": True,
         "BLANK_EXPECTED_MARGIN": 0.05,
         "ALLOW_MANUAL_DESTRUCTIVE": False,
+        "GUARDRAILS_MODE": "warn",
         "STARTUP_EXECUTION": None,
         "STARTUP_EXECUTION_ARN": None,
         "_cdc_started_result": (False, ""),
@@ -375,16 +377,46 @@ def test_g2_running_execution_allows_blank():
     check(True, "G2: a RUNNING workflow execution blanks WITHOUT the manual flag")
 
 
-def test_g2_console_load_cannot_blank():
-    """A MANUAL run (no workflow) WITHOUT --allow_manual_destructive refuses the blank."""
+def test_g2_console_load_warns_but_allows_by_default():
+    """EASE-GUARDRAILS: a MANUAL run (no workflow) WITHOUT --allow_manual_destructive no longer
+    FAILS by default. In guardrails_mode=warn the blank is ALLOWED with a loud WARNING + an
+    audit row (G1/G4 still gate real data loss). The guard must not fail a legitimate reblank
+    for its own bookkeeping (e.g. a missing states:DescribeExecution)."""
     ns = _load_blank_guard({"_workflow_result": ("none", "this is a MANUAL run"),
-                            "ALLOW_MANUAL_DESTRUCTIVE": False})
+                            "ALLOW_MANUAL_DESTRUCTIVE": False, "GUARDRAILS_MODE": "warn"})
+    ns["assert_blank_allowed"]("s", "t", 100, 100, True, "auto_reblank")   # no raise
+    joined = " ".join(str(a) + str(k) for (a, k) in ns["audit_calls"])
+    check("g2_warn_allowed" in joined,
+          "G2 warn (default): a no-workflow blank is ALLOWED and audited (run does not fail)")
+
+
+def test_g2_console_load_missing_describe_permission_allows():
+    """A Glue role WITHOUT states:DescribeExecution: _workflow_execution_running() returns
+    'not_running' with the permission hint, but --startup_execution was passed. In warn mode the
+    workflow-driven reblank is allowed anyway (missing permission must not block it)."""
+    ns = _load_blank_guard({"_workflow_result": ("not_running",
+                            "could not describe the Step Functions execution (AccessDenied: "
+                            "states:DescribeExecution)."),
+                            "STARTUP_EXECUTION": "startup-abc123",
+                            "ALLOW_MANUAL_DESTRUCTIVE": False, "GUARDRAILS_MODE": "warn"})
+    ns["assert_blank_allowed"]("s", "t", 100, 100, True, "auto_reblank")   # no raise
+    joined = " ".join(str(a) + str(k) for (a, k) in ns["audit_calls"])
+    check("g2_warn_allowed" in joined,
+          "G2 warn: a workflow run whose execution can't be described (missing permission) still "
+          "blanks (allowed + audited)")
+
+
+def test_g2_strict_console_load_cannot_blank():
+    """guardrails_mode=strict restores fail-closed: a MANUAL blank without the flag is REFUSED
+    and the message names --allow_manual_destructive."""
+    ns = _load_blank_guard({"_workflow_result": ("none", "this is a MANUAL run"),
+                            "ALLOW_MANUAL_DESTRUCTIVE": False, "GUARDRAILS_MODE": "strict"})
     try:
         ns["assert_blank_allowed"]("s", "t", 100, 100, True, "auto_reblank")
-        check(False, "G2: expected a refusal for a manual blank without the flag")
+        check(False, "G2 strict: expected a refusal for a manual blank without the flag")
     except Exception as e:
         check("G2" in str(e) and "allow_manual_destructive" in str(e),
-              "G2: a manual destructive blank is refused and the message names the flag")
+              "G2 strict: a manual destructive blank is refused and names the flag")
 
 
 def test_g2_manual_blank_allowed_with_flag_and_audited():
@@ -421,9 +453,11 @@ def test_g2_empty_table_plain_load_ok():
                   if "assert_blank_allowed(" in ln and "def assert_blank_allowed" not in ln]
     check(len(call_lines) >= 2, "G2: assert_blank_allowed is wired on >=2 destructive paths")
     # Each call must be within a window that also contains a blank_whole_table invocation
-    # (i.e. a reblank path), never standalone on the register-empty path.
+    # (i.e. a reblank path), never standalone on the register-empty path. The window is generous
+    # (+50) because the SOFT G3 lock handling (warn/strict/contended) now sits between the gate
+    # call and the blank_whole_table it guards; the empty-register path has NO blank at all.
     for i in call_lines:
-        window = "\n".join(lines[max(0, i - 5):i + 25])
+        window = "\n".join(lines[max(0, i - 5):i + 50])
         check("blank_whole_table(" in window,
               f"G2: assert_blank_allowed call near line {i+1} is on a reblank (destructive) path")
     # The empty-register return path ("_EMPTY_VERIFIED.add" after the non-empty branch) must not

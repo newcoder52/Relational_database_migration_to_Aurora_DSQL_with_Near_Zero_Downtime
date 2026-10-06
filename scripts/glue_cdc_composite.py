@@ -353,6 +353,14 @@ CDC_DRIFT_CHECK_MINUTES = 30     # G9: minutes between live-count-vs-expected ch
 CDC_DRIFT_TOLERANCE = 0.0        # G9: allowed |live − expected| row difference before firing
 CDC_DRIFT_ACTION = "warn"        # G9: "warn" (log+metric+audit) or "block" (also set 'blocked')
 _DRIFT_LAST_RUN = {}             # G9: per-table monotonic clock of the last drift check (throttle)
+# EASE-GUARDRAILS: master mode + per-guard WARN/block knobs. In "warn" (default) a soft guard
+# NEVER blocks a table for its own bookkeeping — it logs a WARNING + a DsqlGuardWarn metric and
+# keeps applying. "strict" restores the fail-closed (block) behaviour. The HARD G6 mass-delete
+# guard blocks in BOTH modes (it only ever stops a destructive op). The per-guard actions below
+# default to the master mode when left at "warn".
+GUARDRAILS_MODE = "warn"            # "warn" | "strict"
+CDC_FILE_ORDER_ACTION = "warn"      # G8 order/gap/new-LOAD-after-CDC: "warn" | "block"
+CDC_NOPK_OVERMATCH_ACTION = "warn"  # G7 no-PK over-match precision: "warn" | "block"
 
 # =============================================================================
 # DSQL TRANSACTION LIMITS + RETRY TUNING  (borrowed verbatim from job2 v15)
@@ -467,6 +475,7 @@ def _apply_cdc_arg_overrides():
     global CDC_OWNER_SELF, CDC_OWNERS_KEY
     global CDC_MAX_DELETE_FRACTION, CDC_MAX_DELETE_ROWS
     global CDC_DRIFT_CHECK_MINUTES, CDC_DRIFT_TOLERANCE, CDC_DRIFT_ACTION
+    global GUARDRAILS_MODE, CDC_FILE_ORDER_ACTION, CDC_NOPK_OVERMATCH_ACTION
     optional = ["config_prefix", "index_s3_key", "load_status_key", "s3_bucket", "cdc_root",
                 "dsql_endpoint", "dsql_database", "dsql_user", "region",
                 "dms_task_arn", "control_schema",
@@ -475,6 +484,7 @@ def _apply_cdc_arg_overrides():
                 "cdc_validation", "cdc_validation_sample",
                 "cdc_max_delete_fraction", "cdc_max_delete_rows",
                 "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
+                "guardrails_mode", "cdc_file_order_action", "cdc_nopk_overmatch_action",
                 "cdc_owner_self", "cdc_owners_key"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
@@ -581,6 +591,29 @@ def _apply_cdc_arg_overrides():
         else:
             print(f"  ⚠️ ignoring invalid cdc_drift_action={ov['cdc_drift_action']!r} "
                   f"(must be warn|block)")
+    # EASE-GUARDRAILS master mode. strict => fail-closed: the soft CDC guards (G7/G8) block.
+    if "guardrails_mode" in ov and ov["guardrails_mode"] is not None:
+        _gm = str(ov["guardrails_mode"]).strip().lower()
+        if _gm in ("warn", "strict"):
+            GUARDRAILS_MODE = _gm
+            print(f"  ↪ GUARDRAILS_MODE -> {GUARDRAILS_MODE}")
+            if _gm == "strict":
+                # strict implies block for the soft CDC guards (an explicit per-guard override
+                # below still wins).
+                CDC_FILE_ORDER_ACTION = "block"
+                CDC_NOPK_OVERMATCH_ACTION = "block"
+        else:
+            print(f"  ⚠️ ignoring invalid guardrails_mode={ov['guardrails_mode']!r} "
+                  f"(must be warn|strict)")
+    for _ek, _gl in (("cdc_file_order_action", "CDC_FILE_ORDER_ACTION"),
+                     ("cdc_nopk_overmatch_action", "CDC_NOPK_OVERMATCH_ACTION")):
+        if _ek in ov and ov[_ek] is not None and str(ov[_ek]).strip():
+            _v = str(ov[_ek]).strip().lower()
+            if _v in ("warn", "block"):
+                globals()[_gl] = _v
+                print(f"  ↪ {_gl} overridden -> {_v}")
+            else:
+                print(f"  ⚠️ ignoring invalid {_ek}={ov[_ek]!r} (must be warn|block)")
 
 
 _apply_cdc_arg_overrides()
@@ -1271,6 +1304,41 @@ def write_audit_log(cur, table_name, action, rows_before, rows_deleted, reason,
     return _id
 
 
+def guard_action_blocks(action):
+    """EASE-GUARDRAILS (PURE): map a per-guard action string to whether the guard should BLOCK
+    the table (True) or merely WARN and keep applying (False). Any value other than the exact
+    string 'block' is treated as warn (the SAFE default never fails a run). Used by the soft CDC
+    guards G7 (cdc_nopk_overmatch_action) and G8 (cdc_file_order_action)."""
+    return str(action).strip().lower() == "block"
+
+
+def emit_guard_warn_metric(label, guard):
+    """EASE-GUARDRAILS best-effort CloudWatch metric emitted when a SOFT guard (G7/G8) trips in
+    WARN mode (table NOT blocked). Lets operators alarm on 'a guard would have blocked but we
+    kept going' without failing the run. Same namespace as the drift metric (GlueCDC/NonPK), so
+    no new IAM. Never raises — a metric must not affect the apply."""
+    if not cloudwatch or _OPTIONAL_API_DOWN["cloudwatch"]:
+        return
+    try:
+        cloudwatch.put_metric_data(
+            Namespace="GlueCDC/NonPK",
+            MetricData=[{
+                "MetricName": "DsqlGuardWarn",
+                "Dimensions": [{"Name": "Table", "Value": label},
+                               {"Name": "Guard", "Value": str(guard)}],
+                "Value": 1.0,
+                "Unit": "Count",
+            }])
+    except Exception as e:
+        if _is_unreachable(e):
+            _OPTIONAL_API_DOWN["cloudwatch"] = True
+            print(f"    ⚠️ CloudWatch is not reachable from this job ({type(e).__name__}); the "
+                  f"DsqlGuardWarn metric is turned off for this run (the warning is still "
+                  f"logged + written to {CONTROL_SCHEMA}.audit_log).")
+        else:
+            print(f"    ⚠️ CW guard-warn-metric emit failed (non-fatal) for {label}: {e}")
+
+
 def emit_drift_metric(label, delta):
     """G9 best-effort CloudWatch metric for row drift (|live − expected|). Never raises — a
     metric must not affect the apply. Emits into the SAME namespace the pipeline already uses
@@ -1646,26 +1714,36 @@ def _ensure_control_tables_once():
         # emptied/shrank a table is always attributable, even if the job then crashes. id is a
         # Python uuid4 (DSQL has no guaranteed server-side gen_random_uuid() DDL default — same
         # reason as cdc_apply_exceptions). CREATE TABLE only; no DEFAULT-on-ALTER anywhere.
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.audit_log (
-                id              uuid PRIMARY KEY,
-                event_time      timestamptz,
-                task            varchar(512),
-                job             varchar(256),
-                run_id          varchar(256),
-                execution_id    varchar(512),
-                table_name      varchar(512),
-                action          varchar(64),
-                rows_before     bigint,
-                rows_deleted    bigint,
-                reason          varchar(8000)
-            )
-        """)
-        # G9 upgrade path: an OLDER cdc_status table predates the drift counters + the G6
-        # allow_mass_delete flag. Add any missing column with NO DEFAULT (DSQL forbids
-        # DEFAULT-on-ALTER, SQLSTATE 0A000) — new rows set them explicitly; readers treat NULL
-        # as "unknown/0". Same add-if-missing pattern as _ensure_resolved_column (B17).
-        _ensure_cdc_status_guardrail_columns(cur)
+        # EASE-GUARDRAILS: audit_log + the cdc_status guardrail columns are GUARDRAIL bookkeeping,
+        # not the resume ledger. If their create/upgrade fails on an older or locked schema, a
+        # guardrail must not fail CDC startup — warn and continue. The guards that write them are
+        # all best-effort (they catch their own write errors), so a missing audit_log/column just
+        # means that bookkeeping is skipped, never that the apply stops.
+        try:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.audit_log (
+                    id              uuid PRIMARY KEY,
+                    event_time      timestamptz,
+                    task            varchar(512),
+                    job             varchar(256),
+                    run_id          varchar(256),
+                    execution_id    varchar(512),
+                    table_name      varchar(512),
+                    action          varchar(64),
+                    rows_before     bigint,
+                    rows_deleted    bigint,
+                    reason          varchar(8000)
+                )
+            """)
+            # G9 upgrade path: an OLDER cdc_status table predates the drift counters + the G6
+            # allow_mass_delete flag. Add any missing column with NO DEFAULT (DSQL forbids
+            # DEFAULT-on-ALTER, SQLSTATE 0A000) — new rows set them explicitly; readers treat
+            # NULL as "unknown/0". Same add-if-missing pattern as _ensure_resolved_column (B17).
+            _ensure_cdc_status_guardrail_columns(cur)
+        except Exception as _ge:
+            print(f"  ⚠️ guardrail control bookkeeping (audit_log / cdc_status counters) could "
+                  f"not be created/upgraded ({_ge}); CDC continues without it (the guards that "
+                  f"use it are best-effort). guardrails_mode does not change this.")
         print(f"  ✓ control tables ready in {CONTROL_SCHEMA}")
     finally:
         cur.close()
@@ -3880,10 +3958,21 @@ def apply_file_nonpk(ctx, cdc_key, start_offset, conn_holder, prior_watermark=No
         _ok, _why7 = _nopk_delete_precision_check(conn_holder, label, dsql_schema, dsql_table,
                                                   delete_ops, _content_where)
         if not _ok:
-            _audit_destructive(conn_holder, label, "cdc_nopk_overmatch_blocked",
+            if guard_action_blocks(CDC_NOPK_OVERMATCH_ACTION):
+                _audit_destructive(conn_holder, label, "cdc_nopk_overmatch_blocked",
+                                   rows_before=_cur_cnt, rows_deleted=0,
+                                   reason=f"{cdc_key.split('/')[-1]}: {_why7}")
+                raise TableBlocked(f"NO-PK DELETE GUARD [{label}] {cdc_key.split('/')[-1]}: {_why7}")
+            # WARN (default): record + metric; apply the content DELETEs as the file specifies.
+            # The G6 mass-delete guard (above, HARD) is the real volume cap; this precision check
+            # is a refinement that must not fail a normal run for its own bookkeeping. Set
+            # cdc_nopk_overmatch_action=block (or guardrails_mode=strict) to block instead.
+            _audit_destructive(conn_holder, label, "cdc_nopk_overmatch_warn",
                                rows_before=_cur_cnt, rows_deleted=0,
                                reason=f"{cdc_key.split('/')[-1]}: {_why7}")
-            raise TableBlocked(f"NO-PK DELETE GUARD [{label}] {cdc_key.split('/')[-1]}: {_why7}")
+            emit_guard_warn_metric(label, "G7_nopk_overmatch")
+            print(f"    ⚠️  G7 {label} {cdc_key.split('/')[-1]}: {_why7} (guardrails_mode=warn — "
+                  f"WARNING, applying anyway; set cdc_nopk_overmatch_action=block to block)")
     # G9: stash this file's net INSERT/DELETE counts so process_table can advance the running
     # expectation counters (cdc_status.inserts_applied/deletes_applied) after the file applies.
     ctx["_last_file_io"] = (vstats.get("n_insert", 0), vstats.get("n_delete", 0))
@@ -4506,14 +4595,32 @@ def process_table(ctx, load_status_map=None):
         # DMS 'reload table' under a live CDC stream — block rather than ignore it (a reload
         # would reblank/clobber the target). Checked ONCE per cycle, before any apply.
         _cdc_started = bool(last_done) or bool(in_progress)
-        _ok8, _why8 = guard_new_load_after_cdc(list_load_files(ctx), _cdc_started)
+        try:
+            _load_files_for_g8 = list_load_files(ctx)
+        except Exception as _e8:
+            # A guard's own read must never raise into the apply path. Warn and treat as "no
+            # new LOAD files" (guard passes); the stream keeps flowing.
+            _load_files_for_g8 = []
+            print(f"    ⚠️  G8 {label}: could not list LOAD* files ({_e8}); skipping the "
+                  f"new-LOAD-after-CDC check this cycle (carry on as if it passed).")
+        _ok8, _why8 = guard_new_load_after_cdc(_load_files_for_g8, _cdc_started)
         if not _ok8:
-            _audit_destructive(conn_holder, label, "cdc_new_load_after_start_blocked",
+            if guard_action_blocks(CDC_FILE_ORDER_ACTION):
+                _audit_destructive(conn_holder, label, "cdc_new_load_after_start_blocked",
+                                   rows_before=None, rows_deleted=0, reason=_why8)
+                _set_blocked_status(conn_holder, label, _why8)
+                _mf["status"] = "blocked"
+                print(f"    ⛔ {label} BLOCKED: {_why8}")
+                return {"table": label, "status": "blocked", "files": 0, "rows": 0,
+                        "error": _why8}
+            # WARN (default): record + metric, but keep applying this cycle. A new LOAD* after
+            # CDC started is unusual, so it is loud; set cdc_file_order_action=block (or
+            # guardrails_mode=strict) to stop the table instead.
+            _audit_destructive(conn_holder, label, "cdc_new_load_after_start_warn",
                                rows_before=None, rows_deleted=0, reason=_why8)
-            _set_blocked_status(conn_holder, label, _why8)
-            _mf["status"] = "blocked"
-            print(f"    ⛔ {label} BLOCKED: {_why8}")
-            return {"table": label, "status": "blocked", "files": 0, "rows": 0, "error": _why8}
+            emit_guard_warn_metric(label, "G8_new_load")
+            print(f"    ⚠️  G8 {label}: {_why8} (guardrails_mode=warn — WARNING, not blocking; "
+                  f"set cdc_file_order_action=block to block)")
 
         # ── G8 ORDERING / HIGH-WATER / GAP GUARD: every pending file must sort strictly AFTER
         # the high-water mark and in order. A file at/under the high-water (replay/regression,
@@ -4523,13 +4630,23 @@ def process_table(ctx, load_status_map=None):
         for _pk in pending:
             _ok8b, _why8b = guard_file_order(_pk, last_done, _done8)
             if not _ok8b:
-                _audit_destructive(conn_holder, label, "cdc_file_order_blocked",
+                if guard_action_blocks(CDC_FILE_ORDER_ACTION):
+                    _audit_destructive(conn_holder, label, "cdc_file_order_blocked",
+                                       rows_before=None, rows_deleted=0, reason=_why8b)
+                    _set_blocked_status(conn_holder, label, _why8b)
+                    _mf["status"] = "blocked"
+                    print(f"    ⛔ {label} BLOCKED: {_why8b}")
+                    return {"table": label, "status": "blocked", "files": 0, "rows": 0,
+                            "error": _why8b}
+                # WARN (default): record + metric; keep applying in the natural (sorted) order.
+                # A gap/regression is logged so an operator can investigate, but a transient
+                # ordering wobble does not stop the stream. cdc_file_order_action=block (or
+                # guardrails_mode=strict) blocks instead.
+                _audit_destructive(conn_holder, label, "cdc_file_order_warn",
                                    rows_before=None, rows_deleted=0, reason=_why8b)
-                _set_blocked_status(conn_holder, label, _why8b)
-                _mf["status"] = "blocked"
-                print(f"    ⛔ {label} BLOCKED: {_why8b}")
-                return {"table": label, "status": "blocked", "files": 0, "rows": 0,
-                        "error": _why8b}
+                emit_guard_warn_metric(label, "G8_file_order")
+                print(f"    ⚠️  G8 {label}: {_why8b} (guardrails_mode=warn — WARNING, not "
+                      f"blocking; set cdc_file_order_action=block to block)")
             _done8.append(_pk)
 
         # Guarantee the cdc_status row EXISTS before any chunk runs, so the per-chunk

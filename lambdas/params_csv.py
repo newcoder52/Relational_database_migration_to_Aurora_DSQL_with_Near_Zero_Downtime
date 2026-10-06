@@ -41,6 +41,13 @@ KEYS
                                               0 = off)
     cdc_drift_tolerance = 0                  (G9: allowed row difference before drift fires)
     cdc_drift_action   = warn                (G9: warn | block on drift)
+    guardrails_mode    = warn                (master switch: warn | strict. warn never fails a
+                                              run for a guard's own bookkeeping; strict restores
+                                              fail-closed. Per-guard keys below still override.)
+    cdc_file_order_action = warn             (G8 order/gap/new-LOAD: warn | block)
+    cdc_nopk_overmatch_action = warn         (G7 no-PK over-match: warn | block)
+    validate_count_check = warn              (G10 validate vs DMS FullLoadRows: warn | strict)
+    cutover_count_check  = warn              (G10 cutover count equation: warn | strict)
     glue_role_arn      = arn:aws:iam::<account_id>:role/<project>-glue-exec-role
   Setup-only (used by tools/setup.sh; NOT part of pipeline.json):
     subnet_id, security_group_id            both together, or neither (Glue network connection)
@@ -108,6 +115,28 @@ OPTIONAL_DEFAULTS = {
     "cdc_drift_check_minutes": "30",
     "cdc_drift_tolerance": "0",
     "cdc_drift_action": "warn",
+    # guardrails_mode (master switch): "warn" (default) or "strict".
+    #   warn   — a guardrail may STOP a destructive action (G1 no-blank-after-CDC, G4 blank
+    #            sanity, G6 mass-delete) but NEVER fails a run for its own bookkeeping: a missing
+    #            permission, a missing control table, a lock it can't take, or a check it can't
+    #            compute degrades to a WARNING and the run continues (other tables + all
+    #            non-destructive work keep flowing). G2/G3/G5/G7/G8/G9/G10 are WARN by default.
+    #   strict — restores fail-closed behaviour for operators who want it (G2 blocks a
+    #            no-workflow blank, G3 refuses on a lock it can't take, G7/G8 block, G10 fails).
+    #   Individual settings below still override per-guard regardless of the mode.
+    "guardrails_mode": "warn",
+    # cdc_file_order_action (G8 ordering/gap/new-LOAD-after-CDC): "warn" (default; log + metric,
+    #   keep applying in order) or "block" (set the table 'blocked'). strict mode implies block.
+    "cdc_file_order_action": "warn",
+    # cdc_nopk_overmatch_action (G7 no-PK over-match precision): "warn" (default; apply and warn)
+    #   or "block". strict mode implies block.
+    "cdc_nopk_overmatch_action": "warn",
+    # validate_count_check / cutover_count_check (G10): "warn" (default; DSQL-vs-DMS FullLoadRows
+    #   mismatch logs a WARNING, validation/cutover still passes) or "strict" (mismatch fails /
+    #   cutover refuses with CountMismatch). DMS counts can legitimately differ (e.g. the source
+    #   changed during the load), so warn is the safe default. strict mode implies strict here.
+    "validate_count_check": "warn",
+    "cutover_count_check": "warn",
     "max_composite_forks": "8",
     "max_big_cdc_forks": "8",
     # Planning thresholds (plan_split fan-out knobs; defaults equal the former ASL literals).
@@ -209,6 +238,8 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "control_schema", "cdc_validation", "cdc_validation_sample",
                  "cdc_max_delete_fraction", "cdc_max_delete_rows",
                  "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
+                 "guardrails_mode", "cdc_file_order_action", "cdc_nopk_overmatch_action",
+                 "validate_count_check", "cutover_count_check",
                  "max_composite_forks", "max_big_cdc_forks",
                  "big_table_row_threshold", "file_fanout_threshold", "big_table_bytes_threshold",
                  "max_groups", "map_max_concurrency", "max_files_in_parallel",
@@ -410,6 +441,21 @@ def parse(text):
         if _da not in ("warn", "block"):
             errors.append(f"cdc_drift_action must be 'warn' or 'block' (got "
                           f"{raw['cdc_drift_action']!r}).")
+    # Guardrail enum keys (ease-guardrails):
+    #   guardrails_mode               : warn | strict   (master switch)
+    #   cdc_file_order_action (G8)    : warn | block
+    #   cdc_nopk_overmatch_action(G7) : warn | block
+    #   validate_count_check (G10)    : warn | strict
+    #   cutover_count_check (G10)     : warn | strict
+    for _k, _allowed in (("guardrails_mode", ("warn", "strict")),
+                         ("cdc_file_order_action", ("warn", "block")),
+                         ("cdc_nopk_overmatch_action", ("warn", "block")),
+                         ("validate_count_check", ("warn", "strict")),
+                         ("cutover_count_check", ("warn", "strict"))):
+        if _k in raw:
+            _v = str(raw[_k]).strip().lower()
+            if _v not in _allowed:
+                errors.append(f"{_k} must be one of {_allowed} (got {raw[_k]!r}).")
     # min_writers_per_loader <= max_writers_per_loader (only when both parsed cleanly).
     if "min_writers_per_loader" in ints and "max_writers_per_loader" in ints:
         if ints["min_writers_per_loader"] > ints["max_writers_per_loader"]:
