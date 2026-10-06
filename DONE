@@ -1,10 +1,31 @@
 DONE
 
-Task: RUNBOOK §3 "Fill in params.csv" restructured so every parameter shows its Phase(s) and the
-component (script / Lambda / state machine) that uses it, derived from the code. MANUAL_SETUP §3c
-mirrors the Phase(s) / Used-by columns. tests/test_docs_params.py extended to require a non-empty
-Phase(s) and Used-by cell for every key, and all suites pass.
+Task: fix B20 (cutover DeleteGlueJobs can't resolve the account id -> GlueJobsNotDeleted) and B21
+(composite CDC run slow to stop times the 300s delete Lambda out), both still present on current
+main.
 
-Base commit: 8825b413d61872d558ad014eaa7fd345cc0663e7
-Files changed: RUNBOOK.md, docs/MANUAL_SETUP.md, tests/test_docs_params.py
-No runtime file changed. All 11 test files green.
+B20: cutover DeleteGlueJobs now passes account_id (+ dms_task_arn), and create_glue_jobs
+_account_id falls back to the Lambda's own context ARN then STS, so delete/list_fork_cdc can never
+fail to resolve the account again. Extended the ASL payload-contract test with an INPUT-side check
+(ASL Parameters keys superset the keys each Lambda mode requires), with a B20 negative regression,
+and audited all 4 state machines for the same class of gap (none other found).
+
+B21: _wait_runs_stopped is bounded by context.get_remaining_time_in_millis() and delete mode
+returns still-stopping jobs under "pending" (force-stopped, not deleted); cutover.asl.json loops
+DeleteGlueJobs (Wait -> delete) up to a ~60-min budget, then ends in GlueJobsNotDeleted naming the
+jobs. glue_cdc_composite.py reacts to a stop promptly (interruptible wait + SIGTERM handler); the
+root cause of the slow stop (a 30s uninterruptible poll sleep) is documented.
+
+Base commit: 0d7d2d86dda7c97ae893c366781fd3980f4d4deb (docs-only above 8825b41)
+Fix commit:  6c5c4f74aee970f5f2841a66247b4adb068df988
+
+Runtime files changed:
+  lambdas/create_glue_jobs.py
+  scripts/glue_cdc_composite.py
+  stepfunctions/cutover.asl.json
+  (glue-templates/: none)
+
+Non-runtime: RUNBOOK.md, tests/test_asl_payload_contract.py, tests/test_e2e_fixes.py
+
+All required suites green: test_asl_paths, test_asl_payload_contract, test_guardrails,
+test_e2e_fixes, test_b17_b13, test_b18_validate_throughput, test_docs_params, test_fix6.
