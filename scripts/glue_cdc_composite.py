@@ -648,6 +648,17 @@ try:
         cloudwatch = boto3.client('cloudwatch', region_name=REGION)
 except Exception:
     cloudwatch = None
+# B25 FIX: the best-effort CloudWatch metric emitters (emit_drift_metric / emit_guard_warn_metric)
+# gate on _OPTIONAL_API_DOWN["cloudwatch"] to stop retrying metric puts once CW is unreachable.
+# This module referenced that flag but never defined it (glue_cdc_continuous.py defines it; the
+# composite fork dropped it). The reference lives OUTSIDE the functions' try/except, so the FIRST
+# time a drift (G9) or a soft-guard warn (G7/G8) fired, emit_* raised NameError -> it propagated
+# into process_table's table-level safety net -> the table was logged as a transient "cycle error
+# (isolated, will retry next poll)" and parked forever. Because the drift/guard warn re-fires every
+# cycle, the table never advanced: after the first applied batch, list_cdc_files kept finding the
+# new files but the cycle crashed before applying them, so batch 2/3 were never consumed (B25).
+# Defined here identically to glue_cdc_continuous.py so metric emission is a true no-op-on-failure.
+_OPTIONAL_API_DOWN = {"cloudwatch": False, "dms_logged": False}
 
 
 def _is_unreachable(e):
