@@ -1,88 +1,10 @@
 DONE
 
-Task: fix B19 and B18 from real-e2e/REPORT.md. Offline only; no AWS account touched.
+Task: RUNBOOK §3 "Fill in params.csv" restructured so every parameter shows its Phase(s) and the
+component (script / Lambda / state machine) that uses it, derived from the code. MANUAL_SETUP §3c
+mirrors the Phase(s) / Used-by columns. tests/test_docs_params.py extended to require a non-empty
+Phase(s) and Used-by cell for every key, and all suites pass.
 
-Base HEAD (verified via git ls-remote): 5e4adf8
-Commit:                               dd88d83  (parent 5e4adf8, fast-forward)
-Author:                               newcoder52 <aash.798@gmail.com>
-Pushed:                               origin/main  5e4adf8..dd88d83  (plain git push, no force)
-Verified:                             2nd fresh clone at HEAD dd88d83, all 9 suites green,
-                                      cutover composite reads gone (grep = 0).
-
-B19 (HIGH): removed the two obsolete $.Payload reads (compositeCdcJobName, hasCompositeTables)
-from cutover.asl.json CutoverResolveTask — forks are found by tag at cutover, so the fields are
-dead. Added tests/test_asl_payload_contract.py (every $.Payload.<field> a ResultSelector reads
-must be returned by the Lambda in that mode, all 4 state machines incl. fleet-*; + fake-invoke
-of resolve_task cutover mode). test_asl_paths.py now also runs this audit.
-
-B18 (HIGH): job3_validate.py now (1) computes md5 ONCE per value via a derived table
-(identical numbers, ~6x fewer md5 calls — the 300s root cause), (2) drops redundant text
-MIN/MAX when hashing + adds validate_hash=all|keys|off, (3) replaces the N-deep F.when source
-bucketing with a broadcast range-join + bounded ranges-per-plan (StackOverflow fix), (4) runs
-per-range DSQL queries in parallel sized from the worker and hard-capped by conn_budget + DSQL's
-10,000-conn cluster limit, (5) sizes ranges by TIME (adaptive, 5-20s band) with
-validate_rows_per_range as a seed, (6) logs per-table throughput. Settings validate_parallelism /
-validate_target_seconds_per_range / validate_hash wired params.csv -> pipeline.json ->
-resolve_task -> startup ASL -> validate/ck-validate job args. Tests:
-tests/test_b18_validate_throughput.py (8M/100M/1B bounded plans, parallelism <= conn_budget,
-sizer converges, single-md5 identical, parallel >> sequential).
-
-Docs: RUNBOOK §3/§8 + MANUAL_SETUP §3/§3c + params.example.csv + pipeline.example.json updated;
-removed advice to raise validate_rows_per_range for StackOverflow; added an EXPLAIN ANALYZE
-snippet (RUNBOOK §8) to time one range query.
-
-Runtime files changed:
-  scripts/job3_validate.py
-  lambdas/resolve_task.py
-  lambdas/create_glue_jobs.py
-  lambdas/params_csv.py
-  stepfunctions/cutover.asl.json
-  stepfunctions/startup.asl.json
-(glue-templates/ unchanged — validate args are injected by create_glue_jobs.)
-
-Tests added/changed: tests/test_asl_payload_contract.py, tests/test_b18_validate_throughput.py,
-tests/test_asl_paths.py, tests/test_e2e_fixes.py, tests/test_fix6.py.
-Docs/examples: RUNBOOK.md, docs/MANUAL_SETUP.md, config/params.example.csv, config/pipeline.example.json.
-Deliverables: RESULT.md, DONE.
-
-Sync: ~/Downloads/dms-s3-glue-dsql-migration/ backed up to
-~/Downloads/cdc_backups/before-dd88d83/ (no .git), then the 15 changed files copied in
-(byte-identical to repo); its .git was not touched. Sync target suites green.
-
-All existing suites green (9/9).
-
-
-==================== (appended) data-safety guardrails ====================
-
-DONE — data-safety guardrails (G1–G10)
-
-Built offline (no AWS touched) on remote HEAD 5e4adf8, then rebased onto main at push time
-(dd88d83 = the parallel B19/B18 commit), resolving conflicts by KEEPING BOTH sides:
-  - RESULT.md (add/add): both the B19/B18 result and the guardrails result are kept.
-  - RUNBOOK.md: pipeline-key count merged to 48 (43 from B18/B19 + 5 new guardrail keys);
-    both key lists kept.
-  - lambdas/create_glue_jobs.py: both B18 validate throughput args and the G10 DMS args kept.
-  - scripts/job3_validate.py: both B18 globals/args and the G10 globals/args kept.
-
-Guardrails: G1 (no blank once CDC started), G2 (destructive blank only from a RUNNING workflow
-or an explicit --allow_manual_destructive manual run; manual loads/validates/CDC always allowed),
-G3 (per-table lock), G4 (blank sanity vs DMS FullLoadRows), G5 (audit_log before every destructive
-op), G6 (CDC mass-delete guard), G7 (no-PK delete precision + exact _cdc_file purge), G8 (ordering/
-high-water/gap/new-LOAD), G9 (drift detector + DsqlRowDrift metric), G10 (validate & cutover vs DMS
-FullLoadRows(+I-D), new CountMismatch state).
-
-Shared CDC helpers byte-identical across glue_cdc_continuous.py and glue_cdc_composite.py; Spark CDC
-uses the same scripts. New settings cdc_max_delete_fraction / cdc_max_delete_rows /
-cdc_drift_check_minutes / cdc_drift_tolerance / cdc_drift_action flow params.csv -> pipeline.json ->
-resolve_task payload -> create_glue_jobs job args. iam/glue.json adds states:DescribeExecution.
-
-Tests: tests/test_guardrails.py (78 checks, one+ per WHAT_IF row). ALL existing suites green,
-including test_e2e_fixes.py, test_b17_b13.py, and the B18/B19 suites (test_asl_payload_contract.py,
-test_b18_validate_throughput.py). Offline; fake DSQL enforces the 3000-row/txn cap. The static DSQL
-rule (no ADD COLUMN ... DEFAULT) still passes.
-
-Commit as newcoder52 <aash.798@gmail.com>, plain git push (no tokens, no force), verified in a
-second fresh clone.
-
-Final commit sha: the HEAD of main after this push (git log -1). The parent is dd88d83 (B19/B18),
-whose parent is 5e4adf8. Verified by re-cloning and confirming origin/main == this commit.
+Base commit: 8825b413d61872d558ad014eaa7fd345cc0663e7
+Files changed: RUNBOOK.md, docs/MANUAL_SETUP.md, tests/test_docs_params.py
+No runtime file changed. All 11 test files green.

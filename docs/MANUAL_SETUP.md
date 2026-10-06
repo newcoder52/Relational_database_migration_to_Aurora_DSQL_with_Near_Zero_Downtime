@@ -389,56 +389,56 @@ out); `account_id`, `subnet_id`, `security_group_id` are **not** written. Don't 
 `config/pipeline.example.json` as-is — its `description` holds `<bucket>`, and any value with `<`/`>`
 is rejected at run time.
 
-| `config/pipeline.json` key | from `params.csv` | default |
-|---|---|---|
-| `project` | `project` | — |
-| `region` | `region` | — |
-| `dsql_endpoint` | `dsql_endpoint` | — |
-| `dsql_user` | `dsql_user` | `admin` |
-| `dsql_database` | `dsql_database` | `postgres` |
-| `glue_role_arn` | `glue_role_arn` | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` |
-| `glue_connection` | `glue_connection` | `""` |
-| `cdc_engine` | `cdc_engine` | `pythonshell` |
-| `cdc_spark_fallback` | `cdc_spark_fallback` | `true` |
-| `control_schema` | `control_schema` | `cdc_control` |
-| `cdc_validation` | `cdc_validation` | `true` |
-| `cdc_validation_sample` | `cdc_validation_sample` | `20` |
-| `cdc_max_delete_fraction` | `cdc_max_delete_fraction` | `0.5` |
-| `cdc_max_delete_rows` | `cdc_max_delete_rows` | `100000` |
-| `cdc_drift_check_minutes` | `cdc_drift_check_minutes` | `30` |
-| `cdc_drift_tolerance` | `cdc_drift_tolerance` | `0` |
-| `cdc_drift_action` | `cdc_drift_action` | `warn` |
-| `max_composite_forks` | `max_composite_forks` | `8` |
-| `max_big_cdc_forks` | `max_big_cdc_forks` | `8` |
-| `big_table_row_threshold` | `big_table_row_threshold` | `6000000` |
-| `file_fanout_threshold` | `file_fanout_threshold` | `8` |
-| `big_table_bytes_threshold` | `big_table_bytes_threshold` | `1000000000` |
-| `max_groups` | `max_groups` | `10` |
-| `map_max_concurrency` | `map_max_concurrency` | `6` |
-| `max_files_in_parallel` | `max_files_in_parallel` | `30` |
-| `writers_per_file` | `writers_per_file` | `8` |
-| `conn_budget` | `conn_budget` | `900` |
-| `min_writers_per_loader` | `min_writers_per_loader` | `100` |
-| `max_writers_per_loader` | `max_writers_per_loader` | `150` |
-| `validate_rows_per_range` | `validate_rows_per_range` | `10000` |
-| `validate_parallelism` | `validate_parallelism` | `0` |
-| `validate_target_seconds_per_range` | `validate_target_seconds_per_range` | `12` |
-| `validate_hash` | `validate_hash` | `all` |
-| `glue_version` | `glue_version` | `4.0` |
-| `discovery_worker_type` | `discovery_worker_type` | `G.2X` |
-| `discovery_num_workers` | `discovery_num_workers` | `5` |
-| `discovery_timeout_minutes` | `discovery_timeout_minutes` | `480` |
-| `load_worker_type` | `load_worker_type` | `G.4X` |
-| `load_num_workers` | `load_num_workers` | `10` |
-| `load_timeout_minutes` | `load_timeout_minutes` | `2880` |
-| `load_big_worker_type` | `load_big_worker_type` | `G.8X` |
-| `load_big_num_workers` | `load_big_num_workers` | `10` |
-| `load_big_timeout_minutes` | `load_big_timeout_minutes` | `2880` |
-| `validate_worker_type` | `validate_worker_type` | `G.8X` |
-| `validate_num_workers` | `validate_num_workers` | `10` |
-| `validate_timeout_minutes` | `validate_timeout_minutes` | `2880` |
-| `max_parallel_tables` | `max_parallel_tables` | `20` |
-| `per_worker_mem_budget_mb` | `per_worker_mem_budget_mb` | `1500` |
+| `config/pipeline.json` key | from `params.csv` | default | Phase(s) | Used by |
+|---|---|---|---|---|
+| `project` | `project` | — | Discovery, Planning, Full load, Validation, CDC, Cutover | `resolve_task` (Glue job names); `plan_split` |
+| `region` | `region` | — | Discovery, Full load, Validation, CDC, Cutover | `create_glue_jobs` `--region`; all Glue jobs; `drain_check`/`drop_tags` |
+| `dsql_endpoint` | `dsql_endpoint` | — | Discovery, Full load, Validation, CDC, Cutover | `create_glue_jobs` `--dsql_endpoint`; all Glue jobs; `drain_check`/`drop_tags` |
+| `dsql_user` | `dsql_user` | `admin` | Discovery, Full load, Validation, CDC, Cutover | `create_glue_jobs` `--dsql_user`; all Glue jobs; `drain_check`/`drop_tags` |
+| `dsql_database` | `dsql_database` | `postgres` | Discovery, Full load, Validation, CDC, Cutover | `create_glue_jobs` `--dsql_database`; all Glue jobs; `drain_check`/`drop_tags` |
+| `glue_role_arn` | `glue_role_arn` | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | Discovery, Full load, Validation, CDC | `create_glue_jobs` (every job's `Role`, baked at creation) |
+| `glue_connection` | `glue_connection` | `""` | Discovery, Full load, Validation, CDC | `create_glue_jobs` `_connections_for` → job `Connections` (baked at creation) |
+| `cdc_engine` | `cdc_engine` | `pythonshell` | CDC | `create_glue_jobs` (pythonshell vs spark CDC job) |
+| `cdc_spark_fallback` | `cdc_spark_fallback` | `true` | CDC | `startup` SM PrepareDrivers + `create_glue_jobs` (re-create as Spark) |
+| `control_schema` | `control_schema` | `cdc_control` | CDC, Cutover | `create_glue_jobs` `--control_schema`; `glue_cdc_continuous`/`glue_cdc_composite`; `drain_check` |
+| `cdc_validation` | `cdc_validation` | `true` | CDC, Cutover | `create_glue_jobs` `--cdc_validation`; CDC jobs (write failures); `drain_check` (cutover gate) |
+| `cdc_validation_sample` | `cdc_validation_sample` | `20` | CDC | `create_glue_jobs` `--cdc_validation_sample`; CDC jobs |
+| `cdc_max_delete_fraction` | `cdc_max_delete_fraction` | `0.5` | CDC | `create_glue_jobs` `--cdc_max_delete_fraction`; CDC jobs (G6) |
+| `cdc_max_delete_rows` | `cdc_max_delete_rows` | `100000` | CDC | `create_glue_jobs` `--cdc_max_delete_rows`; CDC jobs (G6) |
+| `cdc_drift_check_minutes` | `cdc_drift_check_minutes` | `30` | CDC | `create_glue_jobs` `--cdc_drift_check_minutes`; CDC jobs (G9, periodic) |
+| `cdc_drift_tolerance` | `cdc_drift_tolerance` | `0` | CDC | `create_glue_jobs` `--cdc_drift_tolerance` (+validate `--count_mismatch_tolerance`); CDC jobs (G9) |
+| `cdc_drift_action` | `cdc_drift_action` | `warn` | CDC | `create_glue_jobs` `--cdc_drift_action`; CDC jobs (G9) |
+| `max_composite_forks` | `max_composite_forks` | `8` | Planning | `plan_split` (fork gate) |
+| `max_big_cdc_forks` | `max_big_cdc_forks` | `8` | Planning | `plan_split` (big-CDC fork cap) |
+| `big_table_row_threshold` | `big_table_row_threshold` | `6000000` | Planning | `plan_split` (big-table classification) |
+| `file_fanout_threshold` | `file_fanout_threshold` | `8` | Planning | `plan_split` (big-table classification) |
+| `big_table_bytes_threshold` | `big_table_bytes_threshold` | `1000000000` | Planning | `plan_split` (big-table classification) |
+| `max_groups` | `max_groups` | `10` | Planning | `plan_split` (group/pool sizing) |
+| `map_max_concurrency` | `map_max_concurrency` | `6` | Planning, Full load, Validation | `plan_split` (Map concurrency + writers sizing) |
+| `max_files_in_parallel` | `max_files_in_parallel` | `30` | Planning, Full load | `plan_split` → `--max_files_in_parallel`; `job2_load` |
+| `writers_per_file` | `writers_per_file` | `8` | Planning, Full load | `plan_split` → `--writers_per_file`; `job2_load` |
+| `conn_budget` | `conn_budget` | `900` | Planning, Full load, Validation | `plan_split` (writers sizing); `create_glue_jobs` `--conn_budget` → `job3_validate` |
+| `min_writers_per_loader` | `min_writers_per_loader` | `100` | Planning, Full load | `plan_split` (floor for `--max_write_concurrency` → `job2_load`) |
+| `max_writers_per_loader` | `max_writers_per_loader` | `150` | Planning, Full load | `plan_split` (ceiling for `--max_write_concurrency` → `job2_load`) |
+| `validate_rows_per_range` | `validate_rows_per_range` | `10000` | Validation | `create_glue_jobs` `--validate_rows_per_range`; `job3_validate` |
+| `validate_parallelism` | `validate_parallelism` | `0` | Validation | `create_glue_jobs` `--validate_parallelism`; `job3_validate` |
+| `validate_target_seconds_per_range` | `validate_target_seconds_per_range` | `12` | Validation | `create_glue_jobs` `--validate_target_seconds_per_range`; `job3_validate` |
+| `validate_hash` | `validate_hash` | `all` | Validation | `create_glue_jobs` `--validate_hash`; `job3_validate` |
+| `glue_version` | `glue_version` | `4.0` | Discovery, Full load, Validation, CDC | `create_glue_jobs` (every Spark job's `GlueVersion`, baked at creation) |
+| `discovery_worker_type` | `discovery_worker_type` | `G.2X` | Discovery | `create_glue_jobs` (discovery `WorkerType`, baked at creation) |
+| `discovery_num_workers` | `discovery_num_workers` | `5` | Discovery | `create_glue_jobs` (discovery `NumberOfWorkers`, baked at creation) |
+| `discovery_timeout_minutes` | `discovery_timeout_minutes` | `480` | Discovery | `create_glue_jobs` (discovery `Timeout`, baked at creation) |
+| `load_worker_type` | `load_worker_type` | `G.4X` | Full load | `create_glue_jobs` (load `WorkerType`, baked at creation) |
+| `load_num_workers` | `load_num_workers` | `10` | Full load | `create_glue_jobs` (load `NumberOfWorkers`, baked at creation) |
+| `load_timeout_minutes` | `load_timeout_minutes` | `2880` | Full load | `create_glue_jobs` (load `Timeout`, baked at creation) |
+| `load_big_worker_type` | `load_big_worker_type` | `G.8X` | Full load | `create_glue_jobs` (load-big `WorkerType`, baked at creation) |
+| `load_big_num_workers` | `load_big_num_workers` | `10` | Full load | `create_glue_jobs` (load-big `NumberOfWorkers`, baked at creation) |
+| `load_big_timeout_minutes` | `load_big_timeout_minutes` | `2880` | Full load | `create_glue_jobs` (load-big `Timeout`, baked at creation) |
+| `validate_worker_type` | `validate_worker_type` | `G.8X` | Validation | `create_glue_jobs` (validate `WorkerType`, baked at creation) |
+| `validate_num_workers` | `validate_num_workers` | `10` | Validation | `create_glue_jobs` (validate `NumberOfWorkers`, baked at creation) |
+| `validate_timeout_minutes` | `validate_timeout_minutes` | `2880` | Validation | `create_glue_jobs` (validate `Timeout`, baked at creation) |
+| `max_parallel_tables` | `max_parallel_tables` | `20` | Full load | `create_glue_jobs` `--max_parallel_tables`; `job2_load` |
+| `per_worker_mem_budget_mb` | `per_worker_mem_budget_mb` | `1500` | Full load | `create_glue_jobs` `--per_worker_mem_budget_mb`; `job2_load` |
 
 Write it from the export block and upload it to the fixed key `config/pipeline.json`:
 

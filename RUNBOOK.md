@@ -177,62 +177,137 @@ are ignored; values are trimmed; a duplicate or unknown key is an error. The **b
 — it is the bucket the CSV itself lives in. `dsql_cluster_id` is **derived** (first label of
 `dsql_endpoint`) and must not be listed.
 
-| Parameter | Required? | Default | Meaning |
-|---|---|---|---|
-| `account_id` | **required** | — | 12-digit AWS account id (setup/IAM only; never written to `pipeline.json`) |
-| `region` | **required** | — | AWS region of the DMS tasks and pipeline (must equal the task ARN's region) |
-| `project` | **required** | — | short prefix (letters, digits, hyphens) for role, Lambda and job names |
-| `dsql_endpoint` | **required** | — | the cluster endpoint from the DSQL console, `<cluster>.dsql.<region>.on.aws`. If Glue has no internet, it needs a route to DSQL (e.g. a DSQL VPC endpoint); the pipeline picks the reachable hostname automatically |
-| `dsql_user` | optional | `admin` | DSQL user |
-| `dsql_database` | optional | `postgres` | DSQL database |
-| `glue_connection` | optional | `""` (no VPC) | the Glue network connection's **exact** name; `""` = Glue runs with no VPC connection |
-| `cdc_engine` | optional | `pythonshell` | `pythonshell` (1 DPU) or `spark` (Glue 4.0, 2 × G.1X) |
-| `cdc_spark_fallback` | optional | `true` | `true`: on a Python-shell CDC driver failure the startup re-creates that task's CDC job as Spark; `false`: stop at `DriversFailed` / `CdcRunFailed` |
-| `cdc_validation` | optional | `true` | Tier-2 CDC validation: each CDC job re-reads a sample of every committed file's rows by key and records persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover **stops** at `CdcValidationFailed` if any unresolved failure exists. Set `false` to disable |
-| `cdc_validation_sample` | optional | `20` | rows re-checked per committed CDC file (`0` = check every change — expensive) |
-| `cdc_max_delete_fraction` | optional | `0.5` | **G6 mass-delete guard**: a single CDC file (or one poll cycle) whose net DELETEs would remove more than this fraction of a table's current rows **and** more than `cdc_max_delete_rows` is **blocked** and nothing from that file is applied. Set `>= 1` to disable the guard |
-| `cdc_max_delete_rows` | optional | `100000` | **G6**: the absolute delete floor; both thresholds must be crossed, so a tiny table is never blocked by normal churn |
-| `cdc_drift_check_minutes` | optional | `30` | **G9 drift detector**: minutes between live-DSQL-count vs expected (`full_load_rows + inserts − deletes`) checks per table. `0` = off |
-| `cdc_drift_tolerance` | optional | `0` | **G9**: allowed row difference before drift fires (`0` = exact, for PK tables; raise slightly for no-PK tables) |
-| `cdc_drift_action` | optional | `warn` | **G9**: `warn` (log ERROR + CloudWatch `DsqlRowDrift` + `cdc_control.audit_log`) or `block` (also set the table `blocked`) |
-| `control_schema` | optional | `cdc_control` | DSQL schema for the CDC control tables |
-| `max_composite_forks` | optional | `8` | max composite-PK tables that may be forked out of **one** task (each runs its own always-on CDC job, plus its own load/validate jobs). A task with **more** composite tables than this fails early at startup `PlanSplitFailed` — the cause names the tables — and **no** Glue jobs are created. Raise it (mind Glue job/concurrent-run and DSQL connection quotas) or split the task |
-| `max_big_cdc_forks` | optional | `8` | max **big** single-/no-PK tables that get their **own** CDC job (`bg` fork); each big table keeps the shared `load-big` + `validate`. Big tables **past** the cap are **not** a failure — they stay on the **main** CDC job (serial apply) with a warning. Raise it to give more big tables their own CDC job |
-| `big_table_row_threshold` | optional | `6000000` | int ≥ 1. A table with **≥ this many** full-load rows is **big** (own `load-big` group **and** its own `bg` CDC job). Lower to treat more tables as big; raise for fewer. Applies only to tasks **started after** this is published; never re-assigns a table whose CDC already started |
-| `file_fanout_threshold` | optional | `8` | int ≥ 1. A table with **≥ this many** LOAD part-files is also **big** (same effect as the row threshold). Same apply-after-publish / no-reassign rule |
-| `big_table_bytes_threshold` | optional | `1000000000` | int ≥ 1. A table whose **total full-load bytes ≥ this** is also **big**. Rescues a huge **single-file** table (num_files=1) whose DMS row count is missing from the index — so the biggest table still gets its own load-big group + bg CDC job |
-| `max_groups` | optional | `10` | int ≥ 1. Cap on load/validate groups per task (**= the pre-created CDC job pool size**); big tables each take one group, small tables bin-pack into the rest. Raise it to spread small tables across more lanes |
-| `map_max_concurrency` | optional | `6` | int **1–40**. How many groups/forks load+validate **at once** (also the `GroupFanOut` Map concurrency). Higher = faster but more concurrent Glue runs and DSQL connections |
-| `max_files_in_parallel` | optional | `30` | int ≥ 1. Per-loader cap on LOAD files read at once |
-| `writers_per_file` | optional | `8` | int ≥ 1. Concurrent DSQL writer threads for **one** part-file. The DMS full load is usually a **single** LOAD*.csv per table, so this is the lever that parallelises a big single-file table; `1` = the old one-writer-per-file behaviour. Bounded by the per-group write cap |
-| `conn_budget` | optional | `900` | int ≥ 1. DSQL connection budget shared across in-flight loaders; sets writers-per-loader (the planner never exceeds it) |
-| `min_writers_per_loader` | optional | `100` | int ≥ 1. Floor for a small group's DSQL write concurrency. Must be **≤** `max_writers_per_loader` |
-| `max_writers_per_loader` | optional | `150` | int ≥ 1. Ceiling for a small group's DSQL write concurrency. Must be **≥** `min_writers_per_loader` |
-| `validate_rows_per_range` | optional | `10000` | int ≥ 1. **Starting value / upper cap** for job3's adaptive range sizer (shared validate job **and** every composite ck-validate fork). The sizer grows or shrinks each range from the measured query time (see `validate_target_seconds_per_range`), so you do **not** tune this for throughput or StackOverflow — the source side never builds one Spark plan over all ranges. Lower it only to cap the largest range on an unusually wide row |
-| `validate_parallelism` | optional | `0` | int 0–10000. Concurrent per-range DSQL validation queries — **the main throughput lever**. `0` = auto (sized from the validate worker type/count), then **hard-capped** by `conn_budget` and DSQL's 10,000-connection cluster limit, so validation can never exhaust the cluster. Raise for more rows/sec on big tables if the connection budget allows |
-| `validate_target_seconds_per_range` | optional | `12` | int 1–120. The adaptive sizer aims each range query at this many seconds (5–20 s band), well under DSQL's 300 s transaction-age limit. Smaller = more, shorter queries; larger = fewer, longer ones |
-| `validate_hash` | optional | `all` | `all` \| `keys` \| `off`. Scope of the per-value md5 content check (md5 is computed **once** per value). `all` hashes every text/char/uuid/bytea column; `keys` only key columns; `off` uses count + length + min/max only. Use `keys`/`off` to speed validation of very wide or large-object (LOB) tables |
-| `glue_version` | optional | `4.0` | `4.0` (tested default) or `5.0` (re-test the pg8000/boto3 driver wheels on Python 3.11 first). Applied to the Spark jobs |
-| `discovery_worker_type` | optional | `G.2X` | Glue worker type for discovery. One of G.1X/G.2X/G.4X/G.8X/G.12X/G.16X/R.1X/R.2X/R.4X/R.8X (G.12X+/R.* are newer, higher startup latency — confirm Region/version) |
-| `discovery_num_workers` | optional | `5` | int 1–299. Discovery worker count |
-| `discovery_timeout_minutes` | optional | `480` | int 1–10080 (Glue 7-day max). Discovery job timeout |
-| `load_worker_type` | optional | `G.4X` | Glue worker type for the normal (small-group) load. **Bigger = bigger driver** (the load runs driver-side), which is what speeds it. Same allow-list |
-| `load_num_workers` | optional | `10` | int 1–299. Load worker count (executors mostly help the CSV read) |
-| `load_timeout_minutes` | optional | `2880` | int 1–10080. Load job timeout (48 h default) |
-| `load_big_worker_type` | optional | `G.8X` | Glue worker type for the **big-table** load (128 GB driver by default; raise to G.12X/G.16X for very large tables). Same allow-list |
-| `load_big_num_workers` | optional | `10` | int 1–299. Big-load worker count |
-| `load_big_timeout_minutes` | optional | `2880` | int 1–10080. Big-load timeout (raise toward 10080 = 7 days for very large tables) |
-| `validate_worker_type` | optional | `G.8X` | Glue worker type for validate (big-table COUNT/scan needs a big driver). Same allow-list |
-| `validate_num_workers` | optional | `10` | int 1–299. Validate worker count |
-| `validate_timeout_minutes` | optional | `2880` | int 1–10080. Validate timeout |
-| `max_parallel_tables` | optional | `20` | int 1–40. How many tables load **at once** on the driver thread pool |
-| `per_worker_mem_budget_mb` | optional | `1500` | int ≥ 1. Per-table driver-memory budget the auto-throttle uses. The throttle **never silently drops to 1** — it holds a floor even if driver memory is unknown/misreported |
-| `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | set only if your Glue role name differs from the default. A role **path** is allowed; the role **name** is the last ARN segment |
-| `lambda_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-lambda-exec-role` | the role **all 8 Lambdas** run as. Set it to point the Lambdas at a role your IAM team already made. Must be an IAM role ARN in `account_id`; a path is allowed. Not written to `pipeline.json` |
-| `sfn_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-sfn-exec-role` | the role **all 4 state machines** run as. Same rules as `lambda_role_arn`. Not written to `pipeline.json` |
-| `manage_iam` | optional (setup-only) | `true` | `true`: setup **creates/updates** the three roles as always. `false`: setup only **reads** the three roles you already have (`iam get-role` + trust check + a best-effort `simulate-principal-policy`) and **never** makes an IAM write call — it writes each role's policy JSON to `iam-out/` for your IAM team instead. See [§4 "Using roles your IAM team already created"](#using-roles-your-iam-team-already-created-manage_iamfalse). Not written to `pipeline.json` |
-| `subnet_id` | optional (setup-only) | — | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not written to `pipeline.json` |
-| `security_group_id` | optional (setup-only) | — | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not written to `pipeline.json` |
+The table below is **derived from the code**, not from prose: for every key it names the actual
+script / Lambda / state machine that reads it (**Used by**) and the pipeline phase(s) it acts in
+(**Phase(s)**). Phases, in pipeline order, are: **Setup → Preflight → Discovery → Planning →
+Full load → Validation → CDC → Cutover**. A key used in more than one phase appears **once**, under
+its main phase, with every phase it touches listed in its **Phase(s)** cell. Rows are grouped by
+phase under the bold sub-headings below.
+
+**When a change takes effect** (read the per-row note; this is the general rule):
+- **Most pipeline keys** take effect for **tasks started after `pipeline.json` is republished**
+  (upload `params.csv` → republish `pipeline.json` → the next `startup`/`cutover` run reads it).
+- **Setup-only keys** take effect only when you **re-run setup**.
+- **Keys baked into Glue job args at job creation** — the worker sizes, worker counts, timeouts,
+  `glue_version`, `glue_connection`, and every CDC `--cdc_*` guardrail/validation arg — apply **only
+  to Glue jobs created after the change. Already-created jobs keep their old values** until those
+  jobs are deleted and re-created (new task startup, or a manual job re-create). See the
+  "Which settings affect a running task?" note after the tables.
+
+**Setup only** (not written to `pipeline.json`; used by `tools/setup.sh` — re-run setup for a change to take effect)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `account_id` | **required** | — | Setup | `tools/setup.sh` (role-ARN derivation + IAM calls); `lambdas/params_csv.py` validates it | 12-digit AWS account id (setup/IAM only; never written to `pipeline.json`). `resolve_task` takes the run's account from the DMS task ARN, not this key. Takes effect on the next setup run |
+| `subnet_id` | optional (setup-only) | — | Setup | `tools/setup.sh` Step 1b (Glue VPC connection) | private subnet for the Glue VPC connection. Set **both** `subnet_id` and `security_group_id`, or neither. Not in `pipeline.json`. Re-run setup to apply |
+| `security_group_id` | optional (setup-only) | — | Setup | `tools/setup.sh` Step 1b (Glue VPC connection) | security group for the Glue VPC connection. Both-or-neither with `subnet_id`. Not in `pipeline.json`. Re-run setup to apply |
+| `manage_iam` | optional (setup-only) | `true` | Setup | `tools/setup.sh` (IAM create vs read-only mode) | `true`: setup **creates/updates** the three roles as always. `false`: setup only **reads** the three roles you already have (`iam get-role` + trust check + a best-effort `simulate-principal-policy`) and **never** makes an IAM write call — it writes each role's policy JSON to `iam-out/` for your IAM team instead. See [§4 "Using roles your IAM team already created"](#using-roles-your-iam-team-already-created-manage_iamfalse). Not in `pipeline.json`. Re-run setup to apply |
+| `lambda_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-lambda-exec-role` | Setup | `tools/setup.sh` (Lambda role; role **name** = last ARN segment) | the role **all 8 Lambdas** run as. Set it to point the Lambdas at a role your IAM team already made. Must be an IAM role ARN in `account_id`; a path is allowed. Not in `pipeline.json`. Re-run setup to apply |
+| `sfn_role_arn` | optional (setup-only) | `arn:aws:iam::<account_id>:role/<project>-sfn-exec-role` | Setup | `tools/setup.sh` (state-machine role; role **name** = last ARN segment) | the role **all 4 state machines** run as. Same rules as `lambda_role_arn`. Not in `pipeline.json`. Re-run setup to apply |
+
+**Everywhere** (connection / identity keys read by essentially every component)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `region` | **required** | — | Setup, Discovery, Full load, Validation, CDC, Cutover | `tools/setup.sh`; `resolve_task` (region check); `create_glue_jobs` `--region`; `job1_discovery`, `job2_load`, `job3_validate`, the CDC jobs; `drain_check`/`drop_tags` | AWS region of the DMS tasks and pipeline (must equal the task ARN's region). Takes effect on tasks started after republish; baked into existing Glue job args at creation |
+| `project` | **required** | — | Setup, Discovery, Planning, Full load, Validation, CDC, Cutover | `tools/setup.sh` (resource names); `resolve_task` (builds Glue job names `project-suffix-role`); `plan_split` | short prefix (letters, digits, hyphens) for role, Lambda and job names. Takes effect on the next task started after republish (new job names) |
+| `dsql_endpoint` | **required** | — | Discovery, Full load, Validation, CDC, Cutover | `resolve_task` (emits `dsqlEndpoint` + candidate list); `create_glue_jobs` `--dsql_endpoint`/`--dsql_endpoint_candidates`; `job1_discovery`, `job2_load`, `job3_validate`, the CDC jobs; `drain_check`/`drop_tags`. `dsql_cluster_id` is derived from it by `tools/setup.sh` | the cluster endpoint from the DSQL console, `<cluster>.dsql.<region>.on.aws`. If Glue has no internet, it needs a route to DSQL (e.g. a DSQL VPC endpoint); the pipeline picks the reachable hostname automatically. Takes effect on tasks started after republish; baked into existing Glue job args at creation |
+| `dsql_user` | optional | `admin` | Discovery, Full load, Validation, CDC, Cutover | `create_glue_jobs` `--dsql_user`; `job1_discovery`, `job2_load`, `job3_validate`, the CDC jobs; `drain_check`/`drop_tags` | DSQL user. Takes effect on tasks started after republish; baked into existing Glue job args at creation |
+| `dsql_database` | optional | `postgres` | Discovery, Full load, Validation, CDC, Cutover | `create_glue_jobs` `--dsql_database`; `job1_discovery`, `job2_load`, `job3_validate`, the CDC jobs; `drain_check`/`drop_tags` | DSQL database. Takes effect on tasks started after republish; baked into existing Glue job args at creation |
+| `control_schema` | optional | `cdc_control` | CDC, Cutover | `create_glue_jobs` `--control_schema` (CDC jobs); `glue_cdc_continuous`/`glue_cdc_composite`; `drain_check` (cutover validation gate query) | DSQL schema for the CDC control tables. Takes effect on CDC jobs created after republish; a running CDC job keeps the schema it started with |
+| `glue_connection` | optional | `""` (no VPC) | Setup, Discovery, Full load, Validation, CDC | `tools/setup.sh` Step 1b (creates the connection); `create_glue_jobs` `_connections_for` → each Glue job's `Connections` | the Glue network connection's **exact** name; `""` = Glue runs with no VPC connection. **Baked into the Glue job definition at job creation** — only jobs created after the change use the new value |
+| `glue_role_arn` | optional | `arn:aws:iam::<account_id>:role/<project>-glue-exec-role` | Setup, Discovery, Full load, Validation, CDC | `tools/setup.sh`; `create_glue_jobs` (the `Role` on every Glue job) | set only if your Glue role name differs from the default. A role **path** is allowed; the role **name** is the last ARN segment. **Baked into the Glue job definition at job creation** — only jobs created after the change use the new value |
+
+**Planning / fan-out** (read by `plan_split`; most of these never leave the Planning Lambda)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `max_composite_forks` | optional | `8` | Planning | `plan_split` (PlanSplit state; gate) | max composite-PK tables that may be forked out of **one** task (each runs its own always-on CDC job, plus its own load/validate jobs). A task with **more** composite tables than this fails early at startup `PlanSplitFailed` — the cause names the tables — and **no** Glue jobs are created. Raise it (mind Glue job/concurrent-run and DSQL connection quotas) or split the task. Takes effect on tasks started after republish |
+| `max_big_cdc_forks` | optional | `8` | Planning | `plan_split` (PlanSplit state) | max **big** single-/no-PK tables that get their **own** CDC job (`bg` fork); each big table keeps the shared `load-big` + `validate`. Big tables **past** the cap are **not** a failure — they stay on the **main** CDC job (serial apply) with a warning. Raise it to give more big tables their own CDC job. Takes effect on tasks started after republish |
+| `big_table_row_threshold` | optional | `6000000` | Planning | `plan_split` (big-table classification) | int ≥ 1. A table with **≥ this many** full-load rows is **big** (own `load-big` group **and** its own `bg` CDC job). Lower to treat more tables as big; raise for fewer. Applies only to tasks **started after** this is published; never re-assigns a table whose CDC already started |
+| `file_fanout_threshold` | optional | `8` | Planning | `plan_split` (big-table classification) | int ≥ 1. A table with **≥ this many** LOAD part-files is also **big** (same effect as the row threshold). Same apply-after-publish / no-reassign rule |
+| `big_table_bytes_threshold` | optional | `1000000000` | Planning | `plan_split` (big-table classification) | int ≥ 1. A table whose **total full-load bytes ≥ this** is also **big**. Rescues a huge **single-file** table (num_files=1) whose DMS row count is missing from the index — so the biggest table still gets its own load-big group + bg CDC job. Takes effect on tasks started after republish |
+| `max_groups` | optional | `10` | Planning | `plan_split` (group/pool sizing) | int ≥ 1. Cap on load/validate groups per task (**= the pre-created CDC job pool size**); big tables each take one group, small tables bin-pack into the rest. Raise it to spread small tables across more lanes. Takes effect on tasks started after republish |
+| `map_max_concurrency` | optional | `6` | Planning, Full load, Validation | `plan_split` (`GroupFanOut` Map concurrency + writers-per-loader sizing) | int **1–40**. How many groups/forks load+validate **at once** (also the `GroupFanOut` Map concurrency). Higher = faster but more concurrent Glue runs and DSQL connections. Takes effect on tasks started after republish |
+| `min_writers_per_loader` | optional | `100` | Planning, Full load | `plan_split` (floor for a group's `--max_write_concurrency` passed to `job2_load`) | int ≥ 1. Floor for a small group's DSQL write concurrency. Must be **≤** `max_writers_per_loader`. Takes effect on tasks started after republish (baked into the loader job args at creation) |
+| `max_writers_per_loader` | optional | `150` | Planning, Full load | `plan_split` (ceiling for a group's `--max_write_concurrency` passed to `job2_load`) | int ≥ 1. Ceiling for a small group's DSQL write concurrency. Must be **≥** `min_writers_per_loader`. Takes effect on tasks started after republish (baked into the loader job args at creation) |
+| `conn_budget` | optional | `900` | Planning, Full load, Validation | `plan_split` (writers-per-loader sizing → `job2_load`); `create_glue_jobs` `--conn_budget` → `job3_validate` (hard-caps validate parallelism) | int ≥ 1. DSQL connection budget shared across in-flight loaders; sets writers-per-loader (the planner never exceeds it) and hard-caps validation parallelism. Takes effect on tasks started after republish (baked into job args at creation) |
+
+**Full load** (read by `job2_load`; `plan_split` passes the per-group values; sizing/`--arg` values are baked at job creation)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `max_files_in_parallel` | optional | `30` | Planning, Full load | `plan_split` → `--max_files_in_parallel`; `job2_load` | int ≥ 1. Per-loader cap on LOAD files read at once. Baked into the load job args at creation — only jobs created after the change use the new value |
+| `writers_per_file` | optional | `8` | Planning, Full load | `plan_split` → `--writers_per_file`; `job2_load` | int ≥ 1. Concurrent DSQL writer threads for **one** part-file. The DMS full load is usually a **single** LOAD*.csv per table, so this is the lever that parallelises a big single-file table; `1` = the old one-writer-per-file behaviour. Bounded by the per-group write cap. Baked into the load job args at creation |
+| `max_parallel_tables` | optional | `20` | Full load | `create_glue_jobs` `--max_parallel_tables`; `job2_load` | int 1–40. How many tables load **at once** on the driver thread pool. Baked into the load job args at creation — only jobs created after the change use the new value |
+| `per_worker_mem_budget_mb` | optional | `1500` | Full load | `create_glue_jobs` `--per_worker_mem_budget_mb`; `job2_load` | int ≥ 1. Per-table driver-memory budget the auto-throttle uses. The throttle **never silently drops to 1** — it holds a floor even if driver memory is unknown/misreported. Baked into the load job args at creation |
+| `load_worker_type` | optional | `G.4X` | Full load | `create_glue_jobs` (job `WorkerType`) | Glue worker type for the normal (small-group) load. **Bigger = bigger driver** (the load runs driver-side), which is what speeds it. Allow-list G.1X/G.2X/G.4X/G.8X/G.12X/G.16X/R.1X/R.2X/R.4X/R.8X. **Baked into the job definition at creation** — only jobs created after the change use the new size |
+| `load_num_workers` | optional | `10` | Full load | `create_glue_jobs` (job `NumberOfWorkers`) | int 1–299. Load worker count (executors mostly help the CSV read). Baked into the job definition at creation |
+| `load_timeout_minutes` | optional | `2880` | Full load | `create_glue_jobs` (job `Timeout`) | int 1–10080. Load job timeout (48 h default). Baked into the job definition at creation |
+| `load_big_worker_type` | optional | `G.8X` | Full load | `create_glue_jobs` (big-load job `WorkerType`) | Glue worker type for the **big-table** load (128 GB driver by default; raise to G.12X/G.16X for very large tables). Same allow-list. Baked into the job definition at creation |
+| `load_big_num_workers` | optional | `10` | Full load | `create_glue_jobs` (big-load job `NumberOfWorkers`) | int 1–299. Big-load worker count. Baked into the job definition at creation |
+| `load_big_timeout_minutes` | optional | `2880` | Full load | `create_glue_jobs` (big-load job `Timeout`) | int 1–10080. Big-load timeout (raise toward 10080 = 7 days for very large tables). Baked into the job definition at creation |
+
+**Validation** (read by `job3_validate`; sizing/`--arg` values baked at job creation)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `validate_rows_per_range` | optional | `10000` | Validation | `create_glue_jobs` `--validate_rows_per_range`; `job3_validate` | int ≥ 1. **Starting value / upper cap** for job3's adaptive range sizer (shared validate job **and** every composite ck-validate fork). The sizer grows or shrinks each range from the measured query time (see `validate_target_seconds_per_range`), so you do **not** tune this for throughput or StackOverflow — the source side never builds one Spark plan over all ranges. Lower it only to cap the largest range on an unusually wide row. Baked into the validate job args at creation |
+| `validate_parallelism` | optional | `0` | Validation | `create_glue_jobs` `--validate_parallelism`; `job3_validate` | int 0–10000. Concurrent per-range DSQL validation queries — **the main throughput lever**. `0` = auto (sized from the validate worker type/count), then **hard-capped** by `conn_budget` and DSQL's 10,000-connection cluster limit, so validation can never exhaust the cluster. Raise for more rows/sec on big tables if the connection budget allows. Baked into the validate job args at creation |
+| `validate_target_seconds_per_range` | optional | `12` | Validation | `create_glue_jobs` `--validate_target_seconds_per_range`; `job3_validate` | int 1–120. The adaptive sizer aims each range query at this many seconds (5–20 s band), well under DSQL's 300 s transaction-age limit. Smaller = more, shorter queries; larger = fewer, longer ones. Baked into the validate job args at creation |
+| `validate_hash` | optional | `all` | Validation | `create_glue_jobs` `--validate_hash`; `job3_validate` | `all` \| `keys` \| `off`. Scope of the per-value md5 content check (md5 is computed **once** per value). `all` hashes every text/char/uuid/bytea column; `keys` only key columns; `off` uses count + length + min/max only. Use `keys`/`off` to speed validation of very wide or large-object (LOB) tables. Baked into the validate job args at creation |
+| `validate_worker_type` | optional | `G.8X` | Validation | `create_glue_jobs` (validate job `WorkerType`) | Glue worker type for validate (big-table COUNT/scan needs a big driver). Same allow-list. **Baked into the job definition at creation** — only jobs created after the change use the new size |
+| `validate_num_workers` | optional | `10` | Validation | `create_glue_jobs` (validate job `NumberOfWorkers`) | int 1–299. Validate worker count. Baked into the job definition at creation |
+| `validate_timeout_minutes` | optional | `2880` | Validation | `create_glue_jobs` (validate job `Timeout`) | int 1–10080. Validate timeout. Baked into the job definition at creation |
+
+**Discovery** (read by `job1_discovery`; sizing baked at job creation)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `discovery_worker_type` | optional | `G.2X` | Discovery | `create_glue_jobs` (discovery job `WorkerType`) | Glue worker type for discovery. One of G.1X/G.2X/G.4X/G.8X/G.12X/G.16X/R.1X/R.2X/R.4X/R.8X (G.12X+/R.* are newer, higher startup latency — confirm Region/version). **Baked into the job definition at creation** — only jobs created after the change use the new size |
+| `discovery_num_workers` | optional | `5` | Discovery | `create_glue_jobs` (discovery job `NumberOfWorkers`) | int 1–299. Discovery worker count. Baked into the job definition at creation |
+| `discovery_timeout_minutes` | optional | `480` | Discovery | `create_glue_jobs` (discovery job `Timeout`) | int 1–10080 (Glue 7-day max). Discovery job timeout. Baked into the job definition at creation |
+| `glue_version` | optional | `4.0` | Discovery, Full load, Validation, CDC | `create_glue_jobs` (every Spark job's `GlueVersion`) | `4.0` (tested default) or `5.0` (re-test the pg8000/boto3 driver wheels on Python 3.11 first). Applied to the Spark jobs. **Baked into the job definition at creation** — only jobs created after the change use the new version |
+
+**CDC** (read by `glue_cdc_continuous` / `glue_cdc_composite`; every `--cdc_*` arg is baked into the CDC job at creation and read **once** at CDC-run start — a running CDC run never re-reads them)
+
+| Parameter | Required? | Default | Phase(s) | Used by | Meaning |
+|---|---|---|---|---|---|
+| `cdc_engine` | optional | `pythonshell` | CDC | `create_glue_jobs` (selects the pythonshell vs spark CDC job); `resolve_task` (spark-sticky after a fallback) | `pythonshell` (1 DPU) or `spark` (Glue 4.0, 2 × G.1X). Decides which CDC job definition is created; applies to CDC jobs created after republish |
+| `cdc_spark_fallback` | optional | `true` | CDC | `startup` state machine (PrepareDrivers) + `create_glue_jobs` (re-create as Spark) | `true`: on a Python-shell CDC driver failure the startup re-creates that task's CDC job as Spark; `false`: stop at `DriversFailed` / `CdcRunFailed`. Applies to tasks started after republish |
+| `cdc_validation` | optional | `true` | CDC, Cutover | `create_glue_jobs` `--cdc_validation`; `glue_cdc_continuous`/`glue_cdc_composite` (writes failures); `drain_check` (cutover gate reads them) | Tier-2 CDC validation: each CDC job re-reads a sample of every committed file's rows by key and records persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover **stops** at `CdcValidationFailed` if any unresolved failure exists. Set `false` to disable. Baked into the CDC job args at creation; a running CDC run keeps its startup value |
+| `cdc_validation_sample` | optional | `20` | CDC | `create_glue_jobs` `--cdc_validation_sample`; `glue_cdc_continuous`/`glue_cdc_composite` | rows re-checked per committed CDC file (`0` = check every change — expensive). Baked into the CDC job args at creation; a running CDC run keeps its startup value |
+| `cdc_max_delete_fraction` | optional | `0.5` | CDC | `create_glue_jobs` `--cdc_max_delete_fraction`; `glue_cdc_continuous`/`glue_cdc_composite` (**G6**) | **G6 mass-delete guard**: a single CDC file (or one poll cycle) whose net DELETEs would remove more than this fraction of a table's current rows **and** more than `cdc_max_delete_rows` is **blocked** and nothing from that file is applied. Set `>= 1` to disable the guard. Baked into the CDC job args at creation; a running CDC run keeps its startup value |
+| `cdc_max_delete_rows` | optional | `100000` | CDC | `create_glue_jobs` `--cdc_max_delete_rows`; `glue_cdc_continuous`/`glue_cdc_composite` (**G6**) | **G6**: the absolute delete floor; both thresholds must be crossed, so a tiny table is never blocked by normal churn. Baked into the CDC job args at creation; a running CDC run keeps its startup value |
+| `cdc_drift_check_minutes` | optional | `30` | CDC | `create_glue_jobs` `--cdc_drift_check_minutes`; `glue_cdc_continuous`/`glue_cdc_composite` (**G9**, periodic in-job timer) | **G9 drift detector**: minutes between live-DSQL-count vs expected (`full_load_rows + inserts − deletes`) checks per table. `0` = off. Baked into the CDC job args at creation; the running CDC run checks on this interval using the value it started with |
+| `cdc_drift_tolerance` | optional | `0` | CDC | `create_glue_jobs` `--cdc_drift_tolerance` (also validate `--count_mismatch_tolerance`); `glue_cdc_continuous`/`glue_cdc_composite` (**G9**) | **G9**: allowed row difference before drift fires (`0` = exact, for PK tables; raise slightly for no-PK tables). Baked into the CDC/validate job args at creation; a running CDC run keeps its startup value |
+| `cdc_drift_action` | optional | `warn` | CDC | `create_glue_jobs` `--cdc_drift_action`; `glue_cdc_continuous`/`glue_cdc_composite` (**G9**) | **G9**: `warn` (log ERROR + CloudWatch `DsqlRowDrift` + `cdc_control.audit_log`) or `block` (also set the table `blocked`). Baked into the CDC job args at creation; a running CDC run keeps its startup value |
+
+### Which settings affect a running task?
+
+Everything above is captured by the component **when it starts**, not continuously:
+
+- A **running CDC job** reads **all** its `--cdc_*` args **once** at run start (`getResolvedOptions`)
+  and keeps them for the life of the run. Its 30-second poll loop re-lists S3 for new CDC files but
+  **does not** re-read `params.csv` / `pipeline.json` or its own job args. The **G9 drift check**
+  (`cdc_drift_check_minutes` / `cdc_drift_tolerance` / `cdc_drift_action`) and the **G6 mass-delete
+  guard** (`cdc_max_delete_fraction` / `cdc_max_delete_rows`), as well as `cdc_validation` /
+  `cdc_validation_sample`, therefore use the value the run started with. To change any of them for a
+  table whose CDC is already running you must **stop that CDC run and start a new one** (and, if the
+  value is baked into the job definition, re-create the CDC job).
+- **Worker sizes, worker counts, timeouts, `glue_version`, `glue_connection`, `glue_role_arn`** are
+  part of the **Glue job definition**, written by `create_glue_jobs` at job-creation time. Changing
+  them in `params.csv` and republishing affects **only jobs created afterwards**; an already-created
+  discovery/load/validate/CDC job keeps its old definition until it is deleted and re-created (a new
+  task startup, or a manual re-create).
+- **`plan_split` / planning keys** (`max_groups`, `map_max_concurrency`, the `big_table_*` and
+  `*_writers_per_loader` / `conn_budget` / `writers_per_file` / `max_files_in_parallel` knobs) are
+  consumed when a task's **PlanSplit** runs at startup; a task already past planning is unaffected.
+- **Setup-only keys** (`account_id`, `subnet_id`, `security_group_id`, `manage_iam`,
+  `lambda_role_arn`, `sfn_role_arn`) only act when you **re-run `tools/setup.sh`**.
+
+In short: republishing `params.csv` → `pipeline.json` changes **future** task runs and **future** job
+creations. It never reaches into a job or CDC run that is already in flight.
 
 Forty-eight keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,

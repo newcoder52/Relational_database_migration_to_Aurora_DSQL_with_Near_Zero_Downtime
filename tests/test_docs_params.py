@@ -108,6 +108,46 @@ def _csv_row_keys(csv_text):
     return keys
 
 
+def _row_cells_by_key(table_text):
+    """Map first-column backtick key -> list of all cell strings for rows whose first cell is a
+    single backtick-quoted token. Used to assert later columns (Phase(s), Used by) are present
+    and non-empty for every documented key."""
+    rows = {}
+    for line in table_text.splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip("|").split("|")]
+        if not cells:
+            continue
+        m = re.fullmatch(r"`([a-z0-9_]+)`", cells[0])
+        if m:
+            rows[m.group(1)] = cells
+    return rows
+
+
+def _check_phase_usedby(name, table_text, expected_keys, phase_idx, usedby_idx):
+    """Every row for a known key must have a non-empty Phase(s) cell (phase_idx) and a non-empty
+    Used-by cell (usedby_idx). Fails if a key row is missing, or either cell is blank/'-'."""
+    rows = _row_cells_by_key(table_text)
+    bad = []
+    for k in sorted(expected_keys):
+        cells = rows.get(k)
+        if cells is None:
+            bad.append(f"{k} (row missing)")
+            continue
+        phase = cells[phase_idx].strip() if len(cells) > phase_idx else ""
+        used = cells[usedby_idx].strip() if len(cells) > usedby_idx else ""
+        if not phase or phase in ("—", "-"):
+            bad.append(f"{k} (empty Phase(s))")
+        if not used or used in ("—", "-"):
+            bad.append(f"{k} (empty Used by)")
+    if bad:
+        failures.append(f"{name}: Phase/Used-by cell problem(s): {bad}")
+    else:
+        print(f"[PASS] {name}: every key row has a non-empty Phase(s) and Used-by cell")
+
+
 def _check(name, found, expected):
     missing = expected - found
     extra = found - KNOWN  # documented but not a real params_csv key
@@ -126,6 +166,9 @@ def main():
     runbook = _read("RUNBOOK.md")
     sec3 = _section(runbook, r"#+\s*3\.\s*Fill in params\.csv")
     _check("RUNBOOK §3 table", _first_col_backtick_keys(sec3), ALLOWED)
+    # Every key row in §3 must now also name its Phase(s) and the component that uses it.
+    # §3 columns: Parameter | Required? | Default | Phase(s) | Used by | Meaning
+    _check_phase_usedby("RUNBOOK §3 Phase/Used-by", sec3, ALLOWED, phase_idx=3, usedby_idx=4)
 
     # ---- RUNBOOK pipeline-key count sentence ("<N> keys end up in config/pipeline.json") ----
     mcount = re.search(r"([A-Za-z]+(?:-[A-Za-z]+)?|\d+)\s+keys end up in\s+`?config/pipeline\.json`?",
@@ -153,6 +196,9 @@ def main():
     manual = _read("docs/MANUAL_SETUP.md")
     sec3c = _section(manual, r"#+\s*Step 3c")
     _check("MANUAL_SETUP §3c mapping", _first_col_backtick_keys(sec3c), PIPELINE_KEYS)
+    # §3c columns: key | from params.csv | default | Phase(s) | Used by
+    _check_phase_usedby("MANUAL_SETUP §3c Phase/Used-by", sec3c, PIPELINE_KEYS,
+                        phase_idx=3, usedby_idx=4)
 
     if failures:
         print("\nDOCS/PARAMS CONSISTENCY: FAIL")
