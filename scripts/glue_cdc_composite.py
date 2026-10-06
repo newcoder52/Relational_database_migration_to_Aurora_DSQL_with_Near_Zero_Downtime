@@ -4684,15 +4684,20 @@ def process_table(ctx, load_status_map=None):
 # WAKE — how the loop waits between apply cycles
 # =============================================================================
 def wait_for_wake():
-    """Sleep POLL_INTERVAL, then return so the caller runs the next list+apply cycle.
+    """Sleep up to POLL_INTERVAL, then return so the caller runs the next list+apply cycle.
 
     The loop re-lists S3 each cycle; per-table serial DMS-timestamp order is owned by
     files.sort(), and already-applied files are skipped via last_done_file / processed-move
     (idempotent no-op), so an extra cycle with nothing new is cheap.
 
-    Returns True on a normal wake (always True today; reserved for future stop signals)."""
-    time.sleep(POLL_INTERVAL)
-    return True
+    B21 (faster exit on stop): wait on _stop_event instead of a bare time.sleep(), so a stop
+    signalled via _stop_event (SIGTERM handler below / KeyboardInterrupt path) wakes the loop
+    at once instead of after up to POLL_INTERVAL seconds. The idle poll gap was the single
+    longest blocking interval in which the job could not react to a stop; between files/chunks
+    the apply loop is already short and checkpointed. Returns False when a stop was signalled
+    during the wait (loop should exit), True on a normal timeout wake."""
+    woke = _stop_event.wait(POLL_INTERVAL)
+    return not woke
 
 
 # =============================================================================
@@ -4838,10 +4843,28 @@ def main():
     print("  [startup] entering poll loop.", flush=True)
     write_started_marker()
 
+    # B21 faster-exit: Glue stops a job by sending SIGTERM to the container. Install a handler
+    # that sets _stop_event so an in-progress POLL_INTERVAL wait (the longest idle blocking gap)
+    # wakes immediately and the loop exits cleanly, instead of the run lingering in STOPPING
+    # until the sleep elapses / the container is force-killed. Best-effort: if signals aren't
+    # available in this runtime, the loop still exits on the Glue hard-stop as before.
+    try:
+        import signal as _signal
+
+        def _on_sigterm(_signum, _frame):
+            print("\n⏹️  SIGTERM received (Glue stop) — exiting after the current chunk.",
+                  flush=True)
+            _stop_event.set()
+
+        _signal.signal(_signal.SIGTERM, _on_sigterm)
+    except Exception as _se:
+        print(f"  (info) SIGTERM handler not installed ({type(_se).__name__}); relying on "
+              f"Glue hard-stop.", flush=True)
+
     last_activity = time.time()
     poll = 0
     try:
-        while True:
+        while not _stop_event.is_set():
             poll += 1
             any_work = False
             results = []
@@ -4922,9 +4945,12 @@ def main():
                     print(f"\n⏹️  Idle {MAX_IDLE_HOURS}h and RUN_FOREVER=False — stopping.")
                     break
 
-            # Wait for the next cycle: sleep POLL_INTERVAL, then re-list and apply. The
-            # apply cycle above is idempotent, so an extra cycle with nothing new is cheap.
-            wait_for_wake()
+            # Wait for the next cycle: wait up to POLL_INTERVAL on _stop_event, then re-list and
+            # apply. The apply cycle above is idempotent, so an extra cycle with nothing new is
+            # cheap. A stop signalled during the wait returns False -> exit now (B21).
+            if not wait_for_wake():
+                print("\n⏹️  Stop signalled — leaving the poll loop.", flush=True)
+                break
     except KeyboardInterrupt:
         print("\n⏹️  Manual stop.")
     finally:

@@ -658,6 +658,15 @@
           "ResultPath": "$.error"
         }
       ],
+      "Next": "InitDeleteLoop"
+    },
+    "InitDeleteLoop": {
+      "Type": "Pass",
+      "Comment": "B21: cutover retries DeleteGlueJobs in a loop (Wait -> delete) until nothing is pending or the budget runs out. c counts the passes; at 10s + ~30s delete per pass, 120 passes is a generous ~60-80 min ceiling for a composite CDC run that is slow to stop.",
+      "Parameters": {
+        "c": 0
+      },
+      "ResultPath": "$.deleteLoop",
       "Next": "DeleteGlueJobs"
     },
     "DeleteGlueJobs": {
@@ -669,7 +678,11 @@
           "mode": "delete",
           "bucket": "<<BUCKET>>",
           "project.$": "$.resolved.project",
-          "taskSuffix.$": "$.resolved.taskSuffix"
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "region.$": "$.resolved.region",
+          "account_id.$": "$.resolved.accountId",
+          "dms_task_arn.$": "$.taskArn",
+          "configPrefix.$": "$.resolved.configPrefix"
         }
       },
       "ResultPath": "$.deleteJobs",
@@ -693,19 +706,59 @@
         }
       ],
       "Next": "AllGlueJobsDeleted",
-      "Comment": "Deletes this task's 5 Glue jobs. A job already gone counts as deleted; any other failure ends at GlueJobsNotDeleted instead of reporting success."
+      "Comment": "B20: the delete Lambda needs the account id to build job ARNs for the get_tags lookup; pass account_id ($.resolved.accountId) AND dms_task_arn ($.taskArn, which the cutover input always carries) so it never fails to resolve the account (the Lambda also falls back to its own context ARN / STS). Deletes this task's Glue jobs; a job whose CDC run is still stopping is returned under 'pending' (B21) and retried by the loop below, not left orphaned."
     },
     "AllGlueJobsDeleted": {
       "Type": "Choice",
-      "Comment": "create-glue-jobs lists jobs it could not delete under 'failed' (older versions return no such list).",
+      "Comment": "Order matters: a hard 'failed' (couldn't delete for a non-pending reason) ends at GlueJobsNotDeletedList; a 'pending' job (its CDC run is still stopping, B21) loops back after a short wait until the budget runs out; otherwise every job is gone -> success. 'failed'/'pending' lists are absent on older Lambda versions (treated as none).",
       "Choices": [
         {
           "Variable": "$.deleteJobs.Payload.failed[0]",
           "IsPresent": true,
           "Next": "GlueJobsNotDeletedList"
+        },
+        {
+          "Variable": "$.deleteJobs.Payload.pending[0]",
+          "IsPresent": true,
+          "Next": "IncrDeleteLoop"
         }
       ],
       "Default": "CutoverSucceeded"
+    },
+    "IncrDeleteLoop": {
+      "Type": "Pass",
+      "Parameters": {
+        "c.$": "States.MathAdd($.deleteLoop.c, 1)"
+      },
+      "ResultPath": "$.deleteLoop",
+      "Next": "DeleteBudgetLeft"
+    },
+    "DeleteBudgetLeft": {
+      "Type": "Choice",
+      "Comment": "B21: keep looping DeleteGlueJobs while jobs are still pending, up to the budget. Past the budget, end in GlueJobsNotDeleted naming the still-pending jobs so an operator can finish by hand.",
+      "Choices": [
+        {
+          "Variable": "$.deleteLoop.c",
+          "NumericLessThan": 120,
+          "Next": "WaitDeleteRetry"
+        }
+      ],
+      "Default": "GlueJobsPendingTimedOut"
+    },
+    "WaitDeleteRetry": {
+      "Type": "Wait",
+      "Comment": "Give the slow (composite) CDC run time to actually stop before the next delete pass. The delete Lambda already force batch-stopped it; this just lets the run reach a stopped state.",
+      "Seconds": 10,
+      "Next": "DeleteGlueJobs"
+    },
+    "GlueJobsPendingTimedOut": {
+      "Type": "Pass",
+      "Parameters": {
+        "Error": "GlueJobsNotDeleted",
+        "Cause.$": "States.Format('Cutover stopped DMS, drained CDC and dropped _cdc_file, but these Glue jobs still had a CDC run that would not stop within the delete budget, so they were not deleted: {}. Stop their runs and delete them by hand (aws glue batch-stop-job-run / aws glue delete-job --job-name <name>), or re-run cutover.', States.JsonToString($.deleteJobs.Payload.pending))"
+      },
+      "ResultPath": "$.error",
+      "Next": "GlueJobsNotDeleted"
     },
     "GlueJobsNotDeletedList": {
       "Type": "Pass",

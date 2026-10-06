@@ -20,6 +20,7 @@ Covers the four bugs the real-AWS mixed test found:
 Run: python3 tests/test_e2e_fixes.py   (REPO_DIR overridable)
 """
 import ast
+import json
 import os
 import re
 import sys
@@ -636,6 +637,216 @@ def test_b16_selected_empty_table_still_included():
     check("empty_sel" in manifest, "B16: a selected 0-row table stays in the manifest")
     check(not out.get("ignoredUnselected"),
           "B16: nothing ignored when every reported table is selected")
+
+# =============================================================================================
+# B20 + B21 — create_glue_jobs delete-mode account resolution + bounded stop-wait (fake Glue).
+#
+# B20: delete/list_fork_cdc must resolve the account id even when the ASL payload omits it,
+#      by falling back to the Lambda's own context.invoked_function_arn, then STS.
+# B21: _wait_runs_stopped must never block past the Lambda timeout — it is bounded by
+#      context.get_remaining_time_in_millis(); delete mode batch-stops a still-running job and
+#      returns it under "pending" (not deleted) so the ASL loop retries it. With a fake Glue
+#      where a run takes N get_job_runs calls to go from RUNNING -> STOPPED, NO single Lambda
+#      call exceeds its (tiny) time budget, and looping delete eventually deletes everything.
+# =============================================================================================
+import importlib as _il
+import time as _time
+
+
+def _load_create_glue_jobs():
+    sys.path.insert(0, os.path.join(REPO, "lambdas"))
+    _b = types.ModuleType("boto3")
+    _b.client = lambda *a, **k: None
+    sys.modules["boto3"] = _b
+    cgj = _il.import_module("create_glue_jobs")
+    _il.reload(cgj)
+    return cgj
+
+
+class _FakeGlueExc:
+    class EntityNotFoundException(Exception):
+        pass
+
+
+class _FakeGlue:
+    """Minimal Glue stub. Each job's run goes RUNNING for `stop_after_calls` get_job_runs reads
+    (or until batch_stop_job_run flips it immediately), then STOPPED. Records deletes + stops."""
+
+    def __init__(self, jobs, stop_after_calls=0, stop_on_signal=True):
+        # jobs: {name: calls_remaining_running}
+        self._run_state = dict(jobs)
+        self._stop_after = stop_after_calls
+        self._stop_on_signal = stop_on_signal
+        self.exceptions = _FakeGlueExc()
+        self.deleted = []
+        self.stopped = []
+        self._calls = {}
+
+    def get_job_runs(self, JobName=None, MaxResults=50, NextToken=None):
+        self._calls[JobName] = self._calls.get(JobName, 0) + 1
+        left = self._run_state.get(JobName, 0)
+        state = "RUNNING" if left > 0 else "SUCCEEDED"
+        if left > 0:
+            self._run_state[JobName] = left - 1   # each poll moves it one step toward stopped
+        return {"JobRuns": [{"Id": f"{JobName}:run", "JobRunState": state}]}
+
+    def batch_stop_job_run(self, JobName=None, JobRunIds=None):
+        self.stopped.append(JobName)
+        if self._stop_on_signal:
+            self._run_state[JobName] = 0          # a stop signal makes the next poll see STOPPED
+        return {"SuccessfulSubmissions": [{"JobName": JobName, "JobRunId": i}
+                                          for i in (JobRunIds or [])]}
+
+    def delete_job(self, JobName=None):
+        if self._run_state.get(JobName, 0) > 0:
+            # Guard the invariant the fix guarantees: delete is only called on a stopped job.
+            raise AssertionError(f"delete_job called on {JobName} while its run is still RUNNING")
+        self.deleted.append(JobName)
+        return {}
+
+    def list_jobs(self, MaxResults=200, NextToken=None):
+        return {"JobNames": []}   # delete mode uses the registry union; tag selection returns []
+
+
+class _FakeS3Empty:
+    """No registry object -> _read_registry returns {} (NoSuchKey). put/get for registry clear."""
+    class _Exc(Exception):
+        pass
+
+    def get_object(self, Bucket=None, Key=None):
+        e = Exception("missing")
+        e.response = {"Error": {"Code": "NoSuchKey"}}
+        raise e
+
+    def put_object(self, **k):
+        return {"ETag": '"x"'}
+
+
+class _Ctx:
+    def __init__(self, arn, remaining_ms):
+        self.invoked_function_arn = arn
+        self._rem = remaining_ms
+
+    def get_remaining_time_in_millis(self):
+        return self._rem
+
+
+def test_b20_account_from_context_and_sts():
+    cgj = _load_create_glue_jobs()
+    ctx = _Ctx("arn:aws:lambda:us-east-1:222233334444:function:sharedtest-create-glue-jobs", 300000)
+    # 1) explicit event wins
+    check(cgj._account_id({"account_id": "111111111111"}, ctx) == "111111111111",
+          "B20: _account_id prefers the explicit event account_id")
+    # 2) dms_task_arn field 4
+    check(cgj._account_id({"dms_task_arn": "arn:aws:dms:us-east-1:555566667777:task:X"}, ctx)
+          == "555566667777",
+          "B20: _account_id derives the account from dms_task_arn when account_id is absent")
+    # 3) neither in event -> the Lambda's OWN context ARN
+    check(cgj._account_id({}, ctx) == "222233334444",
+          "B20: _account_id falls back to context.invoked_function_arn (account can't be empty)")
+    # 4) no event, no context -> STS (cached). Patch sts.get_caller_identity.
+    cgj._STS_ACCOUNT_CACHE["id"] = None
+
+    class _Sts:
+        def get_caller_identity(self):
+            return {"Account": "888899990000"}
+    cgj.boto3 = types.SimpleNamespace(client=lambda *a, **k: _Sts())
+    check(cgj._account_id({}, None) == "888899990000",
+          "B20: _account_id falls back to sts:GetCallerIdentity when event+context are empty")
+    cgj._STS_ACCOUNT_CACHE["id"] = None
+
+
+def test_b21_wait_runs_stopped_bounded_by_remaining_time():
+    cgj = _load_create_glue_jobs()
+    # A run that would take ~100 polls (never stops within the budget). With only ~1.2s of
+    # Lambda time left (margin 30s), the wait must NOT loop to the Lambda timeout: it returns
+    # False promptly (still active) after bounding on remaining time.
+    glue = _FakeGlue({"j": 100}, stop_on_signal=False)
+    ctx = _Ctx("arn:aws:lambda:us-east-1:1:function:f", 300000)  # plenty, but see below
+    t0 = _time.monotonic()
+    # Force the time bound to bite: remaining just above the margin so (now+delay) >= deadline
+    ctx._rem = cgj._WAIT_MARGIN_MS + 500
+    ok = cgj._wait_runs_stopped(glue, "j", attempts=100, delay=10, context=ctx)
+    elapsed = _time.monotonic() - t0
+    check(ok is False, "B21: a run still active at the time budget returns False (not blocked)")
+    check(elapsed < 5, f"B21: the bounded wait returns promptly (no 100x10s block); {elapsed:.2f}s")
+
+    # With context=None the static attempts*delay budget still applies and a run that is already
+    # stopped returns True at once.
+    check(cgj._wait_runs_stopped(_FakeGlue({"k": 0}), "k", attempts=3, delay=0, context=None)
+          is True,
+          "B21: an already-stopped run returns True (static budget path, context=None)")
+
+
+def _run_delete(cgj, glue, ctx):
+    """Invoke create_glue_jobs delete mode against a fake Glue + a registry listing `jobs`."""
+    # Patch the registry read to return our two jobs (so delete's `found` = these names).
+    jobs = sorted(glue._run_state)
+    cgj._read_registry = lambda s3, b, k: ({"jobs": [{"name": n} for n in jobs]}, None)
+    cgj._update_registry = lambda *a, **k: None
+    cgj._select_task_jobs_by_tag = lambda *a, **k: set()
+    cgj.boto3 = types.SimpleNamespace(
+        client=lambda svc, region_name=None: (glue if svc == "glue" else _FakeS3Empty()))
+    event = {"mode": "delete", "bucket": "b", "project": "sharedtest", "taskSuffix": "t",
+             "account_id": "111111111111"}
+    return cgj.handler(event, ctx)
+
+
+def test_b21_delete_pending_then_loop_terminates():
+    cgj = _load_create_glue_jobs()
+    ctx = _Ctx("arn:aws:lambda:us-east-1:1:function:f", 300000)
+
+    # Two composite CDC jobs whose runs take 2 polls to actually stop, but a stop SIGNAL
+    # (batch_stop_job_run) flips them stopped on the next poll. Tiny time budget so the bounded
+    # wait returns pending on the FIRST pass (proving no single call blocks), then the loop's
+    # next pass (fresh budget) finds them stopped and deletes them.
+    glue = _FakeGlue({"sharedtest-t-ck-nd-cdc": 2, "sharedtest-t-ck-sd-cdc": 2},
+                     stop_on_signal=True)
+
+    # PASS 1: starve the time budget so the wait bails to pending (and batch-stops the runs).
+    ctx._rem = cgj._WAIT_MARGIN_MS + 200
+    r1 = _run_delete(cgj, glue, ctx)
+    check(sorted(r1.get("pending", [])) == ["sharedtest-t-ck-nd-cdc", "sharedtest-t-ck-sd-cdc"],
+          "B21: delete returns both slow jobs under 'pending' (not deleted) on the first pass")
+    check(r1.get("deleted") == [], "B21: nothing deleted while runs are still stopping")
+    check(sorted(set(glue.stopped)) == ["sharedtest-t-ck-nd-cdc", "sharedtest-t-ck-sd-cdc"],
+          "B21: delete issued batch_stop_job_run for each still-running job")
+    check(glue.deleted == [], "B21: no delete_job on a running job (invariant held by the fake)")
+
+    # PASS 2: full budget. The runs are now stopped (the stop signal flipped them) -> deleted,
+    # nothing pending -> the ASL loop's AllGlueJobsDeleted takes Default -> CutoverSucceeded.
+    ctx._rem = 300000
+    r2 = _run_delete(cgj, glue, ctx)
+    check(sorted(r2.get("deleted", [])) == ["sharedtest-t-ck-nd-cdc", "sharedtest-t-ck-sd-cdc"],
+          "B21: the next delete pass (fresh budget) deletes the now-stopped jobs")
+    check(r2.get("pending") == [] and r2.get("failed") == [],
+          "B21: no pending/failed remain -> ASL loop terminates at CutoverSucceeded")
+
+
+def test_b21_asl_cutover_loops_delete_until_empty_or_budget():
+    """The cutover ASL loop: AllGlueJobsDeleted -> (pending) IncrDeleteLoop -> DeleteBudgetLeft
+    -> WaitDeleteRetry -> DeleteGlueJobs, bounded by a counter; else -> CutoverSucceeded; a hard
+    'failed' -> GlueJobsNotDeletedList. Static shape check so the loop can't silently regress."""
+    cut = json.load(open(os.path.join(REPO, "stepfunctions", "cutover.asl.json")))
+    s = cut["States"]
+    for st in ("InitDeleteLoop", "DeleteGlueJobs", "AllGlueJobsDeleted", "IncrDeleteLoop",
+               "DeleteBudgetLeft", "WaitDeleteRetry", "GlueJobsPendingTimedOut"):
+        check(st in s, f"B21: cutover has loop state {st}")
+    choices = {c.get("Next") for c in s["AllGlueJobsDeleted"].get("Choices", [])}
+    check("IncrDeleteLoop" in choices,
+          "B21: AllGlueJobsDeleted routes a 'pending' job back into the delete loop")
+    check(s["AllGlueJobsDeleted"].get("Default") == "CutoverSucceeded",
+          "B21: AllGlueJobsDeleted default (nothing pending/failed) succeeds")
+    check(s["WaitDeleteRetry"]["Next"] == "DeleteGlueJobs",
+          "B21: the loop waits then calls DeleteGlueJobs again")
+    check(s["DeleteBudgetLeft"].get("Default") == "GlueJobsPendingTimedOut",
+          "B21: past the budget the loop ends in GlueJobsNotDeleted naming the pending jobs")
+    # the pending choice guards on $.deleteJobs.Payload.pending[0]
+    pend = [c for c in s["AllGlueJobsDeleted"]["Choices"]
+            if c.get("Next") == "IncrDeleteLoop"][0]
+    check(pend.get("Variable") == "$.deleteJobs.Payload.pending[0]",
+          "B21: the loop condition reads the delete Lambda's pending list")
+
 
 
 def main():

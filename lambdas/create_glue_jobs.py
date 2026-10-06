@@ -196,26 +196,79 @@ def _active_runs(glue, name):
     return [r["Id"] for r in runs if r.get("JobRunState") in _ACTIVE_RUN_STATES]
 
 
+def _best_effort_stop_runs(glue, name):
+    """Issue batch_stop_job_run for every STARTING/RUNNING run of a job (B21). Best-effort: a
+    run already stopping/gone, or a transient Glue error, is ignored — the next DeleteGlueJobs
+    loop pass checks again. Returns the run ids a stop was requested for."""
+    try:
+        runs = glue.get_job_runs(JobName=name, MaxResults=50).get("JobRuns", [])
+    except Exception:
+        return []
+    ids = [r["Id"] for r in runs if r.get("JobRunState") in ("STARTING", "RUNNING")]
+    if ids:
+        try:
+            glue.batch_stop_job_run(JobName=name, JobRunIds=ids[:25])
+            print(f"(info) delete: requested stop of {len(ids[:25])} active run(s) of {name}")
+        except Exception as e:
+            print(f"(warn) delete: could not batch-stop runs of {name}: "
+                  f"{type(e).__name__}: {e}")
+    return ids[:25]
+
+
 def _now_iso():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _wait_runs_stopped(glue, name, attempts=30, delay=10):
-    """Before deleting a job, wait for any STARTING/RUNNING/STOPPING run to reach a stopped state
-    (G3). A job that doesn't exist has no runs. Best-effort: after the budget, proceed to delete
-    (Glue stops runs on delete) rather than block cutover forever."""
+def _remaining_ms(context):
+    """Milliseconds left before this Lambda is killed, or None when unknown (context=None in
+    unit tests, or an old runtime without the method). None => callers use their static budget."""
+    try:
+        fn = getattr(context, "get_remaining_time_in_millis", None)
+        return int(fn()) if callable(fn) else None
+    except Exception:
+        return None
+
+
+# Never block a Lambda right up to its own timeout (B21): leave at least this much time to do the
+# actual delete + return a clean result. The ASL loops DeleteGlueJobs, so an unfinished stop is
+# retried on the next pass rather than killing the Lambda mid-flight.
+_WAIT_MARGIN_MS = 30_000
+
+
+def _wait_runs_stopped(glue, name, attempts=30, delay=10, context=None):
+    """Wait for a job's STARTING/RUNNING/STOPPING run to reach a stopped state (G3) BEFORE
+    deleting it, but never wait past the Lambda's own timeout (B21). Returns True once no run is
+    active (or the job is gone); returns False if runs are still active when the time budget runs
+    out — the caller then leaves that job for the next DeleteGlueJobs pass instead of blocking to
+    a Sandbox.Timedout. A composite CDC run slow to stop therefore no longer times the Lambda
+    out; it just stays 'pending' for one more loop.
+
+    Budget = min(attempts*delay, remaining Lambda time - margin). With context=None (unit tests)
+    the static attempts*delay budget is used unchanged."""
     import time
+    deadline = None
+    rem = _remaining_ms(context)
+    if rem is not None:
+        deadline = time.monotonic() + max(0.0, (rem - _WAIT_MARGIN_MS) / 1000.0)
     for _i in range(attempts):
         try:
             act = _active_runs(glue, name)
         except glue.exceptions.EntityNotFoundException:
-            return
+            return True
         except Exception:
-            return
+            return True
         if not act:
-            return
+            return True
+        # Stop if we're out of static attempts or about to run into the Lambda timeout.
+        if deadline is not None and (time.monotonic() + delay) >= deadline:
+            return False
         time.sleep(delay)
+    # Static budget exhausted: report whether anything is still active.
+    try:
+        return not _active_runs(glue, name)
+    except Exception:
+        return True
 
 
 def _read_json(s3, bucket, key):
@@ -226,11 +279,53 @@ def _job_arn(region, account_id, name):
     return f"arn:aws:glue:{region}:{account_id}:job/{name}"
 
 
-def _account_id(event):
+_STS_ACCOUNT_CACHE = {"id": None}
+
+
+def _account_from_context(context):
+    """Account id from the Lambda's OWN invoked_function_arn (field 4 of
+    arn:aws:lambda:<region>:<account>:function:<name>). Always correct — the Lambda runs in the
+    pipeline account that owns the Glue jobs — and needs no extra IAM. Returns "" if unavailable
+    (e.g. a unit test passing context=None)."""
+    arn = str(getattr(context, "invoked_function_arn", "") or "")
+    _p = arn.split(":")
+    return _p[4] if len(_p) > 4 else ""
+
+
+def _account_from_sts():
+    """Last-resort account id via sts:GetCallerIdentity (cached for the warm container). Only
+    reached when neither the event nor the Lambda context carried it. Returns "" if the call
+    fails rather than raising, so the caller can emit its own clear error."""
+    if _STS_ACCOUNT_CACHE["id"]:
+        return _STS_ACCOUNT_CACHE["id"]
+    try:
+        acct = str(boto3.client("sts", region_name=REGION).get_caller_identity().get("Account")
+                   or "").strip()
+    except Exception as e:
+        print(f"(warn) sts:GetCallerIdentity could not resolve the account id: "
+              f"{type(e).__name__}: {e}")
+        acct = ""
+    _STS_ACCOUNT_CACHE["id"] = acct
+    return acct
+
+
+def _account_id(event, context=None):
+    """The account id that owns this task's Glue jobs, needed to build job ARNs for get_tags.
+
+    Resolution order (B20 — never fail just because the ASL payload omitted it):
+      1. event["account_id"] (what resolve_task emits as $.resolved.accountId),
+      2. field 4 of event["dms_task_arn"] (the cutover input carries taskArn),
+      3. field 4 of the Lambda's OWN context.invoked_function_arn (same account as the jobs),
+      4. sts:GetCallerIdentity (cached).
+    Returns "" only if every source is unavailable."""
     acct = str(event.get("account_id") or "").strip()
     if not acct:
         _p = str(event.get("dms_task_arn") or "").split(":")
         acct = _p[4] if len(_p) > 4 else ""
+    if not acct:
+        acct = _account_from_context(context)
+    if not acct:
+        acct = _account_from_sts()
     return acct
 
 
@@ -445,7 +540,7 @@ def handler(event, context):
     glue = boto3.client("glue", region_name=REGION)
     s3 = boto3.client("s3", region_name=REGION)
     region = event.get("region", REGION)
-    account_id = _account_id(event)
+    account_id = _account_id(event, context)
     names = {role: _job_name(project, task_suffix, role) for role in _ROLES}
     reg_key = _registry_key(event.get("configPrefix") or f"config/_task/{task_suffix}/", task_suffix)
 
@@ -482,10 +577,17 @@ def handler(event, context):
         tagged = _select_task_jobs_by_tag(glue, region, account_id, project, task_suffix)
         found = reg_names | tagged
         reported_missing = sorted(reg_names - tagged)
-        deleted, failed = [], []
+        deleted, failed, pending = [], [], []
         for name in sorted(found):
             try:
-                _wait_runs_stopped(glue, name)
+                # Wait for any active run to stop, bounded by the Lambda's own time budget (B21).
+                # If a run is still active when the budget runs low (e.g. a composite CDC run
+                # slow to react to its stop), issue a best-effort batch-stop and leave the job
+                # for the next DeleteGlueJobs loop pass instead of blocking to a Lambda timeout.
+                if not _wait_runs_stopped(glue, name, context=context):
+                    _best_effort_stop_runs(glue, name)
+                    pending.append(name)
+                    continue
                 glue.delete_job(JobName=name)
                 deleted.append(name)
             except glue.exceptions.EntityNotFoundException:
@@ -493,13 +595,18 @@ def handler(event, context):
             except Exception as e:
                 print(f"(error) could not delete {name}: {e}")
                 failed.append({"job": name, "error": f"{type(e).__name__}: {e}"[:500]})
-        # Clear the registry (best-effort) so a re-created task starts clean.
-        try:
-            _update_registry(s3, bucket, reg_key, lambda d: d.update(
-                {"jobs": [], "cdcOwners": {}, "deletedAt": _now_iso()}))
-        except Exception as e:
-            print(f"(warn) could not clear registry {reg_key}: {e}")
-        return {"jobs": names, "deleted": deleted, "failed": failed,
+        if pending:
+            print(f"(info) delete: {len(pending)} job(s) still have a run stopping; left for "
+                  f"the next cutover DeleteGlueJobs pass: {pending}")
+        # Clear the registry ONLY when every job is gone (nothing pending/failed) so a re-looped
+        # DeleteGlueJobs can still find the pending jobs by registry on the next pass.
+        if not pending and not failed:
+            try:
+                _update_registry(s3, bucket, reg_key, lambda d: d.update(
+                    {"jobs": [], "cdcOwners": {}, "deletedAt": _now_iso()}))
+            except Exception as e:
+                print(f"(warn) could not clear registry {reg_key}: {e}")
+        return {"jobs": names, "deleted": deleted, "failed": failed, "pending": pending,
                 "reportedMissing": reported_missing, "created": [], "updated": []}
 
     # ---- create / ensure_fork_jobs / cdc_fallback ------------------------------------------
@@ -959,10 +1066,10 @@ def handler(event, context):
         # if already present). Best-effort — a tagging hiccup must not fail job creation.
         if job_tags:
             try:
-                acct = (event.get("account_id") or "").strip()
-                if not acct and dms_task_arn:
-                    _p = str(dms_task_arn).split(":")
-                    acct = _p[4] if len(_p) > 4 else ""
+                # Reuse the account id resolved at the top of handler() (event -> dms_task_arn ->
+                # context ARN -> STS). This can no longer be empty just because the payload
+                # omitted account_id/dms_task_arn (B20).
+                acct = account_id
                 if acct:
                     arn = f"arn:aws:glue:{region}:{acct}:job/{name}"
                     glue.tag_resource(ResourceArn=arn, TagsToAdd=dict(job_tags))

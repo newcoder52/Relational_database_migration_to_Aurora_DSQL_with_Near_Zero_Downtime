@@ -457,6 +457,159 @@ def test_cutover_resolve_output_satisfies_resultselector():
                   f"cutover resolve carries no obsolete composite fields ({label})")
 
 
+# =============================================================================================
+# INPUT-side payload contract (B20): the mirror of the output-side check above.
+#
+# The output-side audit proves every $.Payload.<field> an ASL ResultSelector READS is a field
+# the Lambda returns. This INPUT-side audit proves the opposite direction: every key a Lambda's
+# mode REQUIRES from its event (read as event["x"], or event.get("x") with NO safe fallback) is a
+# key the invoking state's ASL `Parameters.Payload` actually PASSES. A gap here is exactly B20:
+# cutover's DeleteGlueJobs passed only {mode,bucket,project,taskSuffix}, but create_glue_jobs
+# delete-mode needs the account id (account_id OR dms_task_arn) to build job ARNs for get_tags,
+# so it raised "delete: cannot resolve account id ..." and cutover ended in GlueJobsNotDeleted.
+#
+# Requirements are declared explicitly (readable, reviewable) as MODE_REQUIRED_INPUT. Each entry
+# is either:
+#   * a str  -> that key MUST appear in the state's Payload, or
+#   * a tuple -> AN-OF: at least one of these keys must appear (models "account_id OR
+#                dms_task_arn", the B20 class).
+# A separate drift guard asserts every declared single-key requirement is actually read with no
+# fallback in the Lambda source, so the spec can't quietly rot.
+# =============================================================================================
+
+# create_glue_jobs create/ensure_fork_jobs/cdc_fallback share these hard event["..."] reads.
+_CGJ_BUILD = ["bucket", "project", "taskSuffix", "glue_templates_prefix", "scripts_prefix",
+              "configPrefix", "glue_role_arn", "dsql_endpoint"]
+# The account-id requirement (B20): satisfiable by account_id OR dms_task_arn in the Payload.
+# (The Lambda additionally self-derives from its own context ARN / STS, but the ASL should still
+# pass a hint; this any-of is what the state's Parameters must satisfy.)
+_ACCOUNT_ANYOF = ("account_id", "dms_task_arn")
+
+MODE_REQUIRED_INPUT = {
+    ("resolve_task.py", "startup"): ["bucket"],
+    ("resolve_task.py", "cutover"): ["bucket"],
+    ("resolve_task.py", "build_table_list"): [],          # all event.get(...) with fallbacks
+    ("driver_discovery.py", None): ["bucket"],
+    ("plan_split.py", None): ["config_prefix"],
+    ("create_glue_jobs.py", "create"): list(_CGJ_BUILD),
+    ("create_glue_jobs.py", "ensure_fork_jobs"): list(_CGJ_BUILD),
+    ("create_glue_jobs.py", "cdc_fallback"): list(_CGJ_BUILD),
+    ("create_glue_jobs.py", "delete"): ["bucket", "project", "taskSuffix", _ACCOUNT_ANYOF],
+    ("create_glue_jobs.py", "list_fork_cdc"): ["bucket", "project", "taskSuffix", _ACCOUNT_ANYOF],
+    ("drain_check.py", None): ["config_prefix", "dsql_endpoint"],
+    ("drain_check.py", "validation_gate"): ["config_prefix", "dsql_endpoint"],
+    ("drop_tags.py", None): ["config_prefix", "dsql_endpoint"],
+    ("stop_cdc_run.py", None): ["cdcJobName", "configPrefix"],
+    ("preflight_tasks.py", "startup"): [],                # fleetInput/bucket all have fallbacks
+    ("preflight_tasks.py", "cutover"): [],
+}
+
+
+def _lambda_invoking_states(sm):
+    """Yield (state_name, FunctionName, mode, {payload_keys}) for EVERY Lambda-invoking Task
+    (including nested Map iterator states) -- with or without a ResultSelector (unlike the
+    output-side walker, which only visits states that read $.Payload). payload_keys has the
+    trailing '.$' stripped so '$.taskArn'-valued keys compare by their plain name."""
+    out = []
+
+    def walk(states, scope):
+        for name, st in states.items():
+            params = st.get("Parameters") or {}
+            fn = params.get("FunctionName")
+            if fn and st.get("Resource", "").startswith("arn:aws:states:::lambda:invoke"):
+                payload = params.get("Payload") or {}
+                keys = {(k[:-2] if k.endswith(".$") else k) for k in payload}
+                mode = payload.get("mode")
+                out.append((f"{scope}{name}", fn, mode, keys))
+            if st.get("Type") == "Map":
+                it = st.get("Iterator") or st.get("ItemProcessor")
+                if it:
+                    walk(it["States"], f"{scope}{name}.Iterator/")
+
+    walk(sm["States"], "")
+    return out
+
+
+def _requirement_satisfied(req, payload_keys):
+    """req is a str (key must be present) or a tuple (any-of must be present)."""
+    if isinstance(req, (tuple, list)):
+        return any(k in payload_keys for k in req), " or ".join(req)
+    return req in payload_keys, req
+
+
+def test_input_payload_contract_all_state_machines():
+    """ASL Parameters.Payload keys ⊇ the keys each invoked Lambda mode requires from its event."""
+    files = sorted(f for f in os.listdir(SF_DIR) if f.endswith(".asl.json"))
+    checked = 0
+    for f in files:
+        sm = json.load(open(os.path.join(SF_DIR, f)))
+        for state, fn, mode, payload_keys in _lambda_invoking_states(sm):
+            lambda_file = PLACEHOLDER_TO_FILE.get(fn)
+            check(lambda_file is not None,
+                  f"{f}:{state} FunctionName {fn!r} maps to a known Lambda")
+            if lambda_file is None:
+                continue
+            required = MODE_REQUIRED_INPUT.get((lambda_file, mode))
+            check(required is not None,
+                  f"{f}:{state} ({lambda_file} mode={mode}) has a declared INPUT contract")
+            if required is None:
+                continue
+            missing = []
+            for req in required:
+                ok, label = _requirement_satisfied(req, payload_keys)
+                if not ok:
+                    missing.append(label)
+            check(not missing,
+                  f"{f}:{state} Payload passes every key {lambda_file} (mode={mode}) requires; "
+                  f"missing={missing}")
+            checked += 1
+    check(checked >= 14,
+          f"audited {checked} Lambda-invoking state(s) on the INPUT side across the fleet")
+
+
+def test_b20_delete_payload_passes_account_resolution():
+    """B20 pin: cutover's DeleteGlueJobs must pass an account hint (account_id OR dms_task_arn)
+    so create_glue_jobs delete-mode can build job ARNs for get_tags. Also a NEGATIVE check: the
+    pre-fix payload {mode,bucket,project,taskSuffix} would FAIL this requirement -- proving the
+    test catches today's bug, not just today's fix."""
+    cut = json.load(open(os.path.join(SF_DIR, "cutover.asl.json")))
+    delete = cut["States"]["DeleteGlueJobs"]["Parameters"]["Payload"]
+    keys = {(k[:-2] if k.endswith(".$") else k) for k in delete}
+    ok, _ = _requirement_satisfied(_ACCOUNT_ANYOF, keys)
+    check(ok, "B20: DeleteGlueJobs Payload passes account_id or dms_task_arn "
+              f"(keys={sorted(keys)})")
+    # taskArn (the cutover start input) is what feeds dms_task_arn here.
+    if "dms_task_arn" in delete:
+        check(delete["dms_task_arn"] == "$.taskArn",
+              "B20: DeleteGlueJobs maps dms_task_arn to the cutover input $.taskArn")
+
+    # NEGATIVE: the exact pre-fix payload must NOT satisfy the account requirement.
+    pre_fix = {"mode", "bucket", "project", "taskSuffix"}
+    bad_ok, _ = _requirement_satisfied(_ACCOUNT_ANYOF, pre_fix)
+    check(not bad_ok,
+          "B20 negative: the pre-fix delete payload {mode,bucket,project,taskSuffix} fails the "
+          "account-resolution requirement (the test would have caught the bug)")
+
+
+def test_input_contract_spec_matches_lambda_source():
+    """Drift guard: every single-key requirement declared in MODE_REQUIRED_INPUT must actually be
+    read as event["<key>"] (no safe fallback) somewhere in the mapped Lambda source. Keeps the
+    declarative spec honest. (Any-of tuples model account resolution and are checked separately
+    by the B20 test; they are not asserted here because their reads are indirect via _account_id.)"""
+    import re
+    seen_reads = {}
+    for (lambda_file, _mode), reqs in MODE_REQUIRED_INPUT.items():
+        if lambda_file not in seen_reads:
+            src = open(os.path.join(LAMBDAS, lambda_file)).read()
+            seen_reads[lambda_file] = set(re.findall(r'event\[\s*"([a-zA-Z_]+)"\s*\]', src))
+        reads = seen_reads[lambda_file]
+        for req in reqs:
+            if isinstance(req, str):
+                check(req in reads,
+                      f"spec drift: {lambda_file} declares required input {req!r} but the source "
+                      f"has no event[{req!r}] read")
+
+
 def main():
     for fn in sorted(g for g in globals() if g.startswith("test_")):
         globals()[fn]()
