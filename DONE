@@ -1,93 +1,45 @@
-Task: make the data-safety guardrails (added in 8825b41) never break a normal run, and fix B22
-(IAM MalformedPolicyDocument on setup).
+DONE — runtime `override` for startup & cutover
 
-B22: iam/glue.json had a "_comment" INSIDE a Policy Statement (plus three doc-level "_comment"
-keys); IAM rejects put-role-policy with MalformedPolicyDocument, so every setup failed. Removed
-them (explanations moved to docs/IAM_POLICY_NOTES.md); tools/setup.sh split_iam and the
-MANUAL_SETUP fill-in step now strip any non-IAM key from TrustPolicy/Policy/VpcPolicy (and their
-Statements) before put-role-policy as a backstop. New tests/test_iam_policies.py asserts every
-Statement in iam/*.json carries only valid IAM keys and that both strip backstops work.
+Pushed to origin/main as newcoder52 <aash.798@gmail.com>:
+  69fb12b  Add runtime override for startup/cutover (code + tests)
+  b6159d6  RESULT.md (final HEAD)
+Parent: d0cd1e7 (fix-b27). Fresh clone on d0cd1e7; git pull --rebase before each push (no
+parallel changes landed); plain push, never forced. Verified in a 2nd fresh clone at b6159d6.
 
-Ease guardrails (principle: a guard may only STOP a destructive action; it must NEVER fail a run
-for its own bookkeeping — a missing permission, missing control table, a lock it can't take, or a
-check it can't compute):
-- New master setting guardrails_mode = warn (default) | strict, plumbed params.csv -> pipeline.json
-  -> resolve_task -> create_glue_jobs -> load/validate/CDC job args, with per-guard knobs
-  cdc_file_order_action (G8), cdc_nopk_overmatch_action (G7), validate_count_check /
-  cutover_count_check (G10). strict restores fail-closed.
-- HARD G1/G4/G6 still refuse the destructive op (and only that op; the per-table loop keeps the run
-  going). SOFT G2/G3/G5/G7/G8/G9/G10 warn + continue by default; each guard call is wrapped so an
-  exception can't raise into the main path.
-- G2 missing states:DescribeExecution no longer fails a reblank; G3 warns+proceeds on a bookkeeping
-  lock failure and skips only on a live holder; G7/G8 warn+apply; G10 mismatch is a WARNING and
-  validate/cutover still pass. All reversible via guardrails_mode=strict or the per-guard setting.
-- New control bookkeeping (cdc_control_lock, audit_log, cdc_status counters) is add-if-missing (no
-  DEFAULT-on-ALTER, B17-safe); a create/upgrade failure warns and continues.
-- Shared CDC helpers (incl. new guard_action_blocks / emit_guard_warn_metric) stay byte-identical
-  across the continuous + composite engines.
+WHAT SHIPPED
+- Startup: {"override": true} lets a validate_failed group resume DMS + start CDC and end in the
+  new TaskSucceededWithOverride (lists overridden groups/tables + validation report paths). A
+  LOAD failure still stops at GroupsFailed. Override normalized once in resolve_task
+  (resolved.override), IsPresent-guarded in the ASL. Override record +
+  _startup_override.json marker written to config/_task/<task>/_overrides/. Optional
+  overrideReason recorded.
+- Cutover: override bypasses-but-logs the pre- and post-drain CdcValidationFailed gates and (via
+  the same validation_gate) the cutover count check; ends in CutoverSucceededWithOverride. The
+  startup-override marker makes an un-overridden cutover refuse (StartupOverrideRequiresOverride,
+  "pass override=true to accept"). Safety ordering (DMS stop -> drain -> stop CDC runs -> delete
+  jobs) never bypassed.
+- Fleet: fleet-startup/-cutover accept top-level "override": true (preflight passes it to each
+  child); optional per-task override column in fleet_tasks.csv (blank=false), OR'd with the
+  fleet-level flag. Preflight never rejects the extra column.
+- job2_load already skips tables marked "done" unconditionally -> an override re-run reloads
+  nothing already done (verified by test; no code change needed).
+- Docs: RUNBOOK §8 "Validation failed — re-run with override" (exact start-execution commands,
+  task + fleet), new end states in the outcome + reference tables, risk note; FLEET_LAUNCHER
+  override note + CSV column.
 
-Base commit: cbb85014722379e4319c05df45e212accdb105be (git ls-remote main HEAD)
-Fix commit:  1d3ed4c98be6aa4b74d56e02b0095d3501a09f63
+RUNTIME FILES CHANGED (redeploy in RESULT.md): stepfunctions/startup.asl.json,
+stepfunctions/cutover.asl.json (state-machine definition updates); lambdas/resolve_task.py,
+lambdas/preflight_tasks.py (one shared fn.zip -> update $PROJECT-resolve-task +
+$PROJECT-preflight-tasks). No Glue script change -> no S3 upload. No IAM change (PutObject on the
+bucket already covers _overrides/). Fleet state machines unchanged.
 
-Runtime files changed:
-  scripts/job2_load.py
-  scripts/glue_cdc_continuous.py
-  scripts/glue_cdc_composite.py
-  scripts/job3_validate.py
-  lambdas/params_csv.py
-  lambdas/resolve_task.py
-  lambdas/create_glue_jobs.py
-  stepfunctions/startup.asl.json
-  iam/glue.json, iam/lambda.json, iam/stepfunctions.json
-  tools/setup.sh
-  (glue-templates/: none)
+TESTS (offline, all green): ASL path audit PASS; payload-contract 185 PASS (incl. new override
+pins + write_override_record mode); tests/test_override.py 43 PASS; test_docs_params PASS; full
+suite 168 passed. Re-run after rebase and in the 2nd clone.
 
-Non-runtime: RUNBOOK.md, docs/MANUAL_SETUP.md, docs/IAM_POLICY_NOTES.md (new),
-config/params.example.csv, config/pipeline.example.json, tests/test_guardrails.py,
-tests/test_ease_guardrails.py (new), tests/test_iam_policies.py (new).
+MIRROR: ~/Downloads/dms-s3-glue-dsql-migration/ synced to b6159d6 content (.git untouched,
+still 668fa27). Backup of the pre-change mirror (files only, no .git, 72 files) at
+~/Downloads/cdc_backups/before-69fb12b/.
 
-All suites green (fresh clone, offline): test_asl_paths (165), test_asl_payload_contract (165),
-test_b17_b13 (24), test_b18_validate_throughput (27), test_docs_params (PASS), test_e2e_fixes (80),
-test_ease_guardrails (86), test_existing_roles (66), test_fix6 (51), test_guardrails (80),
-test_iam_policies (158), test_planning_settings (58/58).
-
-================================================================================================
-
-Task: fix B23 — startup `ForkCdcStartNotConfirmed` was a FALSE failure for every composite (ck)
-and big-table (bg) CDC fork. The workflow polled the start marker at the TASK-level key
-config/_task/<suffix>/_cdc_started/<exec>-ck-<slug>.json, but each fork CDC job runs with
---config_prefix = its FORK prefix (.../_orchestrator/ck-<slug>/ or .../_orchestrator/bg-<slug>/)
-and write_started_marker() writes under <CONFIG_PREFIX>_cdc_started/. The poll never matched, the
-Map waited 45 min and failed, while the fork CDC job was actually RUNNING. Main CDC was fine (its
-config_prefix IS the task prefix).
-
-Fix:
-- plan_split.py now emits config_prefix_key (bare S3 key, trailing slash) for every ck and bg fork.
-- startup.asl.json CheckForkStarted now polls the fork's OWN prefix:
-  States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug).
-- Both CDC scripts (glue_cdc_composite.py, glue_cdc_continuous.py) ALSO write a second copy of the
-  start marker at the task level when --cdc_owners_key is present (its dirname is the task prefix),
-  so older/unpatched workflows confirm too. Main run still writes once.
-- Optional _latest.json LastModified fallback: deliberately not added (not simpler; the two fixes
-  above are deterministic and cover back-compat).
-
-Both fork kinds confirmed affected and fixed (ck + bg exercised in the new test).
-
-Base commit: cbb85014722379e4319c05df45e212accdb105be (HEAD when started); rebased onto
-             d1bd703483a45bb2929e661f67ab82a8ac0de8c1 (ease-guardrails + B22 landed meanwhile)
-Fix commit:  559edfd80a1d6bc314320fc40c9586469ade90b7
-
-Runtime files changed:
-  lambdas/plan_split.py
-  scripts/glue_cdc_composite.py
-  scripts/glue_cdc_continuous.py
-  stepfunctions/startup.asl.json
-  (glue-templates/: none; iam/: none)
-
-Non-runtime: RUNBOOK.md (§8 ForkCdcStartNotConfirmed row), tests/test_marker_paths.py
-
-All suites green (verified in a 2nd fresh clone), on the rebased tree that includes the
-ease-guardrails + B22 fix: test_asl_paths, test_asl_payload_contract (165), test_marker_paths (17),
-test_guardrails (80), test_ease_guardrails (86), test_iam_policies (158), test_e2e_fixes (80),
-test_b17_b13 (24), test_b18_validate_throughput (27), test_docs_params, test_fix6 (51),
-test_existing_roles (66), test_planning_settings (58/58).
+No customer identifiers (only the standard 123456789012 / us-east-1 docs placeholders already in
+the example files).
