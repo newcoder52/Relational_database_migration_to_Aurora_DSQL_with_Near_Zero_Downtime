@@ -87,6 +87,7 @@ MODE_RETURN_FUNCS = {
     ("resolve_task.py", "startup"): ["handler_shared", "_endpoint_contract"],
     ("resolve_task.py", "cutover"): ["handler_shared", "_endpoint_contract"],
     ("resolve_task.py", "build_table_list"): ["handler_build_table_list"],
+    ("resolve_task.py", "write_override_record"): ["handler_write_override_record"],
     # driver_discovery: one handler; plain dict + `.update(engine=..., fallbackReason=...)`.
     ("driver_discovery.py", None): ["handler"],
     # plan_split: one handler, single terminal `return {...}`.
@@ -313,6 +314,41 @@ def test_b19_regression_cutover_resolve_fields_are_returned():
           "B19: resolve_task (cutover mode) does not return the obsolete composite fields")
 
 
+def test_override_fields_are_returned_by_resolve_task():
+    """OVERRIDE payload contract: the startup/cutover ResolveTask ResultSelectors read the new
+    override fields, and resolve_task returns them in those modes (so the ASL never reads a field
+    the Lambda doesn't produce — the B19 class, pinned for the override feature)."""
+    startup = json.load(open(os.path.join(SF_DIR, "startup.asl.json")))
+    cutover = json.load(open(os.path.join(SF_DIR, "cutover.asl.json")))
+    su_rs = startup["States"]["ResolveTask"]["ResultSelector"]
+    cu_rs = cutover["States"]["CutoverResolveTask"]["ResultSelector"]
+    su_read = {v.split("$.Payload.", 1)[1] for v in su_rs.values()
+               if isinstance(v, str) and v.startswith("$.Payload.")}
+    cu_read = {v.split("$.Payload.", 1)[1] for v in cu_rs.values()
+               if isinstance(v, str) and v.startswith("$.Payload.")}
+    su_keys = returned_keys("resolve_task.py", "startup")
+    cu_keys = returned_keys("resolve_task.py", "cutover")
+    check({"override", "overrideReason"} <= su_read,
+          "startup ResolveTask reads $.Payload.override + overrideReason")
+    check({"override", "overrideReason", "startupOverrideUsed"} <= cu_read,
+          "cutover ResolveTask reads override + overrideReason + startupOverrideUsed")
+    check({"override", "overrideReason"} <= su_keys,
+          "resolve_task (startup) returns override + overrideReason")
+    check({"override", "overrideReason", "startupOverrideUsed"} <= cu_keys,
+          "resolve_task (cutover) returns override + overrideReason + startupOverrideUsed")
+    # And the write_override_record mode returns the fields the override-record ResultSelectors read.
+    wor_keys = returned_keys("resolve_task.py", "write_override_record")
+    for state_sm, state_name in (("startup.asl.json", "WriteStartupOverrideRecord"),
+                                 ("cutover.asl.json", "WriteCutoverOverrideRecord")):
+        sm = json.load(open(os.path.join(SF_DIR, state_sm)))
+        rs = sm["States"][state_name]["ResultSelector"]
+        read = {v.split("$.Payload.", 1)[1] for v in rs.values()
+                if isinstance(v, str) and v.startswith("$.Payload.")}
+        missing = sorted(read - wor_keys)
+        check(not missing,
+              f"{state_name} reads only write_override_record return keys; missing={missing}")
+
+
 # ---------------------------------------------------------------------------------------------
 # Fake-invoke resolve_task in CUTOVER mode (composite table + non-composite table), then run the
 # real cutover ResultSelector against the output: every `.$` path must resolve.
@@ -489,6 +525,7 @@ MODE_REQUIRED_INPUT = {
     ("resolve_task.py", "startup"): ["bucket"],
     ("resolve_task.py", "cutover"): ["bucket"],
     ("resolve_task.py", "build_table_list"): [],          # all event.get(...) with fallbacks
+    ("resolve_task.py", "write_override_record"): ["bucket", "taskSuffix"],
     ("driver_discovery.py", None): ["bucket"],
     ("plan_split.py", None): ["config_prefix"],
     ("create_glue_jobs.py", "create"): list(_CGJ_BUILD),

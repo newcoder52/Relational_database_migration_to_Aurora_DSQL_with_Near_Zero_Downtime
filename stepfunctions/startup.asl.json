@@ -46,6 +46,8 @@
         "taskName.$": "$.Payload.taskName",
         "taskSuffix.$": "$.Payload.taskSuffix",
         "configPrefix.$": "$.Payload.configPrefix",
+        "override.$": "$.Payload.override",
+        "overrideReason.$": "$.Payload.overrideReason",
         "project.$": "$.Payload.project",
         "region.$": "$.Payload.region",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
@@ -1036,28 +1038,60 @@
     },
     "AllGroupsSucceeded": {
       "Type": "Choice",
-      "Comment": "Do NOT resume DMS or start CDC if any group's load or validation failed.",
+      "Comment": "A LOAD failure always stops the run (override covers validation only). A validation-only failure stops at GroupsFailed UNLESS the run was started with override=true, in which case it continues (MarkOverrideActive -> ResumeDmsToCdc -> StartCdcJob) and ends in TaskSucceededWithOverride. The override comparison is IsPresent-guarded so the path audit passes and an older execution with no $.resolved.override behaves as the default (no override).",
       "Choices": [
         {
-          "Or": [
-            {
-              "Variable": "$.groupCheck.anyLoadFailed",
-              "BooleanEquals": true
-            },
+          "Variable": "$.groupCheck.anyLoadFailed",
+          "BooleanEquals": true,
+          "Next": "GroupsFailed"
+        },
+        {
+          "And": [
             {
               "Variable": "$.groupCheck.anyValidateFailed",
               "BooleanEquals": true
+            },
+            {
+              "Variable": "$.resolved.override",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.override",
+              "BooleanEquals": true
             }
           ],
+          "Next": "MarkOverrideActive"
+        },
+        {
+          "Variable": "$.groupCheck.anyValidateFailed",
+          "BooleanEquals": true,
           "Next": "GroupsFailed"
         }
       ],
-      "Default": "ResumeDmsToCdc"
+      "Default": "MarkOverrideInactive"
+    },
+    "MarkOverrideActive": {
+      "Type": "Pass",
+      "Comment": "Validation failed but override=true: carry overrideActive=true so the terminal routes to TaskSucceededWithOverride (which writes the override record). DMS is resumed and CDC starts as on the normal path.",
+      "Parameters": {
+        "active": true
+      },
+      "ResultPath": "$.overrideResolved",
+      "Next": "ResumeDmsToCdc"
+    },
+    "MarkOverrideInactive": {
+      "Type": "Pass",
+      "Comment": "All groups passed (no override needed). overrideActive=false -> the terminal is the normal TaskSucceeded. Produced on this route too so the terminal Choice's $.overrideResolved.active read is present on every path (ASL path audit).",
+      "Parameters": {
+        "active": false
+      },
+      "ResultPath": "$.overrideResolved",
+      "Next": "ResumeDmsToCdc"
     },
     "GroupsFailed": {
       "Type": "Fail",
       "Error": "GroupLoadOrValidateFailed",
-      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run."
+      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run. If the failure is validation only (not a load failure) and you have reviewed the discrepancy and accept it, start a NEW execution with input {\"taskArn\": \"...\", \"override\": true} (optional \"overrideReason\"): the run records the validation result, resumes DMS, starts CDC and ends in TaskSucceededWithOverride. A LOAD failure always stops here even with override."
     },
     "ResumeDmsToCdc": {
       "Type": "Task",
@@ -1626,7 +1660,86 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "TaskSucceeded"
+      "Next": "OverrideTerminal"
+    },
+    "OverrideTerminal": {
+      "Type": "Choice",
+      "Comment": "CDC (and every fork) confirmed. If this run carried a validation failure past the gate (overrideActive=true, set at MarkOverrideActive), write the override record and end in the distinct TaskSucceededWithOverride; otherwise end in the normal TaskSucceeded. $.overrideResolved.active is produced on every route here (MarkOverrideActive / MarkOverrideInactive), so the read is audit-safe.",
+      "Choices": [
+        {
+          "Variable": "$.overrideResolved.active",
+          "BooleanEquals": true,
+          "Next": "WriteStartupOverrideRecord"
+        }
+      ],
+      "Default": "TaskSucceeded"
+    },
+    "WriteStartupOverrideRecord": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Write the override audit record to config/_task/<suffix>/_overrides/<execution>.json (who=execution ARN, when, overridden groups + tables, reason, validation report paths, bypassed gate) AND the stable startup-override marker _startup_override.json, which makes a later cutover refuse unless cutover is also started with override. Reuses resolve_task (mode write_override_record).",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "write_override_record",
+          "bucket": "<<BUCKET>>",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "workflow": "startup",
+          "execution.$": "$$.Execution.Id",
+          "executionName.$": "$$.Execution.Name",
+          "reason.$": "$.resolved.overrideReason",
+          "planGroups.$": "$.plan.groups",
+          "groupStatuses.$": "$.groupCheck.statuses",
+          "bypassedGates": [
+            "GroupsFailed (validate_failed)"
+          ]
+        }
+      },
+      "ResultSelector": {
+        "recordKey.$": "$.Payload.recordKey",
+        "markerKey.$": "$.Payload.markerKey",
+        "markerWritten.$": "$.Payload.markerWritten",
+        "overriddenGroups.$": "$.Payload.overriddenGroups",
+        "overriddenTables.$": "$.Payload.overriddenTables",
+        "validationReportPaths.$": "$.Payload.validationReportPaths",
+        "who.$": "$.Payload.who",
+        "when.$": "$.Payload.when",
+        "reason.$": "$.Payload.reason"
+      },
+      "ResultPath": "$.overrideRecord",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "OverrideRecordFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "TaskSucceededWithOverride"
+    },
+    "OverrideRecordFailed": {
+      "Type": "Fail",
+      "Error": "OverrideRecordNotWritten",
+      "Comment": "CDC started with override, but writing the override audit record / startup-override marker failed. The data was accepted past a validation failure yet the marker that forces an explicit cutover was not written. Investigate (Glue/Lambda S3 permissions on config/_task/<suffix>/_overrides/) before cutting over.",
+      "CausePath": "$.error.Cause"
+    },
+    "TaskSucceededWithOverride": {
+      "Type": "Succeed",
+      "Comment": "Startup finished WITH override: one or more groups were validate_failed, but override=true let the run resume DMS and start CDC. The output's $.overrideRecord lists the overridden groups and tables, the validation report paths, and the record/marker keys. A later cutover of this task MUST be started with override=true (the startup-override marker is set)."
     },
     "ForkCdcStartNotConfirmed": {
       "Type": "Fail",

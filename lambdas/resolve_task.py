@@ -86,6 +86,8 @@ def handler(event, context):
         return handler_shared(event, context)
     if event.get("mode") == "build_table_list":
         return handler_build_table_list(event, context)
+    if event.get("mode") == "write_override_record":
+        return handler_write_override_record(event, context)
     task_arn = event["taskArn"]
     dms = boto3.client("dms", region_name=REGION)
 
@@ -228,6 +230,156 @@ def _endpoint_contract(dms, task, task_arn):
 # this task's CDC job to Spark (written by create-glue-jobs), whatever pipeline.json says.
 
 SETTINGS_KEY_DEFAULT = "config/pipeline.json"
+
+# ── RUNTIME OVERRIDE (startup/cutover run input "override": true) ───────────────────────────
+# The operator opts in, per execution, by starting the workflow with {"taskArn": "...",
+# "override": true}. It is a RUN input, never a pipeline.json/params.csv setting, so the default
+# (absent / false) run is byte-identical to before. _normalize_override() accepts the boolean
+# true as well as the common string spellings ("true"/"1"/"yes"/"on", any case) so a value typed
+# into the console or a CSV cell behaves the same as a JSON boolean; everything else is false.
+# "overrideReason" is an optional free-text note recorded with the override.
+_OVERRIDE_TRUE = {"true", "1", "yes", "y", "on"}
+# Per-execution override records and the stable startup-override marker live here.
+#   config/_task/<suffix>/_overrides/<execution>.json   one record per overriding execution
+#   config/_task/<suffix>/_overrides/_startup_override.json   stable marker: startup used override
+# The marker makes a later cutover REFUSE unless it, too, is started with override=true, so
+# validation that an operator chose to override at startup can never be cut over silently.
+_OVERRIDES_SUBPREFIX = "_overrides"
+_STARTUP_OVERRIDE_MARKER = "_startup_override.json"
+
+
+def _normalize_override(inp):
+    """(bool, reason): read the run input's "override" (default false; the boolean true or a
+    string true/1/yes/y/on, any case) and the optional "overrideReason" free-text note. Any
+    other value — including an absent key — is false, so the default run is unchanged."""
+    raw = (inp or {}).get("override", False)
+    if isinstance(raw, bool):
+        is_on = raw
+    elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        is_on = raw == 1
+    else:
+        is_on = str(raw).strip().lower() in _OVERRIDE_TRUE
+    reason = str((inp or {}).get("overrideReason") or "").strip()
+    return is_on, reason
+
+
+def _startup_override_marker_key(suffix):
+    return f"config/_task/{suffix}/{_OVERRIDES_SUBPREFIX}/{_STARTUP_OVERRIDE_MARKER}"
+
+
+def _override_record_key(suffix, execution_name):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(execution_name or "unknown"))
+    return f"config/_task/{suffix}/{_OVERRIDES_SUBPREFIX}/{safe}.json"
+
+
+def _execution_name(event):
+    """The Step Functions execution NAME from the event's "execution" ARN ($$.Execution.Id,
+    arn:aws:states:<region>:<acct>:execution:<stateMachine>:<name>). Returns "unknown" when the
+    workflow did not pass it (older callers / unit tests)."""
+    arn = str(event.get("execution") or "").strip()
+    return arn.rsplit(":", 1)[-1] if arn else "unknown"
+
+
+def handler_write_override_record(event, context):
+    """Write the override audit record to S3 at the END of a run that overrode a validation
+    failure, and (for a startup run) the stable startup-override marker that makes a later
+    cutover refuse unless cutover is ALSO started with override.
+
+    Writes to config/_task/<suffix>/_overrides/:
+      <execution>.json         who (execution ARN), when, scope (groups + tables), reason,
+                               validation report paths, workflow (startup|cutover), and the
+                               bypassed gates. One record per overriding execution.
+      _startup_override.json   stable marker (startup workflow only) — its presence makes
+                               cutover refuse without override.
+
+    Event: { mode:"write_override_record", bucket, taskSuffix, workflow:"startup"|"cutover",
+             execution (ARN), executionName, reason, overriddenGroups:[...],
+             overriddenTables:[...], validationReportPaths:[...], bypassedGates:[...] }.
+    Returns the record (recordKey, markerKey, markerWritten, overriddenGroups,
+    overriddenTables, validationReportPaths, reason, who, when, workflow)."""
+    bucket = event["bucket"]
+    suffix = event["taskSuffix"]
+    workflow = str(event.get("workflow") or "startup").strip().lower()
+    exec_arn = str(event.get("execution") or "").strip()
+    exec_name = str(event.get("executionName") or "").strip() or _execution_name(event)
+    reason = str(event.get("reason") or "").strip()
+    bypassed = event.get("bypassedGates") or []
+    when = _now()
+
+    # Derive the overridden scope from the plan groups + their per-group statuses: a group whose
+    # status is "validate_failed" is one the override carried past. Each such group contributes
+    # its table labels and its validation report path (<group config_prefix>/_validation_report.json,
+    # exactly where job3_validate writes it). Callers may instead pass overriddenGroups/
+    # overriddenTables/validationReportPaths directly (e.g. a future cutover record).
+    plan_groups = event.get("planGroups") or []
+    statuses = event.get("groupStatuses") or []
+    groups = list(event.get("overriddenGroups") or [])
+    tables = list(event.get("overriddenTables") or [])
+    report_paths = list(event.get("validationReportPaths") or [])
+    if plan_groups and statuses:
+        for g in plan_groups:
+            gi = g.get("group_index")
+            status = statuses[gi] if isinstance(gi, int) and 0 <= gi < len(statuses) else None
+            if status != "validate_failed":
+                continue
+            groups.append(gi)
+            tables.extend(g.get("tables") or [])
+            cp = str(g.get("config_prefix") or "").rstrip("/")
+            if cp:
+                report_paths.append(f"{cp}/_validation_report.json")
+    # De-dupe tables / report paths while preserving order.
+    tables = list(dict.fromkeys(tables))
+    report_paths = list(dict.fromkeys(report_paths))
+
+    record = {
+        "who": exec_arn or exec_name,
+        "executionArn": exec_arn,
+        "executionName": exec_name,
+        "when": when,
+        "workflow": workflow,
+        "taskSuffix": suffix,
+        "override": True,
+        "reason": reason,
+        "overriddenGroups": groups,
+        "overriddenTables": tables,
+        "validationReportPaths": report_paths,
+        "bypassedGates": bypassed,
+    }
+    s3 = boto3.client("s3", region_name=REGION)
+    record_key = _override_record_key(suffix, exec_name)
+    _put_json(s3, bucket, record_key, record)
+
+    # The stable marker is a STARTUP concern only: it tells a later cutover that this task's
+    # data was accepted past a validation failure, so cutover must be explicit about it too.
+    marker_key = _startup_override_marker_key(suffix)
+    marker_written = False
+    if workflow == "startup":
+        _put_json(s3, bucket, marker_key, {
+            "startupOverride": True, "when": when, "executionArn": exec_arn,
+            "executionName": exec_name, "reason": reason,
+            "overriddenGroups": groups, "overriddenTables": tables,
+            "lastRecordKey": record_key,
+        })
+        marker_written = True
+
+    print(f"(info) override record written: s3://{bucket}/{record_key} "
+          f"(workflow={workflow}, groups={groups}, tables={len(tables)}, "
+          f"marker={'written' if marker_written else 'n/a'})")
+    return {
+        "recordKey": f"s3://{bucket}/{record_key}",
+        "markerKey": f"s3://{bucket}/{marker_key}",
+        "markerWritten": marker_written,
+        "workflow": workflow,
+        "who": exec_arn or exec_name,
+        "when": when,
+        "reason": reason,
+        "overriddenGroups": groups,
+        "overriddenTables": tables,
+        "validationReportPaths": report_paths,
+        "bypassedGates": bypassed,
+    }
+
+
 SETTINGS_REQUIRED = ("project", "region", "dsql_endpoint", "glue_role_arn")
 SETTINGS_DEFAULTS = {
     "dsql_user": "admin",
@@ -911,6 +1063,7 @@ def handler_shared(event, context):
     inp = event.get("input") or {}
     task_arn = str(inp.get("taskArn") or "").strip()
     warnings = []
+    override, override_reason = _normalize_override(inp)
 
     ids = _parse_task_arn(task_arn)
     s3 = boto3.client("s3", region_name=REGION)
@@ -954,6 +1107,15 @@ def handler_shared(event, context):
         warnings.append(f"This task's CDC job runs on Spark: an earlier run switched it on "
                         f"{engine_doc.get('at')} because {str(engine_doc.get('reason'))[:400]}. "
                         f"Delete s3://{bucket}/{engine_key} to use Python shell again.")
+    # Runtime override (validation-only): did the STARTUP of this task use override=true? The
+    # stable marker is written by the override-record step at the end of a startup run that
+    # overrode a validation failure. cutover reads it so it can REFUSE unless cutover was ALSO
+    # started with override=true (unvalidated data must never be cut over silently). startup
+    # mode does not need to read it; it is false there.
+    startup_override_used = False
+    if mode == "cutover":
+        startup_override_used = _get_json(
+            s3, bucket, _startup_override_marker_key(suffix)) is not None
     out = dict(contract)
     out.update({
         "taskArn": task_arn,
@@ -963,6 +1125,11 @@ def handler_shared(event, context):
         "suffixSource": source,
         "configPrefix": f"s3://{bucket}/config/_task/{suffix}/",
         "ownerRecord": f"s3://{bucket}/{marker_key}",
+        "override": override,
+        "overrideReason": override_reason,
+        "startupOverrideUsed": startup_override_used,
+        "overrideMarkerKey": _startup_override_marker_key(suffix),
+        "overrideRecordKey": _override_record_key(suffix, _execution_name(event)),
         "project": cfg["project"],
         "region": cfg["region"],
         "accountId": ids["account"],

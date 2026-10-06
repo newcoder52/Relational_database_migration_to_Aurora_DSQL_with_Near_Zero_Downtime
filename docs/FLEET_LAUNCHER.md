@@ -49,6 +49,7 @@ the generated `pipeline.json` share `config/` by design, so there is no second-c
 | `task_arn` | required. The DMS task ARN |
 | `task_suffix` | optional. Leave blank to use the folder the pipeline would pick anyway: the one recorded for this task (a renamed DMS task keeps its first folder), else the DMS task name. Set it only for a task you also start by hand with a `taskSuffix` |
 | `adopt_existing_folder` | optional, startup only. `true` for a task whose folder holds files from an earlier run but no owner record |
+| `override` | optional. `true` to pass `{"override": true}` to this task's child execution (accept a validation failure at startup / a validation gate or startup-override marker at cutover). **Blank = false.** An unknown extra column is ignored, never rejected |
 
 Each task's table list is built automatically from the DMS task after its full load, so there is
 nothing to upload. To load fewer tables, change the DMS task's selection rules.
@@ -57,6 +58,18 @@ nothing to upload. To load fewer tables, change the DMS task's selection rules.
 
 ```json
 { "bucket": "<pipeline bucket>" }
+```
+
+**Runtime override.** Add a top-level `"override": true` to the start input to turn override on
+for **every** task in the CSV; or set the per-task `override` column to `true` for just some rows.
+Fleet-level and per-task are OR'd. An optional `"overrideReason"` (start input) / `override_reason`
+(CSV column) is recorded with the override. Override covers **validation only** — a load failure
+still stops a task, and a run without override is byte-identical to before. A startup that used
+override makes that task's later cutover refuse unless the cutover is also started with override.
+See the RUNBOOK, "Validation failed — re-run with override".
+
+```json
+{ "bucket": "<pipeline bucket>", "override": true, "overrideReason": "reviewed batch re-run" }
 ```
 
 Operator files are read from the fixed folder `s3://<bucket>/config/` (`fleet_tasks.csv`,

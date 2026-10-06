@@ -47,6 +47,9 @@
         "taskName.$": "$.Payload.taskName",
         "taskSuffix.$": "$.Payload.taskSuffix",
         "configPrefix.$": "$.Payload.configPrefix",
+        "override.$": "$.Payload.override",
+        "overrideReason.$": "$.Payload.overrideReason",
+        "startupOverrideUsed.$": "$.Payload.startupOverrideUsed",
         "project.$": "$.Payload.project",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
         "dsqlEndpointCandidates.$": "$.Payload.dsqlEndpointCandidates",
@@ -82,7 +85,44 @@
           "ResultPath": "$.error"
         }
       ],
-      "Next": "CdcValidationPreCheck"
+      "Next": "StartupOverrideGate"
+    },
+    "StartupOverrideGate": {
+      "Type": "Choice",
+      "Comment": "If this task's STARTUP was finished with override=true (the startup-override marker is present -> $.resolved.startupOverrideUsed), its data was accepted past a validation failure. Refuse the cutover UNLESS it, too, was started with override=true, so unvalidated data can never be cut over silently. Both reads are IsPresent-guarded (older resolve_task that returns neither -> behaves as no startup override, so cutover proceeds as before). Otherwise continue to the normal pre-DMS-stop validation gate.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.resolved.startupOverrideUsed",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.startupOverrideUsed",
+              "BooleanEquals": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.resolved.override",
+                  "IsPresent": false
+                },
+                {
+                  "Variable": "$.resolved.override",
+                  "BooleanEquals": false
+                }
+              ]
+            }
+          ],
+          "Next": "StartupOverrideRequiresOverride"
+        }
+      ],
+      "Default": "CdcValidationPreCheck"
+    },
+    "StartupOverrideRequiresOverride": {
+      "Type": "Fail",
+      "Error": "StartupOverrideRequiresOverride",
+      "Cause": "This task's startup was completed WITH override=true (its data was accepted past a validation failure; see config/_task/<suffix>/_overrides/). Cutting it over would move unvalidated data, so this cutover refuses. If you have reviewed the overridden validation result and accept it, start a NEW cutover execution with input {\"taskArn\": \"...\", \"override\": true} (optional \"overrideReason\") to accept it. Nothing was touched: DMS is still running and CDC is still running."
     },
     "CdcValidationPreCheck": {
       "Type": "Task",
@@ -128,15 +168,40 @@
     },
     "CdcValidationPreGate": {
       "Type": "Choice",
-      "Comment": "Pass only when there are zero unresolved validation failures. Otherwise stop the cutover before touching DMS.",
+      "Comment": "Pass only when there are zero unresolved validation failures. Otherwise stop the cutover before touching DMS — UNLESS the cutover was started with override=true, in which case the failures are logged (LogPreValidationOverride) and the cutover continues. The override comparison is IsPresent-guarded for the audit.",
       "Choices": [
         {
           "Variable": "$.validationPre.ok",
           "BooleanEquals": true,
           "Next": "DescribeBeforeStop"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.resolved.override",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.override",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "LogPreValidationOverride"
         }
       ],
       "Default": "CdcValidationFailedPre"
+    },
+    "LogPreValidationOverride": {
+      "Type": "Pass",
+      "Comment": "override=true: unresolved CDC-validation failures existed at the pre-DMS-stop check but are being bypassed on the operator's explicit instruction. Record what was bypassed on the execution (nothing has been touched yet; the drain/stop/delete safety ordering below is unchanged) and continue.",
+      "Parameters": {
+        "bypassed": true,
+        "at": "pre-dms-stop",
+        "failures.$": "$.validationPre.failures",
+        "byTable.$": "$.validationPre.byTable"
+      },
+      "ResultPath": "$.preValidationOverride",
+      "Next": "DescribeBeforeStop"
     },
     "DescribeBeforeStop": {
       "Type": "Task",
@@ -432,15 +497,40 @@
     },
     "CdcValidationFinalGate": {
       "Type": "Choice",
-      "Comment": "Pass only with zero unresolved validation failures. Otherwise stop before StopCdcRun (CDC run + jobs stay).",
+      "Comment": "Pass only with zero unresolved validation failures. Otherwise stop before StopCdcRun (CDC run + jobs stay) — UNLESS the cutover was started with override=true, in which case the failures are logged (LogFinalValidationOverride) and the cutover continues to StopCdcRun. The safety ordering (DMS already stopped; drain already complete) is unchanged; only the refuse-gate is bypassed.",
       "Choices": [
         {
           "Variable": "$.validationFinal.ok",
           "BooleanEquals": true,
           "Next": "StopCdcRun"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.resolved.override",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.override",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "LogFinalValidationOverride"
         }
       ],
       "Default": "CdcValidationFailedFinal"
+    },
+    "LogFinalValidationOverride": {
+      "Type": "Pass",
+      "Comment": "override=true: unresolved CDC-validation failures remain after the drain but are being bypassed on the operator's explicit instruction. DMS is already stopped and the drain is complete; the CDC run, _cdc_file column and Glue jobs are still untouched. Record what was bypassed and continue to StopCdcRun (the safety ordering is unchanged).",
+      "Parameters": {
+        "bypassed": true,
+        "at": "post-drain",
+        "failures.$": "$.validationFinal.failures",
+        "byTable.$": "$.validationFinal.byTable"
+      },
+      "ResultPath": "$.finalValidationOverride",
+      "Next": "StopCdcRun"
     },
     "CdcValidationFailedFinal": {
       "Type": "Pass",
@@ -738,7 +828,86 @@
           "Next": "IncrDeleteLoop"
         }
       ],
+      "Default": "CutoverOverrideTerminal"
+    },
+    "CutoverOverrideTerminal": {
+      "Type": "Choice",
+      "Comment": "Every Glue job is deleted — the task is cut over. If this cutover was started with override=true (it bypassed a validation gate and/or accepted a startup override), write the cutover override record and end in the distinct CutoverSucceededWithOverride; otherwise end in the normal CutoverSucceeded. The read is IsPresent-guarded so an older resolve_task (no $.resolved.override) ends in CutoverSucceeded exactly as before.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.resolved.override",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.override",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "WriteCutoverOverrideRecord"
+        }
+      ],
       "Default": "CutoverSucceeded"
+    },
+    "WriteCutoverOverrideRecord": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Write the cutover override audit record to config/_task/<suffix>/_overrides/<execution>.json (who=execution ARN, when, reason, bypassed gates). workflow=cutover, so NO startup-override marker is written. Reuses resolve_task (mode write_override_record).",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "write_override_record",
+          "bucket": "<<BUCKET>>",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "workflow": "cutover",
+          "execution.$": "$$.Execution.Id",
+          "executionName.$": "$$.Execution.Name",
+          "reason.$": "$.resolved.overrideReason",
+          "bypassedGates": [
+            "CdcValidationFailed (pre/final, if any)",
+            "StartupOverrideRequiresOverride (if startup used override)",
+            "cutover count check (validation gate)"
+          ]
+        }
+      },
+      "ResultSelector": {
+        "recordKey.$": "$.Payload.recordKey",
+        "markerKey.$": "$.Payload.markerKey",
+        "who.$": "$.Payload.who",
+        "when.$": "$.Payload.when",
+        "reason.$": "$.Payload.reason",
+        "bypassedGates.$": "$.Payload.bypassedGates"
+      },
+      "ResultPath": "$.overrideRecord",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "The cutover itself is complete (DMS stopped, drained, CDC stopped, jobs deleted); only writing the audit record failed. Record the error but still end in CutoverSucceededWithOverride — the migration is cut over and must not be reported as failed.",
+          "Next": "CutoverSucceededWithOverride",
+          "ResultPath": "$.overrideRecordError"
+        }
+      ],
+      "Next": "CutoverSucceededWithOverride"
+    },
+    "CutoverSucceededWithOverride": {
+      "Type": "Succeed",
+      "Comment": "Cutover finished WITH override: a validation gate was bypassed and/or a startup override was accepted on the operator's explicit instruction. The safety ordering (DMS stop -> drain -> stop CDC runs -> delete jobs) was NOT bypassed. $.overrideRecord has the audit record key, who/when and the bypassed gates."
     },
     "IncrDeleteLoop": {
       "Type": "Pass",

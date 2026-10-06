@@ -778,9 +778,11 @@ Each child ends at one of:
 | Ends at | Meaning | What to do |
 |---|---|---|
 | `CutoverSucceeded` | done | point the application at Aurora DSQL |
+| `CutoverSucceededWithOverride` | done, but this cutover was started with `override=true` — it bypassed one or more validation gates (`CdcValidationFailed` pre/final, the cutover count check) and/or accepted a startup that itself used override. The safety ordering (DMS stop → drain → stop CDC runs → delete jobs) was **not** bypassed. An override audit record was written to `config/_task/<suffix>/_overrides/<execution>.json` | point the application at Aurora DSQL, and review the override record — the data was accepted past a validation result on your explicit instruction |
 | `GlueJobsNotDeleted` | data is cut over; only deleting a Glue job failed. Cutover retries deletion in a loop — a job whose CDC run is still stopping is force-stopped (`batch-stop-job-run`) and retried on the next pass (named under `pending`), so a composite (`ck-*`) CDC run that is slow to stop no longer times the delete Lambda out. You only land here if a job could not be deleted for another reason, or the pending jobs did not stop within the ~60-min delete budget (the error names them; the jobs are `$PROJECT-$TASK_NAME-{discovery,load,load-big,validate,cdc}`, plus each per-table fork job `ck-<slug>-*` / `bg-<slug>-cdc`, found by this task's tags) | just re-run cutover for this task — it is idempotent and resumes the delete loop (a job already gone counts as deleted). Only if it keeps failing, stop any lingering run and delete by hand: `aws glue batch-stop-job-run --job-name <name> --job-run-ids <id>` then `aws glue delete-job --job-name <name>` |
 | `ResolveFailed`, or `CutoverFailed` **while DMS is still running** | nothing changed for this task | fix the error shown, re-run cutover for this task via the fleet |
-| `CdcValidationFailed` | unresolved CDC-validation discrepancies blocked cutover (pre-check: nothing touched; final check: DMS stopped, CDC run/`_cdc_file`/Glue jobs all untouched) | review `cdc_control.cdc_validation_failures`, clear each reviewed row with `UPDATE … SET resolved=true` (never `DELETE`), then re-run cutover ([§8](#8-if-something-fails)) |
+| `CdcValidationFailed` | unresolved CDC-validation discrepancies blocked cutover (pre-check: nothing touched; final check: DMS stopped, CDC run/`_cdc_file`/Glue jobs all untouched) | review `cdc_control.cdc_validation_failures`, clear each reviewed row with `UPDATE … SET resolved=true` (never `DELETE`), then re-run cutover ([§8](#8-if-something-fails)). **Or**, if you have reviewed the discrepancy and accept it, start a new cutover with `override=true` ([§8 "Validation failed — re-run with override"](#validation-failed--re-run-with-override)) |
+| `StartupOverrideRequiresOverride` | this task's **startup** was finished with `override=true` (its data was accepted past a validation failure; see `config/_task/<suffix>/_overrides/`), so cutting it over without acknowledging that would move unvalidated data. Nothing was touched — DMS and CDC are still running | review the startup override record, and if you accept the data, start a new cutover with `override=true` ([§8 "Validation failed — re-run with override"](#validation-failed--re-run-with-override)) |
 | `CdcDrainTimedOut` (error `CdcDrainBudgetExceeded`) | DMS is stopped; a table's last file wasn't applied within ~12 h | fix the cause ([§8](#8-if-something-fails)), then **re-run cutover for this task** — it skips the already-stopped DMS and re-drains |
 | `CutoverFailed` at a step **after DMS was stopped** | DMS is stopped | open the failed state, fix the cause, then **re-run cutover for this task** — it is now re-runnable (skips the already-stopped DMS, every later step is idempotent) |
 
@@ -955,6 +957,86 @@ Aim for each range query to land in the 5–20 s band (`validate_target_seconds_
 job sizes ranges automatically to hit it. If a single range is still slow, raise
 `validate_parallelism` (throughput) or set `validate_hash=keys` / `off` for very wide / large-
 object tables — do **not** raise `validate_rows_per_range`.
+
+---
+
+### Validation failed — re-run with override
+
+When validation fails for a reason you have **reviewed and accept** — an IP shortage, a timeout,
+or a count/by-key mismatch you understand — you do not have to clear control rows and re-run the
+whole thing. Start a **new** execution with `"override": true` and the run carries on instead of
+stopping.
+
+Override covers **validation only**. A **load** failure (a table status `failed`) still stops the
+run even with override; override never resumes DMS on a load failure, never skips a safety step,
+and never changes the default (absent/`false`) run — a run without `override` behaves exactly as
+before. Finished files and tables are still skipped on the re-run (a table already marked `done`
+is **not** reloaded), so override only changes the validation gate decision.
+
+Each override run writes an audit record to
+`config/_task/<task>/_overrides/<execution>.json` (who = execution ARN, when, which groups and
+tables, the reason you gave, and the validation report paths). A **startup** override also writes
+a stable marker `config/_task/<task>/_overrides/_startup_override.json`, which makes a later
+cutover of that task **refuse** (`StartupOverrideRequiresOverride`) unless cutover is **also**
+started with `override=true` — so unvalidated data can never be cut over silently.
+
+**Risk note.** `override=true` means an operator has chosen to accept data that failed a
+validation check. Only use it after you have looked at the discrepancy (the validation report
+and/or `cdc_control.cdc_validation_failures`) and understand why it is safe. The override is
+recorded with your execution ARN and reason for the audit trail.
+
+New end states: a startup that overrode a validation failure ends in
+**`TaskSucceededWithOverride`** (its output lists the overridden groups and tables and the
+validation report paths); a cutover started with override ends in
+**`CutoverSucceededWithOverride`**.
+
+**Start a task-level startup with override** (set `TASK_ARN`; `overrideReason` is optional):
+
+```bash
+PROJECT="<project>"; export AWS_PAGER=""
+SM="arn:aws:states:<region>:<account>:stateMachine:$PROJECT-startup"
+TASK_ARN="arn:aws:dms:<region>:<account>:task:<id>"
+aws stepfunctions start-execution --state-machine-arn "$SM" \
+  --input "{\"taskArn\":\"$TASK_ARN\",\"override\":true,\"overrideReason\":\"reviewed: source changed during full load\"}" \
+  --query executionArn --output text
+```
+
+**Start a task-level cutover with override** (same input shape, `$PROJECT-cutover`):
+
+```bash
+PROJECT="<project>"; export AWS_PAGER=""
+SM="arn:aws:states:<region>:<account>:stateMachine:$PROJECT-cutover"
+TASK_ARN="arn:aws:dms:<region>:<account>:task:<id>"
+aws stepfunctions start-execution --state-machine-arn "$SM" \
+  --input "{\"taskArn\":\"$TASK_ARN\",\"override\":true,\"overrideReason\":\"reviewed and accepted\"}" \
+  --query executionArn --output text
+```
+
+**Fleet-wide override** — add a top-level `"override": true` to the fleet start input to turn it
+on for **every** task in the CSV, or set the per-task `override` column to `true` for just some
+rows (blank = false). Fleet-level and per-task are OR'd:
+
+```bash
+PROJECT="<project>"; BUCKET="<bucket>"; export AWS_PAGER=""
+# startup fleet, override every task:
+aws stepfunctions start-execution \
+  --state-machine-arn "arn:aws:states:<region>:<account>:stateMachine:$PROJECT-fleet-startup" \
+  --input "{\"bucket\":\"$BUCKET\",\"override\":true,\"overrideReason\":\"reviewed batch re-run\"}" \
+  --query executionArn --output text
+# cutover fleet, override every task:
+aws stepfunctions start-execution \
+  --state-machine-arn "arn:aws:states:<region>:<account>:stateMachine:$PROJECT-fleet-cutover" \
+  --input "{\"bucket\":\"$BUCKET\",\"override\":true}" \
+  --query executionArn --output text
+```
+
+Per-task CSV override (blank = false; an unknown column is never rejected by preflight):
+
+```csv
+task_arn,task_suffix,adopt_existing_folder,override
+arn:aws:dms:us-east-1:123456789012:task:ABCDEF1234567890,,,
+arn:aws:dms:us-east-1:123456789012:task:STUVWX3344556677,,,true
+```
 
 ---
 
@@ -1300,6 +1382,14 @@ not that the migrations finished.
 **Per-task cutover:** `MissingTaskArn`, `ResolveFailed` (nothing touched) · `CutoverFailed` (DMS may
 be stopped — check the failed step), `CdcDrainTimedOut` (`CdcDrainBudgetExceeded`), `GlueJobsNotDeleted`
 (fully cut over bar one job delete).
+
+**Override success states (runtime `override=true`):** startup ends in `TaskSucceededWithOverride`
+instead of `TaskSucceeded` when it carried a `validate_failed` group past the gate; cutover ends in
+`CutoverSucceededWithOverride` instead of `CutoverSucceeded` when it bypassed a validation gate
+and/or accepted a startup override. A cutover of a task whose startup used override, started
+**without** `override`, refuses at `StartupOverrideRequiresOverride` (nothing touched); if writing
+the startup override record fails, startup ends at `OverrideRecordNotWritten`. See
+[§8 "Validation failed — re-run with override"](#validation-failed--re-run-with-override).
 
 See [§8](#8-if-something-fails) for the recovery keyed to each state, and
 [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for the fleet reference.

@@ -1,4 +1,5 @@
-task_arn,task_suffix,adopt_existing_folder
-arn:aws:dms:us-east-1:123456789012:task:ABCDEF1234567890,,
-arn:aws:dms:us-east-1:123456789012:task:GHIJKL0987654321,orders-cdc,
-arn:aws:dms:us-east-1:123456789012:task:MNOPQR1122334455,,true
+task_arn,task_suffix,adopt_existing_folder,override
+arn:aws:dms:us-east-1:123456789012:task:ABCDEF1234567890,,,
+arn:aws:dms:us-east-1:123456789012:task:GHIJKL0987654321,orders-cdc,,
+arn:aws:dms:us-east-1:123456789012:task:MNOPQR1122334455,,true,
+arn:aws:dms:us-east-1:123456789012:task:STUVWX3344556677,,,true
