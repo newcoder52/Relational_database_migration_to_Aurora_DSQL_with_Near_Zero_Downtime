@@ -493,7 +493,14 @@
         }
       },
       "ResultPath": "$.stopRun",
+      "Comment": "B27: a 2nd cutover of an already-cut-over task reaches here after the 1st cutover deleted the CDC job. The stop-cdc-run Lambda now treats a missing job as alreadyStopped (jobMissing=true); this Retry/Catch is defense-in-depth so even an un-redeployed Lambda that still raises Glue.EntityNotFoundException is treated as a no-op (job already gone -> nothing to stop) and cutover continues instead of failing. Real errors (AccessDenied, throttling) are NOT EntityNotFound, so they still retry and then fail closed at CutoverFailed.",
       "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.EntityNotFoundException"
+          ],
+          "MaxAttempts": 0
+        },
         {
           "ErrorEquals": [
             "States.ALL"
@@ -504,6 +511,14 @@
         }
       ],
       "Catch": [
+        {
+          "ErrorEquals": [
+            "Glue.EntityNotFoundException"
+          ],
+          "Comment": "The CDC job no longer exists (a prior cutover deleted it); nothing to stop. Skip to the fork stop/delete steps, which also tolerate already-gone jobs.",
+          "Next": "ListForkCdcJobs",
+          "ResultPath": "$.stopRun"
+        },
         {
           "ErrorEquals": [
             "States.ALL"
