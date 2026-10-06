@@ -145,7 +145,7 @@ Non-runtime: `RUNBOOK.md`, `docs/MANUAL_SETUP.md`, `docs/IAM_POLICY_NOTES.md` (n
 **Base commit:** `cbb85014722379e4319c05df45e212accdb105be` was HEAD when this fix started
 (verified with `git ls-remote`); the concurrent **ease-guardrails + B22** fix landed meanwhile, so
 this fix was rebased onto `d1bd703483a45bb2929e661f67ab82a8ac0de8c1` (both sides kept).
-**Fix commit (runtime + tests + RUNBOOK):** `__FIX_SHA__`
+**Fix commit (runtime + tests + RUNBOOK):** `559edfd80a1d6bc314320fc40c9586469ade90b7`
 
 ---
 
@@ -223,10 +223,12 @@ writes. Includes:
 - a **positive** test that the fixed fork-prefix poll matches;
 - a **back-compat** test that the task-level dual-write makes the old task-level poll match too.
 
-All suites green (2nd fresh clone verified):
-`test_asl_paths, test_asl_payload_contract, test_marker_paths, test_guardrails, test_e2e_fixes,
-test_b17_b13, test_b18_validate_throughput, test_docs_params, test_fix6, test_existing_roles,
-test_planning_settings`.
+All suites green (2nd fresh clone verified), on the rebased tree that includes the
+ease-guardrails + B22 fix:
+`test_asl_paths, test_asl_payload_contract (165), test_marker_paths (17), test_guardrails (80),
+test_ease_guardrails (86), test_iam_policies (158), test_e2e_fixes (80), test_b17_b13 (24),
+test_b18_validate_throughput (27), test_docs_params, test_fix6 (51), test_existing_roles (66),
+test_planning_settings (58/58)`.
 
 ---
 
