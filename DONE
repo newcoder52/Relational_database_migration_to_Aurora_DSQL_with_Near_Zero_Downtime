@@ -1,6 +1,6 @@
 DONE — runtime `override` for startup & cutover
 
-Pushed to origin/main as newcoder52 <aash.798@gmail.com>:
+Pushed to origin/main as newcoder52:
   69fb12b  Add runtime override for startup/cutover (code + tests)
   b6159d6  RESULT.md (final HEAD)
 Parent: d0cd1e7 (fix-b27). Fresh clone on d0cd1e7; git pull --rebase before each push (no

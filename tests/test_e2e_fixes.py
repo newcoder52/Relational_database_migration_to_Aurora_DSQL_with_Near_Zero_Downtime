@@ -825,8 +825,10 @@ def test_b21_delete_pending_then_loop_terminates():
 
 def test_b21_asl_cutover_loops_delete_until_empty_or_budget():
     """The cutover ASL loop: AllGlueJobsDeleted -> (pending) IncrDeleteLoop -> DeleteBudgetLeft
-    -> WaitDeleteRetry -> DeleteGlueJobs, bounded by a counter; else -> CutoverSucceeded; a hard
-    'failed' -> GlueJobsNotDeletedList. Static shape check so the loop can't silently regress."""
+    -> WaitDeleteRetry -> DeleteGlueJobs, bounded by a counter; else -> CutoverOverrideTerminal
+    (-> CutoverSucceeded, or -> WriteCutoverOverrideRecord -> CutoverSucceededWithOverride when
+    override=true); a hard 'failed' -> GlueJobsNotDeletedList. Static shape check so the loop
+    can't silently regress."""
     cut = json.load(open(os.path.join(REPO, "stepfunctions", "cutover.asl.json")))
     s = cut["States"]
     for st in ("InitDeleteLoop", "DeleteGlueJobs", "AllGlueJobsDeleted", "IncrDeleteLoop",
@@ -835,8 +837,16 @@ def test_b21_asl_cutover_loops_delete_until_empty_or_budget():
     choices = {c.get("Next") for c in s["AllGlueJobsDeleted"].get("Choices", [])}
     check("IncrDeleteLoop" in choices,
           "B21: AllGlueJobsDeleted routes a 'pending' job back into the delete loop")
-    check(s["AllGlueJobsDeleted"].get("Default") == "CutoverSucceeded",
-          "B21: AllGlueJobsDeleted default (nothing pending/failed) succeeds")
+    check(s["AllGlueJobsDeleted"].get("Default") == "CutoverOverrideTerminal",
+          "B21: AllGlueJobsDeleted default (nothing pending/failed) -> CutoverOverrideTerminal")
+    term = s["CutoverOverrideTerminal"]
+    check(term.get("Default") == "CutoverSucceeded",
+          "B21: CutoverOverrideTerminal default (no override) -> CutoverSucceeded")
+    ov_next = term["Choices"][0]["Next"]
+    check(ov_next == "WriteCutoverOverrideRecord"
+          and s[ov_next]["Next"] == "CutoverSucceededWithOverride",
+          "B21: CutoverOverrideTerminal override branch -> WriteCutoverOverrideRecord "
+          "-> CutoverSucceededWithOverride")
     check(s["WaitDeleteRetry"]["Next"] == "DeleteGlueJobs",
           "B21: the loop waits then calls DeleteGlueJobs again")
     check(s["DeleteBudgetLeft"].get("Default") == "GlueJobsPendingTimedOut",

@@ -1,6 +1,6 @@
 # Runtime `override` for startup & cutover — RESULT
 
-**Commit pushed:** `69fb12b` on `main` (parent `d0cd1e7`), as `newcoder52 <aash.798@gmail.com>`.
+**Commit pushed:** `69fb12b` on `main` (parent `d0cd1e7`), as `newcoder52`.
 Remote: `Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime`.
 
 ## What this adds

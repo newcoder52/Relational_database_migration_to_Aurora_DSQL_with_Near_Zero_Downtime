@@ -207,15 +207,27 @@ def test_asl_fork_stop_still_tolerates_entitynotfound():
 
 def test_asl_recutover_reaches_success_with_no_jobs():
     # Trace the re-cutover happy path statically: with no running/failed/pending jobs the
-    # DeleteGlueJobs Choice (AllGlueJobsDeleted) default is CutoverSucceeded.
+    # DeleteGlueJobs Choice (AllGlueJobsDeleted) default routes to CutoverOverrideTerminal,
+    # whose default is the normal CutoverSucceeded and whose override branch
+    # (resolved.override==true) writes the override record and ends in
+    # CutoverSucceededWithOverride.
     asl = _cutover_asl()
     choice = asl["States"]["AllGlueJobsDeleted"]
-    check(choice["Default"] == "CutoverSucceeded",
-          "ASL: AllGlueJobsDeleted default (no failed/pending) -> CutoverSucceeded")
+    check(choice["Default"] == "CutoverOverrideTerminal",
+          "ASL: AllGlueJobsDeleted default (no failed/pending) -> CutoverOverrideTerminal")
+    term = asl["States"]["CutoverOverrideTerminal"]
+    check(term["Default"] == "CutoverSucceeded",
+          "ASL: CutoverOverrideTerminal default (no override) -> CutoverSucceeded")
+    ov_next = term["Choices"][0]["Next"]
+    check(ov_next == "WriteCutoverOverrideRecord",
+          "ASL: CutoverOverrideTerminal override branch -> WriteCutoverOverrideRecord")
+    check(asl["States"][ov_next]["Next"] == "CutoverSucceededWithOverride",
+          "ASL: WriteCutoverOverrideRecord -> CutoverSucceededWithOverride")
     # StopCdcRun's EntityNotFound no-op leads into ListForkCdcJobs -> StopForkCdcRuns -> DropTags
     # -> InitDeleteLoop -> DeleteGlueJobs, i.e. the normal tail. Confirm the chain exists.
     for name in ("ListForkCdcJobs", "StopForkCdcRuns", "DropTags", "InitDeleteLoop",
-                 "DeleteGlueJobs", "CutoverSucceeded"):
+                 "DeleteGlueJobs", "CutoverOverrideTerminal", "CutoverSucceeded",
+                 "CutoverSucceededWithOverride"):
         check(name in asl["States"], f"ASL: re-cutover tail state present: {name}")
 
 
