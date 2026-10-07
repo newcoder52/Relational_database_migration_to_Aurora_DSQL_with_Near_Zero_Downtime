@@ -11,8 +11,7 @@ WHAT SHIPPED
   new TaskSucceededWithOverride (lists overridden groups/tables + validation report paths). A
   LOAD failure still stops at GroupsFailed. Override normalized once in resolve_task
   (resolved.override), IsPresent-guarded in the ASL. Override record +
-  _startup_override.json marker written to config/_task/<task>/_overrides/. Optional
-  overrideReason recorded.
+  _startup_override.json marker written to config/_task/<task>/_overrides/.
 - Cutover: override bypasses-but-logs the pre- and post-drain CdcValidationFailed gates and (via
   the same validation_gate) the cutover count check; ends in CutoverSucceededWithOverride. The
   startup-override marker makes an un-overridden cutover refuse (StartupOverrideRequiresOverride,

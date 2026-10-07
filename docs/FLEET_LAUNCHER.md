@@ -62,14 +62,13 @@ nothing to upload. To load fewer tables, change the DMS task's selection rules.
 
 **Runtime override.** Add a top-level `"override": true` to the start input to turn override on
 for **every** task in the CSV; or set the per-task `override` column to `true` for just some rows.
-Fleet-level and per-task are OR'd. An optional `"overrideReason"` (start input) / `override_reason`
-(CSV column) is recorded with the override. Override covers **validation only** — a load failure
+Fleet-level and per-task are OR'd. Override covers **validation only** — a load failure
 still stops a task, and a run without override is byte-identical to before. A startup that used
 override makes that task's later cutover refuse unless the cutover is also started with override.
 See the RUNBOOK, "Validation failed — re-run with override".
 
 ```json
-{ "bucket": "<pipeline bucket>", "override": true, "overrideReason": "reviewed batch re-run" }
+{ "bucket": "<pipeline bucket>", "override": true }
 ```
 
 Operator files are read from the fixed folder `s3://<bucket>/config/` (`fleet_tasks.csv`,

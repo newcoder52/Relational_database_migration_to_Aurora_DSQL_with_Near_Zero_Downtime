@@ -328,14 +328,20 @@ def test_override_fields_are_returned_by_resolve_task():
                if isinstance(v, str) and v.startswith("$.Payload.")}
     su_keys = returned_keys("resolve_task.py", "startup")
     cu_keys = returned_keys("resolve_task.py", "cutover")
-    check({"override", "overrideReason"} <= su_read,
-          "startup ResolveTask reads $.Payload.override + overrideReason")
-    check({"override", "overrideReason", "startupOverrideUsed"} <= cu_read,
-          "cutover ResolveTask reads override + overrideReason + startupOverrideUsed")
-    check({"override", "overrideReason"} <= su_keys,
-          "resolve_task (startup) returns override + overrideReason")
-    check({"override", "overrideReason", "startupOverrideUsed"} <= cu_keys,
-          "resolve_task (cutover) returns override + overrideReason + startupOverrideUsed")
+    check({"override"} <= su_read,
+          "startup ResolveTask reads $.Payload.override")
+    check({"override", "startupOverrideUsed"} <= cu_read,
+          "cutover ResolveTask reads override + startupOverrideUsed")
+    check({"override"} <= su_keys,
+          "resolve_task (startup) returns override")
+    check({"override", "startupOverrideUsed"} <= cu_keys,
+          "resolve_task (cutover) returns override + startupOverrideUsed")
+    # the removed reason field must be GONE everywhere.
+    _reason_field = "override" + "Reason"
+    check(_reason_field not in su_read and _reason_field not in cu_read,
+          "ResolveTask ResultSelectors no longer read the removed reason field")
+    check(_reason_field not in su_keys and _reason_field not in cu_keys,
+          "resolve_task no longer returns the removed reason field")
     # And the write_override_record mode returns the fields the override-record ResultSelectors read.
     wor_keys = returned_keys("resolve_task.py", "write_override_record")
     for state_sm, state_name in (("startup.asl.json", "WriteStartupOverrideRecord"),

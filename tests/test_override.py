@@ -178,7 +178,7 @@ def _cutover():
 # =============================================================================================
 def _startup_input(any_load_failed, any_validate_failed, override):
     return {
-        "resolved": {"override": override, "overrideReason": "", "taskSuffix": "t"},
+        "resolved": {"override": override, "taskSuffix": "t"},
         "groupCheck": {
             "anyLoadFailed": any_load_failed,
             "anyValidateFailed": any_validate_failed,
@@ -245,7 +245,7 @@ def test_startup_no_failure_normal_terminal_unchanged():
 # =============================================================================================
 def _cutover_data(override=False, startup_override_used=False, pre_ok=True, final_ok=True):
     return {
-        "resolved": {"override": override, "overrideReason": "",
+        "resolved": {"override": override,
                      "startupOverrideUsed": startup_override_used, "taskSuffix": "t"},
         "validationPre": {"ok": pre_ok, "failures": 0 if pre_ok else 3, "byTable": {}},
         "validationFinal": {"ok": final_ok, "failures": 0 if final_ok else 2, "byTable": {}},
@@ -339,10 +339,11 @@ def test_normalize_override_accepts_bool_and_strings():
         ({}, False), ({"override": False}, False), ({"override": "false"}, False),
         ({"override": "0"}, False), ({"override": "no"}, False), ({"override": 0}, False),
     ]
-    ok = all(rt._normalize_override(inp)[0] is exp for inp, exp in cases)
+    ok = all(rt._normalize_override(inp) is exp for inp, exp in cases)
     check(ok, "override normalizes bool true + 'true'/'1'/'yes'/1 (any case); else false")
-    _on, reason = rt._normalize_override({"override": True, "overrideReason": "  ip shortage "})
-    check(_on and reason == "ip shortage", "overrideReason is read and trimmed")
+    check(rt._normalize_override({"override": True}) is True
+          and rt._normalize_override({}) is False,
+          "_normalize_override returns a plain bool (no reason tuple)")
 
 
 class _FakeS3Rec:
@@ -364,7 +365,7 @@ def test_write_override_record_writes_record_and_startup_marker():
         "mode": "write_override_record", "bucket": "b", "taskSuffix": "orders-cdc",
         "workflow": "startup",
         "execution": "arn:aws:states:us-east-1:111:execution:p-startup:run-7",
-        "executionName": "run-7", "reason": "operator accepts drift",
+        "executionName": "run-7",
         "planGroups": [
             {"group_index": 0, "config_prefix": "s3://b/config/_task/orders-cdc/g0", "tables": ["s.a"]},
             {"group_index": 1, "config_prefix": "s3://b/config/_task/orders-cdc/g1", "tables": ["s.b", "s.c"]},
@@ -384,9 +385,11 @@ def test_write_override_record_writes_record_and_startup_marker():
     check(marker_key in s3.puts and out["markerWritten"] is True,
           "stable startup-override marker written (startup workflow)")
     rec = json.loads(s3.puts[rec_key])
-    check(rec["who"] == event["execution"] and rec["reason"] == "operator accepts drift"
-          and rec["workflow"] == "startup",
-          "record carries who (execution ARN), when, reason, workflow")
+    check(rec["who"] == event["execution"] and rec["workflow"] == "startup",
+          "record carries who (execution ARN), when, workflow")
+    marker = json.loads(s3.puts[marker_key])
+    check("reason" not in rec and "reason" not in marker and "reason" not in out,
+          "override record / marker / return carry NO reason field")
 
 
 def test_write_override_record_cutover_no_startup_marker():
@@ -396,7 +399,7 @@ def test_write_override_record_cutover_no_startup_marker():
     out = rt.handler_write_override_record(
         {"mode": "write_override_record", "bucket": "b", "taskSuffix": "t",
          "workflow": "cutover", "execution": "arn:x:execution:p-cutover:c1",
-         "executionName": "c1", "reason": ""}, None)
+         "executionName": "c1"}, None)
     marker_key = "config/_task/t/_overrides/_startup_override.json"
     check(out["markerWritten"] is False and marker_key not in s3.puts,
           "cutover override record does NOT write the startup-override marker")
@@ -441,13 +444,17 @@ def _load_preflight():
 def test_preflight_fleet_and_per_task_override_source_wiring():
     pf = _load_preflight()
     src = open(os.path.join(LAMBDAS, "preflight_tasks.py")).read()
-    check("fleet_override, fleet_reason = rt._normalize_override(fleet_input)" in src,
+    check("fleet_override = rt._normalize_override(fleet_input)" in src,
           "preflight reads a fleet-level override from the fleet start input")
     check('"override": row.get("override")' in src,
           "preflight reads a per-task 'override' CSV column")
     check("if fleet_override or row_override:" in src and 'child_input["override"] = True' in src,
           "fleet-level OR per-task override adds {'override': true} to the child input")
-    on, _ = pf.rt._normalize_override({"override": "", "overrideReason": ""})
+    _camel = "override" + "Reason"
+    _snake = "override" + "_reason"
+    check(_camel not in src and _snake not in src,
+          "preflight has no reason-field handling")
+    on = pf.rt._normalize_override({"override": ""})
     check(on is False, "a blank CSV override cell is false (adds nothing)")
 
 

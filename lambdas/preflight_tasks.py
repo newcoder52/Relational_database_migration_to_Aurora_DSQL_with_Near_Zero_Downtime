@@ -29,8 +29,6 @@ INPUTS  (all operator files live in the one fixed folder s3://<bucket>/config/)
                                          is accepted (startup) / a validation gate or startup
                                          override is accepted (cutover). The fleet start input's
                                          top-level {"override": true} turns it on for EVERY task.
-        override_reason        optional  free-text note recorded with the override (per-row;
-                                         the fleet-level "overrideReason" is the fallback).
                                          An unknown extra column is ignored (never rejected).
 
 CHECKS, every row (all problems collected, then one error):
@@ -316,7 +314,7 @@ def handler(event, context):
     # Fleet-wide runtime override: top-level {"override": true} in the fleet start input turns
     # override on for EVERY task's child execution (a per-task CSV column can also turn it on for
     # one task). Normalized the same way the per-task workflow does.
-    fleet_override, fleet_reason = rt._normalize_override(fleet_input)
+    fleet_override = rt._normalize_override(fleet_input)
     s3 = boto3.client("s3", region_name=REGION)
     dms = boto3.client("dms", region_name=REGION)
     errors, warnings = [], []
@@ -399,16 +397,11 @@ def handler(event, context):
         # Runtime override: a per-task CSV "override" column (blank = false) OR the fleet-wide
         # top-level {"override": true} turns override on for this task's child execution. The
         # child workflow re-normalizes it (resolve_task._normalize_override), so passing the
-        # boolean true here matches a by-hand start. An optional "overrideReason" (per-row column
-        # or fleet-level) is passed through unchanged. Blank/absent -> nothing added, so the
+        # boolean true here matches a by-hand start. Blank/absent -> nothing added, so the
         # default (no override) child input is byte-identical to before.
-        row_override, row_reason = rt._normalize_override(
-            {"override": row.get("override"), "overrideReason": row.get("override_reason")})
+        row_override = rt._normalize_override({"override": row.get("override")})
         if fleet_override or row_override:
             child_input["override"] = True
-            _reason = row_reason or fleet_reason
-            if _reason:
-                child_input["overrideReason"] = _reason
         try:
             suffix, source, _rec, _ = rt._pick_suffix(s3, bucket, child_input, task, ids)
             rt._validate_suffix(suffix, project)

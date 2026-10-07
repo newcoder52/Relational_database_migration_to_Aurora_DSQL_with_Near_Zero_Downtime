@@ -48,7 +48,6 @@
         "taskSuffix.$": "$.Payload.taskSuffix",
         "configPrefix.$": "$.Payload.configPrefix",
         "override.$": "$.Payload.override",
-        "overrideReason.$": "$.Payload.overrideReason",
         "startupOverrideUsed.$": "$.Payload.startupOverrideUsed",
         "project.$": "$.Payload.project",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
@@ -122,7 +121,7 @@
     "StartupOverrideRequiresOverride": {
       "Type": "Fail",
       "Error": "StartupOverrideRequiresOverride",
-      "Cause": "This task's startup was completed WITH override=true (its data was accepted past a validation failure; see config/_task/<suffix>/_overrides/). Cutting it over would move unvalidated data, so this cutover refuses. If you have reviewed the overridden validation result and accept it, start a NEW cutover execution with input {\"taskArn\": \"...\", \"override\": true} (optional \"overrideReason\") to accept it. Nothing was touched: DMS is still running and CDC is still running."
+      "Cause": "This task's startup was completed WITH override=true (its data was accepted past a validation failure; see config/_task/<suffix>/_overrides/). Cutting it over would move unvalidated data, so this cutover refuses. If you have reviewed the overridden validation result and accept it, start a NEW cutover execution with input {\"taskArn\": \"...\", \"override\": true} to accept it. Nothing was touched: DMS is still running and CDC is still running."
     },
     "CdcValidationPreCheck": {
       "Type": "Task",
@@ -863,7 +862,6 @@
           "workflow": "cutover",
           "execution.$": "$$.Execution.Id",
           "executionName.$": "$$.Execution.Name",
-          "reason.$": "$.resolved.overrideReason",
           "bypassedGates": [
             "CdcValidationFailed (pre/final, if any)",
             "StartupOverrideRequiresOverride (if startup used override)",
@@ -876,7 +874,6 @@
         "markerKey.$": "$.Payload.markerKey",
         "who.$": "$.Payload.who",
         "when.$": "$.Payload.when",
-        "reason.$": "$.Payload.reason",
         "bypassedGates.$": "$.Payload.bypassedGates"
       },
       "ResultPath": "$.overrideRecord",

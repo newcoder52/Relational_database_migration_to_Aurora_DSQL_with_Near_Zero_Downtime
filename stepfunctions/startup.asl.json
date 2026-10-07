@@ -47,7 +47,6 @@
         "taskSuffix.$": "$.Payload.taskSuffix",
         "configPrefix.$": "$.Payload.configPrefix",
         "override.$": "$.Payload.override",
-        "overrideReason.$": "$.Payload.overrideReason",
         "project.$": "$.Payload.project",
         "region.$": "$.Payload.region",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
@@ -1091,7 +1090,7 @@
     "GroupsFailed": {
       "Type": "Fail",
       "Error": "GroupLoadOrValidateFailed",
-      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run. If the failure is validation only (not a load failure) and you have reviewed the discrepancy and accept it, start a NEW execution with input {\"taskArn\": \"...\", \"override\": true} (optional \"overrideReason\"): the run records the validation result, resumes DMS, starts CDC and ends in TaskSucceededWithOverride. A LOAD failure always stops here even with override."
+      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run. If the failure is validation only (not a load failure) and you have reviewed the discrepancy and accept it, start a NEW execution with input {\"taskArn\": \"...\", \"override\": true}: the run records the validation result, resumes DMS, starts CDC and ends in TaskSucceededWithOverride. A LOAD failure always stops here even with override."
     },
     "ResumeDmsToCdc": {
       "Type": "Task",
@@ -1687,7 +1686,6 @@
           "workflow": "startup",
           "execution.$": "$$.Execution.Id",
           "executionName.$": "$$.Execution.Name",
-          "reason.$": "$.resolved.overrideReason",
           "planGroups.$": "$.plan.groups",
           "groupStatuses.$": "$.groupCheck.statuses",
           "bypassedGates": [
@@ -1703,8 +1701,7 @@
         "overriddenTables.$": "$.Payload.overriddenTables",
         "validationReportPaths.$": "$.Payload.validationReportPaths",
         "who.$": "$.Payload.who",
-        "when.$": "$.Payload.when",
-        "reason.$": "$.Payload.reason"
+        "when.$": "$.Payload.when"
       },
       "ResultPath": "$.overrideRecord",
       "Retry": [

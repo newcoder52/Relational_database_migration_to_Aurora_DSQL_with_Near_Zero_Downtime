@@ -237,7 +237,6 @@ SETTINGS_KEY_DEFAULT = "config/pipeline.json"
 # (absent / false) run is byte-identical to before. _normalize_override() accepts the boolean
 # true as well as the common string spellings ("true"/"1"/"yes"/"on", any case) so a value typed
 # into the console or a CSV cell behaves the same as a JSON boolean; everything else is false.
-# "overrideReason" is an optional free-text note recorded with the override.
 _OVERRIDE_TRUE = {"true", "1", "yes", "y", "on"}
 # Per-execution override records and the stable startup-override marker live here.
 #   config/_task/<suffix>/_overrides/<execution>.json   one record per overriding execution
@@ -249,18 +248,15 @@ _STARTUP_OVERRIDE_MARKER = "_startup_override.json"
 
 
 def _normalize_override(inp):
-    """(bool, reason): read the run input's "override" (default false; the boolean true or a
-    string true/1/yes/y/on, any case) and the optional "overrideReason" free-text note. Any
-    other value — including an absent key — is false, so the default run is unchanged."""
+    """bool: read the run input's "override" (default false; the boolean true or a string
+    true/1/yes/y/on, any case). Any other value — including an absent key — is false, so the
+    default run is unchanged."""
     raw = (inp or {}).get("override", False)
     if isinstance(raw, bool):
-        is_on = raw
-    elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        is_on = raw == 1
-    else:
-        is_on = str(raw).strip().lower() in _OVERRIDE_TRUE
-    reason = str((inp or {}).get("overrideReason") or "").strip()
-    return is_on, reason
+        return raw
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return raw == 1
+    return str(raw).strip().lower() in _OVERRIDE_TRUE
 
 
 def _startup_override_marker_key(suffix):
@@ -286,23 +282,22 @@ def handler_write_override_record(event, context):
     cutover refuse unless cutover is ALSO started with override.
 
     Writes to config/_task/<suffix>/_overrides/:
-      <execution>.json         who (execution ARN), when, scope (groups + tables), reason,
+      <execution>.json         who (execution ARN), when, scope (groups + tables),
                                validation report paths, workflow (startup|cutover), and the
                                bypassed gates. One record per overriding execution.
       _startup_override.json   stable marker (startup workflow only) — its presence makes
                                cutover refuse without override.
 
     Event: { mode:"write_override_record", bucket, taskSuffix, workflow:"startup"|"cutover",
-             execution (ARN), executionName, reason, overriddenGroups:[...],
+             execution (ARN), executionName, overriddenGroups:[...],
              overriddenTables:[...], validationReportPaths:[...], bypassedGates:[...] }.
     Returns the record (recordKey, markerKey, markerWritten, overriddenGroups,
-    overriddenTables, validationReportPaths, reason, who, when, workflow)."""
+    overriddenTables, validationReportPaths, who, when, workflow)."""
     bucket = event["bucket"]
     suffix = event["taskSuffix"]
     workflow = str(event.get("workflow") or "startup").strip().lower()
     exec_arn = str(event.get("execution") or "").strip()
     exec_name = str(event.get("executionName") or "").strip() or _execution_name(event)
-    reason = str(event.get("reason") or "").strip()
     bypassed = event.get("bypassedGates") or []
     when = _now()
 
@@ -339,7 +334,6 @@ def handler_write_override_record(event, context):
         "workflow": workflow,
         "taskSuffix": suffix,
         "override": True,
-        "reason": reason,
         "overriddenGroups": groups,
         "overriddenTables": tables,
         "validationReportPaths": report_paths,
@@ -356,7 +350,7 @@ def handler_write_override_record(event, context):
     if workflow == "startup":
         _put_json(s3, bucket, marker_key, {
             "startupOverride": True, "when": when, "executionArn": exec_arn,
-            "executionName": exec_name, "reason": reason,
+            "executionName": exec_name,
             "overriddenGroups": groups, "overriddenTables": tables,
             "lastRecordKey": record_key,
         })
@@ -372,7 +366,6 @@ def handler_write_override_record(event, context):
         "workflow": workflow,
         "who": exec_arn or exec_name,
         "when": when,
-        "reason": reason,
         "overriddenGroups": groups,
         "overriddenTables": tables,
         "validationReportPaths": report_paths,
@@ -1063,7 +1056,7 @@ def handler_shared(event, context):
     inp = event.get("input") or {}
     task_arn = str(inp.get("taskArn") or "").strip()
     warnings = []
-    override, override_reason = _normalize_override(inp)
+    override = _normalize_override(inp)
 
     ids = _parse_task_arn(task_arn)
     s3 = boto3.client("s3", region_name=REGION)
@@ -1126,7 +1119,6 @@ def handler_shared(event, context):
         "configPrefix": f"s3://{bucket}/config/_task/{suffix}/",
         "ownerRecord": f"s3://{bucket}/{marker_key}",
         "override": override,
-        "overrideReason": override_reason,
         "startupOverrideUsed": startup_override_used,
         "overrideMarkerKey": _startup_override_marker_key(suffix),
         "overrideRecordKey": _override_record_key(suffix, _execution_name(event)),

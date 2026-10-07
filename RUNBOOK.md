@@ -975,7 +975,7 @@ is **not** reloaded), so override only changes the validation gate decision.
 
 Each override run writes an audit record to
 `config/_task/<task>/_overrides/<execution>.json` (who = execution ARN, when, which groups and
-tables, the reason you gave, and the validation report paths). A **startup** override also writes
+tables, and the validation report paths). A **startup** override also writes
 a stable marker `config/_task/<task>/_overrides/_startup_override.json`, which makes a later
 cutover of that task **refuse** (`StartupOverrideRequiresOverride`) unless cutover is **also**
 started with `override=true` — so unvalidated data can never be cut over silently.
@@ -983,21 +983,21 @@ started with `override=true` — so unvalidated data can never be cut over silen
 **Risk note.** `override=true` means an operator has chosen to accept data that failed a
 validation check. Only use it after you have looked at the discrepancy (the validation report
 and/or `cdc_control.cdc_validation_failures`) and understand why it is safe. The override is
-recorded with your execution ARN and reason for the audit trail.
+recorded with your execution ARN for the audit trail.
 
 New end states: a startup that overrode a validation failure ends in
 **`TaskSucceededWithOverride`** (its output lists the overridden groups and tables and the
 validation report paths); a cutover started with override ends in
 **`CutoverSucceededWithOverride`**.
 
-**Start a task-level startup with override** (set `TASK_ARN`; `overrideReason` is optional):
+**Start a task-level startup with override** (set `TASK_ARN`):
 
 ```bash
 PROJECT="<project>"; export AWS_PAGER=""
 SM="arn:aws:states:<region>:<account>:stateMachine:$PROJECT-startup"
 TASK_ARN="arn:aws:dms:<region>:<account>:task:<id>"
 aws stepfunctions start-execution --state-machine-arn "$SM" \
-  --input "{\"taskArn\":\"$TASK_ARN\",\"override\":true,\"overrideReason\":\"reviewed: source changed during full load\"}" \
+  --input "{\"taskArn\":\"$TASK_ARN\",\"override\":true}" \
   --query executionArn --output text
 ```
 
@@ -1008,7 +1008,7 @@ PROJECT="<project>"; export AWS_PAGER=""
 SM="arn:aws:states:<region>:<account>:stateMachine:$PROJECT-cutover"
 TASK_ARN="arn:aws:dms:<region>:<account>:task:<id>"
 aws stepfunctions start-execution --state-machine-arn "$SM" \
-  --input "{\"taskArn\":\"$TASK_ARN\",\"override\":true,\"overrideReason\":\"reviewed and accepted\"}" \
+  --input "{\"taskArn\":\"$TASK_ARN\",\"override\":true}" \
   --query executionArn --output text
 ```
 
@@ -1021,7 +1021,7 @@ PROJECT="<project>"; BUCKET="<bucket>"; export AWS_PAGER=""
 # startup fleet, override every task:
 aws stepfunctions start-execution \
   --state-machine-arn "arn:aws:states:<region>:<account>:stateMachine:$PROJECT-fleet-startup" \
-  --input "{\"bucket\":\"$BUCKET\",\"override\":true,\"overrideReason\":\"reviewed batch re-run\"}" \
+  --input "{\"bucket\":\"$BUCKET\",\"override\":true}" \
   --query executionArn --output text
 # cutover fleet, override every task:
 aws stepfunctions start-execution \

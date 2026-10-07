@@ -13,13 +13,12 @@ only new state data on a default run is `$.resolved.override=false` and a pass-t
 `TaskSucceeded`/`CutoverSucceeded` are identical to before.
 
 Override is a **run input, never a `pipeline.json`/`params.csv` setting**, so no setting changes
-and `test_docs_params` is unaffected (no new params key). An optional `"overrideReason"` string
-is accepted and recorded.
+and `test_docs_params` is unaffected (no new params key).
 
 ### Startup
 1. `resolve_task` normalizes `$.override` once (`_normalize_override`: the boolean `true`, or the
    strings `true`/`1`/`yes`/`y`/`on`, any case; everything else false) and emits it as
-   `resolved.override` (+ `resolved.overrideReason`). The `AllGroupsSucceeded` Choice reads
+   `resolved.override`. The `AllGroupsSucceeded` Choice reads
    `$.resolved.override` **IsPresent-guarded**, so the ASL path audit passes and an older
    execution with no field behaves as the default.
 2. **Load failure always stops** (`$.groupCheck.anyLoadFailed` → `GroupsFailed`), even with
@@ -60,7 +59,7 @@ is accepted and recorded.
 ### Fleet
 - `preflight_tasks` reads a fleet-level top-level `{"override": true}` (applies to **every**
   task) and a per-task `override` CSV column (blank = false), OR's them, and adds
-  `{"override": true}` (+ `overrideReason`) to each child's start input. `fleet_tasks.csv` gets
+  `{"override": true}` to each child's start input. `fleet_tasks.csv` gets
   an optional `override` column; preflight uses `csv.DictReader` and never rejects an extra
   column. The fleet ASLs pass `fleetInput.$: "$"` already, so no fleet-ASL change was needed.
 
@@ -72,8 +71,8 @@ Set once: `PROJECT=<project>`, `BUCKET=<bucket>`, `REGION=<region>`, `ACCOUNT=<a
 
 | Runtime file | Change | Redeploy |
 |---|---|---|
-| `stepfunctions/startup.asl.json` | override gate + override terminal + `WriteStartupOverrideRecord` + `TaskSucceededWithOverride`; ResolveTask ResultSelector gains `override`/`overrideReason` | **State machine definition update** (startup) |
-| `stepfunctions/cutover.asl.json` | `StartupOverrideGate`, pre/final validation override bypass, override terminal + `WriteCutoverOverrideRecord` + `CutoverSucceededWithOverride`; CutoverResolveTask ResultSelector gains `override`/`overrideReason`/`startupOverrideUsed` | **State machine definition update** (cutover) |
+| `stepfunctions/startup.asl.json` | override gate + override terminal + `WriteStartupOverrideRecord` + `TaskSucceededWithOverride`; ResolveTask ResultSelector gains `override` | **State machine definition update** (startup) |
+| `stepfunctions/cutover.asl.json` | `StartupOverrideGate`, pre/final validation override bypass, override terminal + `WriteCutoverOverrideRecord` + `CutoverSucceededWithOverride`; CutoverResolveTask ResultSelector gains `override`/`startupOverrideUsed` | **State machine definition update** (cutover) |
 | `lambdas/resolve_task.py` | `_normalize_override`, override keys in `handler_shared`, cutover marker read, new `write_override_record` mode | **Lambda zip update** (`fn.zip`) → `$PROJECT-resolve-task` (and the rest, same zip) |
 | `lambdas/preflight_tasks.py` | fleet-level + per-task override → child input | **Lambda zip update** (`fn.zip`) → `$PROJECT-preflight-tasks` |
 | `config/fleet_tasks.example.csv` | documents the optional `override` column (example only) | copy-me only — nothing to deploy |
@@ -130,7 +129,7 @@ needed; they already forward the fleet start input to preflight.
 # task-level startup with override
 aws stepfunctions start-execution \
   --state-machine-arn "$SM_BASE:$PROJECT-startup" \
-  --input '{"taskArn":"arn:aws:dms:'"$REGION"':'"$ACCOUNT"':task:<id>","override":true,"overrideReason":"reviewed"}'
+  --input '{"taskArn":"arn:aws:dms:'"$REGION"':'"$ACCOUNT"':task:<id>","override":true}'
 # task-level cutover with override (same input shape, -cutover)
 # fleet: add top-level "override": true to the fleet input, or set the per-task override column
 ```
