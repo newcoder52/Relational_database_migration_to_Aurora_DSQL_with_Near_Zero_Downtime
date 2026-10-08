@@ -1,197 +1,169 @@
-# RESULT — main CDC job must not crash when every table is owned by a fork
+# RESULT — customer-controlled NULL handling (`null_values` + `null_rules`)
 
 ## Commit
 
-- **fix sha (runtime change):** `fe3e01effff3770050c0d46cd972f3a2f2c59f69` (short `fe3e01e`)
-- parent / base: `64cc24d` (remote `main` HEAD at start, pinned via `git ls-remote`)
-- branch: `main` (plain push, no force)
-- committer: `newcoder52`
+- **sha (runtime change):** `7939e46be0d532f517de748a36fb70ea3000918e` (short `7939e46`)
+- parent / base: `152f332` (remote `main` HEAD at start, pinned via `git ls-remote`)
+- branch: `main` (plain push, never forced)
+- committer: `newcoder52 <aash.798@gmail.com>` (git config only; never in file content)
+- `git pull --rebase origin main` before push (nothing new had landed); verified in a 2nd
+  fresh clone at `7939e46` (**199 passed**; ASL path audit + payload-contract audit green).
 
-## Root cause
+## What the feature does
 
-`scripts/glue_cdc_continuous.py` → `main()` builds three lists from the manifest:
+Two optional `params.csv` settings let a customer control which CSV values DMS wrote become
+SQL NULL. They are applied **identically** in the full load, CDC and validation, so validation
+never false-flags a correctly-loaded row.
 
-- `contexts`  — tables THIS job owns and will apply (owner == `CDC_OWNER_SELF`, default `main`),
-- `multi_key` — tables skipped because they have a multi-column primary key (applied by the
-  separate composite CDC job),
-- `not_owned` — tables whose recorded owner in `_cdc_owners.json` is **another** CDC job
-  (a `bg-…` big-table fork or a `ck-…` composite fork).
+- **`null_values`** (all columns): a `|`-separated list of exact strings that become SQL NULL.
+  Blank (default) = today's behaviour exactly — the DMS endpoint's `CsvNullValue`, as resolved by
+  `resolve_task` and passed as `--csv_null_value`. Set, it **replaces** that marker list for every
+  column.
+- **`null_rules`** (per-column overrides): `schema.table.column=VALUES` entries joined by `;`.
+  `VALUES` is `none` (nothing in that column becomes NULL from a text value — the text `NULL` is
+  **kept as data**) or a `|`-separated list that replaces the default for that one column. Names
+  match **case-insensitively** against the DSQL lowercase schema/table/column; value matching is
+  exact, case-sensitive, whole-value. Example:
+  `cns_schema.orders.status=none; cns_schema.orders.region=NULL|NA`.
+- **Precedence** for a column: a `null_rules` entry > `null_values` > the endpoint marker.
+- **Empty fields are ALWAYS NULL**, in every mode including `none` (unchanged).
+- **Both blank/absent ⇒ byte-identical to today** (proven by `tests/test_null_rules.py`).
 
-The guard was:
+The parse/match logic is ONE shared block copied **byte-identically** into the four Glue scripts
+(they share no imports); a test asserts the four copies are identical. The Spark `null_marker_expr`
+(load/validate) and the Python `_coerce_null` (CDC, including CDC validation sampling) consume the
+shared per-column marker resolver `_effective_null_markers`, comparing at the **same comparison
+point** as the canonical `_coerce_null` (exact, case-sensitive, no trimming).
 
-```python
-if not contexts and not multi_key:
-    raise Exception("No usable tables from the manifest.")
-```
+## Runtime files changed (8)
 
-It **ignored `not_owned`**. So the MAIN CDC run of a task whose tables are **all owned by fork
-jobs** crashed on startup. Concrete trigger: a task with a single big table — a partitions-auto
-source writes many LOAD files, the table is classified "big", its `bg-<slug>` fork owns it, so
-the main run sees `contexts=[]`, `multi_key=[]`, `not_owned=[that table]` → raise.
+Glue scripts (shared null-rules block + column-aware consumers + `--null_values`/`--null_rules`
+arg wiring + startup log + unknown-entry warning):
 
-Why that is fatal for the whole task (see `stepfunctions/startup.asl.json`): the startup state
-machine starts the **main** CDC job first and must confirm it before fanning out the forks —
+- `scripts/job2_load.py`            — `null_marker_expr` + per-table loop (Spark, per-file load)
+- `scripts/job3_validate.py`        — `null_marker_expr` (Spark)
+- `scripts/glue_cdc_continuous.py`  — `_coerce_null` incl. CDC validation sampling (Python)
+- `scripts/glue_cdc_composite.py`   — `_coerce_null` (Python)
 
-```
-… → ResumeDmsToCdc → StartCdcJob → GetCdcRun → IsCdcRunAlive
-                                 → CheckCdcStarted → IsCdcStarted → StartForkCdcMap (forks)
-```
+Lambdas (plumbing, mirrors how `--csv_null_value` is wired):
 
-`StartForkCdcMap` (which starts the `bg-`/`ck-` fork that actually **owns the table**) only runs
-**after** the main run is alive (`IsCdcRunAlive`) **and** has written its `_cdc_started` marker
-(`CheckCdcStarted` polls S3 for it). A crashing main run therefore:
+- `lambdas/params_csv.py`      — `null_values`/`null_rules` added to `OPTIONAL_DEFAULTS` + `PIPELINE_KEYS`
+- `lambdas/resolve_task.py`    — `SETTINGS_DEFAULTS` + `_validate_null_settings` (malformed ⇒ preflight
+  FAILS naming the bad entry) + `nullValues`/`nullRules` in the resolved payload
+- `lambdas/create_glue_jobs.py`— sets `--null_values`/`--null_rules` on load/load-big/validate/cdc/
+  cdc-spark/cdc-composite/cdc-composite-spark (blank ⇒ `__NULL_UNSET__`, since Glue can't pass an
+  empty arg)
 
-1. fails `IsCdcRunAlive` → terminal state **`CdcRunFailed`**, or
-2. never writes the marker → **`CdcStartNotConfirmed`** (`ForkCdcStartNotConfirmed` downstream),
+State machine:
 
-and in either case the forks never start → **no CDC at all** for that task.
+- `stepfunctions/startup.asl.json` — `nullValues`/`nullRules` into the `ResolveTask` `ResultSelector`
+  (so `$.resolved.*` is produced) and `null_values.$`/`null_rules.$` into the three
+  `create_glue_jobs` payloads: `CreateGlueJobs` (main), `EnsureForkJobs` (ck/bg forks),
+  `CdcDriverFallback` (Spark recreate).
 
-## The fix (minimal, no other behavior change)
+Docs / config (not runtime):
 
-Raise **only** when the manifest truly yields nothing usable — no owned contexts, no multi-key
-tables, **and** nothing owned by another job:
+- `RUNBOOK.md` (§3 rows + "when a change takes effect" + pipeline-key count 53→55),
+  `config/params.example.csv`, `config/pipeline.example.json`, `docs/MANUAL_SETUP.md` (§3c).
 
-```python
-if not contexts and not multi_key and not not_owned:
-    raise Exception("No usable tables from the manifest.")
-```
+Test (new): `tests/test_null_rules.py`.
 
-When `contexts` is empty but something is owned elsewhere, the main run takes the **existing
-all-multi-key idle path**: it logs clearly that every table is owned by another CDC job (listing
-them), writes its start marker (task-level + own, exactly as before via `write_started_marker()`),
-and enters the poll loop with an empty `contexts` list. The loop does no work each cycle, sleeps,
-and is stopped by cutover's `BatchStopJobRun` — identical to how an all-multi-key main run already
-behaved. The idle log message is specialized for the three cases (all-forked / mixed / all
-multi-key) but the control flow is the same.
+## MANUAL setup — exact redeploy
 
-Verified: the idle path reaches `write_started_marker()` (the key `CheckCdcStarted` polls) and
-then the poll loop, so `IsCdcStarted` passes and `StartForkCdcMap` runs and starts the owning fork.
+Only the runtime artifacts above changed. From a clean checkout at `7939e46`, with the deployment
+env vars you used at setup (`$BUCKET`, `$LAMBDA_BASE` = `arn:aws:lambda:<region>:<acct>:function:<project>`,
+`$SM_BASE` = `arn:aws:states:<region>:<acct>:stateMachine`, `$P_PROJECT`), region exported:
 
-### Scope checked
+1. **Glue scripts → S3** (all four scripts changed):
 
-- **Spark wrapper/template:** `glue-templates/cdc.json` **and** `glue-templates/cdc-spark.json`
-  both run this same `scripts/glue_cdc_continuous.py`, so the one fix covers the Python-shell and
-  the Spark CDC job. No separate change needed.
-- **Composite script** (`scripts/glue_cdc_composite.py`): already handles `not contexts` by
-  logging, writing the start marker, and returning cleanly — it never raises. No equivalent bug.
-- **drain_check** (`lambdas/drain_check.py`): ownership-agnostic. It iterates **all in-scope
-  manifest tables** and checks `cdc_file_status` per table; "no CDC files" counts as caught up. It
-  does **not** assume the main job owns any table. No bug.
-- **cutover / stop_cdc_run:** stop the CDC jobs by tag / run id; no assumption that main owns a
-  table. No bug.
+   ```
+   aws s3 cp scripts/job2_load.py           s3://$BUCKET/scripts/job2_load.py
+   aws s3 cp scripts/job3_validate.py       s3://$BUCKET/scripts/job3_validate.py
+   aws s3 cp scripts/glue_cdc_continuous.py s3://$BUCKET/scripts/glue_cdc_continuous.py
+   aws s3 cp scripts/glue_cdc_composite.py  s3://$BUCKET/scripts/glue_cdc_composite.py
+   ```
+   (Glue job `ScriptLocation` is unchanged, so no job redefinition is needed just to pick up new
+   script bytes — the next job run reads the new object.)
 
-## Runtime files changed
+2. **Lambda zip (WITH pg8000) → ALL functions.** `create_glue_jobs`, `resolve_task` and
+   `params_csv` changed; `preflight_tasks` imports `resolve_task`/`params_csv` from the SAME zip,
+   so **rebuild the one shared zip and update every function** (don't cherry-pick). Build exactly
+   as setup does — every `lambdas/*.py` plus `pg8000` installed into the zip root:
 
-- `scripts/glue_cdc_continuous.py` — the fix (the `main()` startup guard + idle logging). This is
-  the only runtime artifact that changes.
+   ```
+   BUILD=$(mktemp -d); cp lambdas/*.py "$BUILD/"
+   python3 -m pip install pg8000 -t "$BUILD/" --quiet      # pg8000 package must be in the zip
+   (cd "$BUILD" && zip -qr /tmp/fn.zip .)
+   ```
+   Update **every** function the deployment has (enumerate them; don't assume a hard-coded list):
 
-Test added (not a runtime artifact):
+   ```
+   for fn in $(aws lambda list-functions --query "Functions[?starts_with(FunctionName,'$P_PROJECT-')].FunctionName" --output text); do
+     aws lambda update-function-code --function-name "$fn" --zip-file fileb:///tmp/fn.zip
+   done
+   ```
+   (The eight functions are resolve-task, driver-discovery, plan-split, create-glue-jobs,
+   stop-cdc-run, drain-check, drop-tags, preflight-tasks.)
 
-- `tests/test_main_cdc_all_forked.py` — offline. Executes the real `main()` source with stubbed
-  collaborators. Covers: (1) only table owned by `bg-…` → main does **not** raise, writes its
-  start marker, idles; (2) empty ownership → still raises; (3) normal owned table → unchanged;
-  plus a forked+multi-key edge case. Fails before the fix, passes after; `check()` raises under
-  pytest.
+3. **State machines — only `startup` changed.** Fill the placeholders with the SAME `sed` map setup
+   uses (`<<...LAMBDA_ARN>>` → `$LAMBDA_BASE-<name>`, `<<STARTUP/CUTOVER_STATE_MACHINE_ARN>>`,
+   `<<BUCKET>>`), then `update-state-machine` **with `--definition` only and NO `--role-arn`** (the
+   execution role is unchanged — only the ASL definition changed):
 
-Suites all green: `pytest -q` → **189 passed**; ASL audit (`tests/test_asl_paths.py`) →
-**187 payload-contract checks pass**; `tests/test_asl_payload_contract.py` → **7 passed**.
+   ```
+   sed -e "s|<<RESOLVE_TASK_LAMBDA_ARN>>|$LAMBDA_BASE-resolve-task|g" \
+       -e "s|<<DRIVER_DISCOVERY_LAMBDA_ARN>>|$LAMBDA_BASE-driver-discovery|g" \
+       -e "s|<<PLAN_SPLIT_LAMBDA_ARN>>|$LAMBDA_BASE-plan-split|g" \
+       -e "s|<<CREATE_GLUE_JOBS_LAMBDA_ARN>>|$LAMBDA_BASE-create-glue-jobs|g" \
+       -e "s|<<STOP_CDC_RUN_LAMBDA_ARN>>|$LAMBDA_BASE-stop-cdc-run|g" \
+       -e "s|<<DRAIN_CHECK_LAMBDA_ARN>>|$LAMBDA_BASE-drain-check|g" \
+       -e "s|<<DROP_TAGS_LAMBDA_ARN>>|$LAMBDA_BASE-drop-tags|g" \
+       -e "s|<<PREFLIGHT_TASKS_LAMBDA_ARN>>|$LAMBDA_BASE-preflight-tasks|g" \
+       -e "s|<<STARTUP_STATE_MACHINE_ARN>>|$SM_BASE:$P_PROJECT-startup|g" \
+       -e "s|<<CUTOVER_STATE_MACHINE_ARN>>|$SM_BASE:$P_PROJECT-cutover|g" \
+       -e "s|<<BUCKET>>|$BUCKET|g" \
+       stepfunctions/startup.asl.json > /tmp/startup.filled.asl.json
 
----
+   aws stepfunctions update-state-machine \
+     --state-machine-arn "$SM_BASE:$P_PROJECT-startup" \
+     --definition file:///tmp/startup.filled.asl.json
+   ```
+   `cutover.asl.json`, `fleet-startup.asl.json`, `fleet-cutover.asl.json` are **unchanged** — do not
+   redeploy them. (Fleet SMs delegate to the per-task `startup`; cutover's only `create_glue_jobs`
+   calls are `list_fork_cdc`/`delete`, which take no NULL args — same as `--csv_null_value` today.)
 
-## Customer steps
+## How a customer applies new NULL rules to a task
 
-### 1. Deploy the fixed script
+- **Set the keys in `params.csv` and republish `config/pipeline.json`** (upload `params.csv` →
+  rebuild/upload `pipeline.json`, MANUAL_SETUP §3c). A **malformed** `null_rules`/`null_values`
+  **fails preflight** naming the bad entry.
+- **BEFORE the full load (correct path):** set `null_values`/`null_rules`, republish
+  `pipeline.json`, then start the task. The next `startup` run bakes the rules into the
+  load/load-big/validate/cdc/ck/bg job `DefaultArguments` at job creation, so the full load, CDC
+  and validation all share one rule set.
+- **For EXISTING jobs (a task already created):** the rules are **baked at job creation**, so
+  republishing `pipeline.json` alone does **not** change already-created jobs. The change takes
+  effect only when those jobs are **recreated** — re-run `startup`/`CreateGlueJobs` (which also
+  re-runs `EnsureForkJobs` for the `ck`/`bg` forks) — **or** the args are **overridden at run time**
+  on `start_job_run`. Do this **before the full load**: changing rules mid-migration applies one
+  rule set to already-loaded rows and another to CDC-applied rows, so a value could be stored NULL
+  on one side and as text on the other and validation would flag it.
+- An entry naming a table/column not in the task is only a **warning** (each job logs the effective
+  rules at startup and warns about a column it doesn't have).
 
-Upload the single changed runtime file to the pipeline's scripts prefix (overwrites in place; the
-Glue job's `ScriptLocation` already points here, so the **next** run picks it up — no job edit):
+## TESTER_PLAN
 
-```bash
-aws s3 cp scripts/glue_cdc_continuous.py s3://$BUCKET/scripts/glue_cdc_continuous.py
-```
+Offline, no AWS/Spark/boto3. From a clean clone at `7939e46`:
 
-If this task uses the Spark CDC engine, the same file is the script for the Spark CDC job too —
-the one upload covers both.
-
-### 2. Recover a task whose startup ended in CdcRunFailed / CdcStartNotConfirmed
-
-A task that hit this bug has: DMS full load + validation already completed, fork jobs **created**
-but **not started**, and no CDC running. You have two options.
-
-#### Option A (recommended): re-run the startup state machine with the same input
-
-Start a **new execution** of the startup state machine with the **same input** as the failed one.
-
-```bash
-aws stepfunctions start-execution \
-  --state-machine-arn "$STARTUP_SM_ARN" \
-  --input "$(aws stepfunctions describe-execution \
-               --execution-arn "$FAILED_STARTUP_EXECUTION_ARN" \
-               --query input --output text)"
-```
-
-Does a new startup re-run load and validation? **Yes — it re-enters them, but they short-circuit.**
-The flow is `… → GroupFanOut (runs load + validate per group) → ResumeDmsToCdc → StartCdcJob →
-CheckCdcStarted → StartForkCdcMap`. Load (`job2_load.py`) and validate (`job3_validate.py`) are
-resume-gated via `_load_status.json`: files/tables already marked `done` are **skipped**, so for a
-task that already finished load+validation they complete quickly without reloading or
-re-validating data. Then `StartCdcJob` starts the (now fixed) main run, which this time reaches
-its poll loop, writes `_cdc_started`, passes `CheckCdcStarted`, and `StartForkCdcMap` starts the
-fork that owns the table. Net effect: no data is reloaded; CDC finally starts.
-
-(The DMS task is already in CDC; `ResumeDmsToCdc` is idempotent. If a stale/failed main CDC run is
-somehow still present, stop it first so the new start is clean.)
-
-#### Option B: start the CDC jobs by hand
-
-Use this if you do not want to re-drive the state machine. Read two inputs:
-
-- the task registry `s3://$BUCKET/config/_task/<task_suffix>/_jobs.json` — contains `jobs[]` (each
-  with `name`, `role`, `table`, `config_prefix`), and `cdcOwners` (table → owner slug such as
-  `bg-<slug>` / `ck-<slug>`); unlisted tables default to owner `main`;
-- the **failed startup execution** — its input gives `taskArn`, and `resolved.{configPrefix,
-  cdcRoot,timestampColumnName,taskSuffix}`; its name is `<execName>` (used to build the fork start
-  token).
-
-Start the **main** CDC job first (role `cdc`, owner `main`), with the exact args the state machine
-uses (`JobName = $.glue.jobs.cdc` — the `cdc`-role job name in `_jobs.json`):
-
-```bash
-aws glue start-job-run --job-name "<cdc-role job name from _jobs.json>" \
-  --arguments '{
-    "--config_prefix":"<resolved.configPrefix (task config prefix, trailing /)>",
-    "--dms_task_arn":"<taskArn>",
-    "--cdc_root":"<resolved.cdcRoot>",
-    "--timestamp_column":"<resolved.timestampColumnName>",
-    "--startup_execution":"<execName>"
-  }'
-```
-
-The main job needs no `--cdc_owner_self` / `--cdc_owners_key`: it defaults `cdc_owner_self=main`
-and derives `cdc_owners_key` from `--config_prefix`. With the fix it will now idle-and-mark-started
-even though it owns nothing. Wait until it has written
-`s3://$BUCKET/<resolved.configPrefix key>_cdc_started/_latest.json` (a few poll cycles).
-
-Then start **each fork** CDC job listed in `_jobs.json` (`role` `bg-cdc` or `ck-cdc`), one per
-entry, using that fork's `config_prefix`. Fork args mirror `StartForkCdcMap`:
-
-```bash
-aws glue start-job-run --job-name "<fork cdcJobName from _jobs.json>" \
-  --arguments '{
-    "--config_prefix":"<fork config_prefix from _jobs.json>",
-    "--dms_task_arn":"<taskArn>",
-    "--cdc_root":"<resolved.cdcRoot>",
-    "--timestamp_column":"<resolved.timestampColumnName>",
-    "--startup_execution":"<execName>-ck-<fork_slug>"
-  }'
-```
-
-Notes:
-- The fork start token is `"<execName>-ck-<fork_slug>"` for **both** `bg-` and `ck-` forks (this
-  literal `-ck-` form is what the start-marker path contract expects — do not change it).
-- A fork's `cdc_owner_self` / `cdc_owners_key` are baked into its job `DefaultArguments` at job
-  creation (so it only applies its own table); you do not pass them on the manual start.
-- Start the main job **before** the forks (the forks' tables are gated the same way; starting main
-  first matches the state-machine ordering and keeps the start markers consistent).
-
-After the forks are running, the normal cutover path (`drain_check` → stop CDC → drop tags) works
-unchanged.
+- `python3 tests/test_null_rules.py` — the feature suite. Covers: defaults unchanged; `null_values`
+  with 2 values; `null_rules` `none` keeping `NULL` as text; a per-column list; precedence
+  (rule > values > endpoint); value case-sensitivity + name case-insensitivity; empty fields
+  unchanged; a malformed rule failing preflight (resolve_task + params_csv paths); the **four
+  script copies byte-identical**; and **load, validate and CDC agreeing** on the same inputs via a
+  tiny Spark-column simulator vs the real `_coerce_null`. Each `check()` raises under pytest.
+- Prove it's a real test: run the same file against pristine `152f332` scripts (e.g.
+  `REPO_DIR=<pristine>`); it **fails** (no shared block / no `null_values` support).
+- Regression gates (must stay green): `tests/test_composite_coerce_null.py`,
+  `tests/test_docs_params.py`, `tests/test_asl_paths.py` (ASL audit),
+  `tests/test_asl_payload_contract.py` (payload contract), `tests/test_marker_paths.py`.
+- Full suite: `python3 -m pytest -q tests/` → **199 passed**.

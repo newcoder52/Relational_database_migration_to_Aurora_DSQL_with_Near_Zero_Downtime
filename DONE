@@ -1,56 +1,56 @@
-DONE — main CDC job no longer crashes when every table is owned by a fork
+DONE — customer-controlled NULL handling (null_values + null_rules)
 
-Pushed to origin/main as newcoder52:
-  fe3e01e  Fix main CDC crash when every table is owned by a fork job (code + test)
-Parent: 64cc24d (remote main HEAD at start, pinned with git ls-remote). Fresh clone,
-git config LOCAL newcoder52; git pull --rebase before push (nothing new landed);
-plain push, never forced. Verified in a 2nd fresh clone at fe3e01e (189 passed; ASL
-audit 187 payload-contract checks pass).
+Pushed to origin/main as newcoder52 <aash.798@gmail.com>:
+  7939e46  Customer-controlled NULL handling: null_values + null_rules
+Parent: 152f332 (remote main HEAD at start, pinned with git ls-remote). Fresh clone,
+git config LOCAL newcoder52; git pull --rebase before push (nothing new landed); plain
+push, never forced. Verified in a 2nd fresh clone at 7939e46 (199 passed; ASL path
+audit + payload-contract audit green; the four shared-block copies byte-identical).
 
-THE BUG
-main() in scripts/glue_cdc_continuous.py raised
-  Exception("No usable tables from the manifest.")
-when `not contexts and not multi_key`, IGNORING not_owned. A task whose tables are ALL
-owned by fork jobs (e.g. one big table whose bg-<slug> fork owns it after a
-partitions-auto source wrote many LOAD files) therefore crashed the MAIN CDC run on
-startup. In stepfunctions/startup.asl.json the main run must be alive (IsCdcRunAlive)
-and have written its _cdc_started marker (CheckCdcStarted) BEFORE StartForkCdcMap starts
-the forks. So the crash routed to CdcRunFailed / CdcStartNotConfirmed, the owning fork
-never started, and the task got NO CDC at all.
+THE FEATURE
+Two optional params.csv settings control which CSV values DMS wrote become SQL NULL,
+applied IDENTICALLY in the full load, CDC and validation (so validation can't false-flag
+a correctly-loaded row):
+  - null_values (all columns): '|'-separated exact strings -> NULL. Blank = today
+    (the endpoint CsvNullValue, resolved by resolve_task, passed as --csv_null_value).
+    Set, it REPLACES that marker list for every column.
+  - null_rules (per-column): 'schema.table.column=none|V1|V2' entries joined by ';'.
+    'none' keeps the text 'NULL' as data; a list replaces the default for that column.
+    Names match case-insensitively; values match exactly/case-sensitively.
+  - Precedence: rule > values > endpoint marker. Empty fields are ALWAYS NULL (unchanged).
+  - Both blank/absent => BYTE-IDENTICAL to today (proven by a test).
 
-THE FIX
-- Raise ONLY when nothing is usable: `not contexts and not multi_key and not not_owned`.
-- When every table is owned by another CDC job, take the EXISTING all-multi-key idle
-  path: log it clearly (list the tables), write the start marker (task-level + own, as
-  today), and stay idle in the poll loop until cutover's BatchStopJobRun stops it. No
-  other behavior change.
-- Verified the idle path reaches write_started_marker() (the key CheckCdcStarted polls),
-  so IsCdcStarted passes and StartForkCdcMap starts the owning fork.
+ONE SHARED BLOCK, four byte-identical copies (the scripts share no imports):
+scripts/job2_load.py, job3_validate.py, glue_cdc_continuous.py, glue_cdc_composite.py.
+Spark null_marker_expr (load/validate) and _coerce_null (CDC + CDC validation sampling)
+consume the shared _effective_null_markers at the same comparison point as _coerce_null.
+A test asserts the four copies are byte-identical.
 
-SCOPE
-- cdc.json AND cdc-spark.json both run this same script -> one fix covers Python-shell
-  and Spark CDC.
-- glue_cdc_composite.py already idles on `not contexts` (never raised) — no bug.
-- drain_check / cutover / stop_cdc_run are ownership-agnostic — no assumption that the
-  main job owns a table — no bug.
+PLUMBING (mirrors --csv_null_value): params_csv (OPTIONAL_DEFAULTS + PIPELINE_KEYS) ->
+pipeline.json -> resolve_task (SETTINGS_DEFAULTS + _validate_null_settings; a malformed
+entry FAILS preflight naming the bad entry) -> create_glue_jobs (--null_values/--null_rules
+on load/load-big/validate/cdc/ck/bg; blank -> __NULL_UNSET__) -> startup.asl.json
+(ResolveTask ResultSelector + CreateGlueJobs/EnsureForkJobs/CdcDriverFallback payloads).
+An entry naming a table/column not in the task is only a WARNING; each job logs the
+effective rules at startup.
 
-RUNTIME FILE CHANGED
-- scripts/glue_cdc_continuous.py  (only runtime artifact)
+DOCS: RUNBOOK §3 rows + "when a change takes effect" + pipeline-key count 53->55;
+config/params.example.csv; config/pipeline.example.json; docs/MANUAL_SETUP.md §3c. All
+describe both keys, the format, the precedence, the before-full-load warning, and that the
+job DefaultArguments are baked at job creation (existing jobs keep old rules until
+recreated or args passed at run time). tests/test_docs_params.py passes with the new keys.
 
-TEST (offline, new)
-- tests/test_main_cdc_all_forked.py — executes the real main() source with stubbed
-  collaborators: all-forked table -> no raise + marker written + idle; empty ownership
-  -> still raises; normal owned table -> unchanged; plus a forked+multikey edge case.
-  Fails before the fix, passes after; check() raises under pytest.
+RUNTIME FILES CHANGED (8): scripts/{job2_load,job3_validate,glue_cdc_continuous,
+glue_cdc_composite}.py; lambdas/{params_csv,resolve_task,create_glue_jobs}.py;
+stepfunctions/startup.asl.json. New test: tests/test_null_rules.py.
 
-MIRROR
-- backed up ~/Downloads/dms-s3-glue-dsql-migration/ (minus .git) to
-  ~/Downloads/cdc_backups/before-fe3e01e/, then checksum-rsynced the fe3e01e clone into
-  it (excluding .git on both sides; mirror .git untouched; dry-run re-sync shows no diff).
+VERIFICATION: python3 -m pytest -q tests/ => 199 passed. The new suite FAILS on pristine
+152f332 (no shared block / no null_values support) and PASSES at 7939e46. Mirror
+~/Downloads/dms-s3-glue-dsql-migration/ backed up to
+~/Downloads/cdc_backups/before-7939e46be0d532f517de748a36fb70ea3000918e/ then
+checksum-rsynced to match HEAD (diff -rq excluding .git: IDENTICAL); its .git untouched.
 
-CUSTOMER RECOVERY (see RESULT.md)
-- Upload scripts/glue_cdc_continuous.py to s3://$BUCKET/scripts/ (next run picks it up).
-- Recover a CdcRunFailed/CdcStartNotConfirmed task: re-run startup with the same input
-  (load+validate re-enter but short-circuit on already-'done' tables via _load_status.json,
-  then CDC starts) OR start the main + fork CDC jobs by hand with the exact args read from
-  _jobs.json and the failed execution.
+See RESULT.md for the exact MANUAL redeploy (S3 script uploads; the Lambda zip WITH pg8000
+for all functions via list-functions; startup.asl.json with the sed placeholder fill and
+NO --role-arn), how a customer applies new rules (before the full load vs existing jobs),
+and the TESTER_PLAN.
