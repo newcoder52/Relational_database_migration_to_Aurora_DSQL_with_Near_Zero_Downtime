@@ -193,6 +193,15 @@ phase under the bold sub-headings below.
   to Glue jobs created after the change. Already-created jobs keep their old values** until those
   jobs are deleted and re-created (new task startup, or a manual job re-create). See the
   "Which settings affect a running task?" note after the tables.
+- **`null_values` / `null_rules` (customer NULL handling)** are also baked into the load/load-big/
+  validate/CDC (incl. `ck`/`bg` fork) job args as `--null_values` / `--null_rules` at job creation
+  (CreateGlueJobs / EnsureForkJobs). A change takes effect only for jobs **created after** it —
+  existing jobs keep the rules they were created with until recreated, or until the args are
+  overridden at run time on `start_job_run`. **Set them BEFORE the full load**: because the full
+  load and CDC run as separate jobs, changing the rules mid-migration would apply one rule set to
+  already-loaded rows and another to CDC-applied rows, so a value could be stored as NULL on one
+  side and as text on the other and validation would flag it. Recreate all of this task's jobs
+  (re-run startup / CreateGlueJobs) so loader, validate and CDC share one rule set.
 
 **Setup only** (not written to `pipeline.json`; used by `tools/setup.sh` — re-run setup for a change to take effect)
 
@@ -241,6 +250,8 @@ phase under the bold sub-headings below.
 | `writers_per_file` | optional | `8` | Planning, Full load | `plan_split` → `--writers_per_file`; `job2_load` | int ≥ 1. Concurrent DSQL writer threads for **one** part-file. The DMS full load is usually a **single** LOAD*.csv per table, so this is the lever that parallelises a big single-file table; `1` = the old one-writer-per-file behaviour. Bounded by the per-group write cap. Baked into the load job args at creation |
 | `max_parallel_tables` | optional | `20` | Full load | `create_glue_jobs` `--max_parallel_tables`; `job2_load` | int 1–40. How many tables load **at once** on the driver thread pool. Baked into the load job args at creation — only jobs created after the change use the new value |
 | `per_worker_mem_budget_mb` | optional | `1500` | Full load | `create_glue_jobs` `--per_worker_mem_budget_mb`; `job2_load` | int ≥ 1. Per-table driver-memory budget the auto-throttle uses. The throttle **never silently drops to 1** — it holds a floor even if driver memory is unknown/misreported. Baked into the load job args at creation |
+| `null_values` | optional | *(blank)* | Full load, CDC, Validation | `create_glue_jobs` `--null_values`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` | `\|`-separated list of exact strings that become SQL NULL for **every** column. Blank = today's behaviour (only the DMS endpoint `CsvNullValue`, passed as `--csv_null_value`, and an empty field are NULL). Set, it **replaces** that marker list. An empty field is **always** NULL. **Set it BEFORE the full load** — changing it mid-migration mixes rules between loaded and CDC-applied rows. Baked into the load/validate/CDC job args at creation — existing jobs keep the old value until recreated |
+| `null_rules` | optional | *(blank)* | Full load, CDC, Validation | `create_glue_jobs` `--null_rules`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` | Per-column overrides: `schema.table.column=VALUES` entries joined by `;`. `VALUES` is `none` (nothing in that column becomes NULL from a text value — the text `NULL` is **kept as data**) or a `\|`-separated list that replaces the default for that column. Names match **case-insensitively** against the DSQL lowercase schema/table/column; value matching is exact and case-sensitive. **Precedence:** a `null_rules` entry > `null_values` > the endpoint marker. A malformed entry **fails preflight** naming the bad entry; an entry for a table/column not in the task is only a **warning**. Example: `cns_schema.orders.status=none; cns_schema.orders.region=NULL\|NA`. **Set it BEFORE the full load.** Baked into the load/validate/CDC job args at creation — existing jobs keep the old rules until recreated |
 | `load_worker_type` | optional | `G.4X` | Full load | `create_glue_jobs` (job `WorkerType`) | Glue worker type for the normal (small-group) load. **Bigger = bigger driver** (the load runs driver-side), which is what speeds it. Allow-list G.1X/G.2X/G.4X/G.8X/G.12X/G.16X/R.1X/R.2X/R.4X/R.8X. **Baked into the job definition at creation** — only jobs created after the change use the new size |
 | `load_num_workers` | optional | `10` | Full load | `create_glue_jobs` (job `NumberOfWorkers`) | int 1–299. Load worker count (executors mostly help the CSV read). Baked into the job definition at creation |
 | `load_timeout_minutes` | optional | `2880` | Full load | `create_glue_jobs` (job `Timeout`) | int 1–10080. Load job timeout (48 h default). Baked into the job definition at creation |
@@ -314,7 +325,7 @@ Everything above is captured by the component **when it starts**, not continuous
 In short: republishing `params.csv` → `pipeline.json` changes **future** task runs and **future** job
 creations. It never reaches into a job or CDC run that is already in flight.
 
-Fifty-three keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
+Fifty-five keys end up in `config/pipeline.json`: `project`, `region`, `dsql_endpoint`, `dsql_user`,
 `dsql_database`, `glue_role_arn`, `glue_connection`, `cdc_engine`, `cdc_spark_fallback`,
 `control_schema`, `cdc_validation`, `cdc_validation_sample`, `cdc_max_delete_fraction`,
 `cdc_max_delete_rows`, `cdc_drift_check_minutes`, `cdc_drift_tolerance`, `cdc_drift_action`,
@@ -329,7 +340,7 @@ Fifty-three keys end up in `config/pipeline.json`: `project`, `region`, `dsql_en
 `discovery_num_workers`, `discovery_timeout_minutes`, `load_worker_type`, `load_num_workers`,
 `load_timeout_minutes`, `load_big_worker_type`, `load_big_num_workers`, `load_big_timeout_minutes`,
 `validate_worker_type`, `validate_num_workers`, `validate_timeout_minutes`, `max_parallel_tables`,
-`per_worker_mem_budget_mb`. `account_id`, `subnet_id`, `security_group_id`, `lambda_role_arn`,
+`per_worker_mem_budget_mb`, `null_values`, `null_rules`. `account_id`, `subnet_id`, `security_group_id`, `lambda_role_arn`,
 `sfn_role_arn` and `manage_iam` are used only by setup.
 
 ---

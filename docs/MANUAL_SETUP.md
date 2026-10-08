@@ -402,7 +402,7 @@ rm -rf /tmp/_cdc_check && python3 lambdas/prepare_cdc_wheels.py _cdc/ /tmp/_cdc_
 
 ## Step 3c — config/pipeline.json
 
-*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Thirty-nine of the `params.csv` values
+*Replaces in setup.sh: Step 3c (build from `params.csv` + publish).* Fifty-five of the `params.csv` values
 become `config/pipeline.json`. Each key maps straight across (defaults applied where you left a row
 out); `account_id`, `subnet_id`, `security_group_id` are **not** written. Don't copy
 `config/pipeline.example.json` as-is — its `description` holds `<bucket>`, and any value with `<`/`>`
@@ -463,6 +463,30 @@ is rejected at run time.
 | `validate_timeout_minutes` | `validate_timeout_minutes` | `2880` | Validation | `create_glue_jobs` (validate `Timeout`, baked at creation) |
 | `max_parallel_tables` | `max_parallel_tables` | `20` | Full load | `create_glue_jobs` `--max_parallel_tables`; `job2_load` |
 | `per_worker_mem_budget_mb` | `per_worker_mem_budget_mb` | `1500` | Full load | `create_glue_jobs` `--per_worker_mem_budget_mb`; `job2_load` |
+| `null_values` | `null_values` | *(blank)* | Full load, CDC, Validation | `create_glue_jobs` `--null_values`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` |
+| `null_rules` | `null_rules` | *(blank)* | Full load, CDC, Validation | `create_glue_jobs` `--null_rules`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` |
+
+**Customer-controlled NULL handling (`null_values` / `null_rules`).** Both blank by default =
+today's behaviour: only the DMS endpoint `CsvNullValue` (passed as `--csv_null_value`) and an empty
+field become SQL NULL.
+- `null_values` — a `|`-separated list of exact strings that become NULL for **every** column; set,
+  it **replaces** the endpoint marker list.
+- `null_rules` — per-column overrides, `schema.table.column=VALUES` entries joined by `;`. `VALUES`
+  is `none` (nothing in that column becomes NULL from a text value — the text `NULL` is **kept as
+  data**) or a `|`-separated list that replaces the default for that column. Names match
+  **case-insensitively** against the DSQL lowercase schema/table/column; value matching is exact and
+  case-sensitive. Example: `cns_schema.orders.status=none; cns_schema.orders.region=NULL|NA`.
+- **Precedence for a column:** a `null_rules` entry > `null_values` > the endpoint marker. An empty
+  field is **always** NULL, in every mode (including `none`).
+- A malformed entry **fails preflight** (resolve_task validates the format) naming the bad entry; an
+  entry for a table/column not in the task is only a **warning** (logged by the job).
+- **Set both BEFORE the full load.** Changing them mid-migration mixes rules between already-loaded
+  rows and later CDC-applied rows.
+- **How a change takes effect:** these travel to the Glue jobs as `--null_values` / `--null_rules`
+  and are **baked into each job's `DefaultArguments` at job creation** (CreateGlueJobs). An existing
+  job keeps the rules it was created with until it is **recreated** (re-run CreateGlueJobs) or the
+  args are **overridden at run time** on `start_job_run`. Change pipeline.json and recreate the jobs
+  before the full load so the loader, validate and CDC jobs all share one rule set.
 
 Write it from the export block and upload it to the fixed key `config/pipeline.json`:
 

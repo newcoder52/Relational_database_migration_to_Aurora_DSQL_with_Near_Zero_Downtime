@@ -52,5 +52,7 @@
   "validate_num_workers": 10,
   "validate_timeout_minutes": 2880,
   "max_parallel_tables": 20,
-  "per_worker_mem_budget_mb": 1500
+  "per_worker_mem_budget_mb": 1500,
+  "null_values": "",
+  "null_rules": ""
 }

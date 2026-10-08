@@ -60,6 +60,12 @@ Input event: {
   "csv_null_value",    # optional: the DMS endpoint's CsvNullValue (how DMS writes a real NULL);
                        # set on load/load-big/validate/cdc as --csv_null_value ("" -> "__EMPTY__").
                        # Absent (older workflows): the scripts use the DMS default "NULL".
+  "null_values",       # optional: customer NULL-handling. '|'-separated exact strings that
+                       # become SQL NULL for every column; set on load/load-big/validate/cdc/ck/bg
+                       # as --null_values ("" -> "__NULL_UNSET__" = unset). Blank = today.
+  "null_rules",        # optional: per-column NULL overrides, 'schema.table.column=none|V1|V2'
+                       # entries joined by ';'; set as --null_rules ("" -> "__NULL_UNSET__").
+                       # Blank = today. (Both set on the SAME jobs as --csv_null_value.)
   "cdc_engine"         # optional: "pythonshell" (default, glue-templates/cdc.json) or "spark"
                        # (the shared startup workflow passes pipeline.json's cdc_engine)
                        # (glue-templates/cdc-spark.json). Also settable with the Lambda env var
@@ -778,6 +784,22 @@ def handler(event, context):
             # (Everything except discovery takes --csv_null_value.)
             _nv = str(event["csv_null_value"])
             args["--csv_null_value"] = _nv if _nv != "" else "__EMPTY__"
+        if role in ("load", "load-big", "validate", "cdc", "cdc-spark",
+                    _CDC_COMPOSITE_ROLE, "cdc-composite-spark"):
+            # Customer-controlled NULL handling (two params.csv settings), set on the SAME jobs as
+            # --csv_null_value (so load/load-big/validate/cdc/ck/bg all apply NULL identically; a
+            # mismatch would make validation false-flag). Glue cannot pass an empty argument value,
+            # so a BLANK setting (today's behaviour) travels as the sentinel __NULL_UNSET__, which
+            # the scripts' shared null-rules block treats as "unset". Absent from the event (older
+            # workflows) -> the arg is not set and the scripts default to unset too.
+            _nvv = event.get("null_values")
+            if _nvv is not None:
+                _nvv = str(_nvv)
+                args["--null_values"] = _nvv if _nvv != "" else "__NULL_UNSET__"
+            _nrv = event.get("null_rules")
+            if _nrv is not None:
+                _nrv = str(_nrv)
+                args["--null_rules"] = _nrv if _nrv != "" else "__NULL_UNSET__"
         if role in ("load", "load-big"):
             # job2 driver-side parallelism tuning (how many tables load at once + the per-table
             # driver-memory budget the auto-throttle uses). Passed as RUN defaults; absent ->

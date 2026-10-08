@@ -148,6 +148,21 @@ validate_timeout_minutes,2880
 max_parallel_tables,20
 per_worker_mem_budget_mb,1500
 
+# ---- customer-controlled NULL handling (BOTH blank by default = today's behaviour) ----
+# null_values: '|'-separated EXACT strings that become SQL NULL for EVERY column. Blank = only
+#   the DMS endpoint CsvNullValue (passed as --csv_null_value) and an empty field are NULL. Set,
+#   it REPLACES that marker list. An empty field is ALWAYS NULL.
+# null_rules: per-column overrides, 'schema.table.column=VALUES' entries joined by ';'. VALUES is
+#   'none' (keep the text 'NULL' as data) or a '|'-separated list that replaces the default for
+#   that column. Names match case-insensitively; value matching is exact/case-sensitive.
+#   Precedence: a null_rules entry > null_values > the endpoint marker.
+#   Example: null_rules,cns_schema.orders.status=none; cns_schema.orders.region=NULL|NA
+# SET BOTH BEFORE THE FULL LOAD — changing them mid-migration mixes rules between loaded and
+# CDC-applied rows. They are baked into the load/validate/CDC job args at creation; existing jobs
+# keep the old values until the jobs are recreated (CreateGlueJobs) or the args are passed at run.
+null_values,
+null_rules,
+
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
 # Only set it if your Glue role name differs from <project>-glue-exec-role.
 glue_role_arn,arn:aws:iam::123456789012:role/dms-dsql-glue-exec-role

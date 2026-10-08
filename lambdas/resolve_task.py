@@ -544,6 +544,18 @@ SETTINGS_DEFAULTS = {
     # budget used to size that). The throttle can never silently drop to 1 (see job2_load).
     "max_parallel_tables": 20,
     "per_worker_mem_budget_mb": 1500,
+    # ── CUSTOMER-CONTROLLED NULL HANDLING (passed to load/load-big/validate/cdc/ck/bg as
+    # --null_values / --null_rules; the shared null-rules block in each script parses them).
+    # Both BLANK by default = today's behaviour EXACTLY (only the endpoint CsvNullValue, passed
+    # as --csv_null_value, and an empty field are NULL). See RUNBOOK §3 / docs/MANUAL_SETUP.md.
+    #   null_values : '|'-separated exact strings that become SQL NULL for EVERY column
+    #                 (replaces the endpoint marker list when set).
+    #   null_rules  : per-column overrides 'schema.table.column=none|V1|V2' entries joined by
+    #                 ';'. 'none' keeps the text 'NULL' as data. Precedence: rule > values >
+    #                 endpoint marker. Validated here (malformed -> SettingsError -> preflight
+    #                 FAILS naming the bad entry).
+    "null_values": "",
+    "null_rules": "",
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
 GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
@@ -866,7 +878,61 @@ def _validate_settings(cfg, warnings):
         warnings.append(f"per_worker_mem_budget_mb={cfg['per_worker_mem_budget_mb']} is very large; "
                         f"on a smaller driver the table auto-throttle would pick few tables. The "
                         f"loader enforces a floor so it never drops to 1, but check the sizing.")
+    # ── CUSTOMER NULL HANDLING: validate null_values / null_rules FORMAT (malformed -> fail
+    # preflight naming the bad entry; wrong data, not a typo to ignore). The scripts own the
+    # runtime parse (shared null-rules block); this mirrors its rules so a bad setting is caught
+    # before any job is created. Normalised to a trimmed string ("" = unset = today's behaviour).
+    _validate_null_settings(cfg)
     return cfg
+
+
+def _validate_null_settings(cfg):
+    """Validate the FORMAT of the null_values / null_rules settings (customer-controlled NULL
+    handling), raising SettingsError naming the bad entry on any problem. Mirrors the parse rules
+    of the shared null-rules block copied into the four Glue scripts (scripts/job2_load.py,
+    job3_validate.py, glue_cdc_continuous.py, glue_cdc_composite.py), so a malformed setting is
+    caught at preflight rather than only when a job starts. Mutates cfg to the trimmed strings."""
+    nv = str(cfg.get("null_values", "") or "").strip()
+    cfg["null_values"] = nv
+    if nv:
+        if any(tok == "" for tok in nv.split("|")):
+            raise SettingsError(
+                f"pipeline.json 'null_values' {nv!r} has an empty marker between '|' separators; "
+                f"list exact, non-empty strings (an empty field is already treated as NULL).")
+    nr = str(cfg.get("null_rules", "") or "").strip()
+    cfg["null_rules"] = nr
+    if nr:
+        seen = set()
+        for entry in nr.split(";"):
+            e = entry.strip()
+            if e == "":
+                continue
+            if "=" not in e:
+                raise SettingsError(
+                    f"pipeline.json 'null_rules' entry {entry!r} is malformed: expected "
+                    f"'schema.table.column=none|VALUE|VALUE'. No '=' found.")
+            left, _, right = e.partition("=")
+            parts = left.strip().split(".")
+            if len(parts) != 3 or any(p.strip() == "" for p in parts):
+                raise SettingsError(
+                    f"pipeline.json 'null_rules' entry {entry!r} is malformed: the left side "
+                    f"{left.strip()!r} must be exactly 'schema.table.column' (three dot-separated "
+                    f"non-empty names).")
+            key = tuple(p.strip().lower() for p in parts)
+            right = right.strip()
+            if right == "":
+                raise SettingsError(
+                    f"pipeline.json 'null_rules' entry {entry!r} is malformed: VALUES after '=' "
+                    f"is empty; use 'none' (keep text as data) or a '|'-separated marker list.")
+            if right.lower() != "none" and any(m == "" for m in right.split("|")):
+                raise SettingsError(
+                    f"pipeline.json 'null_rules' entry {entry!r} is malformed: an empty marker "
+                    f"between '|' separators. List exact, non-empty strings, or 'none'.")
+            if key in seen:
+                raise SettingsError(
+                    f"pipeline.json 'null_rules' names {left.strip()!r} more than once; give each "
+                    f"schema.table.column at most one entry.")
+            seen.add(key)
 
 
 def _parse_task_arn(task_arn):
@@ -1269,6 +1335,10 @@ def handler_shared(event, context):
         "validateTimeoutMinutes": cfg["validate_timeout_minutes"],
         "maxParallelTables": cfg["max_parallel_tables"],
         "perWorkerMemBudgetMb": cfg["per_worker_mem_budget_mb"],
+        # Customer-controlled NULL handling (blank = today's behaviour). Passed to the Glue jobs
+        # as --null_values / --null_rules by create_glue_jobs, exactly like --csv_null_value.
+        "nullValues": cfg["null_values"],
+        "nullRules": cfg["null_rules"],
         "warnings": warnings,
     })
     for w in warnings:

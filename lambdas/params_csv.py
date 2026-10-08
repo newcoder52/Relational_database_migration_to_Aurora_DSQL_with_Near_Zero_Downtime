@@ -193,6 +193,18 @@ OPTIONAL_DEFAULTS = {
     # tables at once; the throttle can never silently drop to 1 (see job2_load).
     "max_parallel_tables": "20",
     "per_worker_mem_budget_mb": "1500",
+    # Customer-controlled NULL handling. Both BLANK by default = today's behaviour EXACTLY (only
+    # the DMS endpoint CsvNullValue, passed as --csv_null_value, and an empty field become NULL).
+    #   null_values : '|'-separated exact strings that become SQL NULL for EVERY column; set, it
+    #                 REPLACES the endpoint marker list.
+    #   null_rules  : per-column overrides, 'schema.table.column=none|V1|V2' entries joined by
+    #                 ';'. 'none' keeps the text 'NULL' as data. Precedence: rule > values >
+    #                 endpoint marker. Names match case-insensitively. A malformed entry FAILS
+    #                 preflight (resolve_task._validate_null_settings) naming the bad entry.
+    #                 WARNING: set these BEFORE the full load — changing them mid-migration mixes
+    #                 rules between loaded and CDC-applied rows.
+    "null_values": "",
+    "null_rules": "",
 }
 # Setup-only keys: consumed by tools/setup.sh, never written to pipeline.json.
 #   subnet_id / security_group_id : Glue network connection (both-or-neither).
@@ -252,7 +264,8 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "load_worker_type", "load_num_workers", "load_timeout_minutes",
                  "load_big_worker_type", "load_big_num_workers", "load_big_timeout_minutes",
                  "validate_worker_type", "validate_num_workers", "validate_timeout_minutes",
-                 "max_parallel_tables", "per_worker_mem_budget_mb")
+                 "max_parallel_tables", "per_worker_mem_budget_mb",
+                 "null_values", "null_rules")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
 

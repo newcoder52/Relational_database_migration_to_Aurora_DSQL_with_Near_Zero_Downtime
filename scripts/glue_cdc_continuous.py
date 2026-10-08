@@ -483,6 +483,172 @@ CONNECT_MAX_RETRIES = 4
 # sets it to the empty string). Only that exact text, or an empty field, is stored as NULL.
 CSV_NULL_VALUE = "NULL"
 
+# ===================================================================================== #
+# SHARED NULL-RULES BLOCK — customer-controlled NULL handling (two params.csv settings).  #
+# COPIED BYTE-IDENTICALLY into scripts/job2_load.py, scripts/job3_validate.py,            #
+# scripts/glue_cdc_continuous.py and scripts/glue_cdc_composite.py. These four scripts do #
+# NOT share imports (each is a self-contained Glue job script), so the parse/match logic  #
+# lives here as ONE function set that is copied verbatim; tests assert the copies are     #
+# byte-identical (tests/test_null_rules.py::test_four_copies_identical).                   #
+#                                                                                         #
+# TWO settings travel from params.csv -> pipeline.json -> resolve_task -> create_glue_jobs #
+# as the Glue job args --null_values and --null_rules (set on load/load-big/validate/cdc/ #
+# ck/bg, exactly like --csv_null_value):                                                  #
+#                                                                                         #
+#   null_values  (all columns): a '|'-separated list of EXACT strings that become SQL     #
+#                NULL. Blank = today's behaviour: the DMS endpoint's CsvNullValue          #
+#                (CSV_NULL_VALUE, passed as --csv_null_value). If set it REPLACES that     #
+#                marker list for EVERY column.                                            #
+#   null_rules   (per-column): 'schema.table.column=VALUES' entries separated by ';'.     #
+#                VALUES is either 'none' (nothing in that column becomes NULL from a text  #
+#                value, so the text 'NULL' is KEPT as data) or a '|'-separated list that   #
+#                REPLACES the default for that one column. Names match case-INSENSITIVELY  #
+#                against the DSQL lowercase schema/table/column.                          #
+#                                                                                         #
+# PRECEDENCE for a column: a null_rules entry for that column, THEN null_values, THEN the  #
+# endpoint marker (CSV_NULL_VALUE). With both settings blank/absent the effective marker  #
+# list is exactly [CSV_NULL_VALUE] (when non-empty) — i.e. byte-identical to today.       #
+#                                                                                         #
+# EMPTY-FIELD handling is UNCHANGED and lives in the callers, not here: an empty field is #
+# always a real NULL in every mode (including 'none'), exactly as before. This block only #
+# decides which NON-empty TEXT values are markers. The comparison the callers do with the #
+# returned markers is the SAME comparison point as the canonical _coerce_null: exact,     #
+# case-sensitive, whole-value (no trimming).                                              #
+# ===================================================================================== #
+
+# Parsed forms of the two settings. None = "unset" (the arg was absent or blank), which is
+# distinct from an empty list. Set once at startup by _apply_null_settings().
+NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
+NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
+
+
+class NullRulesError(Exception):
+    """A malformed null_rules / null_values setting. Raised so preflight (and each job at
+    startup) FAILS LOUD naming the bad entry — wrong data, never silently ignored."""
+
+
+def _parse_null_values(raw):
+    """'a|b|c' -> ['a','b','c']. Blank/None -> None (unset: keep today's endpoint marker).
+    A '|'-separated list; EMPTY tokens are not allowed (an empty field is always NULL already
+    and is handled by the caller, so '' as a marker is meaningless and almost certainly a typo).
+    Exact strings, no trimming of the token's own characters (only the surrounding arg is
+    stripped by the caller)."""
+    if raw is None:
+        return None
+    s = str(raw)
+    if s == "" or s == "__NULL_UNSET__":
+        return None
+    parts = s.split("|")
+    if any(p == "" for p in parts):
+        raise NullRulesError(
+            f"null_values {raw!r} has an empty marker between '|' separators; list exact, "
+            f"non-empty strings (an empty field is already treated as NULL).")
+    return parts
+
+
+def _parse_null_rules(raw):
+    """'schema.table.column=VALUES; ...' -> {(schema,table,column): [markers] | []}.
+    Blank/None -> None (unset). Keys are lower-cased (matched against the DSQL lowercase
+    schema/table/column). VALUES is 'none' (-> [], no text value becomes NULL) or a
+    '|'-separated marker list (-> that list). Raises NullRulesError, naming the bad entry, on
+    any malformed entry: missing '=', a left side that is not exactly schema.table.column, an
+    empty VALUES, or an empty marker inside the list."""
+    if raw is None:
+        return None
+    s = str(raw)
+    if s == "" or s == "__NULL_UNSET__":
+        return None
+    rules = {}
+    for entry in s.split(";"):
+        e = entry.strip()
+        if e == "":
+            continue   # tolerate a trailing ';' or blank between entries
+        if "=" not in e:
+            raise NullRulesError(
+                f"null_rules entry {entry!r} is malformed: expected "
+                f"'schema.table.column=none|VALUE|VALUE'. No '=' found.")
+        left, _, right = e.partition("=")
+        left = left.strip()
+        name_parts = left.split(".")
+        if len(name_parts) != 3 or any(p.strip() == "" for p in name_parts):
+            raise NullRulesError(
+                f"null_rules entry {entry!r} is malformed: the left side {left!r} must be "
+                f"exactly 'schema.table.column' (three dot-separated non-empty names).")
+        key = tuple(p.strip().lower() for p in name_parts)
+        right = right.strip()
+        if right == "":
+            raise NullRulesError(
+                f"null_rules entry {entry!r} is malformed: VALUES after '=' is empty; use "
+                f"'none' (keep text as data) or a '|'-separated marker list.")
+        if right.lower() == "none":
+            markers = []
+        else:
+            markers = right.split("|")
+            if any(m == "" for m in markers):
+                raise NullRulesError(
+                    f"null_rules entry {entry!r} is malformed: an empty marker between '|' "
+                    f"separators. List exact, non-empty strings, or 'none'.")
+        if key in rules:
+            raise NullRulesError(
+                f"null_rules names {left!r} more than once; give each schema.table.column at "
+                f"most one entry.")
+        rules[key] = markers
+    return rules
+
+
+def _effective_null_markers(schema, table, column):
+    """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
+    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
+    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
+    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
+    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
+    if NULL_RULES is not None:
+        key = (str(schema).lower(), str(table).lower(), str(column).lower())
+        if key in NULL_RULES:
+            return list(NULL_RULES[key])
+    if NULL_VALUES is not None:
+        return list(NULL_VALUES)
+    return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
+
+
+def _apply_null_settings(null_values_arg, null_rules_arg):
+    """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
+    globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
+    empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
+    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
+    global NULL_VALUES, NULL_RULES
+    NULL_VALUES = _parse_null_values(null_values_arg)
+    NULL_RULES = _parse_null_rules(null_rules_arg)
+    nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
+    if NULL_RULES is None:
+        nr = "unset"
+    else:
+        nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
+                       for k, v in NULL_RULES.items()) or "(empty)"
+    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
+
+
+def _null_rules_unknown_warnings(schema, table, columns):
+    """WARN (do not fail) for a null_rules entry that targets THIS table (schema+table match,
+    case-insensitively) but names a COLUMN the table does not have — almost always a column
+    typo. `columns` is this table's column names (any case). Entries for a different table are
+    NOT reported here (they simply never match any column — harmless, still only a warning).
+    Returns a list of warning strings. An unknown table/column is only a WARNING: the operator
+    may drive several tasks from one pipeline.json, so a name not in THIS task is not an error."""
+    if NULL_RULES is None:
+        return []
+    s_l, t_l = str(schema).lower(), str(table).lower()
+    have = {str(c).lower() for c in (columns or [])}
+    return [f"null_rules entry {'.'.join(k)} names column {k[2]!r} not found in "
+            f"{s_l}.{t_l} (ignored; check the column name)"
+            for k in NULL_RULES if k[0] == s_l and k[1] == t_l and k[2] not in have]
+# ===================================================================================== #
+# END SHARED NULL-RULES BLOCK                                                             #
+# ===================================================================================== #
+# ===================================================================================== #
+# ===================================================================================== #
+
+
 
 def _apply_cdc_arg_overrides():
     global CSV_NULL_VALUE
@@ -503,6 +669,7 @@ def _apply_cdc_arg_overrides():
                 "dms_task_arn", "control_schema",
                 "max_parallel_tables", "require_full_load_done", "poll_interval",
                 "timestamp_column", "single_swap_is_rename", "csv_null_value",
+                "null_values", "null_rules",
                 "cdc_validation", "cdc_validation_sample",
                 "cdc_max_delete_fraction", "cdc_max_delete_rows",
                 "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
@@ -541,6 +708,15 @@ def _apply_cdc_arg_overrides():
         _nv = str(ov["csv_null_value"])
         CSV_NULL_VALUE = "" if _nv == "__EMPTY__" else _nv
         print(f"  ↪ CSV_NULL_VALUE (DMS null marker) -> {CSV_NULL_VALUE!r}")
+    # Customer NULL handling (null_values / null_rules). Parse AFTER CSV_NULL_VALUE is final
+    # (precedence falls back to it). A malformed setting fails LOUD (NullRulesError). The
+    # effective rules are logged for every CDC run; an entry naming a table/column not in this
+    # task is only a WARNING (checked per-table as files are processed).
+    _nvl = ov.get("null_values") if "null_values" in ov else None
+    _nrl = ov.get("null_rules") if "null_rules" in ov else None
+    if _nvl is not None or _nrl is not None:
+        _summary = _apply_null_settings(_nvl, _nrl)
+        print(f"  ↪ NULL rules: {_summary}")
     if _s("single_swap_is_rename"):
         SINGLE_SWAP_IS_RENAME = _s("single_swap_is_rename").strip().lower() in ("true", "1", "yes")
         print(f"  ↪ SINGLE_SWAP_IS_RENAME overridden -> {SINGLE_SWAP_IS_RENAME}")
@@ -797,8 +973,15 @@ def hex_to_canonical_uuid(v):
     return s   # pass through unchanged -> guard will reject if it's a uuid column
 
 
-def _coerce_null(v):
+def _coerce_null(v, markers=None):
     """None for a real NULL, else the value exactly as DMS wrote it.
+
+    `markers` (optional) is the pre-resolved list of exact NULL-marker strings for THIS column,
+    from the shared _effective_null_markers(schema, table, column) (customer null_values /
+    null_rules). When it is None (the default, and the case the AST-extract regression test
+    exercises) the behaviour is EXACTLY today's: the only text marker is CSV_NULL_VALUE. An empty
+    field is ALWAYS a real NULL, in every mode (including a 'none' per-column rule). The marker
+    comparison is the canonical one: exact, case-sensitive, whole-value (no trimming).
 
     A real NULL is an empty field or the endpoint's null marker (CSV_NULL_VALUE, DMS default
     "NULL"), compared exactly: no trimming, case-sensitive. Every other value is data and is
@@ -808,7 +991,12 @@ def _coerce_null(v):
     if v is None:
         return None
     s = v if isinstance(v, str) else str(v)
-    if s == "" or (CSV_NULL_VALUE and s == CSV_NULL_VALUE):
+    if s == "":
+        return None
+    if markers is None:
+        if CSV_NULL_VALUE and s == CSV_NULL_VALUE:
+            return None
+    elif s in markers:
         return None
     return s
 
@@ -916,14 +1104,14 @@ def _normalize_timestamp_str(v):
     return s2
 
 
-def convert_value(raw, category):
+def convert_value(raw, category, markers=None):
     """Normalize one raw CSV string to the canonical STRING form for its type category,
     ready to be wrapped by a ::type cast. Returns None for null/sentinel. Mirrors v15's
     Spark normalization, reimplemented in plain Python (no Spark in a Python Shell job).
 
     Does NOT hard-fail here on a bad uuid — the per-row guard (guard_row) does that so the
     error is attributed clearly and halts the table (zero-error policy)."""
-    v = _coerce_null(raw)
+    v = _coerce_null(raw, markers)
     if v is None:
         return None
     # Typed categories re-parse/cast and must not be affected by surrounding whitespace, so
@@ -2638,6 +2826,9 @@ def build_table_context(entry):
     # missed. Absent for most tables.
     rename_hints = meta.get('rename_hints') or {}
     label = f"{dsql_schema}.{dsql_table}"
+    for _w in _null_rules_unknown_warnings(
+            dsql_schema, dsql_table, set(type_categories) | set(target_columns)):
+        print(f"  ⚠️ {label}: {_w}")
     return {
         "label": label,
         "dsql_schema": dsql_schema,
@@ -3535,7 +3726,8 @@ def collapse_net_ops(rows, header, ctx, insert_cols, col_category):
         raw_rows += 1
         op = (row[op_idx].upper() if op_idx < len(row) else 'I')
         pk_raw = row[pk_idx] if pk_idx < len(row) else None
-        pk_val = hex_to_canonical_uuid(pk_raw) if pk_category == 'uuid' else _coerce_null(pk_raw)
+        pk_markers = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], pk_col)
+        pk_val = hex_to_canonical_uuid(pk_raw) if pk_category == 'uuid' else _coerce_null(pk_raw, pk_markers)
         if pk_val is None:
             raise TableBlocked(f"CDC row with empty PK '{pk_col}' in {ctx['label']} "
                                f"(op={op}) — cannot key the change")
@@ -3547,7 +3739,8 @@ def collapse_net_ops(rows, header, ctx, insert_cols, col_category):
             values = {}
             for c, idx in col_idx.items():
                 raw = row[idx] if idx < len(row) else None
-                values[c] = convert_value(raw, col_category.get(c, 'varchar'))
+                _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c)
+                values[c] = convert_value(raw, col_category.get(c, 'varchar'), _m)
             net[pk_val] = {"op": "INSERT", "pk": pk_val, "values": values}
     netops = [net[pk] for pk in ordered_pks]
     # Validation stats (all counters we already had while iterating — no extra work):
@@ -4188,7 +4381,8 @@ def collapse_net_ops_nonpk(rows, header, ctx, insert_cols, col_category):
         vals = {}
         for c, idx in col_idx.items():
             raw = row[idx] if idx < len(row) else None
-            vals[c] = convert_value(raw, col_category.get(c, 'varchar'))
+            _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c)
+            vals[c] = convert_value(raw, col_category.get(c, 'varchar'), _m)
         return vals
 
     netops = []
