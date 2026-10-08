@@ -129,6 +129,10 @@ import json
 import time
 import ssl
 import csv
+# CDC rows can carry CLOB/text values well over the stdlib default field limit of
+# 131072 chars; without this a >128 KB field raises _csv.Error and process_table retries
+# the file forever. 2**31-1 fits a C long on every platform (no OverflowError) and needs no sys.
+csv.field_size_limit(2**31 - 1)
 import io
 import re
 import uuid
