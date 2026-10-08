@@ -55,6 +55,13 @@ def check(cond, msg):
     else:
         _failed += 1
         print(f"[FAIL] {msg}")
+        # Under pytest the direct-run main()/sys.exit path never runs, so a failed check must
+        # surface as a real test failure (otherwise pytest reports PASS even when assertions
+        # fail). Direct `python3 tests/<f>.py` runs are unaffected (PYTEST_CURRENT_TEST unset),
+        # so the count-and-continue summary still works.
+        import os as _os
+        if "PYTEST_CURRENT_TEST" in _os.environ:
+            raise AssertionError(msg)
 
 
 # =============================================================================================

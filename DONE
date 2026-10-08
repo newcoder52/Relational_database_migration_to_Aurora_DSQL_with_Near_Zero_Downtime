@@ -1,10 +1,10 @@
 DONE — override full-bypass + cutover warns; undo M-10 split + M-19 validate_hash reject
 
-Pushed to origin/main as newcoder52 <aash.798@gmail.com>:
+Pushed to origin/main as newcoder52:
   4407893  override: full bypass of load+validation failures; cutover warns instead of
            refusing; undo M-10 split + M-19 validate_hash reject (code + docs + tests)
 Parent: d8a7493 (validate: fix chunk-top double-count + 9 more). Fresh clone pinned on
-d8a7493 (verified with git ls-remote); git config LOCAL newcoder52 <aash.798@gmail.com>;
+d8a7493 (verified with git ls-remote); git config LOCAL newcoder52;
 git pull --rebase before push (no parallel changes landed); plain push, never forced.
 Verified in a 2nd fresh clone at 4407893.
 
@@ -36,7 +36,7 @@ TESTS (offline). pytest: 181 passed. Direct runs (check() doesn't raise under py
   test_asl_paths.py            PASS (exit 0)
   test_asl_payload_contract.py 187 passed, 0 failed
 Each updated test fails before (exit 1) and passes after. See RESULT.md for the full
-TESTER_PLAN and the ONE combined USPS redeploy (d8a7493 + 4407893): S3 script uploads
+TESTER_PLAN and the ONE combined customer redeploy (d8a7493 + 4407893): S3 script uploads
 (job2_load.py, job3_validate.py), the Lambda zip (all 8 functions, from resolve_task.py +
 params_csv.py), and the startup + cutover state machines (placeholder-filled).
 

@@ -3414,11 +3414,12 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
         raise Exception(f"Target columns not in DataFrame (mapping gap): {missing}.")
 
     # NOTE (integer casts ROUND, they don't truncate): '%s::numeric::bigint' (and
-    # ::integer/::smallint) uses PostgreSQL/DSQL numeric->integer rounding (round-half-to-
-    # even), so a fractional source string for an integer-typed target (e.g. an Oracle
-    # NUMBER with unexpected scale mapped to a DSQL integer) is SILENTLY ROUNDED, not
-    # rejected. Intentional and low-probability; for strict rejection, change the target
-    # column type or fail on non-integer input upstream in Job 1.
+    # ::integer/::smallint) uses PostgreSQL/DSQL numeric->integer rounding (round-half-AWAY-
+    # from-zero, e.g. 2.5->3, -2.5->-3), so a fractional source string for an integer-typed
+    # target (e.g. an Oracle NUMBER with unexpected scale mapped to a DSQL integer) is SILENTLY
+    # ROUNDED, not rejected. Intentional and low-probability; for strict rejection, change the
+    # target column type or fail on non-integer input upstream in Job 1. (Job 3 validates this
+    # column's sum with Spark F.round(), which is ties-away-from-zero and matches this cast.)
     # NOTE (bytea): step (b1) turns DMS's hex text into the '\x<hex>' form, so '%s::bytea'
     # stores the real bytes. Trimming is harmless here: the value is hex text, not raw bytes.
     cast_map = {

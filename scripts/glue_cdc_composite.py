@@ -473,6 +473,7 @@ CONNECT_MAX_RETRIES = 4
 # manifest / load_full_load_status derive their keys from CONFIG_PREFIX at call time), so
 # overriding the CONFIG_PREFIX global is sufficient.
 def _apply_cdc_arg_overrides():
+    global CSV_NULL_VALUE
     global CONFIG_PREFIX, INDEX_S3_KEY, LOAD_STATUS_KEY, BUCKET, CDC_ROOT
     global DSQL_ENDPOINT, DSQL_DATABASE, DSQL_USER, REGION
     global DMS_TASK_ARN, CONTROL_SCHEMA
@@ -492,11 +493,16 @@ def _apply_cdc_arg_overrides():
                 "cdc_max_delete_fraction", "cdc_max_delete_rows",
                 "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
                 "guardrails_mode", "cdc_file_order_action", "cdc_nopk_overmatch_action",
-                "cdc_owner_self", "cdc_owners_key"]
+                "cdc_owner_self", "cdc_owners_key", "csv_null_value"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
     ov = getResolvedOptions(sys.argv, present)
+
+    if "csv_null_value" in ov and ov["csv_null_value"] is not None:
+        _nv = str(ov["csv_null_value"])
+        CSV_NULL_VALUE = "" if _nv == "__EMPTY__" else _nv
+        print(f"  ↪ CSV_NULL_VALUE (DMS null marker) -> {CSV_NULL_VALUE!r}")
 
     def _s(key):
         return str(ov[key]).strip() if key in ov and str(ov[key]).strip() else None
@@ -743,8 +749,12 @@ def to_bytea_hex(v):
     h = _BYTEA_PREFIX.sub('', v, count=1)
     return '\\x' + h.lower() if _HEX_BYTES.match(h) else v
 
-NULL_SENTINELS = {"NULL", "N/A", "NA", "NONE", "(NULL)", "\\N"}
-_SENTINEL_UPPER = {s.upper() for s in NULL_SENTINELS}
+# The DMS endpoint's CsvNullValue (how DMS writes a REAL null), default "NULL". Set from the
+# --csv_null_value arg by create-glue-jobs ("__EMPTY__" = the endpoint uses an empty field for
+# NULL). A real NULL is an empty field OR an EXACT, case-sensitive match to this marker — NOT a
+# fuzzy sentinel set. (Kept identical to glue_cdc_continuous.py so the composite fork and the
+# main CDC job coerce NULL the same way.)
+CSV_NULL_VALUE = "NULL"
 
 # Boolean serializations across engines (v15 mapping).
 _BOOL_TRUE = {"true", "t", "y", "yes", "1"}
@@ -785,21 +795,22 @@ def hex_to_canonical_uuid(v):
 
 
 def _coerce_null(v):
-    """Map DMS/CSV null sentinels and empty/whitespace-only string to None.
-    IMPORTANT: the trim is used ONLY to DETECT a null/sentinel — the RETURNED value keeps the
-    ORIGINAL, untrimmed string so that significant leading/trailing whitespace in VARCHAR data
-    is preserved (previously this returned the stripped value, silently trimming padded text).
-    Typed categories (numeric/int/uuid/timestamp/boolean) re-parse in convert_value and are
-    unaffected by surrounding spaces (the DSQL ::cast and the timestamp/uuid normalizers
-    tolerate them)."""
+    """None for a real NULL, else the value exactly as DMS wrote it.
+
+    A real NULL is an empty field or the endpoint's null marker (CSV_NULL_VALUE, DMS default
+    "NULL"), compared exactly: no trimming, case-sensitive. Every other value is data and is
+    kept as written, including 'NA', 'N/A', 'NONE', '(NULL)', '\\N', 'null' and ' NULL '.
+    (An earlier composite version matched a trimmed, upper-cased sentinel SET, which silently
+    turned real text/key values like 'NA'/'NONE'/'null' into NULL — corrupting data columns and,
+    for key columns, blocking the whole composite table with "CDC row with empty key". This is
+    now identical to glue_cdc_continuous.py's _coerce_null.) Whitespace is never trimmed here;
+    convert_value strips it for typed columns only."""
     if v is None:
         return None
-    s = v.strip() if isinstance(v, str) else str(v)
-    if s == "" or s.upper() in _SENTINEL_UPPER:
+    s = v if isinstance(v, str) else str(v)
+    if s == "" or (CSV_NULL_VALUE and s == CSV_NULL_VALUE):
         return None
-    # not a null/sentinel -> return the ORIGINAL value (whitespace intact) for str inputs;
-    # for non-str, return the str() form (no meaningful surrounding whitespace to preserve).
-    return v if isinstance(v, str) else s
+    return s
 
 
 # Oracle/DMS timestamp input formats, translated from v15's Java (Spark) patterns to

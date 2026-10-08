@@ -286,7 +286,7 @@ phase under the bold sub-headings below.
 | `cdc_file_order_action` | optional | `warn` | CDC | `create_glue_jobs` `--cdc_file_order_action`; `glue_cdc_continuous`/`glue_cdc_composite` (**G8**) | **G8** order/gap/new-`LOAD`-after-CDC: `warn` (log + `DsqlGuardWarn` metric, keep applying in order) or `block` (set the table `blocked`). `guardrails_mode=strict` implies `block` |
 | `cdc_nopk_overmatch_action` | optional | `warn` | CDC | `create_glue_jobs` `--cdc_nopk_overmatch_action`; `glue_cdc_continuous`/`glue_cdc_composite` (**G7**) | **G7** no-PK content-DELETE over-match: `warn` (apply and warn + metric) or `block` (block the table). `guardrails_mode=strict` implies `block` |
 | `validate_count_check` | optional | `warn` | Validate | `create_glue_jobs` `--validate_count_check`; `job3_validate` (**G10**) | **G10** validate vs DMS `FullLoadRows`: `warn` (a mismatch logs a WARNING but validation still PASSES — DMS counts can legitimately differ) or `strict` (mismatch FAILS validation). `guardrails_mode=strict` implies `strict` |
-| `cutover_count_check` | optional | `warn` | Cutover | `cutover` state machine `DsqlCountCheck` (reads it via resolve_task); the cutover count equation (**G10**) | **G10** cutover count equation (`FullLoadRows + I − D`): `warn` (a mismatch logs a WARNING but cutover PROCEEDS) or `strict` (cutover refuses with `CountMismatch`). `guardrails_mode=strict` implies `strict` |
+| `cutover_count_check` | optional | `warn` | Cutover | parsed + resolved (`resolve_task` emits `cutoverCountCheck`) but **NOT YET enforced at cutover** — see note | **NOT BUILT at cutover.** The DSQL-vs-`FullLoadRows + I − D` equation exists in Job 3's validate guard (G10), but the `cutover` state machine has **no** count-check state and does not refuse on a count mismatch. Setting `strict` here does **not** make cutover refuse today. (Startup threads `cutoverCountCheck` into the CDC drift guard only.) |
 
 ### Which settings affect a running task?
 
@@ -835,7 +835,6 @@ isn't past full load, so it isn't skipped). Stopped **after** DMS is in CDC → 
 | **CDC** `ROW DRIFT` ERROR / a table `blocked` when `cdc_drift_action=block` (**G9**) | the live DSQL count diverged from `full_load_rows + inserts_applied − deletes_applied` beyond `cdc_drift_tolerance` | the drift is logged + written to `cdc_control.audit_log` + emitted as the `DsqlRowDrift` metric. Investigate the table against the source; if explained, raise `cdc_drift_tolerance` or set the table `active`; if real loss, reload via a new DMS task ([§9](#9-reload-a-task-from-scratch)) |
 | **Load** `BLANK GUARD G1/G2/G3/G4` — a whole-table or range blank was refused | **G1** CDC already started for the table; **G2** a manual (no-workflow) run tried to blank without `--allow_manual_destructive=true`; **G3** another run holds the table lock; **G4** the table was not previously attempted by this task, or its count is above `expected×(1+margin)` | read the audit row in `cdc_control.audit_log` (the `action` ends `_refused_*`). For a legitimate MANUAL reblank re-run the load with `--allow_manual_destructive=true` (G1/G4 still apply); for a CDC-started table reload via a NEW DMS task ([§9](#9-reload-a-task-from-scratch)); for a lock, let the other run finish or clear a stale row in `cdc_control.cdc_control_lock` |
 | **Validate** `mismatch` with a `DMS_COUNT_DIFF` (**G10**) | the DSQL count disagrees with DMS `describe_table_statistics` FullLoadRows beyond `count_mismatch_tolerance` (not only the S3 source count) | the target is short/over vs the authoritative DMS figure — reload the table ([§9](#9-reload-a-task-from-scratch)) or investigate the DMS task before cutover |
-| **Cutover** `CountMismatch` (**G10**) | per table, the DSQL count ≠ DMS `FullLoadRows + Inserts − Deletes` beyond tolerance | investigate the short/over table; reload if needed, or pass the explicit cutover count-override only when the difference is understood and benign |
 | **CDC** run ends with no error after ~7 days | the 7-day Glue timeout (the 10080-minute maximum) | start the CDC job by hand (below); it resumes from where it left off. Cut over before 7 days where you can |
 | **CDC** Spark job: `DataNotFoundError: endpoints` | a boto3/botocore wheel is in `driver-fullload/` or `driver-validation/` | remove it; those folders hold the 5 pg8000 wheels only |
 | **CDC/Glue** `Unknown service: 'dsql'` | `driver-cdc/` lacks a current boto3 set | re-stage drivers (§4), re-trigger the fleet |
@@ -890,6 +889,7 @@ cannot re-run it (set `TASK_NAME` to the folder/job stem). The SQL steps (checki
 
 ```bash
 PROJECT="<project>"; BUCKET="<bucket>"; export AWS_PAGER=""
+REGION="<region>"; ACCOUNT_ID="<account id>"   # needed below to read each Glue job's tags
 TASK_NAME="<task name>"
 # 1. Confirm every table of this task is caught up (none 'blocked'):
 #      SELECT table_name, status FROM cdc_control.cdc_status;
@@ -907,7 +907,7 @@ for r in discovery load load-big validate cdc; do
 done
 # fork jobs (tagged dsql_pipeline_project=$PROJECT, dsql_pipeline_task=$TASK_NAME):
 for j in $(aws glue list-jobs --query 'JobNames[]' --output text | tr '\t' '\n'); do
-  tags=$(aws glue get-tags --resource-arn "arn:aws:glue:$REGION:$ACCOUNT:job/$j" --query 'Tags' --output json 2>/dev/null)
+  tags=$(aws glue get-tags --resource-arn "arn:aws:glue:$REGION:$ACCOUNT_ID:job/$j" --query 'Tags' --output json 2>/dev/null)
   echo "$tags" | grep -q "\"dsql_pipeline_task\": \"$TASK_NAME\"" \
     && echo "$tags" | grep -q "\"dsql_pipeline_project\": \"$PROJECT\"" \
     && echo "$tags" | grep -q "dsql_pipeline_fork" \
@@ -1130,7 +1130,7 @@ keeps going (other tables + all non-destructive work keep flowing). Full scenari
 | **G7** (soft) | A no-PK content DELETE over-matching duplicates (precision check); the `_cdc_file` purge touching other files | **WARN + apply** (G6 is the real volume cap; this is a refinement). The purge-exactness static assertion is unchanged | Blocks the table | CDC — `cdc_nopk_overmatch_action=warn\|block` |
 | **G8** (soft) | A file older than the high-water, a gap, or a new `LOAD*` after CDC started (DMS reload) | **WARN + metric, keep applying in order** | Blocks the table | CDC — `cdc_file_order_action=warn\|block` |
 | **G9** (soft) | Slow drift vs `full_load_rows + inserts − deletes` | WARN + `audit_log` + `DsqlRowDrift` metric (already the default; wrapped so it can't raise) | `cdc_drift_action=block` sets the table blocked | CDC — `cdc_drift_check_minutes=0` (off), `cdc_drift_tolerance`, `cdc_drift_action=warn\|block` |
-| **G10** (soft) | Validate passing while DSQL ≠ DMS `FullLoadRows`; cutover with DSQL ≠ `FullLoadRows + I − D` | **WARN; validation still PASSES / cutover proceeds** (DMS counts can legitimately differ — e.g. the source changed during the load) | `validate_count_check=strict` fails validation; `cutover_count_check=strict` refuses cutover (`CountMismatch`) | validate + cutover — `validate_count_check`, `cutover_count_check`, `count_mismatch_tolerance` |
+| **G10** (soft) | Validate passing while DSQL ≠ DMS `FullLoadRows`; (the analogous cutover `FullLoadRows + I − D` equation exists in Job 3 but is NOT wired into the cutover state machine) | **WARN; validation still PASSES** (DMS counts can legitimately differ — e.g. the source changed during the load) | `validate_count_check=strict` fails validation. `cutover_count_check` is accepted/resolved but **NOT enforced at cutover** (no cutover count-check state exists) — setting `strict` does not refuse cutover today | validate — `validate_count_check`, `count_mismatch_tolerance` (`cutover_count_check` parsed only) |
 
 All of the new control bookkeeping the guards add — `cdc_control.cdc_control_lock`,
 `cdc_control.audit_log`, and the `cdc_status` counter columns (`full_load_rows`,

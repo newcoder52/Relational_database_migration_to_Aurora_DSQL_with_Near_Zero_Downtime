@@ -761,6 +761,7 @@
           "glue_role_arn.$": "$.resolved.glueRoleArn",
           "region.$": "$.resolved.region",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "control_schema.$": "$.resolved.controlSchema",

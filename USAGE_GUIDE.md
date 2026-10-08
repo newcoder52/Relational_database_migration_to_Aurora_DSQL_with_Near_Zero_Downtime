@@ -383,15 +383,17 @@ cutover:
 2. **Drain-checks** each table (latest CDC file applied) until quiesced.
 3. Stops this task's CDC run, drops the `_cdc_file` tracking column, and deletes the task's Glue
    jobs. If a job can't be deleted it ends at `GlueJobsNotDeleted`, naming it (the data is already
-   cut over; delete the job by hand — **do not re-run that task's cutover**).
+   cut over; delete the job by hand, or simply **re-run the task's cutover** — it is idempotent).
 
-**You cannot re-run a task's cutover once its DMS has been stopped (known issue).** The first step
-stops the DMS task, which the DMS API rejects for an already-stopped task, so a second run just
-fails at `CutoverFailed` within ~2 minutes without finishing. Re-launching the **fleet** is safe —
-a task whose cutover is already running is skipped (`already_running`) — but a task that already
-failed **after** DMS was stopped (`CdcDrainTimedOut`, a later `CutoverFailed`, or
-`GlueJobsNotDeleted`) must have its **remaining steps finished by hand** (stop the CDC run, drop the
-`_cdc_file` column on each table, delete the task's five Glue jobs). See `RUNBOOK.md`.
+**You CAN re-run a task's cutover, including after its DMS task has been stopped.** Cutover first
+`DescribeBeforeStop`s the DMS task and SKIPS the stop when it is already stopped (and tolerates the
+DMS `InvalidResourceStateFault`), and every later step is idempotent: a deleted Glue job is a
+no-op, dropping an already-dropped `_cdc_file` column is a no-op, and the drain re-checks from the
+current high-water mark. So if a cutover fails partway (`CdcDrainTimedOut`, a later `CutoverFailed`,
+or `GlueJobsNotDeleted`), the supported recovery is to **re-run that task's cutover** (or re-launch
+the fleet — a task whose cutover is already running is skipped as `already_running`). Only fall back
+to finishing the steps by hand (stop the CDC run, drop the `_cdc_file` column on each table, delete
+the task's Glue jobs) if a re-run cannot complete. See `RUNBOOK.md`.
 
 Then repoint the application to DSQL. The fleet drives both start and cutover for one task or many;
 see [`docs/FLEET_LAUNCHER.md`](docs/FLEET_LAUNCHER.md) for its inputs, skip rules and limits.

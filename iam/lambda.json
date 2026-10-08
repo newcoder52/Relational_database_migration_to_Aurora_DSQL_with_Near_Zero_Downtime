@@ -39,6 +39,12 @@
         "Resource": ["arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>"]
       },
       {
+        "Sid": "DsqlResolvePrivateEndpoint",
+        "Effect": "Allow",
+        "Action": ["dsql:GetVpcEndpointServiceName"],
+        "Resource": ["*"]
+      },
+      {
         "Sid": "GlueManageJobsAtRuntime",
         "Effect": "Allow",
         "Action": ["glue:CreateJob", "glue:UpdateJob", "glue:DeleteJob", "glue:GetJob",

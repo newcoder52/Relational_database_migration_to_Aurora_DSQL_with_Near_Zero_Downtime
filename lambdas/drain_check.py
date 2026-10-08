@@ -211,6 +211,11 @@ def _validation_gate(event):
     endpoint = event["dsql_endpoint"]
     user = event.get("dsql_user", "admin")
     database = event.get("dsql_database", "postgres")
+    # The PrivateLink/public failover list, same as the main drain handler. Without it the gate
+    # would try only the given endpoint, which for the VPC/no-internet customer is the UNreachable
+    # public name -> the cutover's FIRST DSQL touch (CdcValidationPreCheck) fails before DMS is
+    # even stopped. (The state machine must also pass dsql_endpoint_candidates to the gate.)
+    candidates_csv = event.get("dsql_endpoint_candidates", "")
 
     s3 = boto3.client("s3", region_name=REGION)
     # The task's table labels. If the index is missing (task never ran discovery) there are no
@@ -232,7 +237,7 @@ def _validation_gate(event):
     if not labels:
         return {"ok": True, "failures": 0, "byTable": {}, "tables": 0}
 
-    conn = _connect_dsql(endpoint, user, database)
+    conn = _connect_dsql(endpoint, user, database, candidates_csv)
     by_table = {}
     try:
         cur = conn.cursor()

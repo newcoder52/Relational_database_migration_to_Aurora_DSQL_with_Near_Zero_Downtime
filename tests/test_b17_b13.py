@@ -48,6 +48,13 @@ def check(cond, msg):
     else:
         _failed += 1
         print(f"[FAIL] {msg}")
+        # Under pytest the direct-run main()/sys.exit path never runs, so a failed check must
+        # surface as a real test failure (otherwise pytest reports PASS even when assertions
+        # fail). Direct `python3 tests/<f>.py` runs are unaffected (PYTEST_CURRENT_TEST unset),
+        # so the count-and-continue summary still works.
+        import os as _os
+        if "PYTEST_CURRENT_TEST" in _os.environ:
+            raise AssertionError(msg)
 
 
 def _iter_source_files():
@@ -293,8 +300,12 @@ _ALLOWED_ACTIONS = {
     "dms:DescribeReplicationTasks", "dms:DescribeEndpoints", "dms:DescribeTableStatistics",
     "dms:StartReplicationTask", "dms:StopReplicationTask", "dms:ModifyReplicationTask",
     "dms:TestConnection", "dms:DescribeConnections", "dms:DescribeReplicationInstances",
-    # dsql (connect only; GetVpcEndpointServiceName intentionally NOT granted — see B13)
-    "dsql:DbConnect", "dsql:DbConnectAdmin",
+    # dsql: connect + resolve the private PrivateLink endpoint. GetVpcEndpointServiceName is a
+    # REAL action (it is in the AWS-managed policy AmazonAuroraDSQLReadOnlyAccess) that
+    # resolve_task calls to derive the private DSQL hostname for the VPC/no-internet customer;
+    # it MUST be granted or the private-VPC deploy cannot reach DSQL. (Corrects the earlier B13
+    # removal, which was based on a false "IAM rejects it as MalformedPolicyDocument" premise.)
+    "dsql:DbConnect", "dsql:DbConnectAdmin", "dsql:GetVpcEndpointServiceName",
     # glue
     "glue:CreateJob", "glue:UpdateJob", "glue:DeleteJob", "glue:GetJob", "glue:GetJobs",
     "glue:ListJobs", "glue:GetJobRun", "glue:GetJobRuns", "glue:StartJobRun",
@@ -330,15 +341,25 @@ def _actions_in_policy(doc):
     return out
 
 
+# The three TRACKED source IAM policy files (lambda/stepfunctions/glue). We validate ONLY these,
+# not the gitignored deploy artifacts setup.sh/RUNBOOK generate in iam/ (*.filled.json,
+# *.trust.filled.json, *.vpc.filled.json) — those are placeholder-filled copies / trust policies
+# that another test (test_existing_roles runs setup.sh) can drop into iam/, and scanning them made
+# this test flaky and cross-contaminated under pytest. Trust policies' sts:AssumeRole is not a
+# permission action to allow-list.
+_SOURCE_IAM_FILES = ("glue.json", "lambda.json", "stepfunctions.json")
+
+
 def test_b13_iam_actions_known_good():
     iam_dir = os.path.join(REPO, "iam")
     bad_shape = []
     not_allowed = []
     total = 0
-    for name in sorted(os.listdir(iam_dir)):
-        if not name.endswith(".json"):
+    for name in _SOURCE_IAM_FILES:
+        path = os.path.join(iam_dir, name)
+        if not os.path.exists(path):
             continue
-        doc = json.load(open(os.path.join(iam_dir, name)))
+        doc = json.load(open(path))
         for act in _actions_in_policy(doc):
             total += 1
             if not _ACTION_SHAPE.match(act):
@@ -354,24 +375,26 @@ def test_b13_iam_actions_known_good():
           + ("" if not not_allowed else "  UNKNOWN:\n   " + "\n   ".join(not_allowed)))
 
 
-def test_b13_invalid_action_removed():
-    """The specific action IAM rejected (B13) must not be present in any iam/*.json."""
-    iam_dir = os.path.join(REPO, "iam")
-    present = []
-    for name in sorted(os.listdir(iam_dir)):
-        if name.endswith(".json"):
-            if "GetVpcEndpointServiceName" in open(os.path.join(iam_dir, name)).read():
-                present.append(name)
-    check(not present,
-          "B13: dsql:GetVpcEndpointServiceName (IAM-rejected) is gone from iam/*.json"
-          + ("" if not present else f"  STILL IN: {present}"))
+def test_b13_private_endpoint_action_granted():
+    """resolve_task calls dsql:GetVpcEndpointServiceName to derive the private DSQL PrivateLink
+    hostname for the VPC / no-internet customer; the lambda role MUST grant it or that deploy
+    cannot reach DSQL. (This replaces the earlier assertion that the action be ABSENT, which was
+    based on a false "IAM rejects it" premise — the action is real and in the AWS-managed policy
+    AmazonAuroraDSQLReadOnlyAccess.)"""
+    doc = json.load(open(os.path.join(REPO, "iam", "lambda.json")))
+    acts = set(_actions_in_policy(doc))
+    check("dsql:GetVpcEndpointServiceName" in acts,
+          "B13: iam/lambda.json GRANTS dsql:GetVpcEndpointServiceName (resolve_task calls it)"
+          + ("" if "dsql:GetVpcEndpointServiceName" in acts else "  MISSING"))
 
 
 def test_b13_guard_catches_the_regression():
-    """The allow-list guard must reject the exact action B13 was about, so re-adding it trips."""
-    check("dsql:GetVpcEndpointServiceName" not in _ALLOWED_ACTIONS
-          and bool(_ACTION_SHAPE.match("dsql:GetVpcEndpointServiceName")),
-          "B13 static: the guard would flag dsql:GetVpcEndpointServiceName as not-allowed")
+    """The allow-list guard must still reject a genuinely bogus/typo'd action, so an accidental
+    unknown action trips. (Uses a clearly-fake action — the real GetVpcEndpointServiceName is now
+    correctly allow-listed and granted.)"""
+    bogus = "dsql:TotallyNotARealAction"
+    check(bogus not in _ALLOWED_ACTIONS and bool(_ACTION_SHAPE.match(bogus)),
+          "B13 static: the guard would flag an unknown action (e.g. a typo) as not-allowed")
 
 
 def main():

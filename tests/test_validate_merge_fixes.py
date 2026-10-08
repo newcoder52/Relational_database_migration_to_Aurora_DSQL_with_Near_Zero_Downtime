@@ -46,6 +46,13 @@ def check(cond, msg):
     else:
         _failed += 1
         print(f"[FAIL] {msg}")
+        # Under pytest the direct-run main()/sys.exit path never runs, so a failed check must
+        # surface as a real test failure (otherwise pytest reports PASS even when assertions
+        # fail). Direct `python3 tests/<f>.py` runs are unaffected (PYTEST_CURRENT_TEST unset),
+        # so the count-and-continue summary still works.
+        import os as _os
+        if "PYTEST_CURRENT_TEST" in _os.environ:
+            raise AssertionError(msg)
 
 
 def _load(names, injected):
@@ -412,8 +419,11 @@ def test_m03_text_split():
 
 
 # =============================================================================================
-# M-04: int sum uses bround (half-to-even), matching ::numeric::bigint. We check the generated
-# Spark expression calls bround, and model the two roundings on .5 values.
+# M-04 (corrected): int sum uses round (ties-AWAY-FROM-ZERO), matching the loader's
+# ::numeric::bigint cast (PostgreSQL/DSQL numeric->int rounds half away from zero). The earlier
+# M-04 bround (half-to-even) change produced a false CONTENT_DIFF on exact .5 integer values and
+# is reverted. We check the generated Spark expression calls round (not bround) and model the two
+# roundings on .5 values to prove they genuinely differ (so the choice matters).
 # =============================================================================================
 def _decimal_half_even(values):
     from decimal import Decimal, ROUND_HALF_EVEN
@@ -479,11 +489,13 @@ class _BroundRecorder:
 
 
 def test_m04_int_sum_half_even():
-    # The data divergence that the fix removes: on .5 values half-up != half-even.
+    # The data divergence that the fix is about: on .5 values half-up (away-from-zero) !=
+    # half-even, so the rounding choice genuinely changes the integer-column fingerprint.
     vals = [0.5, 1.5, 2.5, 3.5, 4.5, -0.5, -1.5, -2.5]
     check(_decimal_half_up(vals) != _decimal_half_even(vals),
           "M-04 half-up and half-even genuinely differ on .5 data (precondition)")
-    # The int-kind metric expression now calls bround (half-to-even), not round.
+    # The int-kind metric expression must call round (HALF_UP = ties away from zero), which
+    # matches the loader's '%s::numeric::bigint' cast, NOT bround (half-to-even).
     inj = dict(_CONSTS)
     inj["VALIDATE_HASH"] = "all"
     inj["_HASH_DIGITS"] = 6
@@ -494,8 +506,11 @@ def test_m04_int_sum_half_even():
     # evaluate the int sum's src lambda with the recorder F to see which rounding it calls
     summ = [x for x in m if x["check"] == "sum"][0]
     summ["src"](_BroundRecorder, _BroundRecorder._C())
-    check(_BroundRecorder.used == "bround",
-          f"M-04 int sum uses bround (round-half-to-even), got {_BroundRecorder.used!r}")
+    check(_BroundRecorder.used == "round",
+          f"M-04 int sum uses round (ties-away-from-zero, matches ::numeric::bigint), "
+          f"got {_BroundRecorder.used!r}")
+    check(_BroundRecorder.used != "bround",
+          "M-04 int sum must NOT use bround (half-to-even) — that caused a false CONTENT_DIFF")
 
 
 # =============================================================================================

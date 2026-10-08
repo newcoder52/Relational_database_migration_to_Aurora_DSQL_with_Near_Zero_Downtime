@@ -47,6 +47,10 @@ def check(name, cond, extra=""):
     RESULTS.append(bool(cond))
     tag = "PASS" if cond else "FAIL"
     print(f"[{tag}] {name}" + (f"   <- {str(extra)[:300]}" if (not cond and extra) else ""))
+    # Under pytest, surface a failed check as a real failure (see H6 note).
+    import os as _os
+    if not cond and "PYTEST_CURRENT_TEST" in _os.environ:
+        raise AssertionError(f"{name}" + (f": {extra}" if extra else ""))
 
 
 # The eight planning knobs and their former fixed-literal values (defaults must equal these).
@@ -169,6 +173,10 @@ def _run(entries, knobs=None, prior_owners=None):
         extra["config/_task/mytask/_jobs.json"] = json.dumps({"cdcOwners": prior_owners}).encode()
     s3 = PlanS3(entries, extra)
     _boto3.client = lambda svc, **k: s3
+    # Patch the boto3 object plan_split actually holds, not only our module-level _boto3. Under
+    # pytest several test modules each install their own fake boto3 into sys.modules, so the one
+    # plan_split bound at import time may not be ours; ps.boto3 is always the right object.
+    ps.boto3.client = lambda svc, **k: s3
     out = ps.handler(_event(knobs), None)
     return out, s3
 

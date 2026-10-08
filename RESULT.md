@@ -5,7 +5,7 @@
 - **SHA:** `4407893f363424dbe53b8828ce2b4abd79498f25` (`4407893`)
 - **Parent:** `d8a749353ce8379077a346817fc91fc0f5424c47` (`d8a7493`)
 - **Branch:** `main` (pushed, plain push, no force)
-- **Author:** newcoder52 \<aash.798@gmail.com\>
+- **Author:** newcoder52
 
 ## The 4 changes
 
@@ -47,7 +47,7 @@
 Docs updated: `RUNBOOK.md` (§8 override), `docs/FLEET_LAUNCHER.md`.
 Tests updated: `tests/test_override.py`, `tests/test_validate_merge_fixes.py`.
 
-### Also in the parent `d8a7493` (included so USPS does ONE redeploy)
+### Also in the parent `d8a7493` (included so the customer does ONE redeploy)
 
 | File | Deploy target |
 |---|---|

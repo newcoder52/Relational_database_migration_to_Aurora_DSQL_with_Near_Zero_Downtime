@@ -138,6 +138,7 @@
           "mode": "validation_gate",
           "config_prefix.$": "$.resolved.configPrefix",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "control_schema.$": "$.resolved.controlSchema"
@@ -467,6 +468,7 @@
           "mode": "validation_gate",
           "config_prefix.$": "$.resolved.configPrefix",
           "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
           "dsql_user.$": "$.resolved.dsqlUser",
           "dsql_database.$": "$.resolved.dsqlDatabase",
           "control_schema.$": "$.resolved.controlSchema"

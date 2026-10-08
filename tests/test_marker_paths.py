@@ -57,6 +57,10 @@ def check(name, cond, extra=""):
     RESULTS.append(bool(cond))
     tag = "PASS" if cond else "FAIL"
     print(f"[{tag}] {name}" + (f"   <- {str(extra)[:400]}" if (not cond and extra) else ""))
+    # Under pytest, surface a failed check as a real failure (see H6 note).
+    import os as _os
+    if not cond and "PYTEST_CURRENT_TEST" in _os.environ:
+        raise AssertionError(f"{name}" + (f": {extra}" if extra else ""))
 
 
 # ---------------------------------------------------------------------------------------------
