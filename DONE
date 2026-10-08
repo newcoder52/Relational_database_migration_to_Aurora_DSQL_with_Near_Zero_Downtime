@@ -1,43 +1,56 @@
-DONE — override full-bypass + cutover warns; undo M-10 split + M-19 validate_hash reject
+DONE — main CDC job no longer crashes when every table is owned by a fork
 
 Pushed to origin/main as newcoder52:
-  4407893  override: full bypass of load+validation failures; cutover warns instead of
-           refusing; undo M-10 split + M-19 validate_hash reject (code + docs + tests)
-Parent: d8a7493 (validate: fix chunk-top double-count + 9 more). Fresh clone pinned on
-d8a7493 (verified with git ls-remote); git config LOCAL newcoder52;
-git pull --rebase before push (no parallel changes landed); plain push, never forced.
-Verified in a 2nd fresh clone at 4407893.
+  fe3e01e  Fix main CDC crash when every table is owned by a fork job (code + test)
+Parent: 64cc24d (remote main HEAD at start, pinned with git ls-remote). Fresh clone,
+git config LOCAL newcoder52; git pull --rebase before push (nothing new landed);
+plain push, never forced. Verified in a 2nd fresh clone at fe3e01e (189 passed; ASL
+audit 187 payload-contract checks pass).
 
-THE 4 CHANGES
-1. Cutover: removed the StartupOverrideRequiresOverride refusal. A cutover started WITHOUT
-   override on a task whose startup used override now PROCEEDS, logging a warning
-   (LogStartupOverrideWarning Pass) and resolve_task appends the same warning (naming the
-   startup-override record + overridden tables) to the cutover output $.resolved.warnings.
-   Safety ordering (DMS stop -> drain -> stop CDC -> delete) unchanged. ASL path audit +
-   payload contract green.
-2. Override is a FULL BYPASS of load AND validation failures (no data-error carve-out, no
-   DSQL-vs-DMS count check). job2_load classifies and records the per-table failure kind
-   (data_error{table,column,file,reason} vs infra; unknown->infra) in _load_status.json
-   before raising; the override record + run output carry those as warnings. No-override
-   behaviour is byte-identical (load or validation failure stops at GroupsFailed).
-3. Undo M-10: an explicit validate_parallelism (>0) is used verbatim per table (no division
-   by max_parallel_tables); the auto path (0/blank) stays budget-based.
-4. Undo M-19: params_csv no longer rejects an invalid validate_hash; it warns and falls back
-   to the default (all), never failing the fleet start.
+THE BUG
+main() in scripts/glue_cdc_continuous.py raised
+  Exception("No usable tables from the manifest.")
+when `not contexts and not multi_key`, IGNORING not_owned. A task whose tables are ALL
+owned by fork jobs (e.g. one big table whose bg-<slug> fork owns it after a
+partitions-auto source wrote many LOAD files) therefore crashed the MAIN CDC run on
+startup. In stepfunctions/startup.asl.json the main run must be alive (IsCdcRunAlive)
+and have written its _cdc_started marker (CheckCdcStarted) BEFORE StartForkCdcMap starts
+the forks. So the crash routed to CdcRunFailed / CdcStartNotConfirmed, the owning fork
+never started, and the task got NO CDC at all.
 
-RUNTIME FILES CHANGED (4407893): scripts/job2_load.py, scripts/job3_validate.py,
-lambdas/resolve_task.py, lambdas/params_csv.py, stepfunctions/startup.asl.json,
-stepfunctions/cutover.asl.json. Docs: RUNBOOK.md (§8), docs/FLEET_LAUNCHER.md.
-Tests: tests/test_override.py, tests/test_validate_merge_fixes.py.
+THE FIX
+- Raise ONLY when nothing is usable: `not contexts and not multi_key and not not_owned`.
+- When every table is owned by another CDC job, take the EXISTING all-multi-key idle
+  path: log it clearly (list the tables), write the start marker (task-level + own, as
+  today), and stay idle in the poll loop until cutover's BatchStopJobRun stops it. No
+  other behavior change.
+- Verified the idle path reaches write_started_marker() (the key CheckCdcStarted polls),
+  so IsCdcStarted passes and StartForkCdcMap starts the owning fork.
 
-TESTS (offline). pytest: 181 passed. Direct runs (check() doesn't raise under pytest):
-  test_override.py            87 passed, 0 failed
-  test_validate_merge_fixes.py 58 passed, 0 failed
-  test_asl_paths.py            PASS (exit 0)
-  test_asl_payload_contract.py 187 passed, 0 failed
-Each updated test fails before (exit 1) and passes after. See RESULT.md for the full
-TESTER_PLAN and the ONE combined customer redeploy (d8a7493 + 4407893): S3 script uploads
-(job2_load.py, job3_validate.py), the Lambda zip (all 8 functions, from resolve_task.py +
-params_csv.py), and the startup + cutover state machines (placeholder-filled).
+SCOPE
+- cdc.json AND cdc-spark.json both run this same script -> one fix covers Python-shell
+  and Spark CDC.
+- glue_cdc_composite.py already idles on `not contexts` (never raised) — no bug.
+- drain_check / cutover / stop_cdc_run are ownership-agnostic — no assumption that the
+  main job owns a table — no bug.
 
-No customer identifiers in code or commits.
+RUNTIME FILE CHANGED
+- scripts/glue_cdc_continuous.py  (only runtime artifact)
+
+TEST (offline, new)
+- tests/test_main_cdc_all_forked.py — executes the real main() source with stubbed
+  collaborators: all-forked table -> no raise + marker written + idle; empty ownership
+  -> still raises; normal owned table -> unchanged; plus a forked+multikey edge case.
+  Fails before the fix, passes after; check() raises under pytest.
+
+MIRROR
+- backed up ~/Downloads/dms-s3-glue-dsql-migration/ (minus .git) to
+  ~/Downloads/cdc_backups/before-fe3e01e/, then checksum-rsynced the fe3e01e clone into
+  it (excluding .git on both sides; mirror .git untouched; dry-run re-sync shows no diff).
+
+CUSTOMER RECOVERY (see RESULT.md)
+- Upload scripts/glue_cdc_continuous.py to s3://$BUCKET/scripts/ (next run picks it up).
+- Recover a CdcRunFailed/CdcStartNotConfirmed task: re-run startup with the same input
+  (load+validate re-enter but short-circuit on already-'done' tables via _load_status.json,
+  then CDC starts) OR start the main + fork CDC jobs by hand with the exact args read from
+  _jobs.json and the failed execution.
