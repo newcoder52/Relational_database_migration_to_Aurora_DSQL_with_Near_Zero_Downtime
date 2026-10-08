@@ -451,7 +451,8 @@ def parse(text):
                          ("cdc_file_order_action", ("warn", "block")),
                          ("cdc_nopk_overmatch_action", ("warn", "block")),
                          ("validate_count_check", ("warn", "strict")),
-                         ("cutover_count_check", ("warn", "strict"))):
+                         ("cutover_count_check", ("warn", "strict")),
+                         ("validate_hash", ("all", "keys", "off"))):
         if _k in raw:
             _v = str(raw[_k]).strip().lower()
             if _v not in _allowed:

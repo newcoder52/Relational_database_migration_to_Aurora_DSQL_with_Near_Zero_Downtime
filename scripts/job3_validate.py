@@ -288,7 +288,12 @@ def _apply_job3_arg_overrides():
             print(f"  ⚠️ ignoring invalid max_query_concurrency={ov['max_query_concurrency']!r}")
     if "validate_parallelism" in ov:
         try:
-            VALIDATE_PARALLELISM = max(1, int(ov["validate_parallelism"]))
+            # 0 (the shipped default) / blank => auto-size (VALIDATE_PARALLELISM is None).
+            # A positive value is an explicit cap. (B-FIX M-02: the old max(1,int(0))==1 made
+            # the auto path dead and ran every range query serially.)
+            _vp_raw = str(ov["validate_parallelism"]).strip()
+            _vp_n = int(_vp_raw) if _vp_raw != "" else 0
+            VALIDATE_PARALLELISM = _vp_n if _vp_n > 0 else None
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid validate_parallelism={ov['validate_parallelism']!r}")
     if "conn_budget" in ov:
@@ -319,7 +324,10 @@ def _apply_job3_arg_overrides():
         print(f"  ↪ DMS_TASK_ARN set -> G10 DSQL-vs-FullLoadRows check enabled")
     if "count_mismatch_tolerance" in ov and ov["count_mismatch_tolerance"] is not None:
         try:
-            COUNT_MISMATCH_TOLERANCE = max(0, int(ov["count_mismatch_tolerance"]))
+            # cdc_drift_tolerance is a NON-NEGATIVE FLOAT upstream (resolve_task _nonneg_float);
+            # parse via float() first so "0.5" doesn't raise and silently drop the tolerance to 0
+            # (B-FIX M-18). The downstream guard uses an integer row tolerance, so floor it.
+            COUNT_MISMATCH_TOLERANCE = max(0, int(float(ov["count_mismatch_tolerance"])))
         except (TypeError, ValueError):
             print(f"  ⚠️ ignoring invalid count_mismatch_tolerance={ov['count_mismatch_tolerance']!r}")
     if "guardrails_mode" in ov and str(ov.get("guardrails_mode") or "").strip():
@@ -1075,9 +1083,11 @@ def build_metrics(columns, target_types, with_hash=False, key_cols=None):
                 lambda F, x: F.coalesce(F.sum(F.when(x == F.lit("true"), 1).otherwise(0)), F.lit(0)),
                 f"COALESCE(SUM(CASE WHEN {q} THEN 1 ELSE 0 END), 0)")
         elif kind == "int":
-            # The load casts '%s::numeric::bigint': numeric -> integer rounds half away from
-            # zero, which is what Spark's round() does.
-            add("sum", lambda F, x: F.coalesce(F.sum(F.round(x.cast("decimal(38,6)"), 0).cast("decimal(38,0)")),
+            # The load casts '%s::numeric::bigint' (and ::integer/::smallint): PostgreSQL/DSQL
+            # numeric->integer rounding is ROUND-HALF-TO-EVEN (banker's rounding). Spark's
+            # F.round() is HALF-UP, which disagrees on exact .5 values, so use F.bround()
+            # (round-half-to-even) to match the value the loader actually stored. (B-FIX M-04.)
+            add("sum", lambda F, x: F.coalesce(F.sum(F.bround(x.cast("decimal(38,6)"), 0).cast("decimal(38,0)")),
                                               F.lit(0).cast("decimal(38,0)")),
                 f"COALESCE(SUM({q}), 0)", "decimal", 0)
         elif kind == "numeric":
@@ -1097,7 +1107,12 @@ def build_metrics(columns, target_types, with_hash=False, key_cols=None):
                 lambda F, x, tick=tick, fmt=fmt: F.coalesce(F.sum(F.expr(
                     f"CAST(unix_micros(to_timestamp({tick}, '{fmt}')) AS DECIMAL(38,0))")),
                     F.lit(0).cast("decimal(38,0)")),
-                f"COALESCE(SUM(EXTRACT(EPOCH FROM {q}) * 1000000), 0)", "decimal",
+                # B-FIX M-05: EXTRACT(EPOCH FROM ts) is DOUBLE PRECISION; *1000000 then SUM()
+                # accumulates in double and loses whole microseconds once the running total
+                # exceeds 2^53 (modern us timestamps do). Promote each instant to NUMERIC
+                # BEFORE multiplying/summing so the target accumulator is exact and matches the
+                # source's exact int64 micros (tol stays 0 for us-precision columns).
+                f"COALESCE(SUM((EXTRACT(EPOCH FROM {q})::numeric) * 1000000), 0)", "decimal",
                 0 if p6 >= 6 else 10 ** (6 - p6))
     return m
 
@@ -1162,18 +1177,26 @@ def _key_col_expr(F, pk_src_col, pk_kind):
     return F.col(pk_src_col).cast("string")
 
 
-def _source_summaries_one_plan(df, keyc, pk_kind, ranges, base_index, metrics):
+def _source_summaries_one_plan(df, keyc, pk_kind, ranges, base_index, metrics,
+                               total_ranges=None):
     """Summaries for ONE bounded chunk of ranges via a BROADCAST RANGE-JOIN.
 
     The chunk's (index, lo, hi) descriptors become a tiny DataFrame; the source is joined on
     key in [lo, hi). A range-join is a SINGLE plan node whatever the range count, so the plan
     depth does NOT grow with the number of ranges -- this is the fix for the StackOverflowError
-    the old N-deep F.when chain hit at ~800 ranges. Returns {global_range_index: (cnt, [vals])}."""
+    the old N-deep F.when chain hit at ~800 ranges. Returns {global_range_index: (cnt, [vals])}.
+
+    `total_ranges` is the length of the FULL range list (across all chunks). Only the single
+    GLOBAL last range is unbounded above (`is_top`); every other range -- including the last
+    range of a non-final chunk -- keeps its finite upper bound, exactly like the TARGET side
+    (`_one`: is_top = i == len(ranges) - 1). If total_ranges is None we fall back to the chunk
+    length for backward compatibility (single-chunk callers)."""
     from pyspark.sql import functions as F
     rows = []
     n = len(ranges)
+    gtop = (int(total_ranges) - 1) if total_ranges is not None else (base_index + n - 1)
     for i, (lo, hi) in enumerate(ranges):
-        is_top = (base_index + i) == (base_index + n - 1)   # top of THIS chunk
+        is_top = (base_index + i) == gtop   # GLOBAL top only (B-FIX M-01), not chunk-local
         rows.append((base_index + i,
                      (int(lo) if pk_kind == "integer" else str(lo)),
                      (int(hi) if pk_kind == "integer" else str(hi)),
@@ -1215,9 +1238,11 @@ def source_range_summaries(df, pk_src_col, pk_kind, ranges, metrics):
     keyc = _key_col_expr(F, pk_src_col, pk_kind)
     out = {}
     step = max(1, int(VALIDATE_SOURCE_RANGES_PER_PLAN))
+    total = len(ranges)
     for start in range(0, len(ranges), step):
         chunk = ranges[start:start + step]
-        out.update(_source_summaries_one_plan(df, keyc, pk_kind, chunk, start, metrics))
+        out.update(_source_summaries_one_plan(df, keyc, pk_kind, chunk, start, metrics,
+                                              total_ranges=total))
     return out
 
 
@@ -1307,6 +1332,55 @@ def combine_summaries(res_a, res_b, metrics):
     return (int(ca) + int(cb), merged)
 
 
+def _text_midpoint(lo, hi):
+    """A string strictly between `lo` and `hi` in codepoint (byte) order, or None if there is
+    none (lo >= hi, or they are adjacent with no representable value between). Used to halve a
+    text key range for the re-split path (B-FIX M-03). The ordering matches BOTH sides: the
+    Spark join key compares with `_k >= _lo & _k < _hi` (JVM/binary string order) and the DSQL
+    predicate uses `>= lo AND < hi` (byte order under the default C/UTF-8 ordering), so a
+    codepoint midpoint keeps per-range membership consistent across source and target.
+
+    Strategy: walk the common prefix; at the first differing position pick a codepoint strictly
+    between the two bytes if one exists; otherwise descend/extend. Falls back to appending a
+    mid codepoint to `lo` (which is > lo and < hi whenever lo is a strict prefix of hi)."""
+    if lo is None or hi is None:
+        return None
+    lo = str(lo)
+    hi = str(hi)
+    if lo >= hi:
+        return None
+    # Find the first position where they differ (within the shorter length).
+    i = 0
+    n = min(len(lo), len(hi))
+    while i < n and lo[i] == hi[i]:
+        i += 1
+    prefix = lo[:i]
+    lo_ord = ord(lo[i]) if i < len(lo) else -1
+    hi_ord = ord(hi[i]) if i < len(hi) else -1  # hi is longer-or-equal differing char
+    # Case 1: a codepoint strictly between the two differing characters exists.
+    if hi_ord - lo_ord >= 2:
+        mid_ord = lo_ord + (hi_ord - lo_ord) // 2
+        cand = prefix + chr(mid_ord)
+        if lo < cand < hi:
+            return cand
+    # Case 2: lo is a strict prefix of hi (i == len(lo) < len(hi)): append a char to lo so the
+    # result sorts after lo and before hi (hi has a further character at this position).
+    if i == len(lo) and i < len(hi):
+        # Any char < hi[i] appended to lo works; use a midpoint of (0, hi[i]).
+        if hi_ord >= 1:
+            cand = lo + chr(hi_ord // 2)
+            if lo < cand < hi:
+                return cand
+        # hi[i] == '\x00' can't happen for real keys; fall through.
+    # Case 3: differing chars are adjacent (hi_ord - lo_ord == 1). Extend lo with a high char so
+    # it stays < hi (which continues from the lower char or ends) while sorting after lo.
+    if i < len(lo):
+        cand = lo + "\U0010ffff"
+        if lo < cand < hi:
+            return cand
+    return None
+
+
 def split_bounds(lo, hi, pk_kind):
     """Split a half-open key range [lo,hi) into [[lo,mid),[mid,hi)] with a midpoint in the same
     representation the range uses. Returns None when it cannot be split further (degenerate
@@ -1321,7 +1395,19 @@ def split_bounds(lo, hi, pk_kind):
         if mid <= lo_i or mid >= hi_i:
             return None
         return [(lo_i, mid), (mid, hi_i)]
-    # uuid/text ranges are compared as hex integers of the (dash-stripped) key
+    if pk_kind == "text":
+        # B-FIX M-03: a single text PK (or a text first-column fallback) is validated as one
+        # whole-table range; previously split_bounds could not halve it (hex_to_int on text ->
+        # None), so a large text table that hit statement_timeout erred the whole table with no
+        # path to pass. Compute a LEXICAL midpoint so a text range [lo,hi) can be halved and
+        # retried just like integer/uuid. The predicate on both sides is a plain >= lo AND < hi
+        # string compare, so a lexical midpoint keeps membership consistent (same ordering used
+        # by both the Spark `_k >= _lo & _k < _hi` join and the DSQL `>= lo AND < hi`).
+        mid = _text_midpoint(str(lo), str(hi))
+        if mid is None or not (str(lo) < mid < str(hi)):
+            return None
+        return [(str(lo), mid), (mid, str(hi))]
+    # uuid ranges are compared as hex integers of the (dash-stripped) key
     try:
         lo_i, hi_i = hex_to_int(str(lo)), hex_to_int(str(hi))
     except Exception:
@@ -1516,7 +1602,17 @@ def validate_one_table(s3, entry):
     #     source is known-empty but the target has rows.
     #   * target > 0 and discovery did NOT mark it empty -> genuine ambiguity (missing folder for
     #     an unknown reason while the target has rows) -> clear error, not a silent pass.
-    _empty_at_discovery = bool(meta.get("empty_at_discovery")) or (meta.get("full_load_rows") == 0)
+    # B-FIX M-06: discovery writes empty_at_discovery / full_load_rows into the INDEX ENTRY
+    # (job1_discovery.py), NOT into config['metadata']; reading them from `meta` alone made
+    # _empty_at_discovery ALWAYS False, so a known-empty source with a non-empty target was
+    # misreported as an ambiguous "is the DMS folder correct?" error instead of a mismatch.
+    # Prefer the entry (authoritative), fall back to meta for forward-compat.
+    def _entry_or_meta(k):
+        v = entry.get(k) if isinstance(entry, dict) else None
+        return v if v is not None else meta.get(k)
+    _ead = _entry_or_meta("empty_at_discovery")
+    _flr_meta = _entry_or_meta("full_load_rows")
+    _empty_at_discovery = bool(_ead) or (_flr_meta == 0)
     _src_bucket, _src_prefix = split_s3(dms_s3_path) if dms_s3_path else ("", "")
     _source_present = bool(dms_s3_path) and s3_prefix_has_objects(s3, _src_bucket, _src_prefix)
     if not _source_present:
@@ -1643,7 +1739,12 @@ def validate_one_table(s3, entry):
             timings.append((res[0], dt_s))
         sizer.observe(res[0], dt_s)   # keep converging for later tables sharing this process
 
-    parallelism = _default_parallelism()
+    # B-FIX M-10: _default_parallelism() is the task's DSQL connection budget, but up to
+    # MAX_PARALLEL_TABLES tables run concurrently, each opening its OWN per-range pool. Clamping
+    # per table only means peak connections ~= MAX_PARALLEL_TABLES x parallelism, breaking the
+    # "budget shared across the task" invariant. Divide the budget across the tables that can
+    # run at once so the TOTAL concurrent DSQL connections stay within the budget.
+    parallelism = max(1, _default_parallelism() // max(1, MAX_PARALLEL_TABLES))
     with ThreadPoolExecutor(max_workers=max(1, parallelism),
                             thread_name_prefix="vquery") as pool:
         for f in as_completed([pool.submit(_one, (i, rg)) for i, rg in enumerate(ranges)]):
@@ -1699,11 +1800,28 @@ def validate_one_table(s3, entry):
             _dms = make_boto_client('dms')
         except Exception:
             _dms = None
-        _folder_schema = meta.get('dms_folder_schema') or meta.get('source_schema') or dsql_schema
-        _folder_table = meta.get('dms_folder_table') or meta.get('source_table') or dsql_table
+        # B-FIX M-09: discovery records the authoritative DMS folder names as dms_schema /
+        # dms_table (config['metadata'] and the index entry). The old keys
+        # dms_folder_schema / source_schema / source_table do not exist in metadata, so this
+        # fell straight through to dsql_* and silently failed to match whenever the DSQL name
+        # differs from the lowercased source name (reserved-word suffix, char remap, DMS table
+        # rename) -> G10 became a no-op with no note. Prefer the real DMS names, then the entry,
+        # then dsql_* as a last resort.
+        _folder_schema = (meta.get('dms_schema') or (entry.get('dms_schema') if isinstance(entry, dict) else None)
+                          or meta.get('dms_folder_schema') or meta.get('source_schema') or dsql_schema)
+        _folder_table = (meta.get('dms_table') or (entry.get('dms_table') if isinstance(entry, dict) else None)
+                         or meta.get('dms_folder_table') or meta.get('source_table') or dsql_table)
         _flr = dms_full_load_rows_for(_dms, DMS_TASK_ARN, _folder_schema, _folder_table)
         _ok10, _delta10, _exp10, _why10 = guard_count_vs_dms(
             tgt_total, _flr, inserts=0, deletes=0, tolerance=COUNT_MISMATCH_TOLERANCE)
+        if _flr is None:
+            # B-FIX M-09: make a skipped G10 VISIBLE instead of a silent no-op, so the operator
+            # can tell "checked and OK" apart from "could not look up FullLoadRows".
+            notes.append(f"G10 DMS FullLoadRows check SKIPPED: no FullLoadRows for DMS folder "
+                         f"{_folder_schema}.{_folder_table} (table not reported by DMS, name "
+                         f"mismatch, or DMS unavailable); fell back to the S3-vs-DSQL compare")
+            print(f"    ⚠️  G10 [{label}]: no DMS FullLoadRows for {_folder_schema}.{_folder_table}; "
+                  f"G10 cross-check skipped (S3-vs-DSQL compare still applied)")
         if _flr is not None:
             notes.append(f"G10 DMS FullLoadRows check: DSQL={tgt_total:,} vs FullLoadRows="
                          f"{_flr:,} ({'OK' if _ok10 else 'MISMATCH'})")
