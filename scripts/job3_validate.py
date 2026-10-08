@@ -1739,12 +1739,17 @@ def validate_one_table(s3, entry):
             timings.append((res[0], dt_s))
         sizer.observe(res[0], dt_s)   # keep converging for later tables sharing this process
 
-    # B-FIX M-10: _default_parallelism() is the task's DSQL connection budget, but up to
-    # MAX_PARALLEL_TABLES tables run concurrently, each opening its OWN per-range pool. Clamping
-    # per table only means peak connections ~= MAX_PARALLEL_TABLES x parallelism, breaking the
-    # "budget shared across the task" invariant. Divide the budget across the tables that can
-    # run at once so the TOTAL concurrent DSQL connections stay within the budget.
-    parallelism = max(1, _default_parallelism() // max(1, MAX_PARALLEL_TABLES))
+    # Per-table parallelism:
+    #   * EXPLICIT validate_parallelism (>0, VALIDATE_PARALLELISM is not None): use that value
+    #     verbatim for EVERY table, with NO division by MAX_PARALLEL_TABLES. The operator asked
+    #     for exactly that many concurrent per-range queries per table; honour it as given.
+    #   * AUTO (0/blank, VALIDATE_PARALLELISM is None): size from the Glue worker budget and
+    #     divide it across the up-to-MAX_PARALLEL_TABLES tables that can run at once, so the
+    #     TOTAL concurrent DSQL connections stay within the task's connection budget.
+    if VALIDATE_PARALLELISM is not None:
+        parallelism = max(1, _default_parallelism())
+    else:
+        parallelism = max(1, _default_parallelism() // max(1, MAX_PARALLEL_TABLES))
     with ThreadPoolExecutor(max_workers=max(1, parallelism),
                             thread_name_prefix="vquery") as pool:
         for f in as_completed([pool.submit(_one, (i, rg)) for i, rg in enumerate(ranges)]):

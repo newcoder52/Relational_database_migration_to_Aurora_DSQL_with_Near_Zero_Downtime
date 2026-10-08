@@ -49,7 +49,7 @@ the generated `pipeline.json` share `config/` by design, so there is no second-c
 | `task_arn` | required. The DMS task ARN |
 | `task_suffix` | optional. Leave blank to use the folder the pipeline would pick anyway: the one recorded for this task (a renamed DMS task keeps its first folder), else the DMS task name. Set it only for a task you also start by hand with a `taskSuffix` |
 | `adopt_existing_folder` | optional, startup only. `true` for a task whose folder holds files from an earlier run but no owner record |
-| `override` | optional. `true` to pass `{"override": true}` to this task's child execution (accept a validation failure at startup / a validation gate or startup-override marker at cutover). **Blank = false.** An unknown extra column is ignored, never rejected |
+| `override` | optional. `true` to pass `{"override": true}` to this task's child execution — a **full bypass** of load **and** validation failures at startup, and of the validation gates / startup-override marker at cutover. **Blank = false.** An unknown extra column is ignored, never rejected |
 
 Each task's table list is built automatically from the DMS task after its full load, so there is
 nothing to upload. To load fewer tables, change the DMS task's selection rules.
@@ -62,10 +62,15 @@ nothing to upload. To load fewer tables, change the DMS task's selection rules.
 
 **Runtime override.** Add a top-level `"override": true` to the start input to turn override on
 for **every** task in the CSV; or set the per-task `override` column to `true` for just some rows.
-Fleet-level and per-task are OR'd. Override covers **validation only** — a load failure
-still stops a task, and a run without override is byte-identical to before. A startup that used
-override makes that task's later cutover refuse unless the cutover is also started with override.
-See the RUNBOOK, "Validation failed — re-run with override".
+Fleet-level and per-task are OR'd. Override is a **FULL BYPASS**: with override on, a task whose
+**load** failed (for any reason — a data error such as a bad cast/duplicate key, or an infra
+failure such as a timeout/ENI shortage/crash) **and** a task whose **validation** failed both
+continue to CDC and end in `TaskSucceededWithOverride`. The bypassed groups/tables and their
+failure details (including the `data_error` vs `infra` kind) are recorded as **warnings** in the
+override record and the run output. A run without override is byte-identical to before (a load or
+validation failure stops the task). A startup that used override makes that task's later cutover
+**proceed with a warning** if the cutover is started without override (it no longer refuses).
+See the RUNBOOK, "Validation or load failed — re-run with override".
 
 ```json
 { "bucket": "<pipeline bucket>", "override": true }

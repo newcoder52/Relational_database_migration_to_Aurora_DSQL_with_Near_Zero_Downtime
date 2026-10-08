@@ -451,12 +451,24 @@ def parse(text):
                          ("cdc_file_order_action", ("warn", "block")),
                          ("cdc_nopk_overmatch_action", ("warn", "block")),
                          ("validate_count_check", ("warn", "strict")),
-                         ("cutover_count_check", ("warn", "strict")),
-                         ("validate_hash", ("all", "keys", "off"))):
+                         ("cutover_count_check", ("warn", "strict"))):
         if _k in raw:
             _v = str(raw[_k]).strip().lower()
             if _v not in _allowed:
                 errors.append(f"{_k} must be one of {_allowed} (got {raw[_k]!r}).")
+    # validate_hash is NOT a hard error: an invalid value must never fail the fleet start.
+    # Warn and fall back to the default ('all') so the pipeline runs with a safe scope. (This
+    # restores the pre-M-19 behaviour: validate_hash is a validation-only throughput/scope knob;
+    # a typo should not block the whole migration.)
+    _vh_allowed = ("all", "keys", "off")
+    if "validate_hash" in raw:
+        _vh = str(raw["validate_hash"]).strip().lower()
+        if _vh not in _vh_allowed:
+            _vh_default = OPTIONAL_DEFAULTS["validate_hash"]
+            warnings.append(
+                f"validate_hash {raw['validate_hash']!r} is not one of {_vh_allowed}; "
+                f"falling back to the default {_vh_default!r}.")
+            raw["validate_hash"] = _vh_default
     # min_writers_per_loader <= max_writers_per_loader (only when both parsed cleanly).
     if "min_writers_per_loader" in ints and "max_writers_per_loader" in ints:
         if ints["min_writers_per_loader"] > ints["max_writers_per_loader"]:

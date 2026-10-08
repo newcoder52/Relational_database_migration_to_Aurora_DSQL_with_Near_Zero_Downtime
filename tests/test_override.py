@@ -5,24 +5,32 @@ Spark, no network). Run: python3 tests/test_override.py   (REPO_DIR overridable)
 What this covers (the override spec):
 
 STARTUP (stepfunctions/startup.asl.json + resolve_task):
-  * override=false (absent/false) + a validate_failed group  -> GroupsFailed (UNCHANGED).
+  * override=false (absent/false) + a load OR validate failed group -> GroupsFailed (UNCHANGED).
   * override=true  + a validate_failed group                 -> TaskSucceededWithOverride,
                                                                 with CDC started (ResumeDmsToCdc
                                                                 -> StartCdcJob on the path).
-  * override=true  + a LOAD failure                          -> STILL GroupsFailed (override
-                                                                covers validation only).
+  * override=true  + a LOAD failure (data_error OR infra)     -> ALSO continues: override is a
+                                                                FULL BYPASS of load AND validation
+                                                                failures (MarkOverrideActive ->
+                                                                CDC -> TaskSucceededWithOverride).
+                                                                job2_load records the failure kind
+                                                                (data_error vs infra) in
+                                                                _load_status.json so the override
+                                                                record's warnings can name it.
   * resolve_task normalizes $.override once (bool / "true"/"1"/"yes", any case) into
-    resolved.override; the overridden groups+tables and the validation report paths appear in
-    the TaskSucceededWithOverride override record; the record + stable startup-override marker
-    are written to config/_task/<suffix>/_overrides/.
+    resolved.override; the overridden groups+tables, the validation report paths and the
+    per-table load-failure WARNINGS appear in the TaskSucceededWithOverride override record; the
+    record + stable startup-override marker are written to config/_task/<suffix>/_overrides/.
   * A re-run with override does NOT reload tables already marked "done" (job2_load skips them
     from _load_status.json regardless of override).
 
 CUTOVER (stepfunctions/cutover.asl.json):
   * CdcValidationPreGate / CdcValidationFinalGate are BYPASSED (logged) with override=true and
     REFUSE (CdcValidationFailed) without it.
-  * The startup-override marker forces override at cutover: startupOverrideUsed=true +
-    override!=true -> StartupOverrideRequiresOverride ("pass override=true to accept").
+  * The startup-override marker NO LONGER forces override at cutover: startupOverrideUsed=true +
+    override!=true -> LogStartupOverrideWarning (a Pass) -> the cutover PROCEEDS with a warning
+    (resolve_task also appends the warning to $.resolved.warnings). The refusal state
+    StartupOverrideRequiresOverride is removed.
   * The safety ordering (DMS stop -> drain -> stop CDC runs -> delete jobs) is never bypassed.
 
 FLEET: preflight_tasks adds {"override": true} to each child input from a fleet-level
@@ -220,12 +228,38 @@ def test_startup_override_true_validate_failed_resumes_and_succeeds_with_overrid
           f"WriteStartupOverrideRecord -> TaskSucceededWithOverride [{end}]")
 
 
-def test_startup_override_true_load_failed_still_fails():
+def test_startup_override_true_load_failed_continues():
     sm = _startup()
-    term, _ = walk(sm, "AllGroupsSucceeded", _startup_input(True, True, True),
+    # override is a FULL BYPASS now: a LOAD failure with override=true continues (MarkOverrideActive
+    # -> ResumeDmsToCdc -> CDC -> TaskSucceededWithOverride), exactly like a validation failure.
+    term, _ = walk(sm, "AllGroupsSucceeded", _startup_input(True, False, True),
                    stop_at={"GroupsFailed", "MarkOverrideActive", "MarkOverrideInactive"})
-    check(term == "GroupsFailed",
-          f"startup override=true + LOAD failed -> STILL GroupsFailed (validation-only) [{term}]")
+    check(term == "MarkOverrideActive",
+          f"override=true + LOAD failed -> MarkOverrideActive (full bypass) [{term}]")
+    # LOAD failure + validation failure together, override=true -> still a full bypass.
+    term2, _ = walk(sm, "AllGroupsSucceeded", _startup_input(True, True, True),
+                    stop_at={"GroupsFailed", "MarkOverrideActive", "MarkOverrideInactive"})
+    check(term2 == "MarkOverrideActive",
+          f"override=true + LOAD+validation failed -> MarkOverrideActive (full bypass) [{term2}]")
+    # The override path resumes DMS then starts CDC (same as the validation-only override path).
+    _term, visited = walk(sm, "MarkOverrideActive", _startup_input(True, False, True),
+                          stop_at={"StartCdcJob"})
+    check("ResumeDmsToCdc" in visited and _term == "StartCdcJob",
+          f"override load-failure path resumes DMS then starts CDC [{_term}]")
+
+
+def test_startup_no_override_load_or_validate_failed_stops_unchanged():
+    sm = _startup()
+    # No override: a LOAD failure stops at GroupsFailed (byte-identical to before).
+    t_load, _ = walk(sm, "AllGroupsSucceeded", _startup_input(True, False, False),
+                     stop_at={"GroupsFailed", "MarkOverrideActive", "MarkOverrideInactive"})
+    check(t_load == "GroupsFailed",
+          f"no override + LOAD failed -> GroupsFailed (unchanged) [{t_load}]")
+    # No override: a VALIDATION failure stops at GroupsFailed (byte-identical to before).
+    t_val, _ = walk(sm, "AllGroupsSucceeded", _startup_input(False, True, False),
+                    stop_at={"GroupsFailed", "MarkOverrideActive", "MarkOverrideInactive"})
+    check(t_val == "GroupsFailed",
+          f"no override + validation failed -> GroupsFailed (unchanged) [{t_val}]")
 
 
 def test_startup_no_failure_normal_terminal_unchanged():
@@ -252,26 +286,61 @@ def _cutover_data(override=False, startup_override_used=False, pre_ok=True, fina
     }
 
 
-def test_cutover_startup_override_marker_forces_override():
+def test_cutover_startup_override_marker_proceeds_with_warning():
     sm = _cutover()
-    term, _ = walk(sm, "StartupOverrideGate",
-                   _cutover_data(override=False, startup_override_used=True),
-                   stop_at={"StartupOverrideRequiresOverride", "CdcValidationPreCheck"})
-    check(term == "StartupOverrideRequiresOverride",
-          f"startup-override marker + no cutover override -> refuse [{term}]")
-    msg = sm["States"]["StartupOverrideRequiresOverride"]["Cause"]
-    check("override" in msg and "true" in msg,
-          "refusal message tells the operator to pass override=true to accept")
-    term2, _ = walk(sm, "StartupOverrideGate",
-                    _cutover_data(override=True, startup_override_used=True),
-                    stop_at={"StartupOverrideRequiresOverride", "CdcValidationPreCheck"})
-    check(term2 == "CdcValidationPreCheck",
-          f"startup-override marker + cutover override=true -> proceed [{term2}]")
+    # The refusal state is GONE: a startup override no longer forces cutover override.
+    check("StartupOverrideRequiresOverride" not in sm["States"],
+          "T5 UNDO: the StartupOverrideRequiresOverride refusal state is removed")
+    # startup-override marker + NO cutover override -> PROCEED, via the warning Pass, to the
+    # normal pre-DMS-stop validation gate (not a refusal).
+    term, visited = walk(sm, "StartupOverrideGate",
+                         _cutover_data(override=False, startup_override_used=True),
+                         stop_at={"CdcValidationPreCheck"})
+    check("LogStartupOverrideWarning" in visited and term == "CdcValidationPreCheck",
+          f"T5 UNDO: startup-override marker + no cutover override -> warn then PROCEED "
+          f"to CdcValidationPreCheck [{term}, visited={visited}]")
+    warn_state = sm["States"]["LogStartupOverrideWarning"]
+    check(warn_state["Type"] == "Pass" and warn_state["Next"] == "CdcValidationPreCheck",
+          "T5 UNDO: LogStartupOverrideWarning is a Pass that continues to CdcValidationPreCheck")
+    check("override" in warn_state["Parameters"]["warning"].lower()
+          and "proceed" in warn_state["Parameters"]["warning"].lower(),
+          "T5 UNDO: the warning says the cutover proceeds despite the startup override")
+    # startup-override marker + cutover override=true -> straight to the gate (unchanged).
+    term2, visited2 = walk(sm, "StartupOverrideGate",
+                           _cutover_data(override=True, startup_override_used=True),
+                           stop_at={"LogStartupOverrideWarning", "CdcValidationPreCheck"})
+    check(term2 == "CdcValidationPreCheck" and "LogStartupOverrideWarning" not in visited2,
+          f"T5 UNDO: startup-override marker + cutover override=true -> proceed, no warning "
+          f"detour [{term2}]")
+    # no startup override -> cutover proceeds (unchanged).
     term3, _ = walk(sm, "StartupOverrideGate",
                     _cutover_data(override=False, startup_override_used=False),
-                    stop_at={"StartupOverrideRequiresOverride", "CdcValidationPreCheck"})
+                    stop_at={"LogStartupOverrideWarning", "CdcValidationPreCheck"})
     check(term3 == "CdcValidationPreCheck",
-          f"no startup override -> cutover proceeds (unchanged) [{term3}]")
+          f"T5 UNDO: no startup override -> cutover proceeds (unchanged) [{term3}]")
+
+
+def test_cutover_startup_override_warning_names_record_and_tables():
+    """resolve_task (cutover mode) appends a warning naming the startup-override record and the
+    overridden tables when a startup override is present but cutover has no override. The
+    warning flows out in $.resolved.warnings (the cutover output)."""
+    rt = _load_resolve_task()
+    marker = {
+        "startupOverride": True,
+        "overriddenTables": ["sales.orders", "sales.customers"],
+        "lastRecordKey": "config/_task/orders-cdc/_overrides/run-7.json",
+    }
+    w = rt._startup_override_cutover_warning("mybucket", "orders-cdc", marker)
+    check("sales.orders" in w and "sales.customers" in w,
+          f"cutover startup-override warning names the overridden tables [{w}]")
+    check("config/_task/orders-cdc/_overrides/run-7.json" in w,
+          "cutover startup-override warning names the startup-override record key")
+    check("proceeding WITHOUT override" in w,
+          "cutover startup-override warning says the cutover proceeds without override")
+    # A marker with no table list / no record key still yields a usable warning (no crash).
+    w2 = rt._startup_override_cutover_warning("mybucket", "t", {})
+    check("(see record)" in w2 and "config/_task/t/_overrides/_startup_override.json" in w2,
+          f"warning degrades gracefully with an empty marker [{w2}]")
 
 
 def test_cutover_pre_validation_gate_bypass_and_refuse():
@@ -347,19 +416,33 @@ def test_normalize_override_accepts_bool_and_strings():
 
 
 class _FakeS3Rec:
-    def __init__(self):
+    def __init__(self, preset=None):
         self.puts = {}
+        # preset: {key: json-serializable} returned by get_object; absent keys raise NoSuchKey.
+        self._preset = {k: json.dumps(v).encode("utf-8") for k, v in (preset or {}).items()}
 
     def put_object(self, Bucket=None, Key=None, Body=None, **k):
         self.puts[Key] = Body
 
     def get_object(self, Bucket=None, Key=None):
+        if Key in self._preset:
+            import io
+            return {"Body": io.BytesIO(self._preset[Key])}
         raise Exception("NoSuchKey")
 
 
 def test_write_override_record_writes_record_and_startup_marker():
     rt = _load_resolve_task()
-    s3 = _FakeS3Rec()
+    # Group 1 validate_failed; group 2 LOAD failed with one data_error table and one infra table.
+    g2_status_key = "config/_task/orders-cdc/g2/_load_status.json"
+    s3 = _FakeS3Rec(preset={
+        g2_status_key: {"tables": {
+            "s.d": {"status": "failed", "kind": "data_error",
+                    "data_error": {"table": "s.d", "column": "id", "file": "LOAD001.csv",
+                                   "reason": "invalid input syntax for type uuid"}},
+            "s.e": {"status": "failed", "kind": "infra", "error": "ENI capacity exceeded"},
+        }},
+    })
     rt.boto3.client = lambda *a, **k: s3
     event = {
         "mode": "write_override_record", "bucket": "b", "taskSuffix": "orders-cdc",
@@ -369,16 +452,25 @@ def test_write_override_record_writes_record_and_startup_marker():
         "planGroups": [
             {"group_index": 0, "config_prefix": "s3://b/config/_task/orders-cdc/g0", "tables": ["s.a"]},
             {"group_index": 1, "config_prefix": "s3://b/config/_task/orders-cdc/g1", "tables": ["s.b", "s.c"]},
+            {"group_index": 2, "config_prefix": "s3://b/config/_task/orders-cdc/g2", "tables": ["s.d", "s.e"]},
         ],
-        "groupStatuses": ["ok", "validate_failed"],
+        "groupStatuses": ["ok", "validate_failed", "failed"],
     }
     out = rt.handler_write_override_record(event, None)
-    check(out["overriddenGroups"] == [1],
-          f"record lists only the validate_failed group [{out['overriddenGroups']}]")
-    check(out["overriddenTables"] == ["s.b", "s.c"],
-          f"record lists the overridden group's tables [{out['overriddenTables']}]")
+    check(out["overriddenGroups"] == [1, 2],
+          f"record lists BOTH the validate_failed and the load-failed group [{out['overriddenGroups']}]")
+    check(out["overriddenTables"] == ["s.b", "s.c", "s.d", "s.e"],
+          f"record lists every overridden group's tables [{out['overriddenTables']}]")
     check(out["validationReportPaths"] == ["s3://b/config/_task/orders-cdc/g1/_validation_report.json"],
-          "record lists the overridden group's validation report path")
+          "record lists the validate_failed group's validation report path")
+    # Full-bypass warnings: a per-table load-failure warning naming the kind + detail.
+    wtext = " || ".join(out["warnings"])
+    check(any("data_error" in w and "s.d" in w for w in out["warnings"]),
+          f"override record warns about the data_error load failure, naming the table [{wtext}]")
+    check(any("invalid input syntax for type uuid" in w for w in out["warnings"]),
+          "the data_error warning carries the recorded reason")
+    check(any("infra" in w and "s.e" in w for w in out["warnings"]),
+          f"override record warns about the infra load failure, naming the table [{wtext}]")
     rec_key = "config/_task/orders-cdc/_overrides/run-7.json"
     marker_key = "config/_task/orders-cdc/_overrides/_startup_override.json"
     check(rec_key in s3.puts, "per-execution override record written under _overrides/<exec>.json")
@@ -387,6 +479,8 @@ def test_write_override_record_writes_record_and_startup_marker():
     rec = json.loads(s3.puts[rec_key])
     check(rec["who"] == event["execution"] and rec["workflow"] == "startup",
           "record carries who (execution ARN), when, workflow")
+    check(rec.get("warnings") == out["warnings"] and len(rec["warnings"]) >= 3,
+          "the override record persists the full-bypass warnings")
     marker = json.loads(s3.puts[marker_key])
     check("reason" not in rec and "reason" not in marker and "reason" not in out,
           "override record / marker / return carry NO reason field")
@@ -426,6 +520,60 @@ def test_job2_load_skips_done_tables_regardless_of_override():
     blk = src[src.index("if label in done_before:"): src.index("if label in done_before:") + 400]
     check("override" not in blk.lower(),
           "the done-skip block has no override branch (unconditional skip)")
+
+
+def _load_classify_load_error():
+    """AST-extract job2_load.classify_load_error and exec it offline (no pyspark/Glue)."""
+    import ast
+    src = open(os.path.join(SCRIPTS, "job2_load.py")).read()
+    tree = ast.parse(src)
+    seg = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "classify_load_error":
+            seg = ast.get_source_segment(src, node)
+            break
+    if seg is None:
+        raise AssertionError("classify_load_error not found in job2_load.py")
+    ns = {"re": re}
+    exec(compile(seg, "<job2:classify_load_error>", "exec"), ns)
+    return ns["classify_load_error"]
+
+
+def test_job2_classify_load_error_data_vs_infra():
+    classify = _load_classify_load_error()
+    # Every DATA error kind the spec lists classifies as data_error (recording only).
+    data_cases = {
+        "row-split": "ROW-SPLIT GUARD (D1 expected-count) [s.t]: Spark parsed 11 rows but ...",
+        "bad uuid (guard)": "UUID GUARD [s.t]: column 'id' holds a non-uuid value 'xyz' ...",
+        "bad cast (22P02)": 'ERROR: invalid input syntax for type uuid: "nope" (SQLSTATE 22P02)',
+        "not null (23502)": "null value in column \"name\" violates not-null constraint (23502)",
+        "too long (22001)": "ERROR: value too long for type character varying(10) (SQLSTATE 22001)",
+        "length guard": "LENGTH GUARD [s.t]: column 'descr' value length 300 exceeds target varchar(255)",
+        "dup pk (23505)": "duplicate key value violates unique constraint \"t_pkey\" (SQLSTATE 23505)",
+        "malformed csv": "malformed CSV: embedded newline caused column misalignment in LOAD003.csv",
+    }
+    for name, err in data_cases.items():
+        out = classify(err, "s.t")
+        check(out.get("kind") == "data_error",
+              f"classify: {name} -> data_error (got {out.get('kind')!r})")
+        check(isinstance(out.get("data_error"), dict) and out["data_error"].get("reason"),
+              f"classify: {name} data_error carries a reason")
+    # column/file best-effort extraction.
+    c = classify("UUID GUARD [s.t]: column 'id' is not a uuid; file LOAD001.csv", "s.t")
+    check(c["data_error"].get("column") == "id", "classify extracts the column name")
+    check(c["data_error"].get("file") == "LOAD001.csv", "classify extracts the CSV file name")
+    # INFRA / unknown kinds -> infra.
+    infra_cases = [
+        "Could not connect to Aurora DSQL on any candidate hostname [...]",
+        "ENI capacity exceeded; no IP addresses available",
+        "worker crashed: OutOfMemoryError",
+        "Glue job timed out after 2880 minutes",
+        "some totally unrecognized failure with no signature",
+    ]
+    for err in infra_cases:
+        out = classify(err, "s.t")
+        check(out.get("kind") == "infra", f"classify: infra/unknown -> infra [{err[:40]}...]")
+        check("data_error" not in out, "classify: infra rows carry no data_error block")
 
 
 # =============================================================================================

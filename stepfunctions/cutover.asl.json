@@ -88,7 +88,7 @@
     },
     "StartupOverrideGate": {
       "Type": "Choice",
-      "Comment": "If this task's STARTUP was finished with override=true (the startup-override marker is present -> $.resolved.startupOverrideUsed), its data was accepted past a validation failure. Refuse the cutover UNLESS it, too, was started with override=true, so unvalidated data can never be cut over silently. Both reads are IsPresent-guarded (older resolve_task that returns neither -> behaves as no startup override, so cutover proceeds as before). Otherwise continue to the normal pre-DMS-stop validation gate.",
+      "Comment": "If this task's STARTUP was finished with override=true (the startup-override marker is present -> $.resolved.startupOverrideUsed), its data was accepted past a load/validation failure. The cutover no longer REFUSES in that case: an operator who started the task with override has already accepted shared responsibility for its data, so a cutover started WITHOUT override still PROCEEDS — it just logs a warning (LogStartupOverrideWarning) naming the startup-override record and the overridden tables, and that warning is carried in the cutover output ($.resolved.warnings, added by resolve_task). A cutover started WITH override goes straight to the normal pre-DMS-stop validation gate. Both reads are IsPresent-guarded (older resolve_task that returns neither -> behaves as no startup override). The safety ordering (DMS stop -> drain -> stop CDC runs -> delete jobs) below is unchanged on every path.",
       "Choices": [
         {
           "And": [
@@ -113,15 +113,20 @@
               ]
             }
           ],
-          "Next": "StartupOverrideRequiresOverride"
+          "Next": "LogStartupOverrideWarning"
         }
       ],
       "Default": "CdcValidationPreCheck"
     },
-    "StartupOverrideRequiresOverride": {
-      "Type": "Fail",
-      "Error": "StartupOverrideRequiresOverride",
-      "Cause": "This task's startup was completed WITH override=true (its data was accepted past a validation failure; see config/_task/<suffix>/_overrides/). Cutting it over would move unvalidated data, so this cutover refuses. If you have reviewed the overridden validation result and accept it, start a NEW cutover execution with input {\"taskArn\": \"...\", \"override\": true} to accept it. Nothing was touched: DMS is still running and CDC is still running."
+    "LogStartupOverrideWarning": {
+      "Type": "Pass",
+      "Comment": "This task's startup was completed WITH override=true (its data was accepted past a load/validation failure; see config/_task/<suffix>/_overrides/) but this cutover was NOT started with override. The cutover PROCEEDS anyway (the startup override already accepted shared responsibility for the data) and records a warning naming the startup-override record and the overridden tables. resolve_task already appended the same warning to $.resolved.warnings (the cutover output); this Pass records it on the execution for the history. Nothing is bypassed: the normal pre-DMS-stop validation gate and the full safety ordering still run.",
+      "Parameters": {
+        "warning": "This task's startup used override=true; its data was accepted past a load/validation failure. This cutover was started WITHOUT override and PROCEEDS with a warning. See the startup-override record under config/_task/<suffix>/_overrides/ and $.resolved.warnings for the overridden tables.",
+        "startupOverrideUsed": true
+      },
+      "ResultPath": "$.startupOverrideWarning",
+      "Next": "CdcValidationPreCheck"
     },
     "CdcValidationPreCheck": {
       "Type": "Task",
@@ -864,7 +869,7 @@
           "executionName.$": "$$.Execution.Name",
           "bypassedGates": [
             "CdcValidationFailed (pre/final, if any)",
-            "StartupOverrideRequiresOverride (if startup used override)",
+            "startup-override accepted (if startup used override)",
             "cutover count check (validation gate)"
           ]
         }

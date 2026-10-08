@@ -5320,6 +5320,89 @@ def run_one_table(item):
         return (label, None, str(e), log)
 
 
+def classify_load_error(error, label):
+    """Classify a per-table LOAD failure into a durable kind written to _load_status.json:
+
+        {"kind": "data_error", "data_error": {table, column, file, reason}}   or   {"kind": "infra"}
+
+    A DATA error is a problem with the SOURCE DATA (or the CSV encoding of it) that re-running
+    cannot fix without a data/schema change: a malformed CSV / row-split, a value not castable to
+    the column type (bad uuid / wrong datatype), a NULL into a NOT NULL column, a value too long
+    for the column, a duplicate primary key, or any of the pre-write _guard_row violations
+    (BINARY/UUID/LENGTH/LOB GUARD) and the strict row-split guard. Everything else — a connection
+    drop, a throttle, an OOM/crash, an ENI/IP shortage, a timeout, or an UNKNOWN failure with no
+    recognizable signature — is "infra".
+
+    This is RECORDED ONLY. The runtime override is a full bypass and does NOT act on the kind; the
+    classification feeds the override record's warnings now, and a future (separate) auto-recovery
+    feature later. The default (no-override) path is unaffected — this only enriches the status
+    row that was already written on failure.
+    """
+    msg = str(error or "")
+    low = msg.lower()
+    schema, _, table = label.partition(".")
+
+    def _grab(pattern, src=msg, group=1):
+        m = re.search(pattern, src)
+        return m.group(group) if m else None
+
+    # ---- pre-write guard violations (job2_load raises these with a stable UPPER-CASE prefix) --
+    #   "UUID GUARD [schema.table]: column 'c' ..."   /  LENGTH GUARD / BINARY GUARD / LOB ... GUARD
+    #   "ROW-SPLIT GUARD (D1 ...) [schema.table]: ..."
+    guard = None
+    if "ROW-SPLIT GUARD" in msg:
+        guard = "row-split"
+    elif "UUID GUARD" in msg:
+        guard = "uuid"
+    elif "LENGTH GUARD" in msg:
+        guard = "length"
+    elif "BINARY GUARD" in msg:
+        guard = "binary"
+    elif "LOB" in msg and "GUARD" in msg:
+        guard = "lob"
+    # ---- DSQL / PostgreSQL SQLSTATEs + message signatures ---------------------------------------
+    #   23505 unique_violation (duplicate PK), 23502 not_null_violation, 22001 string_data_right_
+    #   truncation (value too long), 22P02 invalid_text_representation (bad cast / invalid uuid).
+    is_dup_pk = ("23505" in low or "unique_violation" in low
+                 or "duplicate key value violates unique constraint" in low
+                 or "violates unique constraint" in low)
+    is_not_null = ("23502" in low or "not-null constraint" in low
+                   or "not null constraint" in low or "null value in column" in low)
+    is_too_long = ("22001" in low or "value too long" in low
+                   or "string_data_right_truncation" in low)
+    is_bad_cast = ("22p02" in low or "invalid input syntax" in low
+                   or "invalid text representation" in low)
+    is_malformed = ("malformed" in low or "row-split" in low
+                    or ("csv" in low and ("column misalignment" in low or "embedded newline" in low)))
+
+    if guard or is_dup_pk or is_not_null or is_too_long or is_bad_cast or is_malformed:
+        if guard == "row-split" or is_malformed:
+            reason = "malformed CSV / row-split (fabricated or dropped rows)"
+        elif is_dup_pk:
+            reason = "duplicate primary key (SQLSTATE 23505)"
+        elif is_not_null or guard == "binary":
+            reason = ("NULL into a NOT NULL column (SQLSTATE 23502)" if is_not_null
+                      else "non-hexadecimal binary value")
+        elif is_too_long or guard == "length":
+            reason = "value too long for the target column (SQLSTATE 22001 / length guard)"
+        elif is_bad_cast or guard == "uuid":
+            reason = "value not castable to the column type (bad uuid / wrong datatype, SQLSTATE 22P02)"
+        elif guard == "lob":
+            reason = "value exceeds the DSQL column byte limit (LOB guard)"
+        else:
+            reason = msg[:300]
+        # Best-effort column + file extraction from the message.
+        column = (_grab(r"column ['\"]([^'\"]+)['\"]")
+                  or _grab(r'column "([^"]+)"')
+                  or _grab(r"column ([A-Za-z0-9_]+)"))
+        file = (_grab(r"\b([0-9A-Za-z._-]+\.csv)\b")
+                or _grab(r"file[=: ]+([^\s,;]+)"))
+        return {"kind": "data_error",
+                "data_error": {"table": label, "column": column, "file": file,
+                               "reason": reason}}
+    return {"kind": "infra"}
+
+
 def record_outcome(label, result, error):
     """Serialize all shared-state mutation + the status S3 write under one lock."""
     global total_rows_all
@@ -5331,8 +5414,17 @@ def record_outcome(label, result, error):
                                        "at": utc_now_iso()}
         else:
             failed.append({"table": label, "error": error})
-            status["tables"][label] = {"status": "failed", "error": error,
-                                       "at": utc_now_iso()}
+            # Classify the failure kind (data_error vs infra) and record it on the status row
+            # BEFORE it is persisted, so the override record / future auto-recovery can read it.
+            # Recording-only: it does not change this job's exit (it still fails below) nor the
+            # no-override pipeline behaviour.
+            row = {"status": "failed", "error": error, "at": utc_now_iso()}
+            try:
+                row.update(classify_load_error(error, label))
+            except Exception as _e:   # never let classification break the status write
+                row["kind"] = "infra"
+                print(f"  ⚠️ {label}: load-error classification failed (recorded as infra): {_e}")
+            status["tables"][label] = row
         # save_status is inside the lock on purpose: it rewrites the whole JSON file,
         # so two threads writing at once would race and lose an update.
         save_status(s3_client, status)

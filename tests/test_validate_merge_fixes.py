@@ -15,9 +15,12 @@ Fixes covered:
   M-05  target timestamp sum promotes to numeric before SUM (no double precision loss).
   M-06  empty_at_discovery / full_load_rows are read from the index ENTRY, not only metadata.
   M-09  G10 folder lookup prefers dms_schema/dms_table.
-  M-10  per-table parallelism is divided across MAX_PARALLEL_TABLES.
+  M-10  per-table parallelism: an EXPLICIT validate_parallelism (>0) is used verbatim per
+        table (no division); the auto path (0/blank) stays budget-based (divided across
+        MAX_PARALLEL_TABLES).
   M-18  count_mismatch_tolerance parses "0.5" without silently dropping to 0.
-  M-19  params_csv.parse enum-checks validate_hash.
+  M-19  params_csv.parse does NOT reject an invalid validate_hash: it warns and falls back to
+        the default, never failing the fleet start.
 
 Harness mirrors tests/test_b18_validate_throughput.py: ast-parse job3_validate.py and exec
 only the needed defs into a seeded namespace. Run: python3 tests/test_validate_merge_fixes.py
@@ -529,33 +532,48 @@ def test_m19_params_csv_validate_hash_enum():
     good = _base + "validate_hash,all\n"
     bad = _base + "validate_hash,hashall\n"
     # parse returns {"params","errors","warnings"}.
-    def _errs(txt):
+    def _result(txt):
         try:
             r = pc.parse(txt)
             if isinstance(r, dict):
-                return r.get("errors", [])
+                return r.get("errors", []), r.get("warnings", []), r.get("params", {})
             if isinstance(r, tuple):
-                return r[1]
-            return []
+                return (r[1], r[2] if len(r) > 2 else [], r[0] if r else {})
+            return [], [], {}
         except Exception as e:
-            return [str(e)]
-    eg = _errs(good)
-    eb = _errs(bad)
+            return [str(e)], [], {}
+    eg, wg, pg = _result(good)
+    eb, wb, pb = _result(bad)
     check(not any("validate_hash" in str(x) for x in eg),
-          "M-19 a valid validate_hash=all passes params_csv.parse")
-    check(any("validate_hash" in str(x) for x in eb),
-          f"M-19 an invalid validate_hash=hashall is rejected by params_csv.parse (errors={eb})")
+          "M-19 UNDO: a valid validate_hash=all passes params_csv.parse (no error)")
+    check(pg.get("validate_hash") == "all",
+          f"M-19 UNDO: a valid validate_hash is kept as-is (got {pg.get('validate_hash')!r})")
+    # The undo: an INVALID validate_hash must NOT fail the fleet start. It is warned about and
+    # falls back to the default, never pushed onto errors.
+    check(not any("validate_hash" in str(x) for x in eb),
+          f"M-19 UNDO: an invalid validate_hash is NOT rejected (errors={eb})")
+    check(any("validate_hash" in str(x) for x in wb),
+          f"M-19 UNDO: an invalid validate_hash is WARNED about (warnings={wb})")
+    check(pb.get("validate_hash") == pc.OPTIONAL_DEFAULTS["validate_hash"],
+          f"M-19 UNDO: an invalid validate_hash falls back to the default "
+          f"{pc.OPTIONAL_DEFAULTS['validate_hash']!r} (got {pb.get('validate_hash')!r})")
 
 
 # =============================================================================================
-# M-10: per-table parallelism divided across MAX_PARALLEL_TABLES. We assert the exact source
-# text wires the division (the behaviour runs inside validate_one_table which needs Spark).
+# M-10 (UNDO): an EXPLICIT validate_parallelism (>0) is used verbatim per table (no division);
+# the AUTO path (0/blank) stays budget-based (divided across MAX_PARALLEL_TABLES). We assert the
+# exact source text wires both branches (the behaviour runs inside validate_one_table, Spark).
 # =============================================================================================
 def test_m10_budget_divided_source():
     with open(os.path.join(REPO, "scripts", "job3_validate.py")) as fh:
         src = fh.read()
+    check("if VALIDATE_PARALLELISM is not None:" in src
+          and "parallelism = max(1, _default_parallelism())" in src,
+          "M-10 UNDO: an explicit validate_parallelism (>0) is used verbatim per table "
+          "(no division by MAX_PARALLEL_TABLES)")
     check("_default_parallelism() // max(1, MAX_PARALLEL_TABLES)" in src,
-          "M-10 per-table parallelism divides the budget by MAX_PARALLEL_TABLES")
+          "M-10 UNDO: the auto path (0/blank) still divides the budget across "
+          "MAX_PARALLEL_TABLES")
 
 
 # =============================================================================================

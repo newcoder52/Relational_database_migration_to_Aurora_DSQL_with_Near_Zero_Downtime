@@ -1037,18 +1037,21 @@
     },
     "AllGroupsSucceeded": {
       "Type": "Choice",
-      "Comment": "A LOAD failure always stops the run (override covers validation only). A validation-only failure stops at GroupsFailed UNLESS the run was started with override=true, in which case it continues (MarkOverrideActive -> ResumeDmsToCdc -> StartCdcJob) and ends in TaskSucceededWithOverride. The override comparison is IsPresent-guarded so the path audit passes and an older execution with no $.resolved.override behaves as the default (no override).",
+      "Comment": "override is a FULL BYPASS. A LOAD failure OR a validation failure stops the run at GroupsFailed UNLESS the run was started with override=true, in which case it continues (MarkOverrideActive -> ResumeDmsToCdc -> StartCdcJob) and ends in TaskSucceededWithOverride. There is NO data-error carve-out and NO DSQL-vs-DMS count check: an operator who passes override=true has manually accepted shared responsibility for the data; the bypassed groups/tables and their failure details (including the load failure kind — data_error vs infra — job2_load records in _load_status.json) are recorded as WARNINGS in the override record and the run output. The override comparison is IsPresent-guarded so the path audit passes and an older execution with no $.resolved.override behaves as the default (no override). Without override the behaviour is byte-identical: a load OR validation failure stops at GroupsFailed.",
       "Choices": [
-        {
-          "Variable": "$.groupCheck.anyLoadFailed",
-          "BooleanEquals": true,
-          "Next": "GroupsFailed"
-        },
         {
           "And": [
             {
-              "Variable": "$.groupCheck.anyValidateFailed",
-              "BooleanEquals": true
+              "Or": [
+                {
+                  "Variable": "$.groupCheck.anyLoadFailed",
+                  "BooleanEquals": true
+                },
+                {
+                  "Variable": "$.groupCheck.anyValidateFailed",
+                  "BooleanEquals": true
+                }
+              ]
             },
             {
               "Variable": "$.resolved.override",
@@ -1062,6 +1065,11 @@
           "Next": "MarkOverrideActive"
         },
         {
+          "Variable": "$.groupCheck.anyLoadFailed",
+          "BooleanEquals": true,
+          "Next": "GroupsFailed"
+        },
+        {
           "Variable": "$.groupCheck.anyValidateFailed",
           "BooleanEquals": true,
           "Next": "GroupsFailed"
@@ -1071,7 +1079,7 @@
     },
     "MarkOverrideActive": {
       "Type": "Pass",
-      "Comment": "Validation failed but override=true: carry overrideActive=true so the terminal routes to TaskSucceededWithOverride (which writes the override record). DMS is resumed and CDC starts as on the normal path.",
+      "Comment": "A load and/or validation failure occurred but override=true: carry overrideActive=true so the terminal routes to TaskSucceededWithOverride (which writes the override record with the bypassed groups/tables + failure warnings). DMS is resumed and CDC starts as on the normal path. This is a FULL bypass — no data-error carve-out, no count check.",
       "Parameters": {
         "active": true
       },
@@ -1090,7 +1098,7 @@
     "GroupsFailed": {
       "Type": "Fail",
       "Error": "GroupLoadOrValidateFailed",
-      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run. If the failure is validation only (not a load failure) and you have reviewed the discrepancy and accept it, start a NEW execution with input {\"taskArn\": \"...\", \"override\": true}: the run records the validation result, resumes DMS, starts CDC and ends in TaskSucceededWithOverride. A LOAD failure always stops here even with override."
+      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run. If you have reviewed the failures and manually accept shared responsibility for the data, start a NEW execution with input {\"taskArn\": \"...\", \"override\": true}: override is a FULL BYPASS that lets the run resume DMS, start CDC and end in TaskSucceededWithOverride for BOTH load and validation failures. The bypassed groups/tables and their failure details are recorded as warnings in the override record."
     },
     "ResumeDmsToCdc": {
       "Type": "Task",
@@ -1689,7 +1697,7 @@
           "planGroups.$": "$.plan.groups",
           "groupStatuses.$": "$.groupCheck.statuses",
           "bypassedGates": [
-            "GroupsFailed (validate_failed)"
+            "GroupsFailed (load and/or validation failure)"
           ]
         }
       },
@@ -1700,6 +1708,7 @@
         "overriddenGroups.$": "$.Payload.overriddenGroups",
         "overriddenTables.$": "$.Payload.overriddenTables",
         "validationReportPaths.$": "$.Payload.validationReportPaths",
+        "warnings.$": "$.Payload.warnings",
         "who.$": "$.Payload.who",
         "when.$": "$.Payload.when"
       },

@@ -268,6 +268,69 @@ def _override_record_key(suffix, execution_name):
     return f"config/_task/{suffix}/{_OVERRIDES_SUBPREFIX}/{safe}.json"
 
 
+def _load_failure_warnings(s3, bucket, group_index, config_prefix):
+    """Build one WARNING per failed table in a (load-)failed group that override bypassed, from
+    the group's _load_status.json (written by job2_load before it raised). Each failed table row
+    carries a classified failure kind: "data_error" (with table/column/file/reason) or "infra"
+    (unknown kinds fall back to infra). Override is a FULL BYPASS — it does NOT act on the kind,
+    it only RECORDS it — but the kind/reason are surfaced here for the operator (and for the
+    future, separate auto-recovery feature). Best-effort: a missing/unreadable status file yields
+    a single generic warning naming the group."""
+    cp = str(config_prefix or "").rstrip("/")
+    if cp.startswith("s3://"):
+        no = cp[len("s3://"):]
+        b = no.split("/", 1)[0]
+        key = (no.split("/", 1)[1] if "/" in no else "") + "/_load_status.json"
+    else:
+        b, key = bucket, f"{cp}/_load_status.json"
+    try:
+        doc = _get_json(s3, b, key)
+    except Exception as e:  # noqa: BLE001 - any read problem -> generic warning below
+        print(f"(warn) could not read load status for group {group_index} at {cp}: {e}")
+        doc = None
+    out = []
+    tables = (doc or {}).get("tables") if isinstance(doc, dict) else None
+    if isinstance(tables, dict):
+        for label, row in tables.items():
+            if not isinstance(row, dict) or row.get("status") != "failed":
+                continue
+            kind = row.get("kind") or "infra"
+            if kind == "data_error":
+                d = row.get("data_error") if isinstance(row.get("data_error"), dict) else {}
+                parts = []
+                for fld in ("table", "column", "file", "reason"):
+                    val = d.get(fld)
+                    if val:
+                        parts.append(f"{fld}={val}")
+                detail = "; ".join(parts) if parts else str(row.get("error") or "")
+                out.append(f"group {group_index} table {label} LOAD FAILED (data_error) and was "
+                           f"bypassed by override: {detail}")
+            else:
+                reason = row.get("error") or row.get("reason") or ""
+                out.append(f"group {group_index} table {label} LOAD FAILED (infra) and was "
+                           f"bypassed by override: {reason}")
+    if not out:
+        out.append(f"group {group_index} LOAD FAILED and was bypassed by override "
+                   f"(no per-table detail available in _load_status.json)")
+    return out
+
+
+
+def _startup_override_cutover_warning(bucket, suffix, marker):
+    """Build the warning a cutover emits when this task's STARTUP used override but THIS
+    cutover was not started with override. Names the startup-override record and the overridden
+    tables (from the marker). The cutover PROCEEDS; this is a warning only (the startup override
+    already accepted shared responsibility for the data). Returns the warning string."""
+    m = marker if isinstance(marker, dict) else {}
+    rec = m.get("lastRecordKey") or _startup_override_marker_key(suffix)
+    ov_tables = m.get("overriddenTables") or []
+    tbl_txt = ", ".join(str(t) for t in ov_tables) if ov_tables else "(see record)"
+    return (
+        f"startup override was used for this task (data accepted past a load/validation "
+        f"failure); cutover is proceeding WITHOUT override. Overridden tables: {tbl_txt}. "
+        f"Startup-override record: s3://{bucket}/{rec}.")
+
+
 def _execution_name(event):
     """The Step Functions execution NAME from the event's "execution" ARN ($$.Execution.Id,
     arn:aws:states:<region>:<acct>:execution:<stateMachine>:<name>). Returns "unknown" when the
@@ -300,31 +363,46 @@ def handler_write_override_record(event, context):
     exec_name = str(event.get("executionName") or "").strip() or _execution_name(event)
     bypassed = event.get("bypassedGates") or []
     when = _now()
+    s3 = boto3.client("s3", region_name=REGION)
 
-    # Derive the overridden scope from the plan groups + their per-group statuses: a group whose
-    # status is "validate_failed" is one the override carried past. Each such group contributes
-    # its table labels and its validation report path (<group config_prefix>/_validation_report.json,
-    # exactly where job3_validate writes it). Callers may instead pass overriddenGroups/
-    # overriddenTables/validationReportPaths directly (e.g. a future cutover record).
+    # Derive the overridden scope from the plan groups + their per-group statuses. override is a
+    # FULL BYPASS, so BOTH a load failure ("failed") and a validation failure ("validate_failed")
+    # are groups the override carried past:
+    #   * a validate_failed group contributes its table labels and its validation report path
+    #     (<group config_prefix>/_validation_report.json, where job3_validate writes it);
+    #   * a (load-)failed group contributes its table labels AND a WARNING per failed table built
+    #     from the group's _load_status.json (the failure kind — data_error with
+    #     table/column/file/reason, vs infra — that job2_load records before raising).
+    # Callers may instead pass overriddenGroups/overriddenTables/validationReportPaths directly.
     plan_groups = event.get("planGroups") or []
     statuses = event.get("groupStatuses") or []
     groups = list(event.get("overriddenGroups") or [])
     tables = list(event.get("overriddenTables") or [])
     report_paths = list(event.get("validationReportPaths") or [])
+    warnings = list(event.get("warnings") or [])
     if plan_groups and statuses:
         for g in plan_groups:
             gi = g.get("group_index")
             status = statuses[gi] if isinstance(gi, int) and 0 <= gi < len(statuses) else None
-            if status != "validate_failed":
+            if status not in ("validate_failed", "failed"):
                 continue
             groups.append(gi)
             tables.extend(g.get("tables") or [])
             cp = str(g.get("config_prefix") or "").rstrip("/")
-            if cp:
-                report_paths.append(f"{cp}/_validation_report.json")
-    # De-dupe tables / report paths while preserving order.
+            if status == "validate_failed":
+                if cp:
+                    report_paths.append(f"{cp}/_validation_report.json")
+                warnings.append(
+                    f"group {gi} validation FAILED and was bypassed by override; see "
+                    f"{cp}/_validation_report.json")
+            elif status == "failed":
+                # Read the group's _load_status.json for the per-table failure kind/reason that
+                # job2_load recorded before raising, and emit a warning per failed table.
+                warnings.extend(_load_failure_warnings(s3, bucket, gi, cp))
+    # De-dupe tables / report paths / warnings while preserving order.
     tables = list(dict.fromkeys(tables))
     report_paths = list(dict.fromkeys(report_paths))
+    warnings = list(dict.fromkeys(warnings))
 
     record = {
         "who": exec_arn or exec_name,
@@ -337,14 +415,14 @@ def handler_write_override_record(event, context):
         "overriddenGroups": groups,
         "overriddenTables": tables,
         "validationReportPaths": report_paths,
+        "warnings": warnings,
         "bypassedGates": bypassed,
     }
-    s3 = boto3.client("s3", region_name=REGION)
     record_key = _override_record_key(suffix, exec_name)
     _put_json(s3, bucket, record_key, record)
 
     # The stable marker is a STARTUP concern only: it tells a later cutover that this task's
-    # data was accepted past a validation failure, so cutover must be explicit about it too.
+    # data was accepted past a load/validation failure, so cutover warns about it.
     marker_key = _startup_override_marker_key(suffix)
     marker_written = False
     if workflow == "startup":
@@ -352,13 +430,14 @@ def handler_write_override_record(event, context):
             "startupOverride": True, "when": when, "executionArn": exec_arn,
             "executionName": exec_name,
             "overriddenGroups": groups, "overriddenTables": tables,
+            "warnings": warnings,
             "lastRecordKey": record_key,
         })
         marker_written = True
 
     print(f"(info) override record written: s3://{bucket}/{record_key} "
           f"(workflow={workflow}, groups={groups}, tables={len(tables)}, "
-          f"marker={'written' if marker_written else 'n/a'})")
+          f"warnings={len(warnings)}, marker={'written' if marker_written else 'n/a'})")
     return {
         "recordKey": f"s3://{bucket}/{record_key}",
         "markerKey": f"s3://{bucket}/{marker_key}",
@@ -369,6 +448,7 @@ def handler_write_override_record(event, context):
         "overriddenGroups": groups,
         "overriddenTables": tables,
         "validationReportPaths": report_paths,
+        "warnings": warnings,
         "bypassedGates": bypassed,
     }
 
@@ -1100,15 +1180,25 @@ def handler_shared(event, context):
         warnings.append(f"This task's CDC job runs on Spark: an earlier run switched it on "
                         f"{engine_doc.get('at')} because {str(engine_doc.get('reason'))[:400]}. "
                         f"Delete s3://{bucket}/{engine_key} to use Python shell again.")
-    # Runtime override (validation-only): did the STARTUP of this task use override=true? The
-    # stable marker is written by the override-record step at the end of a startup run that
-    # overrode a validation failure. cutover reads it so it can REFUSE unless cutover was ALSO
-    # started with override=true (unvalidated data must never be cut over silently). startup
-    # mode does not need to read it; it is false there.
+    # Runtime override: did the STARTUP of this task use override=true? The stable marker is
+    # written by the override-record step at the end of a startup run that overrode a
+    # load/validation failure. The cutover NO LONGER refuses when a startup override is
+    # present and cutover has no override; it proceeds and warns instead (the startup override
+    # already accepted shared responsibility for the data). startup mode does not need to read
+    # it; it is false there.
     startup_override_used = False
     if mode == "cutover":
-        startup_override_used = _get_json(
-            s3, bucket, _startup_override_marker_key(suffix)) is not None
+        _marker = _get_json(s3, bucket, _startup_override_marker_key(suffix))
+        startup_override_used = _marker is not None
+        # When the startup-override marker is present but THIS cutover was not started with
+        # override, surface a warning naming the startup-override record and the overridden
+        # tables. It flows out in $.resolved.warnings (the cutover output) and is also logged
+        # by the ASL LogStartupOverrideWarning Pass. (When cutover IS started with override the
+        # cutover override record already captures the acceptance, so no extra warning here.)
+        if startup_override_used and not override:
+            _w = _startup_override_cutover_warning(bucket, suffix, _marker)
+            if _w:
+                warnings.append(_w)
     out = dict(contract)
     out.update({
         "taskArn": task_arn,
