@@ -1,44 +1,43 @@
-DONE — runtime `override` for startup & cutover
+DONE — override full-bypass + cutover warns; undo M-10 split + M-19 validate_hash reject
 
-Pushed to origin/main as newcoder52:
-  69fb12b  Add runtime override for startup/cutover (code + tests)
-  b6159d6  RESULT.md (final HEAD)
-Parent: d0cd1e7 (fix-b27). Fresh clone on d0cd1e7; git pull --rebase before each push (no
-parallel changes landed); plain push, never forced. Verified in a 2nd fresh clone at b6159d6.
+Pushed to origin/main as newcoder52 <aash.798@gmail.com>:
+  4407893  override: full bypass of load+validation failures; cutover warns instead of
+           refusing; undo M-10 split + M-19 validate_hash reject (code + docs + tests)
+Parent: d8a7493 (validate: fix chunk-top double-count + 9 more). Fresh clone pinned on
+d8a7493 (verified with git ls-remote); git config LOCAL newcoder52 <aash.798@gmail.com>;
+git pull --rebase before push (no parallel changes landed); plain push, never forced.
+Verified in a 2nd fresh clone at 4407893.
 
-WHAT SHIPPED
-- Startup: {"override": true} lets a validate_failed group resume DMS + start CDC and end in the
-  new TaskSucceededWithOverride (lists overridden groups/tables + validation report paths). A
-  LOAD failure still stops at GroupsFailed. Override normalized once in resolve_task
-  (resolved.override), IsPresent-guarded in the ASL. Override record +
-  _startup_override.json marker written to config/_task/<task>/_overrides/.
-- Cutover: override bypasses-but-logs the pre- and post-drain CdcValidationFailed gates and (via
-  the same validation_gate) the cutover count check; ends in CutoverSucceededWithOverride. The
-  startup-override marker makes an un-overridden cutover refuse (StartupOverrideRequiresOverride,
-  "pass override=true to accept"). Safety ordering (DMS stop -> drain -> stop CDC runs -> delete
-  jobs) never bypassed.
-- Fleet: fleet-startup/-cutover accept top-level "override": true (preflight passes it to each
-  child); optional per-task override column in fleet_tasks.csv (blank=false), OR'd with the
-  fleet-level flag. Preflight never rejects the extra column.
-- job2_load already skips tables marked "done" unconditionally -> an override re-run reloads
-  nothing already done (verified by test; no code change needed).
-- Docs: RUNBOOK §8 "Validation failed — re-run with override" (exact start-execution commands,
-  task + fleet), new end states in the outcome + reference tables, risk note; FLEET_LAUNCHER
-  override note + CSV column.
+THE 4 CHANGES
+1. Cutover: removed the StartupOverrideRequiresOverride refusal. A cutover started WITHOUT
+   override on a task whose startup used override now PROCEEDS, logging a warning
+   (LogStartupOverrideWarning Pass) and resolve_task appends the same warning (naming the
+   startup-override record + overridden tables) to the cutover output $.resolved.warnings.
+   Safety ordering (DMS stop -> drain -> stop CDC -> delete) unchanged. ASL path audit +
+   payload contract green.
+2. Override is a FULL BYPASS of load AND validation failures (no data-error carve-out, no
+   DSQL-vs-DMS count check). job2_load classifies and records the per-table failure kind
+   (data_error{table,column,file,reason} vs infra; unknown->infra) in _load_status.json
+   before raising; the override record + run output carry those as warnings. No-override
+   behaviour is byte-identical (load or validation failure stops at GroupsFailed).
+3. Undo M-10: an explicit validate_parallelism (>0) is used verbatim per table (no division
+   by max_parallel_tables); the auto path (0/blank) stays budget-based.
+4. Undo M-19: params_csv no longer rejects an invalid validate_hash; it warns and falls back
+   to the default (all), never failing the fleet start.
 
-RUNTIME FILES CHANGED (redeploy in RESULT.md): stepfunctions/startup.asl.json,
-stepfunctions/cutover.asl.json (state-machine definition updates); lambdas/resolve_task.py,
-lambdas/preflight_tasks.py (one shared fn.zip -> update $PROJECT-resolve-task +
-$PROJECT-preflight-tasks). No Glue script change -> no S3 upload. No IAM change (PutObject on the
-bucket already covers _overrides/). Fleet state machines unchanged.
+RUNTIME FILES CHANGED (4407893): scripts/job2_load.py, scripts/job3_validate.py,
+lambdas/resolve_task.py, lambdas/params_csv.py, stepfunctions/startup.asl.json,
+stepfunctions/cutover.asl.json. Docs: RUNBOOK.md (§8), docs/FLEET_LAUNCHER.md.
+Tests: tests/test_override.py, tests/test_validate_merge_fixes.py.
 
-TESTS (offline, all green): ASL path audit PASS; payload-contract 185 PASS (incl. new override
-pins + write_override_record mode); tests/test_override.py 43 PASS; test_docs_params PASS; full
-suite 168 passed. Re-run after rebase and in the 2nd clone.
+TESTS (offline). pytest: 181 passed. Direct runs (check() doesn't raise under pytest):
+  test_override.py            87 passed, 0 failed
+  test_validate_merge_fixes.py 58 passed, 0 failed
+  test_asl_paths.py            PASS (exit 0)
+  test_asl_payload_contract.py 187 passed, 0 failed
+Each updated test fails before (exit 1) and passes after. See RESULT.md for the full
+TESTER_PLAN and the ONE combined USPS redeploy (d8a7493 + 4407893): S3 script uploads
+(job2_load.py, job3_validate.py), the Lambda zip (all 8 functions, from resolve_task.py +
+params_csv.py), and the startup + cutover state machines (placeholder-filled).
 
-MIRROR: ~/Downloads/dms-s3-glue-dsql-migration/ synced to b6159d6 content (.git untouched,
-still 668fa27). Backup of the pre-change mirror (files only, no .git, 72 files) at
-~/Downloads/cdc_backups/before-69fb12b/.
-
-No customer identifiers (only the standard 123456789012 / us-east-1 docs placeholders already in
-the example files).
+No customer identifiers in code or commits.

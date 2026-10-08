@@ -1,108 +1,125 @@
-# Runtime `override` for startup & cutover — RESULT
+# RESULT — override full-bypass + cutover warn + undo M-10 / M-19
 
-**Commit pushed:** `69fb12b` on `main` (parent `d0cd1e7`), as `newcoder52`.
-Remote: `Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime`.
+## Commit
 
-## What this adds
+- **SHA:** `4407893f363424dbe53b8828ce2b4abd79498f25` (`4407893`)
+- **Parent:** `d8a749353ce8379077a346817fc91fc0f5424c47` (`d8a7493`)
+- **Branch:** `main` (pushed, plain push, no force)
+- **Author:** newcoder52 \<aash.798@gmail.com\>
 
-An operator can start a **new** execution with input `"override": true` so that when
-**validation** fails for any reason (an IP shortage, a timeout, a mismatch the operator accepts)
-the run carries on instead of stopping. Default (absent or `false`) behavior is unchanged — the
-only new state data on a default run is `$.resolved.override=false` and a pass-through
-`$.overrideResolved.active=false`; the side effects, Glue jobs, DMS actions and terminal
-`TaskSucceeded`/`CutoverSucceeded` are identical to before.
+## The 4 changes
 
-Override is a **run input, never a `pipeline.json`/`params.csv` setting**, so no setting changes
-and `test_docs_params` is unaffected (no new params key).
+1. **Cutover — remove the `StartupOverrideRequiresOverride` refusal.** A cutover started
+   **without** override on a task whose startup used override now **PROCEEDS**. It logs a
+   warning (ASL `LogStartupOverrideWarning` Pass) and `resolve_task` (cutover mode) appends the
+   same warning — naming the startup-override record and the overridden tables — to the cutover
+   output `$.resolved.warnings`. The refusal `Fail` state is removed (no orphan). The safety
+   ordering (DMS stop → drain → stop CDC runs → delete jobs) is unchanged. ASL path audit and
+   payload contract stay green.
+2. **Override is a FULL BYPASS of load AND validation failures.** With `override=true`, a group
+   whose **load** failed (for any reason — `data_error` *or* `infra`) **or** whose **validation**
+   failed continues: `MarkOverrideActive → ResumeDmsToCdc → StartCdcJob → CDC`, ending in
+   `TaskSucceededWithOverride`. **No** data-error carve-out and **no** DSQL-vs-DMS count check.
+   `job2_load` still classifies and records the per-table failure **kind**
+   (`data_error` with `table`/`column`/`file`/`reason`, vs `infra`; unknown → `infra`) in the
+   group's `_load_status.json` **before** raising, so the override record and run output carry
+   those as **warnings** (the kind feeds the warnings now and a future, separate auto-recovery
+   feature later). **No-override behaviour is byte-identical:** a load or validation failure
+   stops at `GroupsFailed`.
+3. **Undo the M-10 per-table parallelism split.** When `validate_parallelism > 0` is set
+   explicitly, each table uses exactly that value (no division by `max_parallel_tables`). The
+   auto path (`0`/blank → `VALIDATE_PARALLELISM is None`) stays budget-based (divided across
+   `MAX_PARALLEL_TABLES`).
+4. **Undo M-19.** `params_csv` no longer rejects an invalid `validate_hash`; it **warns** and
+   **falls back to the default** (`all`), never failing the fleet start.
 
-### Startup
-1. `resolve_task` normalizes `$.override` once (`_normalize_override`: the boolean `true`, or the
-   strings `true`/`1`/`yes`/`y`/`on`, any case; everything else false) and emits it as
-   `resolved.override`. The `AllGroupsSucceeded` Choice reads
-   `$.resolved.override` **IsPresent-guarded**, so the ASL path audit passes and an older
-   execution with no field behaves as the default.
-2. **Load failure always stops** (`$.groupCheck.anyLoadFailed` → `GroupsFailed`), even with
-   override — override covers validation only. (No strong reason was found to let override cover
-   load failures, so it does not.)
-3. A `validate_failed` group with `override=true` → `MarkOverrideActive` → `ResumeDmsToCdc` →
-   `StartCdcJob` → the fork CDC map → `OverrideTerminal` → `WriteStartupOverrideRecord` →
-   **`TaskSucceededWithOverride`**. Validation still ran and its results are recorded.
-4. `TaskSucceededWithOverride` output (`$.overrideRecord`) lists the overridden groups + tables
-   and the per-group validation report paths (`<group config_prefix>/_validation_report.json`),
-   plus the record and marker S3 keys.
-5. **Re-run with override does not reload done tables:** `job2_load` already skips tables marked
-   `"done"` in `_load_status.json` up front, unconditionally (no override branch). Verified by
-   test (`test_job2_load_skips_done_tables_regardless_of_override`); no code change was needed.
-6. `WriteStartupOverrideRecord` writes `config/_task/<task>/_overrides/<execution>.json` (who =
-   execution ARN, when, groups, tables, reason, validation report paths, bypassed gate) **and**
-   the stable marker `config/_task/<task>/_overrides/_startup_override.json`.
+## Runtime files changed (this commit `4407893`)
 
-### Cutover
-- With `override=true`, the **refuse-only** gates are bypassed **but logged**:
-  `CdcValidationFailed` pre-DMS-stop (`CdcValidationPreGate` → `LogPreValidationOverride`) and
-  post-drain (`CdcValidationFinalGate` → `LogFinalValidationOverride`). The **cutover count
-  check** (G10 `cutover_count_check=strict`) surfaces as rows in
-  `cdc_control.cdc_validation_failures`, which those same gates read — so bypassing the gates
-  bypasses-but-logs the cutover count check by the same mechanism (no CDC-script change).
-- **Safety ordering is never bypassed:** DMS stop → drain → stop CDC runs → delete jobs are
-  unchanged; the override edits only replace the two refuse-gates and the terminal. The final
-  override bypass lands on `StopCdcRun` (stop CDC before deleting jobs), proven by
-  `test_cutover_safety_ordering_not_bypassed`.
-- Ends in **`CutoverSucceededWithOverride`** (via `WriteCutoverOverrideRecord`, which writes a
-  per-execution record; `workflow=cutover`, so **no** startup marker).
-- **Startup-override marker forces override at cutover:** `resolve_task` (cutover mode) reads the
-  marker and returns `startupOverrideUsed`. `StartupOverrideGate` refuses with
-  **`StartupOverrideRequiresOverride`** ("pass `override=true` to accept") when the marker is
-  present and the cutover was not started with override — so unvalidated data can't be cut over
-  silently.
+| File | Deploy target |
+|---|---|
+| `scripts/job2_load.py` | S3 Glue script `s3://<bucket>/scripts/job2_load.py` |
+| `scripts/job3_validate.py` | S3 Glue script `s3://<bucket>/scripts/job3_validate.py` |
+| `lambdas/resolve_task.py` | Lambda zip (function `<project>-resolve-task`) |
+| `lambdas/params_csv.py` | Lambda zip (used by `<project>-preflight-tasks`; also by `tools/setup.sh` to publish `pipeline.json`) |
+| `stepfunctions/startup.asl.json` | State machine `<project>-startup` |
+| `stepfunctions/cutover.asl.json` | State machine `<project>-cutover` |
 
-### Fleet
-- `preflight_tasks` reads a fleet-level top-level `{"override": true}` (applies to **every**
-  task) and a per-task `override` CSV column (blank = false), OR's them, and adds
-  `{"override": true}` to each child's start input. `fleet_tasks.csv` gets
-  an optional `override` column; preflight uses `csv.DictReader` and never rejects an extra
-  column. The fleet ASLs pass `fleetInput.$: "$"` already, so no fleet-ASL change was needed.
+Docs updated: `RUNBOOK.md` (§8 override), `docs/FLEET_LAUNCHER.md`.
+Tests updated: `tests/test_override.py`, `tests/test_validate_merge_fixes.py`.
 
-## Exact runtime files changed & what a customer redeploys
+### Also in the parent `d8a7493` (included so USPS does ONE redeploy)
 
-Set once: `PROJECT=<project>`, `BUCKET=<bucket>`, `REGION=<region>`, `ACCOUNT=<account-id>`,
-`export AWS_PAGER=""`. `SM_BASE="arn:aws:states:$REGION:$ACCOUNT:stateMachine"`,
-`LAMBDA_BASE="arn:aws:lambda:$REGION:$ACCOUNT:function:$PROJECT"`.
+| File | Deploy target |
+|---|---|
+| `scripts/job3_validate.py` | S3 Glue script (same file; this commit also edits it — one upload covers both) |
+| `lambdas/params_csv.py` | Lambda zip (same file; one zip covers both) |
 
-| Runtime file | Change | Redeploy |
-|---|---|---|
-| `stepfunctions/startup.asl.json` | override gate + override terminal + `WriteStartupOverrideRecord` + `TaskSucceededWithOverride`; ResolveTask ResultSelector gains `override` | **State machine definition update** (startup) |
-| `stepfunctions/cutover.asl.json` | `StartupOverrideGate`, pre/final validation override bypass, override terminal + `WriteCutoverOverrideRecord` + `CutoverSucceededWithOverride`; CutoverResolveTask ResultSelector gains `override`/`startupOverrideUsed` | **State machine definition update** (cutover) |
-| `lambdas/resolve_task.py` | `_normalize_override`, override keys in `handler_shared`, cutover marker read, new `write_override_record` mode | **Lambda zip update** (`fn.zip`) → `$PROJECT-resolve-task` (and the rest, same zip) |
-| `lambdas/preflight_tasks.py` | fleet-level + per-task override → child input | **Lambda zip update** (`fn.zip`) → `$PROJECT-preflight-tasks` |
-| `config/fleet_tasks.example.csv` | documents the optional `override` column (example only) | copy-me only — nothing to deploy |
+**Net combined runtime surface for ONE redeploy covering `d8a7493` + `4407893`:**
+- **S3 Glue scripts:** `scripts/job2_load.py`, `scripts/job3_validate.py`
+- **Lambda zip (ALL functions):** rebuilt from `lambdas/*.py` (the changes are in
+  `resolve_task.py` + `params_csv.py`; the zip is shared, so **every** function is updated)
+- **State machines:** `<project>-startup`, `<project>-cutover` (placeholder-filled)
 
-No Glue script (`scripts/*.py`) changed → **no S3 script upload needed**. No IAM change: the
-override record is written under `config/_task/.../_overrides/` and the Lambda role already has
-`s3:PutObject` on the bucket (`iam/lambda.json` `S3` statement).
+---
 
-### 1. Rebuild & update the Lambda zip (resolve-task + preflight-tasks share the one `fn.zip`)
-The simplest supported path is to re-run `tools/setup.sh` from the repo root (it rebuilds
-`fn.zip` from every `lambdas/*.py` + pg8000, updates all 8 Lambdas, and updates all 4 state
-machines). To update **just** the two changed functions by hand:
+## Exact customer redeploy commands (ONE redeploy = `d8a7493` + `4407893`)
+
+> Simplest: run the pipeline's own installer, which is create-or-update and re-uploads scripts,
+> rebuilds the Lambda zip (all functions), and re-fills + updates all 4 state machines:
+>
+> ```bash
+> tools/setup.sh "s3://<bucket>/config/params.csv"      # add --with-drivers only if wheels changed (they didn't)
+> ```
+>
+> The per-component commands below are the exact steps `tools/setup.sh` runs, for a targeted
+> redeploy of just the changed surface. Set these first:
 
 ```bash
-# build fn.zip exactly as setup.sh does: all lambdas/*.py + pg8000
-WORK=$(mktemp -d); cp lambdas/*.py "$WORK"/; pip install -q pg8000 -t "$WORK"
-( cd "$WORK" && zip -qr fn.zip . )
-for sfx in resolve-task preflight-tasks; do
+export AWS_PAGER=""
+PROJECT="<project>"; REGION="<region>"; ACCOUNT_ID="<account_id>"; BUCKET="<bucket>"
+LAMBDA_BASE="arn:aws:lambda:$REGION:$ACCOUNT_ID:function:$PROJECT"
+SM_BASE="arn:aws:states:$REGION:$ACCOUNT_ID:stateMachine"
+SFN_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/$PROJECT-sfn-exec-role"   # or your customer-named sfn role
+```
+
+### 1. S3 Glue scripts (`job2_load.py` + `job3_validate.py`)
+
+```bash
+aws s3 cp scripts/job2_load.py    "s3://$BUCKET/scripts/job2_load.py"
+aws s3 cp scripts/job3_validate.py "s3://$BUCKET/scripts/job3_validate.py"
+```
+
+(Glue jobs read the script from S3 on their next run; no job re-create needed. Uploading all 5 is
+also fine: `for f in job1_discovery job2_load job3_validate glue_cdc_continuous glue_cdc_composite; do aws s3 cp "scripts/$f.py" "s3://$BUCKET/scripts/$f.py"; done`.)
+
+### 2. Lambda zip — rebuild once, update ALL functions
+
+The changed Lambda code (`resolve_task.py`, `params_csv.py`) ships in the one shared `fn.zip`, so
+rebuild it and update every function (the two edited functions plus the rest, so all stay on the
+same code):
+
+```bash
+# Build fn.zip from lambdas/*.py + pg8000 (exactly as setup.sh does)
+BUILD="$(mktemp -d)"; cp lambdas/*.py "$BUILD/"
+python3 -m pip install pg8000 -t "$BUILD/" --quiet
+FN_ZIP="$(mktemp -d)/fn.zip"; ( cd "$BUILD" && zip -qr "$FN_ZIP" . )
+
+# Update all 8 functions to the new code
+for sfx in resolve-task driver-discovery plan-split create-glue-jobs \
+           stop-cdc-run drain-check drop-tags preflight-tasks; do
   aws lambda update-function-code --function-name "$PROJECT-$sfx" \
-    --zip-file "fileb://$WORK/fn.zip" --region "$REGION" --query FunctionName --output text
-  aws lambda wait function-updated --function-name "$PROJECT-$sfx" --region "$REGION"
+    --zip-file "fileb://$FN_ZIP" --query FunctionName --output text
+  aws lambda wait function-updated --function-name "$PROJECT-$sfx"
 done
 ```
 
-### 2. Update the two state-machine definitions (fill placeholders, then update)
-`startup.asl.json` / `cutover.asl.json` carry `<<BUCKET>>` and the `<<*_LAMBDA_ARN>>`
-placeholders. Fill them exactly as `fill_shared_sm()` in `tools/setup.sh` does, then update:
+(The only functionally changed functions are `resolve-task` and `preflight-tasks`/`params_csv`;
+updating all 8 from the one zip is what `setup.sh` does and keeps them consistent.)
+
+### 3. State machines — fill placeholders and update (`startup` + `cutover`)
 
 ```bash
-for w in startup cutover; do
+fill_sm () {  # $1 src asl, $2 out
   sed -e "s|<<BUCKET>>|$BUCKET|g" \
       -e "s|<<RESOLVE_TASK_LAMBDA_ARN>>|$LAMBDA_BASE-resolve-task|g" \
       -e "s|<<DRIVER_DISCOVERY_LAMBDA_ARN>>|$LAMBDA_BASE-driver-discovery|g" \
@@ -111,38 +128,89 @@ for w in startup cutover; do
       -e "s|<<STOP_CDC_RUN_LAMBDA_ARN>>|$LAMBDA_BASE-stop-cdc-run|g" \
       -e "s|<<DRAIN_CHECK_LAMBDA_ARN>>|$LAMBDA_BASE-drain-check|g" \
       -e "s|<<DROP_TAGS_LAMBDA_ARN>>|$LAMBDA_BASE-drop-tags|g" \
-      "stepfunctions/$w.asl.json" > "/tmp/$w.filled.asl.json"
-  grep -q "<<" "/tmp/$w.filled.asl.json" && { echo "placeholder left"; exit 1; }
-  ARN=$(aws stepfunctions list-state-machines --region "$REGION" \
-        --query "stateMachines[?name=='$PROJECT-$w'].stateMachineArn" --output text)
+      "$1" > "$2"
+  grep -q "<<" "$2" && { echo "ERROR: placeholder left in $2"; grep -n "<<" "$2"; exit 1; } || true
+}
+
+for w in startup cutover; do
+  OUT="$(mktemp -d)/$w.filled.asl.json"
+  fill_sm "stepfunctions/$w.asl.json" "$OUT"
+  ARN="$(aws stepfunctions list-state-machines \
+         --query "stateMachines[?name=='$PROJECT-$w'].stateMachineArn" --output text)"
   aws stepfunctions update-state-machine --state-machine-arn "$ARN" \
-    --definition "file:///tmp/$w.filled.asl.json" --region "$REGION"
+    --definition "file://$OUT" --role-arn "$SFN_ROLE_ARN"
 done
 ```
 
-The fleet state machines (`fleet-startup`, `fleet-cutover`) are **unchanged** — no redeploy
-needed; they already forward the fleet start input to preflight.
+> `fleet-startup.asl.json` / `fleet-cutover.asl.json` are **unchanged** this redeploy, so they do
+> not need updating. If you prefer to redeploy everything, `tools/setup.sh` re-fills all four.
 
-## Using it (also in RUNBOOK §8 "Validation failed — re-run with override")
+### Confirm
 
 ```bash
-# task-level startup with override
-aws stepfunctions start-execution \
-  --state-machine-arn "$SM_BASE:$PROJECT-startup" \
-  --input '{"taskArn":"arn:aws:dms:'"$REGION"':'"$ACCOUNT"':task:<id>","override":true}'
-# task-level cutover with override (same input shape, -cutover)
-# fleet: add top-level "override": true to the fleet input, or set the per-task override column
+aws s3 ls "s3://$BUCKET/scripts/"
+aws lambda get-function --function-name "$PROJECT-resolve-task" --query 'Configuration.LastModified'
+aws stepfunctions describe-state-machine --state-machine-arn "$SM_BASE:$PROJECT-startup"  --query 'name'
+aws stepfunctions describe-state-machine --state-machine-arn "$SM_BASE:$PROJECT-cutover" --query 'name'
 ```
 
-## Tests (all green, offline)
+---
 
-- `tests/test_asl_paths.py` — ASL path audit + reachability + M01 + payload-contract: **PASS**
-  (18 Lambda-ResultSelector states audited; the new `write_override_record` mode and the override
-  ResultSelector reads are covered).
-- `tests/test_asl_payload_contract.py` — 185 checks PASS, incl. the new override-field pins.
-- `tests/test_override.py` — 43 checks: startup (override false→GroupsFailed; true→
-  TaskSucceededWithOverride w/ CDC started; true+load-failed→GroupsFailed; done-table skip),
-  cutover (pre/final gate bypass vs refuse; startup-marker forces override; safety ordering
-  intact), resolve_task normalization + record/marker writes, fleet override wiring.
-- `tests/test_docs_params.py`: **PASS** (unchanged — override is not a params key).
-- Full suite: **168 passed**. Verified in a second fresh clone at `69fb12b`.
+## TESTER_PLAN
+
+All offline (no AWS / Spark / network). Two runners: **pytest** (`../.venv/bin/pytest tests/ -q`,
+expect **181 passed**) **and** the self-executing files run **directly** (their `check()` helper
+does **not** raise under pytest, so a direct run with a non-zero exit is the real signal):
+
+```bash
+python3 tests/test_override.py                 # ==== override tests: 87 passed, 0 failed ====
+python3 tests/test_validate_merge_fixes.py     # ==== validate-merge-fixes: 58 passed, 0 failed ====
+python3 tests/test_asl_paths.py                # ASL path audit: PASS (exit 0)
+python3 tests/test_asl_payload_contract.py     # ==== asl-payload-contract: 187 passed, 0 failed ====
+```
+
+> Note: `tests/test_b17_b13.py` (B13 IAM allow-list) reads **all** `iam/*.json`, including
+> gitignored `*.filled.json` artifacts other tests generate. Run it from a clean tree
+> (`git clean -fdX iam/`) or before the IAM-fixture tests; it is unrelated to this change.
+
+### Change 1 — cutover proceeds with a warning (no refusal)
+- `tests/test_override.py :: test_cutover_startup_override_marker_proceeds_with_warning`:
+  the `StartupOverrideRequiresOverride` state is **removed**; startup-override marker + no cutover
+  override routes `StartupOverrideGate → LogStartupOverrideWarning → CdcValidationPreCheck`
+  (proceeds); with cutover override it goes straight to the gate; no startup override is unchanged.
+- `:: test_cutover_startup_override_warning_names_record_and_tables`: `resolve_task`
+  (`_startup_override_cutover_warning`) names the startup-override record + overridden tables and
+  says "proceeding WITHOUT override".
+
+### Change 2 — override full bypass of load + validation failures
+- `:: test_startup_override_true_load_failed_continues`: override + load failed (and load+validate)
+  → `MarkOverrideActive` → DMS resume → `StartCdcJob` (full bypass, both `data_error` and `infra`
+  load failures route identically in the ASL).
+- `:: test_startup_override_true_validate_failed_resumes_and_succeeds_with_override`: override +
+  validation failed → continues (as today).
+- `:: test_startup_no_override_load_or_validate_failed_stops_unchanged`: **no override** + load OR
+  validation failure → `GroupsFailed` (byte-identical).
+- `:: test_job2_classify_load_error_data_vs_infra`: `job2_load.classify_load_error` tags every
+  data-error kind (row-split, bad uuid/cast 22P02, NOT NULL 23502, too-long 22001, dup PK 23505,
+  guard violations, malformed CSV) as `data_error` with a reason (+ column/file), and connection/
+  ENI/OOM/timeout/unknown as `infra`.
+- `:: test_write_override_record_writes_record_and_startup_marker`: the override record lists both
+  the validate-failed and the load-failed group, and carries per-table **warnings** naming the
+  `data_error`/`infra` kind + reason; warnings are persisted in the record and returned in output.
+
+### Change 3 — explicit validate_parallelism used verbatim
+- `tests/test_validate_merge_fixes.py :: test_m10_budget_divided_source`: an explicit
+  `validate_parallelism (>0)` → `parallelism = max(1, _default_parallelism())` (no division); the
+  auto path keeps `_default_parallelism() // max(1, MAX_PARALLEL_TABLES)`.
+- `:: test_m02_parallelism_zero_is_auto` still green (0/blank → auto `None`).
+
+### Change 4 — params_csv warns + falls back on bad validate_hash
+- `tests/test_validate_merge_fixes.py :: test_m19_params_csv_validate_hash_enum`: a valid
+  `validate_hash` passes; an **invalid** one is **not** in `errors`, **is** in `warnings`, and the
+  resulting params fall back to the default `all`.
+
+### Fails-before / passes-after (offline)
+Each updated test file **fails** against the original runtime (exit 1 on a direct run) and
+**passes** after. Verified by stashing the runtime files and re-running:
+`test_validate_merge_fixes.py` (4 fails before → 0 after), `test_override.py` (T5 + load-bypass
+fails before → 0 after).
