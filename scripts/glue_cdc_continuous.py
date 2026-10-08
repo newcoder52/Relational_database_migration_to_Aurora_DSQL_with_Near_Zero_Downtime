@@ -5124,11 +5124,27 @@ def main():
               f"change files are marked done in {CONTROL_SCHEMA}.cdc_file_status:", flush=True)
         for _m in multi_key:
             print(f"       - {_m}", flush=True)
-    if not contexts and not multi_key:
+    # Raise ONLY when the manifest truly yields nothing usable: nothing this job owns, no
+    # multi-column-key tables, and nothing owned by another CDC job either. If every table is
+    # owned by another CDC job (bg-fork or multi-column-key job), this job legitimately has
+    # nothing to apply — it must NOT crash. In the startup ASL the MAIN run must still reach
+    # its poll loop and write the start marker (CheckCdcStarted polls for it) BEFORE
+    # StartForkCdcMap launches the forks; crashing here would strand those forks
+    # (CdcRunFailed / CdcStartNotConfirmed) and leave the task with no CDC at all.
+    if not contexts and not multi_key and not not_owned:
         raise Exception("No usable tables from the manifest.")
     if not contexts:
-        print("  ℹ️ every table in this task has a multi-column primary key: this job has "
-              "nothing to apply and stays idle (cutover stops it).", flush=True)
+        if not_owned and not multi_key:
+            print(f"  ℹ️ every table in this task ({len(not_owned)}) is applied by another CDC "
+                  f"job (owner != {CDC_OWNER_SELF}, per _cdc_owners.json): this job has nothing "
+                  f"to apply and stays idle (cutover stops it).", flush=True)
+        elif not_owned:
+            print(f"  ℹ️ this job has nothing to apply — every table is owned by another CDC job "
+                  f"({len(not_owned)}) or has a multi-column primary key ({len(multi_key)}): it "
+                  f"stays idle (cutover stops it).", flush=True)
+        else:
+            print("  ℹ️ every table in this task has a multi-column primary key: this job has "
+                  "nothing to apply and stays idle (cutover stops it).", flush=True)
 
     # STARTUP KEY-CONSISTENCY DIAGNOSTIC. The full-load gate matches a table by its EXACT
     # label (dsql_schema.dsql_table) against the keys in _load_status.json. v4 builds that
