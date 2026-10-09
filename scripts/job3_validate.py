@@ -1271,13 +1271,17 @@ def build_metrics(columns, target_types, with_hash=False, key_cols=None):
                 f"COALESCE(SUM(CASE WHEN {q} THEN 1 ELSE 0 END), 0)")
         elif kind == "int":
             # The load casts '%s::numeric::bigint' (and ::integer/::smallint): PostgreSQL/DSQL
-            # numeric->integer rounding is ROUND-HALF-AWAY-FROM-ZERO (e.g. 2.5->3, -2.5->-3) --
-            # this is the documented rounding of the numeric type (float/double round half-to-even,
-            # but the load casts through numeric). Spark's F.round() is HALF_UP = ties away from
-            # zero, which MATCHES that cast; F.bround() (round-half-to-even) does NOT and produced a
-            # false CONTENT_DIFF on exact .5 integer-typed values. Use F.round() to match the value
-            # the loader actually stored. (Reverts the incorrect M-04 bround change.)
-            add("sum", lambda F, x: F.coalesce(F.sum(F.round(x.cast("decimal(38,6)"), 0).cast("decimal(38,0)")),
+            # numeric->integer rounding is ROUND-HALF-AWAY-FROM-ZERO (e.g. 2.5->3, -2.5->-3),
+            # applied to the FULL-precision source numeric (verified against DSQL:
+            # '2.5'::numeric::bigint=3, '0.4999995'::numeric::bigint=0). Spark's F.round() is
+            # HALF_UP = ties away from zero, which matches that cast; F.bround() (half-to-even)
+            # does NOT (reverted). BUT the intermediate cast must NOT pre-round the value: an
+            # earlier decimal(38,6) cast rounds the 7th fractional digit FIRST (0.4999995 ->
+            # 0.500000) and then F.round -> 1, while the loader rounds the full value 0.4999995
+            # -> 0 (double-rounding => false CONTENT_DIFF on correct data). Cast to decimal(38,18)
+            # (20 integer digits >= bigint's 19) so the source value keeps enough precision that a
+            # SINGLE round reproduces the loader's stored integer exactly.
+            add("sum", lambda F, x: F.coalesce(F.sum(F.round(x.cast("decimal(38,18)"), 0).cast("decimal(38,0)")),
                                               F.lit(0).cast("decimal(38,0)")),
                 f"COALESCE(SUM({q}), 0)", "decimal", 0)
         elif kind == "numeric":
