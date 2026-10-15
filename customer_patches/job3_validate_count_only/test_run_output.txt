@@ -1,0 +1,118 @@
+[PASS] untouched plan passes the self-check
+[PASS] self-check catches: range dropped
+[PASS] self-check catches: range counted twice
+[PASS] self-check catches: gap at a boundary
+[PASS] self-check catches: first range not open at bottom
+[PASS] self-check catches: last range not open at top
+[PASS] self-check catches: old bug: a mid-list range left unbounded above
+[PASS] self-check catches: nothing counted
+[PASS] plan: 10 ranges, only the first is open below and only the last is open above
+[PASS] plan 723000000 rows @ 20000000/range over [5..]: 37 ranges, adjacent, widths sum to the key span
+[PASS] plan 723000000 rows @ 20000000/range over [1267650600228229401496703205376..]: 37 ranges, adjacent, widths sum to the key span
+[PASS] plan 723000000 rows @ 20000000/range over [1..]: 37 ranges, adjacent, widths sum to the key span
+[PASS] plan 1000000000 rows @ 20000000/range over [5..]: 50 ranges, adjacent, widths sum to the key span
+[PASS] plan 1000000000 rows @ 20000000/range over [1267650600228229401496703205376..]: 50 ranges, adjacent, widths sum to the key span
+[PASS] plan 1000000000 rows @ 20000000/range over [1..]: 50 ranges, adjacent, widths sum to the key span
+[PASS] plan 50 rows @ 3/range over [5..]: 17 ranges, adjacent, widths sum to the key span
+[PASS] plan 50 rows @ 3/range over [1267650600228229401496703205376..]: 17 ranges, adjacent, widths sum to the key span
+[PASS] plan 50 rows @ 3/range over [1..]: 17 ranges, adjacent, widths sum to the key span
+[PASS] 723M rows @ 20M per range -> 37 ranges
+[PASS] predicate text: open ends have no bound, unbounded range excludes NULL keys
+[PASS] predicate text: uuid bounds are canonical, cast ::uuid, half-open [lo, hi)
+[PASS] [timing] shipped per-table time limit is 900 seconds (must be <= 900 = 15 minutes)
+[PASS] [timing] 300M rows, expected known, parallel server: 160 simulated seconds (limit 900, +5% jitter allowed), 17 queries, result=match counted exactly
+[PASS] [timing] 300M rows, expected known, parallel server: finished the count (not a warning)
+[PASS] [timing] 300M rows, expected known, ONE shared server (no parallel speed-up): 600 simulated seconds (limit 900, +5% jitter allowed), 17 queries, result=match counted exactly
+[PASS] [timing] 300M rows, expected known, ONE shared server (no parallel speed-up): finished the count (not a warning)
+[PASS] [timing] 300M rows, expected count unknown: 841 simulated seconds (limit 900, +5% jitter allowed), 33 queries, result=match counted exactly
+[PASS] [timing] 300M rows, DMS count far too low (20M): 400 simulated seconds (limit 900, +5% jitter allowed), 33 queries, result=mismatch counted exactly
+[PASS] [timing] 300M rows, server 2x slower, parallel: 320 simulated seconds (limit 900, +5% jitter allowed), 17 queries, result=match counted exactly
+[PASS] [timing] 300M rows, server 2x slower, parallel: finished the count (not a warning)
+[PASS] [timing] 99M rows (whole-table count path), expected known: 198 simulated seconds (limit 900, +5% jitter allowed), 1 queries, result=match counted exactly
+[PASS] [timing] 99M rows (whole-table count path), expected known: finished the count (not a warning)
+[PASS] [timing] a query that hangs: table returned after 0.40s with a TIMED OUT warning (limit 0.4s), not after the query's 1.5s
+    ⚠️  count-only [s.t]: COUNT TIMED OUT after the 0.4-second per-table limit; table passed with a WARNING so the run can move on to CDC, nothing was compared
+[PASS] [timing] a hanging DMS row-count lookup is inside the same limit (0.40s)
+[PASS] [timing] expected count too low (20, real 1000): counted exactly in ranges sized for a larger table, reported as a mismatch (queries: 13)
+[PASS] [timing] unknown expected count, table fits: exactly ONE plain whole-table COUNT(*) (no ranges, no key-bound queries)
+[PASS] [timing] unknown expected count, whole-table COUNT(*) too big for DSQL: falls back to key ranges, exact
+[PASS] [timing] known expected >= split size: still key ranges from the start (never a whole-table COUNT)
+[PASS] [timing] known expected under the split size: exactly ONE plain whole-table COUNT(*)
+[PASS] [python] whole-table count that fits
+[PASS] [python] result has every key the job's summary/report reads and is JSON-serialisable
+[PASS] [python] extra rows vs expected -> table FAILS
+[PASS] [python] short vs expected -> table FAILS
+[PASS] [python] tolerance honoured (3 off ok, 10 off fails)
+[PASS] [python] whole-table timeout -> falls back to key ranges, exact
+[PASS] [python] whole-table XX000 'server unavailable' -> falls back to key ranges, exact
+[PASS] [python] size error reported as pg8000 error dict, SQLSTATE 57014 -> split into ranges, exact
+[PASS] [python] size error reported as pg8000 error dict, SQLSTATE 54000 transaction age -> split into ranges, exact
+[PASS] [python] size error reported as client-side socket read timeout -> split into ranges, exact
+[PASS] [python] expected >= split size -> ranges from the start, never a whole-table COUNT
+[PASS] [python] ranges that time out are halved and summed exactly
+[PASS] [python] ranges that fail with XX000 are halved and summed exactly
+[PASS] [python] NULL-key rows are counted once (nullable key column)
+[PASS] [python] NOT NULL key column: no slow 'IS NULL' scan is issued
+[PASS] [python] rows below the sampled minimum / above the sampled maximum are still counted
+[PASS] [python] 2 transient errors are retried, then exact
+[PASS] [python] errors that never clear -> pass with WARNING (move on to CDC)
+[PASS] [python] empty table
+[PASS] [python] single-row table
+[PASS] [python] uuid keys at 0000.. and ffff..
+[PASS] [python] bigint keys near the 64-bit limit
+[PASS] [python] no DMS ARN -> compares with discovery's saved row count
+[PASS] [python] no expected count anywhere -> counted, not compared, WARNING
+[PASS] [python] checksum_mode != off -> patch steps aside (normal validation runs)
+[PASS] [python] single-column key that validation could not range (rangeable False) is still split by the patch
+[PASS] [python] text / keyless table: one whole-table count
+[PASS] [python] one range failing stops the other ranges (queries issued: 11 of ~1000 planned)
+[PASS] [python] time budget stops counting (0.5s, 20 queries) and passes with WARNING
+[PASS] [python] overlapping ranges -> caught by the self-check, count NOT used, WARNING
+[PASS] [python] unexpected exception inside the patch -> WARNING, table does not crash the job
+[PASS] [python] stop message is not mistaken for a timeout
+[PASS] [python] 2000 random cases (int+uuid keys, dense/sparse/clustered/extreme/v7, NULL keys, timeouts, XX000, transient errors, 1/4/8 threads): exact=1763 warned=237 WRONG=0 []
+[PASS] [python] keys exactly on / beside every planned boundary: 12 cases, 0 wrong
+[PASS] [duckdb] whole-table count that fits
+[PASS] [duckdb] result has every key the job's summary/report reads and is JSON-serialisable
+[PASS] [duckdb] extra rows vs expected -> table FAILS
+[PASS] [duckdb] short vs expected -> table FAILS
+[PASS] [duckdb] tolerance honoured (3 off ok, 10 off fails)
+[PASS] [duckdb] whole-table timeout -> falls back to key ranges, exact
+[PASS] [duckdb] whole-table XX000 'server unavailable' -> falls back to key ranges, exact
+[PASS] [duckdb] size error reported as pg8000 error dict, SQLSTATE 57014 -> split into ranges, exact
+[PASS] [duckdb] size error reported as pg8000 error dict, SQLSTATE 54000 transaction age -> split into ranges, exact
+[PASS] [duckdb] size error reported as client-side socket read timeout -> split into ranges, exact
+[PASS] [duckdb] expected >= split size -> ranges from the start, never a whole-table COUNT
+[PASS] [duckdb] ranges that time out are halved and summed exactly
+[PASS] [duckdb] ranges that fail with XX000 are halved and summed exactly
+[PASS] [duckdb] NULL-key rows are counted once (nullable key column)
+[PASS] [duckdb] NOT NULL key column: no slow 'IS NULL' scan is issued
+[PASS] [duckdb] rows below the sampled minimum / above the sampled maximum are still counted
+[PASS] [duckdb] 2 transient errors are retried, then exact
+[PASS] [duckdb] errors that never clear -> pass with WARNING (move on to CDC)
+[PASS] [duckdb] empty table
+[PASS] [duckdb] single-row table
+[PASS] [duckdb] uuid keys at 0000.. and ffff..
+[PASS] [duckdb] bigint keys near the 64-bit limit
+[PASS] [duckdb] no DMS ARN -> compares with discovery's saved row count
+[PASS] [duckdb] no expected count anywhere -> counted, not compared, WARNING
+[PASS] [duckdb] checksum_mode != off -> patch steps aside (normal validation runs)
+[PASS] [duckdb] single-column key that validation could not range (rangeable False) is still split by the patch
+[PASS] [duckdb] text / keyless table: one whole-table count
+[PASS] [duckdb] one range failing stops the other ranges (queries issued: 12 of ~1000 planned)
+[PASS] [duckdb] time budget stops counting (0.4s, 28 queries) and passes with WARNING
+[PASS] [duckdb] overlapping ranges -> caught by the self-check, count NOT used, WARNING
+[PASS] [duckdb] unexpected exception inside the patch -> WARNING, table does not crash the job
+[PASS] [duckdb] stop message is not mistaken for a timeout
+[PASS] [duckdb] 2000 random cases (int+uuid keys, dense/sparse/clustered/extreme/v7, NULL keys, timeouts, XX000, transient errors, 1/4/8 threads): exact=1763 warned=237 WRONG=0 []
+[PASS] [duckdb] keys exactly on / beside every planned boundary: 12 cases, 0 wrong
+[PASS] static check: every name the patch uses is defined in the module (undefined: [])
+[PASS] the patch does not reuse the validation range builders (found: [])
+[PASS] patched file only ADDS lines to the original (removed lines: 0)
+[PASS] no existing name is redefined by the patch ([])
+[PASS] applier output on the original script is byte-identical to the shipped patched script
+[PASS] applier refuses an already-patched file
+[PASS] applier refuses an unrelated file
+[PASS] applier refuses a file missing a required anchor
+
+115 passed, 0 failed
