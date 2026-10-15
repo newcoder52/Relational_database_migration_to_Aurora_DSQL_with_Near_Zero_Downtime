@@ -42,6 +42,21 @@ Requirements: the validate job template has `"--checksum_mode": "off"` in `glue-
 3. Also copy the file over `scripts/job3_validate.py` in your repo clone. `tools/setup.sh` re-uploads the repo copy and would remove the change.
 4. Glue reads the script when a run starts. New validate runs use it; runs already started do not.
 
+## Verify the install (run this after uploading)
+`verify_count_only_patch.py` checks the script that is actually in S3, offline except for reading S3 and the Glue job settings. It confirms:
+the patch text is present exactly once and unmodified; removing it gives back your backup byte for byte (nothing else changed);
+every function the patch calls exists in YOUR script with the expected signature; the call site only uses variables set before it;
+the patch runs correctly against a fake database (exact counts, key-range fallback, retries, 15-minute limit, mismatch fails the table);
+and each validate Glue job reads this script and has `--checksum_mode off`.
+```
+BASE=https://raw.githubusercontent.com/newcoder52/Relational_database_migration_to_Aurora_DSQL_with_Near_Zero_Downtime/main/customer_patches/job3_validate_count_only
+curl -fsSL -o verify_count_only_patch.py $BASE/verify_count_only_patch.py
+curl -fsSL -o apply_count_only_patch.py  $BASE/apply_count_only_patch.py      # the verifier needs this file in the same folder
+JOBS=""; for j in $(aws glue get-jobs --query "Jobs[?ends_with(Name,'-validate')].Name" --output text); do JOBS="$JOBS --job $j"; done
+python3 verify_count_only_patch.py s3://$BUCKET/scripts/job3_validate.py --backup job3_validate.bak.py $JOBS
+```
+The last line must end with `RESULT: PATCH OK`. Any `[FAIL]` means do not run: fix it or restore the backup. `[WARN]` lines are explained in the text.
+
 ## Check the first run
 The validate log header shows `checksum=off`. Each table logs `count-only [schema.table]: DSQL=... vs DMS FullLoadRows=... -> OK`.
 If you see `ranges @ parallelism` lines instead, the job is not running this script (or `checksum_mode` is not `off`).
@@ -55,6 +70,7 @@ Rollback: upload `job3_validate.bak.py` over `scripts/job3_validate.py`.
 | `job3_validate.py` | the complete script, drop-in |
 | `apply_count_only_patch.py` | adds the same change to any copy of job3_validate.py; refuses a file it does not recognise or one already patched |
 | `job3_validate_count_only.diff` | the change against the repo version (additions only) |
+| `verify_count_only_patch.py` | checks that the patch is correctly installed (see above) |
 | `test_count_only_patch.py`, `test_run_output.txt` | offline tests (no AWS, no Spark) and the output of the last run |
 | `SHA256SUMS` | checksums of the files above |
 
