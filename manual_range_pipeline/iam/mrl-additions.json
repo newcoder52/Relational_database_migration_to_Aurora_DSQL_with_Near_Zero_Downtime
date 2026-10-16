@@ -1,0 +1,305 @@
+{
+  "_README": "MRL IAM additions (manage_iam=false convention). MRL's new Lambdas, Step Functions and Glue jobs run under the EXISTING customer roles (the same <project>-lambda-exec-role / <project>-sfn-exec-role / <project>-glue-exec-role the base pipeline uses). This file lists ONLY the EXTRA actions + resources MRL needs on top of what those roles already have for the base pipeline. Give it to your IAM team to attach as an additional inline policy to the matching role. Fill <account-id>, <region>, <project>, <bucket>, <dsql-cluster-id> (no customer names, no real ids). No wildcard resources where a name pattern works. No _comment keys inside policy statements (only this top-level _README and the per-role _attachTo markers, which are NOT policy statements).",
+  "LambdaRoleAdditions": {
+    "_attachTo": "<project>-lambda-exec-role",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "MrlStartAndDescribeChildAndFleet",
+        "Effect": "Allow",
+        "Action": [
+          "states:StartExecution",
+          "states:DescribeExecution",
+          "states:ListExecutions"
+        ],
+        "Resource": [
+          "arn:aws:states:<region>:<account-id>:stateMachine:<project>-mrl-task",
+          "arn:aws:states:<region>:<account-id>:stateMachine:<project>-mrl-fleet",
+          "arn:aws:states:<region>:<account-id>:execution:<project>-mrl-task:*",
+          "arn:aws:states:<region>:<account-id>:execution:<project>-mrl-fleet:*"
+        ]
+      },
+      {
+        "Sid": "MrlRouteConflictGuardReadOriginalMachines",
+        "Effect": "Allow",
+        "Action": [
+          "states:ListExecutions",
+          "states:DescribeExecution"
+        ],
+        "Resource": [
+          "arn:aws:states:<region>:<account-id>:stateMachine:<project>-startup",
+          "arn:aws:states:<region>:<account-id>:stateMachine:<project>-cutover",
+          "arn:aws:states:<region>:<account-id>:execution:<project>-startup:*",
+          "arn:aws:states:<region>:<account-id>:execution:<project>-cutover:*"
+        ]
+      },
+      {
+        "Sid": "MrlEnsureLoadJob",
+        "Effect": "Allow",
+        "Action": [
+          "glue:CreateJob",
+          "glue:UpdateJob",
+          "glue:GetJob",
+          "glue:TagResource",
+          "glue:GetTags"
+        ],
+        "Resource": [
+          "arn:aws:glue:<region>:<account-id>:job/<project>-*-mrl-load"
+        ]
+      },
+      {
+        "Sid": "MrlDescribeDmsForPreflightAndCount",
+        "Effect": "Allow",
+        "Action": [
+          "dms:DescribeReplicationTasks",
+          "dms:DescribeEndpoints",
+          "dms:DescribeTableStatistics"
+        ],
+        "Resource": [
+          "*"
+        ]
+      },
+      {
+        "Sid": "MrlReadConfigInputs",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/config/params.csv",
+          "arn:aws:s3:::<bucket>/config/params_parallel_load.csv",
+          "arn:aws:s3:::<bucket>/config/fleet_task_parallel_load.csv"
+        ]
+      },
+      {
+        "Sid": "MrlOwnSettingsFile",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/config/pipeline_parallel_load.json"
+        ]
+      },
+      {
+        "Sid": "MrlState",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/mrl/*"
+        ]
+      },
+      {
+        "Sid": "MrlTaskConfigNoDelete",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/config/_task/*"
+        ]
+      },
+      {
+        "Sid": "MrlReadScriptsAndTemplates",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/scripts/*",
+          "arn:aws:s3:::<bucket>/glue-templates/*"
+        ]
+      },
+      {
+        "Sid": "MrlS3ListBucket",
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>"
+        ],
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": [
+              "mrl/*",
+              "config/_task/*",
+              "config/",
+              "scripts/*",
+              "glue-templates/*"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "SfnRoleAdditions": {
+    "_attachTo": "<project>-sfn-exec-role",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "MrlInvokeMrlLambdas",
+        "Effect": "Allow",
+        "Action": [
+          "lambda:InvokeFunction"
+        ],
+        "Resource": [
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-settings",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-preflight",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-plan",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-reconcile",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-cdc-handoff",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-gate-eval",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-ensure-job",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-state",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-mrl-fleet-preflight",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-resolve-task",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-driver-discovery",
+          "arn:aws:lambda:<region>:<account-id>:function:<project>-create-glue-jobs"
+        ]
+      },
+      {
+        "Sid": "MrlRunDiscoveryLoadCountGlue",
+        "Effect": "Allow",
+        "Action": [
+          "glue:StartJobRun",
+          "glue:GetJobRun",
+          "glue:GetJobRuns",
+          "glue:BatchStopJobRun"
+        ],
+        "Resource": [
+          "arn:aws:glue:<region>:<account-id>:job/<project>-*-mrl-load",
+          "arn:aws:glue:<region>:<account-id>:job/<project>-*-mrl-count",
+          "arn:aws:glue:<region>:<account-id>:job/<project>-*-discovery",
+          "arn:aws:glue:<region>:<account-id>:job/<project>-*-cdc"
+        ]
+      },
+      {
+        "Sid": "MrlDmsStartResumeDescribe",
+        "Effect": "Allow",
+        "Action": [
+          "dms:StartReplicationTask",
+          "dms:DescribeReplicationTasks"
+        ],
+        "Resource": [
+          "arn:aws:dms:<region>:<account-id>:task:*"
+        ]
+      },
+      {
+        "Sid": "MrlStartChildFromFleet",
+        "Effect": "Allow",
+        "Action": [
+          "states:StartExecution",
+          "states:DescribeExecution",
+          "states:StopExecution"
+        ],
+        "Resource": [
+          "arn:aws:states:<region>:<account-id>:stateMachine:<project>-mrl-task"
+        ]
+      },
+      {
+        "Sid": "MrlSfnSyncEvents",
+        "Effect": "Allow",
+        "Action": [
+          "events:PutTargets",
+          "events:PutRule",
+          "events:DescribeRule"
+        ],
+        "Resource": [
+          "arn:aws:events:<region>:<account-id>:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        ]
+      },
+      {
+        "Sid": "MrlConfirmCdcStartMarker",
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>"
+        ],
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": [
+              "config/_task/*/_cdc_started/*",
+              "mrl/*"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "GlueRoleAdditions": {
+    "_attachTo": "<project>-glue-exec-role",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "MrlCountJobDsql",
+        "Effect": "Allow",
+        "Action": [
+          "dsql:DbConnectAdmin"
+        ],
+        "Resource": [
+          "arn:aws:dsql:<region>:<account-id>:cluster/<dsql-cluster-id>"
+        ]
+      },
+      {
+        "Sid": "MrlCountJobDescribeTableStats",
+        "Effect": "Allow",
+        "Action": [
+          "dms:DescribeTableStatistics"
+        ],
+        "Resource": [
+          "*"
+        ]
+      },
+      {
+        "Sid": "MrlLoadAndCountS3",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/mrl/*"
+        ]
+      },
+      {
+        "Sid": "MrlLoadAndCountTaskConfigNoDelete",
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:PutObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>/config/_task/*"
+        ]
+      },
+      {
+        "Sid": "MrlLoadAndCountS3List",
+        "Effect": "Allow",
+        "Action": [
+          "s3:ListBucket"
+        ],
+        "Resource": [
+          "arn:aws:s3:::<bucket>"
+        ],
+        "Condition": {
+          "StringLike": {
+            "s3:prefix": [
+              "mrl/*",
+              "config/_task/*"
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

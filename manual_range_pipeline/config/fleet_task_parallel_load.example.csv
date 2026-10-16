@@ -1,0 +1,3 @@
+task_arn,task_suffix,cdc,max_concurrency,dms_start_mode,load_worker_type,load_workers,max_files_in_parallel,writers_per_file,tables,override
+arn:aws:dms:<region>:<account-id>:task:<task-suffix>,<task-suffix>,false,4,start,G.4X,20,20,8,,false
+arn:aws:dms:<region>:<account-id>:task:<task-suffix2>,,true,6,adopt_stopped,G.4X,10,20,6,<schema>.<table>,false

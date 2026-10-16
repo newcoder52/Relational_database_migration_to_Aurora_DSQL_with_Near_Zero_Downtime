@@ -1,0 +1,292 @@
+{
+  "Comment": "MRL fleet (parent). Start by hand with {\"bucket\":\"<pipeline bucket>\"} and OPTIONAL \"max_concurrency\":N (1..40) and \"cdc\":true|false. FIRST state PublishSettings builds the MRL settings from the existing config/params.csv (READ-ONLY), validates the optional max_concurrency/cdc BEFORE any DMS call, publishes config/pipeline_parallel_load.json and pins mrl/runs/<exec>/settings.json; it NEVER writes config/params.csv, config/pipeline.json or config/fleet_tasks.csv. Then FleetPreflight validates config/fleet_task_parallel_load.csv (+ optional config/params_parallel_load.csv) strictly and runs ONE MRL child per row with a Map (MaxConcurrency = max_parallel_tasks). Re-trigger safe; aggregates {succeeded, failed, skipped} and FAILS if any child failed (after the others finish).",
+  "StartAt": "CheckFleetInput",
+  "States": {
+    "CheckFleetInput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.bucket",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.bucket",
+              "IsString": true
+            }
+          ],
+          "Next": "PublishSettings"
+        }
+      ],
+      "Default": "MissingFleetInput"
+    },
+    "MissingFleetInput": {
+      "Type": "Fail",
+      "Error": "MissingFleetInput",
+      "Cause": "Start the MRL fleet with {\"bucket\":\"<pipeline bucket>\"}. Operator input files are config/fleet_task_parallel_load.csv (required) and config/params_parallel_load.csv (optional)."
+    },
+    "FleetPreflight": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<MRL_FLEET_PREFLIGHT_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket.$": "$.bucket",
+          "stateMachineArn": "<<MRL_TASK_STATE_MACHINE_ARN>>",
+          "fleetExecutionId.$": "$$.Execution.Id",
+          "pinnedSettingsKey.$": "$.settings.pinnedSettingsKey",
+          "execMaxConcurrency.$": "$.settings.execMaxConcurrency",
+          "execCdc.$": "$.settings.execCdc"
+        }
+      },
+      "ResultSelector": {
+        "tasks.$": "$.Payload.tasks",
+        "count.$": "$.Payload.count",
+        "toStart.$": "$.Payload.toStart",
+        "skipped.$": "$.Payload.skipped",
+        "maxParallelTasks.$": "$.Payload.maxParallelTasks",
+        "warnings.$": "$.Payload.warnings"
+      },
+      "ResultPath": "$.preflight",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PreflightFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "FanOut"
+    },
+    "PreflightFailed": {
+      "Type": "Fail",
+      "Error": "MrlFleetPreflightFailed",
+      "CausePath": "$.error.Cause"
+    },
+    "FanOut": {
+      "Type": "Map",
+      "Comment": "One item per task. MaxConcurrency from params (default 2). Each item starts the MRL child and WAITS for it (startExecution.sync) so the fleet aggregates outcomes and fails if any child failed. A skipped task (already running) is not started again.",
+      "ItemsPath": "$.preflight.tasks",
+      "MaxConcurrencyPath": "$.preflight.maxParallelTasks",
+      "Parameters": {
+        "taskArn.$": "$$.Map.Item.Value.taskArn",
+        "taskSuffix.$": "$$.Map.Item.Value.taskSuffix",
+        "skip.$": "$$.Map.Item.Value.skip",
+        "runningExecution.$": "$$.Map.Item.Value.runningExecution",
+        "runName.$": "$$.Map.Item.Value.runName",
+        "childInput.$": "$$.Map.Item.Value.input"
+      },
+      "ResultPath": "$.results",
+      "Iterator": {
+        "StartAt": "IsSkipped",
+        "States": {
+          "IsSkipped": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.skip",
+                "IsNull": true,
+                "Next": "StartChild"
+              }
+            ],
+            "Default": "Skipped"
+          },
+          "Skipped": {
+            "Type": "Pass",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "status": "skipped",
+              "reason.$": "$.skip",
+              "runningExecution.$": "$.runningExecution"
+            },
+            "End": true
+          },
+          "StartChild": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::states:startExecution.sync:2",
+            "Comment": "Deterministic child execution name (re-trigger safe). startExecution.sync:2 waits for the child and surfaces its final status; a child failure raises States.TaskFailed, caught below as a per-item 'failed' so sibling tasks still finish.",
+            "Parameters": {
+              "StateMachineArn": "<<MRL_TASK_STATE_MACHINE_ARN>>",
+              "Name.$": "$.runName",
+              "Input.$": "$.childInput"
+            },
+            "ResultPath": "$.child",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Sfn.SfnException",
+                  "States.Timeout"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ExecutionAlreadyExists",
+                  "Sfn.ExecutionAlreadyExistsException"
+                ],
+                "Next": "ChildAlreadyRunning",
+                "ResultPath": "$.error"
+              },
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ChildFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "ChildSucceeded"
+          },
+          "ChildSucceeded": {
+            "Type": "Pass",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "status": "succeeded"
+            },
+            "End": true
+          },
+          "ChildFailed": {
+            "Type": "Pass",
+            "Comment": "This task's child failed or could not start; recorded so the fleet can fail AFTER the others finish (the Map does not abort siblings).",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "status": "failed",
+              "error.$": "$.error"
+            },
+            "End": true
+          },
+          "ChildAlreadyRunning": {
+            "Type": "Pass",
+            "Comment": "A7: the deterministic child execution already exists (a benign re-trigger of a task whose child is running/ran). Treated as SKIPPED, not a failure, so the fleet does not fail a re-trigger.",
+            "Parameters": {
+              "taskArn.$": "$.taskArn",
+              "taskSuffix.$": "$.taskSuffix",
+              "status": "skipped",
+              "reason": "child_execution_already_exists"
+            },
+            "End": true
+          }
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FleetFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "Aggregate"
+    },
+    "Aggregate": {
+      "Type": "Pass",
+      "Parameters": {
+        "statuses.$": "$.results[*].status",
+        "anyFailed.$": "States.ArrayContains($.results[*].status, 'failed')"
+      },
+      "ResultPath": "$.agg",
+      "Next": "AnyFailedChoice"
+    },
+    "AnyFailedChoice": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.agg.anyFailed",
+          "BooleanEquals": true,
+          "Next": "FleetHadFailures"
+        }
+      ],
+      "Default": "FleetSucceeded"
+    },
+    "FleetSucceeded": {
+      "Type": "Succeed",
+      "Comment": "Every task's MRL child succeeded (or was skipped as already running). See $.results for the per-task {succeeded|skipped} outcome."
+    },
+    "FleetHadFailures": {
+      "Type": "Fail",
+      "Error": "MrlFleetHadFailures",
+      "Cause": "At least one task's MRL child failed (status 'failed' in the execution output's results). The other tasks were waited for and their outcomes are in $.results. Fix the failed task(s) and start the fleet again with the same input: succeeded tasks are skipped (their child is not re-run) and in-progress children are skipped."
+    },
+    "FleetFailed": {
+      "Type": "Fail",
+      "Error": "MrlFleetFanOutFailed",
+      "Comment": "The fan-out itself failed unexpectedly.",
+      "CausePath": "$.error.Cause"
+    },
+    "PublishSettings": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Build+publish+pin the MRL settings from config/params.csv; validate the optional execution-input max_concurrency and cdc strictly, before any DMS call.",
+      "Parameters": {
+        "FunctionName": "<<MRL_SETTINGS_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket.$": "$.bucket",
+          "rawInput.$": "$",
+          "fleetExecutionName.$": "$$.Execution.Name",
+          "fleetExecutionArn.$": "$$.Execution.Id",
+          "fleetStateMachineArn.$": "$$.StateMachine.Id",
+          "taskStateMachineArn": "<<MRL_TASK_STATE_MACHINE_ARN>>"
+        }
+      },
+      "ResultSelector": {
+        "pinnedSettingsKey.$": "$.Payload.pinnedSettingsKey",
+        "settingsKey.$": "$.Payload.settingsKey",
+        "execMaxConcurrency.$": "$.Payload.execMaxConcurrency",
+        "execCdc.$": "$.Payload.execCdc",
+        "published.$": "$.Payload.published"
+      },
+      "ResultPath": "$.settings",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SettingsFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "FleetPreflight"
+    },
+    "SettingsFailed": {
+      "Type": "Fail",
+      "Error": "MrlSettingsFailed",
+      "CausePath": "$.error.Cause"
+    }
+  }
+}

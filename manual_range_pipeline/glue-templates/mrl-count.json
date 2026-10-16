@@ -1,0 +1,10 @@
+{
+  "role": "mrl-count",
+  "script": "job_mrl_count.py",
+  "command_name": "pythonshell",
+  "glue_version": "3.0",
+  "max_capacity": 1,
+  "timeout_minutes": 2880,
+  "max_concurrent_runs": 10,
+  "default_arguments": {}
+}

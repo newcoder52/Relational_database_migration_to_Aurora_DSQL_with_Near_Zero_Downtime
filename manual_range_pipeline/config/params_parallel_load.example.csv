@@ -1,0 +1,15 @@
+parameter,value
+# MRL fleet params (OPTIONAL). Lives at s3://<bucket>/config/params_parallel_load.csv - a
+# SEPARATE file from the existing pipeline's config/params.csv (which MRL never writes). Only the
+# MRL-only keys below are allowed; unknown keys are rejected. Shared values (DSQL endpoint,
+# region, roles, control schema, CSV NULL defaults) are read READ-ONLY from config/params.csv via
+# a byte-identical copy of the original parser; MRL writes only config/pipeline_parallel_load.json
+# and never config/pipeline.json.
+# Precedence: fleet row > params_parallel_load.csv > config/params.csv.
+max_parallel_tasks,2
+# Optional MRL-only defaults (blank = the built-in default; a fleet row still overrides these):
+# split_by,count
+# split_allow_hex,false
+# count_timeout_action,fail
+# count_tolerance,0
+# write_merged_status,true
