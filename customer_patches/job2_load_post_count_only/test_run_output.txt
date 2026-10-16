@@ -1,0 +1,52 @@
+=== base:    $HOME/Downloads/review3d/post-count-only/repo/scripts/job2_load.py
+=== patched: /var/folders/nt/9tm0gh455n937jnv8q4s_grh0000gr/T/postco_patched_0yt6ub1i/job2_load_patched.py
+=== applier: $HOME/Downloads/review3d/post-count-only/customer_patches/job2_load_post_count_only/apply_post_count_only_patch.py
+
+[PASS] match: OK note with the count
+[PASS] match: prints the one-line 'skipped range/uuid/leak' notice
+[PASS] match: the count connection is autocommit
+[PASS] match: cursor+conn closed
+[PASS] match: exactly ONE plain COUNT(*), no range/uuid/leak query
+[PASS] mismatch: raises _PostCountMismatch
+[PASS] mismatch: message carries BOTH numbers in today's style
+[PASS] txn-timeout-then-OK: OK on retry
+[PASS] txn-timeout-then-OK: slept once for 20s before the retry
+[PASS] txn-timeout-then-OK: a FRESH connection per attempt
+[PASS] txn-timeout-then-OK: names the error class
+[PASS] ssl-eof-x3: loud WARNING, verify manually
+[PASS] ssl-eof-x3: names the SSL EOF error class (not reliant on transient classifier)
+[PASS] ssl-eof-x3: 1 initial + 3 retries = 4 attempts
+[PASS] ssl-eof-by-message: classified as SSL EOF via message
+[PASS] budget-exhaustion: WARNING mentioning the budget
+[PASS] budget-exhaustion: at least one attempt ran
+[PASS] budget-exhaustion: never sleeps past the 600s budget
+[PASS] budget-exhaustion: not an OK note
+[PASS] classify: connection reset -> dropped/broken connection
+[PASS] classify: XX000 -> transient
+[PASS] full: guard reports NOT count_only
+[PASS] arg absent -> full
+[PASS] arg empty -> full
+[PASS] arg 'FULL' (any case) -> full
+[PASS] arg 'count_only' -> count_only
+[PASS] arg invalid -> warn and fall back to full
+[PASS] full/vwtar: issues one per-file range COUNT(*) per file (3)
+[PASS] full/vwtar: still runs the uuid-format regex scan
+[PASS] full/vwtar: still runs the auth-token-leak LIKE scan
+[PASS] A/vwtar count_only: NO per-file range COUNT(*)
+[PASS] A/vwtar count_only: NO uuid/leak scan
+[PASS] A/vwtar count_only: exactly ONE COUNT(*)
+[PASS] B/load_one_table count_only: verified separately by run_bsite_direct (source guard position + behaviour)
+[PASS] B/source: count_only guard is the FIRST statement in the single-table post-load block
+[PASS] B/source: the original bounded probe is still present (full mode unchanged)
+[PASS] B/source: count_only path returns BEFORE the bounded probe / COUNT(*) block
+[PASS] B/behaviour: count_only issues exactly one plain COUNT(*), no probe/scan
+[PASS] applier: applies cleanly to main's job2_load.py
+[PASS] applier: output py_compiles
+[PASS] applier: idempotent (no-op on already-patched)
+[PASS] applier: fails CLOSED on a modified anchor (no output written)
+[PASS] applier: fails CLOSED on an unrecognised file
+[PASS] mutation 'remove 'skip range counts' (count_only still scans ranges)': makes test [A/vwtar count_only: NO per-file range COUNT(*)] FAIL (kill the mutant)
+[PASS] mutation 'warn instead of fail -> turn mismatch into a warning': makes test [mismatch: should have raised] FAIL (kill the mutant)
+[PASS] mutation 'fail instead of warn -> re-raise an infra error': makes test [suite run_core_tests raised] FAIL (kill the mutant)
+
+================  46 passed, 0 failed  ================
