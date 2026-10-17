@@ -1,16 +1,23 @@
-# sha256 OLD (main) -> NEW (patched) for each repo file this patch changes
+# sha256 OLD -> NEW for each repo file this patch changes.
+# OLD = the file in orig/ (this patch's base: release-1 MINUS stopAfterLoad, i.e. a deployed build
+#       that already carries null_notnull_text but not stopAfterLoad). NEW = the shipped release-1
+#       file after the stopAfterLoad transform. patch_<file>(orig/<file>) == the NEW file, so the
+#       patch's own test (test_transform_reproduces_shipped_files) reproduces release-1 exactly.
+# NOTE: the embedded *.diff files are git-apply artifacts that target PRISTINE GitHub main (which
+#       lacks null_notnull_text), for an older deployed build; they apply on main and reproduce the
+#       release-1 files. See README "Which base does this patch target?".
 lambdas/resolve_task.py
-  old: 3829b01a22f3d5e50e5ee7c40c371fe0a5fe5d549078a6c85b567fa4c55d8ca6
-  new: 0ca313996fb37d1b4e7074122eb26303520ef43993c9c68ffed2457ae9018ce5
+  old: 2463f1bae20bfc7a582a89bcc792acb8c8046349d7c5bdc5d854b8423de92be7
+  new: c2dff2a857d1a744b1a0c37a7c05732ad3f603c55e887699029d7ba202e68a82
 lambdas/preflight_tasks.py
   old: b60cf38676783ea0f6ee207e6804fc993efa39438713379198e0e77f84ff8a4c
   new: cb2197bd13574aa0e800d4215f3b06c40a425894c4787ae2e6d7c5b79e58284e
 stepfunctions/startup.asl.json
-  old: ba25e3d2ef3d34bbd8ad28ca5f59517b8a924630b8f6b165674f728dde54f90d
+  old: 4b0825898144905e8f5a0f0adaf1fb9c6a1d16ac5f86df03ab24529f0c52ed81
   new: dbc963f88790bdab9a872cc3b78260ba70ec4e840e8acf9723e4b5c0d980e24a
 tests/test_asl_payload_contract.py
   old: 735d1ff693d6c358a2a968e8cc4c3766c535f4bd2dac54ef2276b286c0f53f60
-  new: b80c69949df19c46a6857200fbbdcec80fe2f0500793d9f5c646337427e8b779
+  new: 3847de289b4a4370f63fb55624c1542582a6ff2c5b039fccea487583abbff35c
 stepfunctions/fleet-startup.asl.json
   old: 284d39a3bf00799c714e6c9fa684ae18742f79e60010cbbacd0059e9c7c12224
   new: 284d39a3bf00799c714e6c9fa684ae18742f79e60010cbbacd0059e9c7c12224
@@ -20,4 +27,4 @@ stepfunctions/fleet-startup.asl.json
   bbcddfc10a17d79e753ee0b701c6515748673588258294d0cae601a92389db0e  apply_stop_after_load_patch.py
   6ddfa05d32cdc02f5f40880a2c2006877c1a1d732c554e54bb7265c6e4f760f3  stop_after_load_transform.py
   b70cb5b460095934fc19472b7c750393626baa031f1ad88ff527fa8b383aac7b  test_stop_after_load_patch.py
-  d867c3377c4a379c33a032da77e6e23a6d9ff26c319e31cef6772d049fee6f02  startup_stop_after_load.repo.diff
+  a362f5ddf71281772f908886ea1431ac846d561f0dc6162d989c4611962ce94e  startup_stop_after_load.repo.diff

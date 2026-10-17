@@ -556,6 +556,10 @@ SETTINGS_DEFAULTS = {
     #                 FAILS naming the bad entry).
     "null_values": "",
     "null_rules": "",
+    # Optional automatic NOT NULL char/text keep-text rule (--null_notnull_text). "off"
+    # (default) = today's behaviour. "keep_text" keeps a text value in a NOT NULL char/text
+    # column as data. Validated below (invalid -> warn and treat as off).
+    "null_notnull_text": "off",
 }
 SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
 GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
@@ -882,11 +886,11 @@ def _validate_settings(cfg, warnings):
     # preflight naming the bad entry; wrong data, not a typo to ignore). The scripts own the
     # runtime parse (shared null-rules block); this mirrors its rules so a bad setting is caught
     # before any job is created. Normalised to a trimmed string ("" = unset = today's behaviour).
-    _validate_null_settings(cfg)
+    _validate_null_settings(cfg, warnings)
     return cfg
 
 
-def _validate_null_settings(cfg):
+def _validate_null_settings(cfg, warnings=None):
     """Validate the FORMAT of the null_values / null_rules settings (customer-controlled NULL
     handling), raising SettingsError naming the bad entry on any problem. Mirrors the parse rules
     of the shared null-rules block copied into the four Glue scripts (scripts/job2_load.py,
@@ -901,6 +905,20 @@ def _validate_null_settings(cfg):
                 f"list exact, non-empty strings (an empty field is already treated as NULL).")
     nr = str(cfg.get("null_rules", "") or "").strip()
     cfg["null_rules"] = nr
+    # Optional automatic NOT NULL char/text keep-text rule. "off" (default) | "keep_text".
+    # Blank / the __NULL_UNSET__ sentinel -> off. An invalid value is a WARNING + off (never
+    # a hard preflight failure, since off is always safe and byte-identical to today).
+    nnt = str(cfg.get("null_notnull_text", "") or "").strip().lower()
+    if nnt in ("", "__null_unset__"):
+        nnt = "off"
+    if nnt not in ("off", "keep_text"):
+        _msg = (f"null_notnull_text {cfg.get('null_notnull_text')!r} is not off|keep_text; using off")
+        if warnings is not None:
+            warnings.append(_msg)
+        else:
+            print(f"(warn) {_msg}")
+        nnt = "off"
+    cfg["null_notnull_text"] = nnt
     if nr:
         seen = set()
         for entry in nr.split(";"):
@@ -1339,6 +1357,7 @@ def handler_shared(event, context):
         # as --null_values / --null_rules by create_glue_jobs, exactly like --csv_null_value.
         "nullValues": cfg["null_values"],
         "nullRules": cfg["null_rules"],
+        "nullNotnullText": cfg["null_notnull_text"],
         "warnings": warnings,
     })
     for w in warnings:

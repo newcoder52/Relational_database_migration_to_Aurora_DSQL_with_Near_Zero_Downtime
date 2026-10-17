@@ -175,7 +175,27 @@ A task whose startup is **still RUNNING** is skipped by the fleet preflight exac
 * `test_stop_after_load_patch.py` — executing, offline tests (no AWS).
 * `test_run_output.txt` — a sample dry-run (against fake clients).
 * `SHA256SUMS` — sha256 old→new for each repo file this patch changes.
-* `orig/` — snapshots of the files as they are on `main` (the diff/transform baseline).
+* `orig/` — snapshots of this patch's **base**: the files as they are on release-1 **minus the
+  stopAfterLoad transform** (i.e. a deployed build that already carries `null_notnull_text` but not
+  stopAfterLoad). `patch_<file>(orig/<file>)` reproduces the shipped release-1 file byte-for-byte
+  (this is what `test_transform_reproduces_shipped_files` checks).
+
+## Which base does this patch target?
+
+This folder has TWO consumers, with two (deliberately different) bases — both verified:
+
+1. **The deployed-environment apply script + transform** (`apply_stop_after_load_patch.py`,
+   `stop_after_load_transform.py`). Base = **`orig/`** = release-1 without stopAfterLoad (it still
+   has `null_notnull_text`). `patch_*(orig/*)` == the shipped release-1 files; `SHA256SUMS` records
+   `old` = `orig/` and `new` = the shipped files. On the **current release-1 files the apply is a
+   clean no-op** (the transform is idempotent: `patch_startup_asl` recognises the load-only states
+   and the ResultSelector entry are already present).
+2. **The `git apply` plain-file path** (`*.repo.diff`, `*.startup_asl.diff`, …). Base = **pristine
+   GitHub `main`** (which does NOT yet carry `null_notnull_text`), for an **older deployed build**.
+   The diffs apply cleanly on `main` and reproduce the release-1 files.
+
+So: it is a no-op on release-1, and it applies on pristine `main` — the two bases differ only by the
+unrelated `null_notnull_text` feature, which neither the transform nor the diffs touch.
 
 ## Deployed environment (no git checkout)
 
