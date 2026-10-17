@@ -10,6 +10,15 @@
 > `apply_stop_after_load_patch.py` script patches a deployed environment in place, and is
 > idempotent — a second apply on an already-integrated environment is a no-op. On a current `main`
 > checkout the plain-file diff is already applied, so there is nothing to apply from the repo.
+>
+> **Release candidate `release-1`:** this feature ships to `main` in the Sunday release via the
+> merge commit _"Merge remote-tracking branch 'integrate/integrate-pc-sal' into release-1"_, which
+> carries the integration commit above (feature commit `98d6c8d`). Verified on the merged tree: a
+> **dry run** of `apply_stop_after_load_patch.py` against the merged `stepfunctions/startup.asl.json`,
+> `lambdas/resolve_task.py` and `lambdas/preflight_tasks.py` (fake boto3) reports **SAME (no-op)**
+> for every state machine and Lambda — `patch_startup_asl` recognises the load-only states are
+> already present and returns unchanged (fail-closed: it would raise a clear `PatchError` on a
+> half-patch), and no `update_*` call is made.
 
 An **optional, fleet-level run parameter** that makes the startup workflow **stop after the full
 load**: `stopAfterLoad`. When it is `true`, every table group **loads** exactly as today

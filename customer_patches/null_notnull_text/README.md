@@ -1,5 +1,15 @@
 # `--null_notnull_text`: keep text in NOT NULL char/text columns (optional, default OFF)
 
+> **Included in `main` as of the integration commit** _"NULL handling: optional automatic
+> text-NULL keep for NOT NULL char/text columns (--null_notnull_text)"_ (feature commit `4ffb93c`).
+> **Release candidate `release-1`:** this feature ships to `main` in the Sunday release via the
+> merge commit _"Merge remote-tracking branch 'nullauto/null-notnull-text' into release-1"_. From
+> that merge on, a customer deploying `main` gets `--null_notnull_text` with **no patching**; this
+> folder is kept for **older, hand-patched deployments**. Verified on the merged tree: a dry run of
+> `apply_null_notnull_text_patch.py <repo_root>` reports **0 files to change** (all 21 touched files
+> "same", sha256 unchanged) — an idempotent no-op; the shared fail-closed transform runs without
+> raising.
+
 An opt-in rule for the NULL pipeline: for a target column that is **NOT NULL**
 (`information_schema.columns.is_nullable='NO'`) **and** whose type is `character varying` /
 `character` / `text`, **no text value is ever converted to SQL NULL** — the DMS endpoint marker

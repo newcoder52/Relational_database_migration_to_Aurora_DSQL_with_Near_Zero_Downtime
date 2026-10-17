@@ -320,6 +320,12 @@ default — operators opt in per deployment by adding `"--post_load_check": "cou
 `default_arguments` in `glue-templates/load.json` (and `load-big.json`) so it survives job
 re-creation, or on the job in the Glue console for a one-off run.
 
+**Automatic NOT NULL char/text keep (`--null_notnull_text`, optional).** The load / load-big /
+validate / CDC jobs also accept `--null_notnull_text` with values `off` (default, byte-identical
+to today) and `keep_text`; `keep_text` stops a NOT NULL `char`/`varchar`/`text` column from turning
+any text value into SQL NULL (it stores the literal text). Set it once as the `null_notnull_text`
+key in `params.csv` — see RUNBOOK §3 for the precedence rule and the data-safety note.
+
 **CDC validation (Tier-2)** is **on by default** (`cdc_validation=true`): each CDC job re-reads a
 sample (`cdc_validation_sample`, default 20) of every committed file's rows by key and records
 persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover stops at

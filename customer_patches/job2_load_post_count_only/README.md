@@ -7,6 +7,14 @@
 > apply script `apply_post_count_only_patch.py` is a **no-op** (it detects the change is already
 > present and exits cleanly without rewriting the file). This folder is kept for **older,
 > hand-patched deployments** whose `job2_load.py` predates that commit.
+>
+> **Release candidate `release-1`:** this feature ships to `main` in the Sunday release via the
+> merge commit _"Merge remote-tracking branch 'integrate/integrate-pc-sal' into release-1"_, which
+> carries the integration commit above (feature commit `0730935`). Verified on the merged tree:
+> `apply_post_count_only_patch.py scripts/job2_load.py` reports _"already patched (no-op)"_ with the
+> input bytes unchanged (merged `scripts/job2_load.py` sha256
+> `9d7a7942921083ac27e9c2bb2375057c83cd4130bb268b7aa2121160389cbeee`, which also includes the
+> coexisting `--null_notnull_text` edits — the apply script matches on its own anchors only).
 
 A small, additive patch for the **load** job (`scripts/job2_load.py`). It adds one optional
 Glue argument, `--post_load_check`, with values **`full`** (default) and **`count_only`**.
