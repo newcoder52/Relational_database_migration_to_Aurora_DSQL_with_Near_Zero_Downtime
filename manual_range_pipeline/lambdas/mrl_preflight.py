@@ -515,6 +515,8 @@ def handler(event, context):
                       else cfg.get("null_values", "") or "")
     null_rules = str(event.get("nullRules") if event.get("nullRules") is not None
                      else cfg.get("null_rules", "") or "")
+    null_notnull_text = str(event.get("nullNotnullText") if event.get("nullNotnullText") is not None
+                            else cfg.get("null_notnull_text", "") or "")
     try:
         _nullcfg = {"null_values": null_values, "null_rules": null_rules}
         rt._validate_null_settings(_nullcfg)
@@ -635,6 +637,7 @@ def handler(event, context):
         "csvNullValue": contract.get("csvNullValue", "NULL"),
         "nullValues": null_values,
         "nullRules": null_rules,
+        "nullNotnullText": null_notnull_text,
         "cdcRoot": contract.get("cdcRoot", "."),
         "capacity": capacity,
         "override": override,

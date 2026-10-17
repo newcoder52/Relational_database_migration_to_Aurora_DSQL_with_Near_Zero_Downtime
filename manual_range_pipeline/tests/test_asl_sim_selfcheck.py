@@ -96,6 +96,7 @@ def test_startup_happy_path_reaches_success():
                 "validateRowsPerRange": 10000, "validateParallelism": 0,
                 "validateTargetSecondsPerRange": 12, "validateHash": "all",
                 "maxParallelTables": 20, "nullValues": "", "nullRules": "",
+                "nullNotnullText": "off",
                 "perWorkerMemBudgetMb": 1500}}
         if "DRIVER_DISCOVERY" in fn:
             return {"Payload": {"extraPyFiles": "s3://b/d/pg8000.whl", "engine": "pythonshell",

@@ -29,6 +29,7 @@ CLASSIFICATION = {
     "control_schema": (PASSED_THROUGH, "reused CDC jobs arg --control_schema (cdc=true only)"),
     "null_values": (USED, "range-load + count job arg --null_values (NULL handling)"),
     "null_rules": (USED, "range-load + count job arg --null_rules (NULL handling)"),
+    "null_notnull_text": (USED, "range-load + count job arg --null_notnull_text (NULL handling)"),
     # --- concurrency / sizing used by the range-load job ---
     "map_max_concurrency": (USED, "the DEFAULT number of parallel range loads per table "
                             "(Amendment 5; explicit key only, else built-in default 3); a fleet "

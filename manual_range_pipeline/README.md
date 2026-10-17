@@ -156,6 +156,13 @@ text/char column. If DMS wrote the literal word `NULL` and the endpoint marker i
 value becomes a real SQL NULL and a NOT NULL column rejects the row. Fix with
 `null_rules=<schema>.<table>.<column>=none` to keep the text as data for that column.
 
+- `null_notnull_text` (`off` default | `keep_text`): a fleet-wide switch — with `keep_text`,
+  any NOT NULL `char`/`varchar`/`text` column keeps a text value (the endpoint marker or a
+  `null_values` entry) as data instead of converting it to SQL NULL, so you need not list
+  hundreds of columns in `null_rules`. Precedence: an explicit `null_rules` entry > this >
+  `null_values` > the endpoint marker. Reaches the MRL range-load and count jobs like the
+  other NULL settings.
+
 **The danger of `null_values`:** setting it REPLACES the endpoint marker, so a real NULL that DMS
 wrote as the word `NULL` would then load as the literal text `NULL` in a nullable text column
 (and break a typed column). Prefer `null_rules` for a specific column over a blanket
@@ -217,6 +224,7 @@ This table (generated from `tools/mrl_settings_classification.py`; a test fails 
 | `max_parallel_tables` | IGNORED HERE | original job2 how-many-tables-at-once; MRL loads one table's ranges with its own max_concurrency (one table per task) |
 | `max_writers_per_loader` | PASSED THROUGH | reused PlanSplit writer sizing (cdc=true) |
 | `min_writers_per_loader` | PASSED THROUGH | reused PlanSplit writer sizing (cdc=true) |
+| `null_notnull_text` | USED | range-load + count job arg --null_notnull_text (NULL handling) |
 | `null_rules` | USED | range-load + count job arg --null_rules (NULL handling) |
 | `null_values` | USED | range-load + count job arg --null_values (NULL handling) |
 | `per_worker_mem_budget_mb` | IGNORED HERE | original job2 driver-memory auto-throttle; MRL sizes the range-load job by worker type/count directly |

@@ -702,6 +702,10 @@ def build_mapping_for_table(spec, target_columns, dms_columns, pk_columns):
                 "type_category": type_categories[target_name],
                 "ordinal_position": target_col['ordinal_position'],
                 "max_length": target_col['max_length'],
+                # is_nullable ('YES'/'NO') lets the load/validate/CDC jobs apply the optional
+                # --null_notnull_text rule without a catalog query. Older mappings omit it and
+                # the jobs fall back to one information_schema read per table.
+                "is_nullable": target_col.get('is_nullable'),
             })
             target_column_names.append(target_name)
         else:

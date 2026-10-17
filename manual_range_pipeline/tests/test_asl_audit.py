@@ -29,7 +29,7 @@ _MRL_TOP_ROOTS = {
     ("$", "maxFilesInParallel"), ("$", "writersPerFile"), ("$", "splitBy"),
     ("$", "splitAllowHex"), ("$", "includeTables"), ("$", "countTolerance"),
     ("$", "countTimeoutAction"), ("$", "writeMergedStatus"), ("$", "connBudget"),
-    ("$", "nullValues"), ("$", "nullRules"),
+    ("$", "nullValues"), ("$", "nullRules"), ("$", "nullNotnullText"),
 }
 _FLEET_TOP_ROOTS = {("$", "bucket"), ("$", "tasksFile"), ("$", "paramsFile")}
 

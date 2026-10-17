@@ -193,6 +193,12 @@ phase under the bold sub-headings below.
   to Glue jobs created after the change. Already-created jobs keep their old values** until those
   jobs are deleted and re-created (new task startup, or a manual job re-create). See the
   "Which settings affect a running task?" note after the tables.
+- **`null_notnull_text` (optional automatic NOT NULL char/text keep-text rule)** is baked into the
+  SAME jobs as `--null_notnull_text` (`off` default | `keep_text`). `keep_text` stops a NOT NULL
+  char/varchar/text column from converting any text value (endpoint marker or `null_values` entry)
+  to NULL — it stores the text. Precedence: a `null_rules` entry > `null_notnull_text` >
+  `null_values` > endpoint. CDC-safe: DMS S3 CSV sends a full after-image per change row
+  (`AddColumnName=true`), so an unchanged UPDATE column carries its real value, never the marker.
 - **`null_values` / `null_rules` (customer NULL handling)** are also baked into the load/load-big/
   validate/CDC (incl. `ck`/`bg` fork) job args as `--null_values` / `--null_rules` at job creation
   (CreateGlueJobs / EnsureForkJobs). A change takes effect only for jobs **created after** it —

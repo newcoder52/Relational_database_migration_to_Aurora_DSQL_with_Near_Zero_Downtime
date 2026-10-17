@@ -99,6 +99,7 @@
     "minWritersPerLoader.$": "$.Payload.minWritersPerLoader",
     "mrlMode.$": "$.Payload.mrlMode",
     "nullRules.$": "$.Payload.nullRules",
+    "nullNotnullText.$": "$.Payload.nullNotnullText",
     "nullValues.$": "$.Payload.nullValues",
     "override.$": "$.Payload.override",
     "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb",
@@ -723,6 +724,7 @@
      "csv_null_value.$": "$.resolved.csvNullValue",
      "null_values.$": "$.resolved.nullValues",
      "null_rules.$": "$.resolved.nullRules",
+     "null_notnull_text.$": "$.resolved.nullNotnullText",
      "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
      "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
      "cdc_validation.$": "$.resolved.cdcValidation",
@@ -847,6 +849,7 @@
      "csv_null_value.$": "$.resolved.csvNullValue",
      "null_values.$": "$.resolved.nullValues",
      "null_rules.$": "$.resolved.nullRules",
+     "null_notnull_text.$": "$.resolved.nullNotnullText",
      "load_args_defaults": {
       "max_files_in_parallel.$": "$.resolved.maxFilesInParallel",
       "writers_per_file.$": "$.resolved.writersPerFile"
@@ -916,6 +919,7 @@
      "csv_null_value.$": "$.resolved.csvNullValue",
      "null_values.$": "$.resolved.nullValues",
      "null_rules.$": "$.resolved.nullRules",
+     "null_notnull_text.$": "$.resolved.nullNotnullText",
      "maxTotalConcurrentRuns.$": "$.plan.maxTotalConcurrentRuns",
      "loadWorkerType.$": "$.resolved.loadWorkerType",
      "loadWorkers.$": "$.resolved.loadWorkers"
@@ -1523,6 +1527,7 @@
      "csv_null_value.$": "$.resolved.csvNullValue",
      "null_values.$": "$.resolved.nullValues",
      "null_rules.$": "$.resolved.nullRules",
+     "null_notnull_text.$": "$.resolved.nullNotnullText",
      "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
      "cdc_validation.$": "$.resolved.cdcValidation",
      "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
@@ -1875,6 +1880,7 @@
      "csv_null_value.$": "$.resolved.csvNullValue",
      "null_values.$": "$.resolved.nullValues",
      "null_rules.$": "$.resolved.nullRules",
+     "null_notnull_text.$": "$.resolved.nullNotnullText",
      "error_message.$": "$.cdcRun.run.ErrorMessage",
      "failed_run_id.$": "$.cdcStart.JobRunId",
      "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
