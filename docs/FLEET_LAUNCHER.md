@@ -76,6 +76,23 @@ See the RUNBOOK, "Validation or load failed — re-run with override".
 { "bucket": "<pipeline bucket>", "override": true }
 ```
 
+**Stop after load (`stopAfterLoad`).** Add a top-level `"stopAfterLoad": true` to the start input
+(or set a per-task `stop_after_load` CSV column to `true`) to make the startup workflow **stop
+after the full load** for every task in the run: each group still loads exactly as today, but **no
+validation Glue job is started, DMS is not resumed, and CDC is not started**, and the task ends in
+`TaskLoadOnlySucceeded`. Unlike `override` it is **strict** (only a real boolean `true`/`false` or
+the strings `"true"`/`"false"`; anything else is rejected in preflight before any task starts) and
+**TRUE WINS** (fleet-level and per-task are OR'd). Absent/`null`/`false` is byte-identical to a
+normal run. **⚠️ Cutover warning:** a task that ended in `TaskLoadOnlySucceeded` (marker
+`config/_task/<suffix>/_load_only.json`) has had **no CDC applied** — never run cutover on it until
+a **normal** startup (started **without** `stopAfterLoad`) has resumed DMS and started CDC
+(confirm `config/_task/<suffix>/_cdc_started/` exists); cutting over a still-load-only task is not
+refused and silently loses every post-load change.
+
+```json
+{ "bucket": "<pipeline bucket>", "stopAfterLoad": true }
+```
+
 Operator files are read from the fixed folder `s3://<bucket>/config/` (`fleet_tasks.csv`,
 `params.csv`, `pipeline.json`); add `"tasksFile": "wave2.csv"` to use another task-list file name
 in that folder. Missing `bucket` ends at `MissingFleetInput`. (The old prefix field was removed; if

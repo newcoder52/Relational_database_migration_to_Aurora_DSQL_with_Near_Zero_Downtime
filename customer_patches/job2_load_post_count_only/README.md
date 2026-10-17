@@ -1,5 +1,13 @@
 # job2_load.py — post-load count-only check (optional `--post_load_check`)
 
+> **Included in `main` as of the integration commit** _"job2_load: integrate optional
+> --post_load_check full|count_only into scripts/job2_load.py"_. From that commit on, the real
+> repo file `scripts/job2_load.py` already contains this change (content sha256
+> `8de7a46c60cdf7c17f3be6e081d4a09483f06f73ebf0d476cdc7e5fd4f7398f1`), so on a current `main` the
+> apply script `apply_post_count_only_patch.py` is a **no-op** (it detects the change is already
+> present and exits cleanly without rewriting the file). This folder is kept for **older,
+> hand-patched deployments** whose `job2_load.py` predates that commit.
+
 A small, additive patch for the **load** job (`scripts/job2_load.py`). It adds one optional
 Glue argument, `--post_load_check`, with values **`full`** (default) and **`count_only`**.
 

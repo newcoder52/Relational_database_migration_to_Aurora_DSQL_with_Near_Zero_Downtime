@@ -1,0 +1,137 @@
+$ python3 apply_stop_after_load_patch.py --project demo --region us-east-1 --bucket demo-bucket
+  (DRY RUN against fake AWS clients; no network. Diffs truncated for readability.)
+
+DRY RUN — nothing is changed. Pass --apply to perform the patch.
+
+===== state machine: demo-startup (PATCH) =====
+--- a/demo-startup.definition.json
++++ b/demo-startup.definition.json
+@@ -831,7 +831,7 @@
+           "ResultPath": "$.error"
+         }
+       ],
+-      "Next": "GroupFanOut"
++      "Next": "IsLoadOnly"
+     },
+     "GroupFanOut": {
+       "Type": "Map",
+@@ -846,7 +846,8 @@
+         "extraPyFilesValidation.$": "$.driverValidation.extraPyFiles",
+         "loadJob.$": "$$.Map.Item.Value.loadJobName",
+         "loadBigJob.$": "$$.Map.Item.Value.loadBigJobName",
+-        "validateJob.$": "$$.Map.Item.Value.validateJobName"
++        "validateJob.$": "$$.Map.Item.Value.validateJobName",
++        "stopAfterLoad.$": "$.loadOnly"
+       },
+       "ResultPath": "$.mapResult",
+       "Iterator": {
+@@ -909,7 +910,7 @@
+                 "ResultPath": "$.error"
+               }
+             ],
+-            "Next": "GroupValidate"
++            "Next": "AfterGroupLoad"
+           },
+           "GroupLoadBig": {
+             "Type": "Task",
+@@ -949,7 +950,7 @@
+                 "ResultPath": "$.error"
+               }
+             ],
+-            "Next": "GroupValidate"
++            "Next": "AfterGroupLoad"
+           },
+           "GroupValidate": {
+             "Type": "Task",
+@@ -1009,6 +1010,26 @@
+    ... (diff continues) ...
+===== state machine: demo-fleet-startup (UNCHANGED (verified recognised shape)) =====
+  (no changes)
+
+===== lambda: demo-resolve-task :: resolve_task.py =====
+--- a/demo-resolve-task:resolve_task.py
++++ b/demo-resolve-task:resolve_task.py
+@@ -88,6 +88,8 @@
+         return handler_build_table_list(event, context)
+     if event.get("mode") == "write_override_record":
+         return handler_write_override_record(event, context)
++    if event.get("mode") == "write_load_only_record":
++        return handler_write_load_only_record(event, context)
+     task_arn = event["taskArn"]
+     dms = boto3.client("dms", region_name=REGION)
+ 
+@@ -257,6 +259,49 @@
+     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+         return raw == 1
+     return str(raw).strip().lower() in _OVERRIDE_TRUE
++
++
++# ── STOP-AFTER-LOAD (startup/fleet run input "stopAfterLoad": true) ───────────────────────
++# A RUN input, spelled exactly like the top-level "override" / "tasksFile" keys, never a
++# pipeline.json/params.csv setting, so the default (absent / null / false) run is BYTE-IDENTICAL
++# to before. It makes the startup workflow STOP AFTER THE FULL LOAD: every group loads (GroupLoad
++# / GroupLoadBig, all retries + resume semantics unchanged), but the path to GroupValidate is
++# skipped, no validation Glue job runs, DMS is NOT resumed and CDC is NOT started. It applies to
++# EVERY task of a fleet run (preflight passes it through to each child, like override).
++#
++# STRICT — unlike _normalize_override (which is lenient: "yes"/1/"on" are all truthy), this field
++# accepts ONLY a real boolean true/false or the strings "true"/"false" (any case). It mirrors the
++# string-casing of _normalize_override but REJECTS anything else (e.g. "yes", 1, "") so a typo can
++# never silently turn load-only on or off. Rejection raises TaskCheckError, which the fleet
++# PREFLIGHT turns into a PreflightError (nothing is started) and the per-task ResolveTask turns
++# into a failed execution before any Glue job — both name the field.
++_STOP_AFTER_LOAD_FIELD = "stopAfterLoad"
++_STOP_AFTER_LOAD_TRUE = {"true"}
++_STOP_AFTER_LOAD_FALSE = {"false"}
++
++
++def _normalize_stop_after_load(inp):
++    """bool: read the run input's "stopAfterLoad". Absent / null -> False (default run is
++    byte-identical). A real boolean -> that boolean. A string "true"/"false" (any case,
++    surrounding spaces ignored) -> that boolean. ANY OTHER value (e.g. "yes", 1, 1.0, "",
+    ... (diff continues) ...
+===== lambda: demo-preflight-tasks :: preflight_tasks.py =====
+--- a/demo-preflight-tasks:preflight_tasks.py
++++ b/demo-preflight-tasks:preflight_tasks.py
+@@ -315,6 +315,16 @@
+     # override on for EVERY task's child execution (a per-task CSV column can also turn it on for
+     # one task). Normalized the same way the per-task workflow does.
+     fleet_override = rt._normalize_override(fleet_input)
++    # Fleet-wide stopAfterLoad: top-level {"stopAfterLoad": true} in the fleet start input makes
++    # EVERY task's child execution stop after the full load (no validation, no DMS resume, no
++    # CDC). STRICT: only boolean true/false or the strings "true"/"false" (any case); anything
++    # else (e.g. "yes", 1, "") is REJECTED HERE, in preflight, before any task is started, with a
++    # message naming the field. Normalized by resolve_task._normalize_stop_after_load, the same
++    # function the per-task ResolveTask uses, so the fleet and per-task rules can never diverge.
++    try:
++        fleet_stop_after_load = rt._normalize_stop_after_load(fleet_input)
++    except rt.TaskCheckError as e:
++        raise PreflightError(f"Fleet start input rejected, nothing was started: {e}")
+     s3 = boto3.client("s3", region_name=REGION)
+     dms = boto3.client("dms", region_name=REGION)
+     errors, warnings = [], []
+@@ -402,6 +412,24 @@
+         row_override = rt._normalize_override({"override": row.get("override")})
+         if fleet_override or row_override:
+             child_input["override"] = True
++        # stopAfterLoad: the fleet-wide flag OR an optional per-task CSV "stop_after_load" column
++        # turns load-only on for this task's child execution. RULE: TRUE WINS. The flag is a
++        # safety reduction (stop earlier, never resume DMS / start CDC), so it is ON when EITHER
++        # source asks for it; a fleet-level false can NOT turn off a per-task true, and a
++        # per-task blank/false can NOT turn off a fleet-level true. Only added when true, so the
++        # default (no load-only) child input is byte-identical to before. The per-task cell is
++        # validated with the SAME strict normalizer; an invalid cell is rejected here (naming the
++        # row and field) before any task starts.
++        row_stop_after_load = False
++        if "stop_after_load" in (reader.fieldnames or []):
++            _cell = row.get("stop_after_load")
++            if str(_cell or "").strip() != "":
++                try:
++                    row_stop_after_load = rt._normalize_stop_after_load({"stopAfterLoad": _cell})
++                except rt.TaskCheckError as e:
++                    errors.append(f"{where}: stop_after_load column: {e}"); continue
++        if fleet_stop_after_load or row_stop_after_load:
+    ... (diff continues) ...
+
+(End of dry-run sample. --apply would update Lambdas first, then the startup state
+ machine, then verify the fleet state machine unchanged, reading each back to compare.)

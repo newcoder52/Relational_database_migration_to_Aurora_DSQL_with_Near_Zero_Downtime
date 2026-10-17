@@ -303,6 +303,23 @@ below DSQL's 300s limit; a range that still hits the limit is **auto re-split** 
 are split the same way. If validation still times out, lower `validate_rows_per_range` in
 `glue-templates/validate.json`.
 
+**Load-job post-load check (`--post_load_check`, optional).** The **load** job (`job2_load.py`,
+used by `glue-templates/load.json` and `load-big.json`) accepts an optional Glue argument
+`--post_load_check` with values `full` (the default) and `count_only`, read with the same
+optional-argument mechanism as the other load overrides. `full` — the value when the argument is
+absent, empty, or unrecognised — is **byte-identical to the current behaviour**: the post-load
+step still runs the per-file range counts and the uuid-format and auth-token-leak full-table
+scans. `count_only` replaces all of that, at every post-load site, with a single
+`SELECT COUNT(*) FROM schema.table` on a fresh autocommit connection under a hard
+`POST_LOAD_COUNT_BUDGET_SECONDS` (600s) budget: a count that **equals** the loaded rows logs OK;
+a count that **differs** fails the table exactly as today (with both numbers); and a count that
+**cannot complete** (txn-age limit, network/SSL EOF, connection reset, `XX000`, or budget
+exhausted) logs a loud WARNING (`row count NOT verified by the load job - verify manually`) and
+lets the load continue. It is **not** set in any `glue-templates/*.json` `default_arguments` by
+default — operators opt in per deployment by adding `"--post_load_check": "count_only"` to
+`default_arguments` in `glue-templates/load.json` (and `load-big.json`) so it survives job
+re-creation, or on the job in the Glue console for a one-off run.
+
 **CDC validation (Tier-2)** is **on by default** (`cdc_validation=true`): each CDC job re-reads a
 sample (`cdc_validation_sample`, default 20) of every committed file's rows by key and records
 persistent mismatches in `cdc_control.cdc_validation_failures`. Cutover stops at
