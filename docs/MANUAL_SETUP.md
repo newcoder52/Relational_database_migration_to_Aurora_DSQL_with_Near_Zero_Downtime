@@ -465,6 +465,7 @@ is rejected at run time.
 | `per_worker_mem_budget_mb` | `per_worker_mem_budget_mb` | `1500` | Full load | `create_glue_jobs` `--per_worker_mem_budget_mb`; `job2_load` |
 | `null_values` | `null_values` | *(blank)* | Full load, CDC, Validation | `create_glue_jobs` `--null_values`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` |
 | `null_rules` | `null_rules` | *(blank)* | Full load, CDC, Validation | `create_glue_jobs` `--null_rules`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` |
+| `null_notnull_text` | `null_notnull_text` | `off` | Full load, CDC, Validation | `create_glue_jobs` `--null_notnull_text`; `job2_load`, `job3_validate`, `glue_cdc_continuous`, `glue_cdc_composite` |
 
 **Customer-controlled NULL handling (`null_values` / `null_rules`).** Both blank by default =
 today's behaviour: only the DMS endpoint `CsvNullValue` (passed as `--csv_null_value`) and an empty

@@ -86,3 +86,22 @@ Everything is produced by the single `nn_transform.py` (anchor-checked, fail-clo
 **Rollback:** set the arg back to `off` (or remove it) — `off` is byte-identical to today.
 Changing the setting mid-migration mixes rules between loaded and CDC-applied rows, so set it
 before the full load.
+
+## Rollback (returning to an older build) — F20
+
+Verified by executing **main's** (pre-release) `lambdas/params_csv.py` and
+`lambdas/resolve_task.py` against inputs that carry the new key:
+
+* **`config/pipeline.json`** — the OLD `resolve_task._validate_settings` **IGNORES** an unknown
+  `null_notnull_text` key (it is logged as an "unknown key … (ignored)" warning, never an error).
+  Harmless. As of this release the key is **omitted from `pipeline.json` entirely while `off`**
+  (it is only emitted when `keep_text`), so a default run's `pipeline.json` is byte-identical to the
+  old build and there is **nothing to strip**.
+* **`config/params.csv`** — the OLD `params_csv.parse` **REJECTS** a `null_notnull_text` row as an
+  `unknown key` (collected error → the fleet refuses to build `pipeline.json`). So **on rollback you
+  MUST remove the `null_notnull_text` row from `params.csv`** (and, if a `keep_text` run left it in
+  `pipeline.json`, remove `"null_notnull_text"` there too). The default params example keeps the row
+  at `off`; delete that one line before running the older build.
+
+Nothing else about this feature needs stripping: the extra per-column `is_nullable` key the new
+Job 1 writes into the mapping JSON is read with `dict.get(...)` by the old jobs and is ignored.

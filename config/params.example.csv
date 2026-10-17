@@ -167,7 +167,8 @@ null_rules,
 #   converting it to SQL NULL - for data that legitimately contains the text 'NULL','NA',...
 #   in NOT NULL columns. Nullable columns and non-text types are unchanged. Precedence:
 #   a null_rules entry > null_notnull_text > null_values > the endpoint marker. SET BEFORE
-#   THE FULL LOAD. Off = byte-identical to today.
+#   THE FULL LOAD. Off = byte-identical to today. While 'off' it is NOT written to pipeline.json
+#   (F20), so a default run and a rollback to an older build are unaffected; set keep_text to use it.
 null_notnull_text,off
 
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.

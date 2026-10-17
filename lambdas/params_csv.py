@@ -573,6 +573,12 @@ def to_pipeline_settings(params):
         cfg = rt._validate_settings(dict(cfg), warnings)
     except rt.SettingsError as e:
         raise ParamsError(str(e))
+    # F20: _validate_settings normalises and re-adds null_notnull_text; drop it from the emitted
+    # pipeline.json when it is 'off' (the default) so a plain params.csv yields a pipeline.json
+    # byte-identical to main and rollback to the OLD build needs nothing stripped. keep_text is
+    # kept. An absent key defaults to 'off' in resolve_task + the shared NULL block (unchanged).
+    if str(cfg.get("null_notnull_text", "") or "").strip().lower() in ("", "off"):
+        cfg.pop("null_notnull_text", None)
     return cfg
 
 
