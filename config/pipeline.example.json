@@ -54,5 +54,6 @@
   "max_parallel_tables": 20,
   "per_worker_mem_budget_mb": 1500,
   "null_values": "",
-  "null_rules": ""
+  "null_rules": "",
+  "null_notnull_text": "off"
 }

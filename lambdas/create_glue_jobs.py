@@ -66,6 +66,9 @@ Input event: {
   "null_rules",        # optional: per-column NULL overrides, 'schema.table.column=none|V1|V2'
                        # entries joined by ';'; set as --null_rules ("" -> "__NULL_UNSET__").
                        # Blank = today. (Both set on the SAME jobs as --csv_null_value.)
+  "null_notnull_text", # optional: "off" (default) | "keep_text". keep_text makes a NOT NULL
+                       # char/varchar/text column keep a text value as data (never SQL NULL).
+                       # Set on the SAME jobs as --null_values ("" -> "__NULL_UNSET__").
   "cdc_engine"         # optional: "pythonshell" (default, glue-templates/cdc.json) or "spark"
                        # (the shared startup workflow passes pipeline.json's cdc_engine)
                        # (glue-templates/cdc-spark.json). Also settable with the Lambda env var
@@ -800,6 +803,10 @@ def handler(event, context):
             if _nrv is not None:
                 _nrv = str(_nrv)
                 args["--null_rules"] = _nrv if _nrv != "" else "__NULL_UNSET__"
+            _nnt = event.get("null_notnull_text")
+            if _nnt is not None:
+                _nnt = str(_nnt)
+                args["--null_notnull_text"] = _nnt if _nnt != "" else "__NULL_UNSET__"
         if role in ("load", "load-big"):
             # job2 driver-side parallelism tuning (how many tables load at once + the per-table
             # driver-memory budget the auto-throttle uses). Passed as RUN defaults; absent ->

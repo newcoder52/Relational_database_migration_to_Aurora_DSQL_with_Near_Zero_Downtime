@@ -1,0 +1,205 @@
+== SET --null_notnull_text=keep_text | project=dms-dsql | APPLY
+CHANGE dms-dsql-08-cdc                          set --null_notnull_text
+       verified: every field identical; backup /Users/haliasgh/nnjobargs/job_backups/dms-dsql-08-cdc.20261017T004637Z.json
+CHANGE dms-dsql-08-ck-a-cdc                     set --null_notnull_text
+       verified: every field identical; backup /Users/haliasgh/nnjobargs/job_backups/dms-dsql-08-ck-a-cdc.20261017T004637Z.json
+SKIP   dms-dsql-08-discovery                    (s3://b/scripts/job1_discovery.py)
+CHANGE dms-dsql-08-load                         set --null_notnull_text
+       verified: every field identical; backup /Users/haliasgh/nnjobargs/job_backups/dms-dsql-08-load.20261017T004637Z.json
+CHANGE dms-dsql-08-validate                     set --null_notnull_text
+       verified: every field identical; backup /Users/haliasgh/nnjobargs/job_backups/dms-dsql-08-validate.20261017T004637Z.json
+SKIP   other-proj-load                          (s3://b/scripts/job2_load.py)
+== done. would-change/changed: 4  skipped: 2  problems: 0
+[PASS] apply: update_job called once per target job (4)
+[PASS] apply: dms-dsql-08-load now carries --null_notnull_text=keep_text (read-back)
+[PASS] apply: dms-dsql-08-load other fields preserved
+[PASS] apply: dms-dsql-08-cdc now carries --null_notnull_text=keep_text (read-back)
+[PASS] apply: dms-dsql-08-cdc other fields preserved
+== SET --null_notnull_text=keep_text | project=dms-dsql | APPLY
+OK     dms-dsql-08-cdc                          already with --null_notnull_text
+OK     dms-dsql-08-ck-a-cdc                     already with --null_notnull_text
+SKIP   dms-dsql-08-discovery                    (s3://b/scripts/job1_discovery.py)
+OK     dms-dsql-08-load                         already with --null_notnull_text
+OK     dms-dsql-08-validate                     already with --null_notnull_text
+SKIP   other-proj-load                          (s3://b/scripts/job2_load.py)
+== done. would-change/changed: 0  skipped: 2  problems: 0
+[PASS] second apply is a no-op (idempotent)
+RESTORED dms-dsql-08-load from /Users/haliasgh/nnjobargs/job_backups/dms-dsql-08-load.20261017T004637Z.json (verified)
+[PASS] restore: the job is put back exactly (arg removed)
+== SET --null_notnull_text=keep_text | project=dms-dsql | DRY RUN (nothing is changed)
+WOULD  dms-dsql-08-cdc                          set --null_notnull_text
+WOULD  dms-dsql-08-ck-a-cdc                     set --null_notnull_text
+SKIP   dms-dsql-08-discovery                    (s3://b/scripts/job1_discovery.py)
+WOULD  dms-dsql-08-load                         set --null_notnull_text
+WOULD  dms-dsql-08-validate                     set --null_notnull_text
+SKIP   other-proj-load                          (s3://b/scripts/job2_load.py)
+== done. would-change/changed: 4  skipped: 2  problems: 0   (dry run; add --apply)
+[PASS] apply-script dry-run returns 0
+[PASS] apply-script dry-run calls NO update_job
+[PASS] apply-script targets exactly the 4 script jobs (load/validate/cdc/ck)
+[PASS] apply-script skips discovery and other-project jobs
+== SET --null_notnull_text=keep_text | project=dms-dsql | DRY RUN (nothing is changed)
+WOULD  dms-dsql-08-cdc                          set --null_notnull_text
+WOULD  dms-dsql-08-ck-a-cdc                     set --null_notnull_text
+SKIP   dms-dsql-08-discovery                    (s3://b/scripts/job1_discovery.py)
+WOULD  dms-dsql-08-load                         set --null_notnull_text
+SKIP   dms-dsql-08-load-big                     (s3://b/scripts/some_other.py)
+WOULD  dms-dsql-08-validate                     set --null_notnull_text
+SKIP   other-proj-load                          (s3://b/scripts/job2_load.py)
+== done. would-change/changed: 4  skipped: 3  problems: 0   (dry run; add --apply)
+[PASS] apply-script skips a filter-matching job whose script is not one of the 4
+[PASS] glue_cdc_continuous.py: keep_text -> literal 'NULL' kept as data
+[PASS] glue_cdc_continuous.py: keep_text -> 'NA' kept
+[PASS] glue_cdc_continuous.py: keep_text -> empty field STILL NULL
+[PASS] glue_cdc_continuous.py: keep_text -> None STILL NULL
+[PASS] glue_cdc_composite.py: keep_text -> literal 'NULL' kept as data
+[PASS] glue_cdc_composite.py: keep_text -> 'NA' kept
+[PASS] glue_cdc_composite.py: keep_text -> empty field STILL NULL
+[PASS] glue_cdc_composite.py: keep_text -> None STILL NULL
+[PASS] job1_discovery: mapped column_mapping entry now carries is_nullable
+[PASS] job1_discovery still compiles after the edit
+[PASS] parity col=status(varchar) raw='NULL' -> NULL=False (got {'glue_cdc_continuous.py': False, 'glue_cdc_composite.py': False, 'job2_load.py': False, 'job3_validate.py': False})
+[PASS] parity col=status(varchar) raw='' -> NULL=True (got {'glue_cdc_continuous.py': True, 'glue_cdc_composite.py': True, 'job2_load.py': True, 'job3_validate.py': True})
+[PASS] parity col=note(varchar) raw='NULL' -> NULL=True (got {'glue_cdc_continuous.py': True, 'glue_cdc_composite.py': True, 'job2_load.py': True, 'job3_validate.py': True})
+[PASS] parity col=id(integer) raw='NULL' -> NULL=True (got {'glue_cdc_continuous.py': True, 'glue_cdc_composite.py': True, 'job2_load.py': True, 'job3_validate.py': True})
+[PASS] parity col=body(text) raw='NULL' -> NULL=False (got {'glue_cdc_continuous.py': False, 'glue_cdc_composite.py': False, 'job2_load.py': False, 'job3_validate.py': False})
+[PASS] job2_load.py: Spark keep_text -> 'NULL' KEPT in NOT NULL varchar
+[PASS] job2_load.py: Spark keep_text -> empty STILL NULL in NOT NULL varchar
+[PASS] job2_load.py: Spark keep_text -> 'NULL' still NULL in NULLABLE varchar
+[PASS] job2_load.py: Spark keep_text -> non-text NOT NULL unaffected
+[PASS] job3_validate.py: Spark keep_text -> 'NULL' KEPT in NOT NULL varchar
+[PASS] job3_validate.py: Spark keep_text -> empty STILL NULL in NOT NULL varchar
+[PASS] job3_validate.py: Spark keep_text -> 'NULL' still NULL in NULLABLE varchar
+[PASS] job3_validate.py: Spark keep_text -> non-text NOT NULL unaffected
+[PASS] glue_cdc_continuous.py: off/status(varchar) -> endpoint marker kept
+[PASS] glue_cdc_continuous.py: off/note(varchar) -> endpoint marker kept
+[PASS] glue_cdc_continuous.py: off/id(integer) -> endpoint marker kept
+[PASS] glue_cdc_continuous.py: off/amt(numeric) -> endpoint marker kept
+[PASS] glue_cdc_continuous.py: off/ts(timestamptz) -> endpoint marker kept
+[PASS] glue_cdc_continuous.py: keep_text NOT NULL varchar -> no marker (keep text)
+[PASS] glue_cdc_continuous.py: keep_text NULLABLE varchar -> marker unchanged
+[PASS] glue_cdc_continuous.py: keep_text NOT NULL integer (non-text) -> marker unchanged
+[PASS] glue_cdc_continuous.py: keep_text NOT NULL numeric (non-text) -> marker unchanged
+[PASS] glue_cdc_continuous.py: keep_text NOT NULL timestamptz (non-text) -> marker unchanged
+[PASS] glue_cdc_continuous.py: keep_text NOT NULL text -> no marker
+[PASS] glue_cdc_composite.py: off/status(varchar) -> endpoint marker kept
+[PASS] glue_cdc_composite.py: off/note(varchar) -> endpoint marker kept
+[PASS] glue_cdc_composite.py: off/id(integer) -> endpoint marker kept
+[PASS] glue_cdc_composite.py: off/amt(numeric) -> endpoint marker kept
+[PASS] glue_cdc_composite.py: off/ts(timestamptz) -> endpoint marker kept
+[PASS] glue_cdc_composite.py: keep_text NOT NULL varchar -> no marker (keep text)
+[PASS] glue_cdc_composite.py: keep_text NULLABLE varchar -> marker unchanged
+[PASS] glue_cdc_composite.py: keep_text NOT NULL integer (non-text) -> marker unchanged
+[PASS] glue_cdc_composite.py: keep_text NOT NULL numeric (non-text) -> marker unchanged
+[PASS] glue_cdc_composite.py: keep_text NOT NULL timestamptz (non-text) -> marker unchanged
+[PASS] glue_cdc_composite.py: keep_text NOT NULL text -> no marker
+[PASS] MUTATION GUARD: NOT NULL int col must NOT be protected (not a text category)
+[PASS] MUTATION GUARD: an explicit null_rules entry MUST win over the automatic rule
+[PASS] MUTATION GUARD: nullable text col must NOT be protected (marker kept)
+[PASS] glue_cdc_continuous.py: off(None) NOT NULL text -> endpoint marker (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'NULL' is NULL (today)
+[PASS] glue_cdc_continuous.py: off(None) -> empty is NULL (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'NA' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'N/A' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'NONE' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> '(NULL)' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> '\\N' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'null' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'Null' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> ' NULL ' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'na' kept (today)
+[PASS] glue_cdc_continuous.py: off(None) -> 'normal' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') NOT NULL text -> endpoint marker (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'NULL' is NULL (today)
+[PASS] glue_cdc_continuous.py: off('off') -> empty is NULL (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'NA' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'N/A' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'NONE' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> '(NULL)' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> '\\N' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'null' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'Null' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> ' NULL ' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'na' kept (today)
+[PASS] glue_cdc_continuous.py: off('off') -> 'normal' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') NOT NULL text -> endpoint marker (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'NULL' is NULL (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> empty is NULL (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'NA' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'N/A' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'NONE' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> '(NULL)' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> '\\N' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'null' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'Null' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> ' NULL ' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'na' kept (today)
+[PASS] glue_cdc_continuous.py: off('__NULL_UNSET__') -> 'normal' kept (today)
+[PASS] glue_cdc_composite.py: off(None) NOT NULL text -> endpoint marker (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'NULL' is NULL (today)
+[PASS] glue_cdc_composite.py: off(None) -> empty is NULL (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'NA' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'N/A' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'NONE' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> '(NULL)' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> '\\N' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'null' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'Null' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> ' NULL ' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'na' kept (today)
+[PASS] glue_cdc_composite.py: off(None) -> 'normal' kept (today)
+[PASS] glue_cdc_composite.py: off('off') NOT NULL text -> endpoint marker (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'NULL' is NULL (today)
+[PASS] glue_cdc_composite.py: off('off') -> empty is NULL (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'NA' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'N/A' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'NONE' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> '(NULL)' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> '\\N' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'null' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'Null' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> ' NULL ' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'na' kept (today)
+[PASS] glue_cdc_composite.py: off('off') -> 'normal' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') NOT NULL text -> endpoint marker (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'NULL' is NULL (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> empty is NULL (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'NA' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'N/A' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'NONE' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> '(NULL)' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> '\\N' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'null' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'Null' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> ' NULL ' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'na' kept (today)
+[PASS] glue_cdc_composite.py: off('__NULL_UNSET__') -> 'normal' kept (today)
+  WARNING ignoring invalid null_notnull_text='bogus' (use off|keep_text); keeping off
+[PASS] glue_cdc_continuous.py: invalid null_notnull_text -> off (today)
+  WARNING ignoring invalid null_notnull_text='bogus' (use off|keep_text); keeping off
+[PASS] glue_cdc_composite.py: invalid null_notnull_text -> off (today)
+[PASS] glue_cdc_continuous.py: new mapping registers -> True
+[PASS] glue_cdc_continuous.py: new mapping -> NOT NULL text protected
+[PASS] glue_cdc_continuous.py: OLD mapping (no is_nullable) -> False (caller must catalog-query)
+[PASS] glue_cdc_continuous.py: old mapping + no catalog registration -> fail loud (no silent skip)
+[PASS] glue_cdc_continuous.py: after catalog fallback registration -> protected
+[PASS] glue_cdc_composite.py: new mapping registers -> True
+[PASS] glue_cdc_composite.py: new mapping -> NOT NULL text protected
+[PASS] glue_cdc_composite.py: OLD mapping (no is_nullable) -> False (caller must catalog-query)
+[PASS] glue_cdc_composite.py: old mapping + no catalog registration -> fail loud (no silent skip)
+[PASS] glue_cdc_composite.py: after catalog fallback registration -> protected
+[PASS] off: _nn_register_from_mapping is a no-op True
+[PASS] glue_cdc_continuous.py: explicit null_rules beats automatic keep_text
+[PASS] glue_cdc_continuous.py: automatic rule beats null_values on NOT NULL text
+[PASS] glue_cdc_continuous.py: null_values applies to a nullable text col under keep_text
+[PASS] glue_cdc_composite.py: explicit null_rules beats automatic keep_text
+[PASS] glue_cdc_composite.py: automatic rule beats null_values on NOT NULL text
+[PASS] glue_cdc_composite.py: null_values applies to a nullable text col under keep_text
+[PASS] patched shared block in job2_load.py byte-identical to job2_load.py
+[PASS] patched shared block in job3_validate.py byte-identical to job2_load.py
+[PASS] patched shared block in glue_cdc_continuous.py byte-identical to job2_load.py
+[PASS] patched shared block in glue_cdc_composite.py byte-identical to job2_load.py
+[PASS] patched shared block in job2_load_manual_range.py byte-identical to job2_load.py
+[PASS] patched shared block carries the feature (NULL_NOTNULL_TEXT + _nn_is_notnull)
+
+==== null_notnull_text: 163 passed, 0 failed ====
