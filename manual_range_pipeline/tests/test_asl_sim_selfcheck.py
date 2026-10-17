@@ -72,7 +72,8 @@ def test_startup_happy_path_reaches_success():
             # shared startup resolve
             return {"Payload": {
                 "taskArnList": ["arn:task"], "taskName": "t", "taskSuffix": "t",
-                "configPrefix": "s3://b/config/_task/t/", "override": False, "project": "p",
+                "configPrefix": "s3://b/config/_task/t/", "override": False,
+                "stopAfterLoad": False, "project": "p",
                 "region": "us-east-1", "dsqlEndpoint": "e", "dsqlEndpointCandidates": "e",
                 "dsqlUser": "admin", "dsqlDatabase": "postgres", "glueRoleArn": "r",
                 "glueConnection": "", "cdcEngine": "pythonshell", "controlSchema": "cdc_control",

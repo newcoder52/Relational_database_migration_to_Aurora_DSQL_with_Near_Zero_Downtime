@@ -363,6 +363,39 @@ def test_override_fields_are_returned_by_resolve_task():
               f"{state_name} reads only write_override_record return keys; missing={missing}")
 
 
+def test_stopafterload_payload_contract_both_ways():
+    """stopAfterLoad payload contract (pins the live-smoke S1 fix), checked BOTH ways end to end:
+      (1) resolve_task (startup mode) RETURNS stopAfterLoad;
+      (2) the startup ResolveTask ResultSelector FORWARDS it ("stopAfterLoad.$":
+          "$.Payload.stopAfterLoad") -> $.resolved.stopAfterLoad;
+      (3) the startup ASL READS $.resolved.stopAfterLoad (the IsLoadOnly guard).
+    S1 was: (1) and (3) held but (2) did not, so the key silently vanished. This asserts all three
+    so neither half of the wiring can regress alone."""
+    startup = json.load(open(os.path.join(SF_DIR, "startup.asl.json")))
+    su_rs = startup["States"]["ResolveTask"]["ResultSelector"]
+    su_read = {v.split("$.Payload.", 1)[1] for v in su_rs.values()
+               if isinstance(v, str) and v.startswith("$.Payload.")}
+    su_keys = returned_keys("resolve_task.py", "startup")
+    # (1) Lambda returns it
+    check("stopAfterLoad" in su_keys, "resolve_task (startup) returns stopAfterLoad")
+    # (2) ResultSelector forwards it from the payload
+    check("stopAfterLoad" in su_read,
+          "startup ResolveTask ResultSelector forwards $.Payload.stopAfterLoad")
+    check(su_rs.get("stopAfterLoad.$") == "$.Payload.stopAfterLoad",
+          "ResultSelector maps stopAfterLoad.$ -> $.Payload.stopAfterLoad")
+    # (3) the ASL reads the resolved field
+    import re as _re
+    reads = set(_re.findall(r"\$\.resolved\.([A-Za-z_][A-Za-z0-9_]*)", json.dumps(startup)))
+    check("stopAfterLoad" in reads, "startup ASL reads $.resolved.stopAfterLoad")
+    # BOTH-WAYS closure: every $.resolved.X the startup ASL reads must be produced by the
+    # ResolveTask ResultSelector (the generic S1 guard, pinned here too).
+    produced = {k[:-2] if k.endswith(".$") else k for k in su_rs}
+    unproduced = sorted(reads - produced)
+    check(not unproduced,
+          f"every $.resolved.X read is produced by the ResolveTask ResultSelector; "
+          f"unproduced={unproduced}")
+
+
 # ---------------------------------------------------------------------------------------------
 # Fake-invoke resolve_task in CUTOVER mode (composite table + non-composite table), then run the
 # real cutover ResultSelector against the output: every `.$` path must resolve.
