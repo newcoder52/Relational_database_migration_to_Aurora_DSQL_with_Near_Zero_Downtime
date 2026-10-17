@@ -95,6 +95,7 @@ MODE_RETURN_FUNCS = {
     ("resolve_task.py", "cutover"): ["handler_shared", "_endpoint_contract"],
     ("resolve_task.py", "build_table_list"): ["handler_build_table_list"],
     ("resolve_task.py", "write_override_record"): ["handler_write_override_record"],
+    ("resolve_task.py", "write_load_only_record"): ["handler_write_load_only_record"],
     # driver_discovery: one handler; plain dict + `.update(engine=..., fallbackReason=...)`.
     ("driver_discovery.py", None): ["handler"],
     # plan_split: one handler, single terminal `return {...}`.
@@ -539,6 +540,7 @@ MODE_REQUIRED_INPUT = {
     ("resolve_task.py", "cutover"): ["bucket"],
     ("resolve_task.py", "build_table_list"): [],          # all event.get(...) with fallbacks
     ("resolve_task.py", "write_override_record"): ["bucket", "taskSuffix"],
+    ("resolve_task.py", "write_load_only_record"): ["bucket", "taskSuffix"],
     ("driver_discovery.py", None): ["bucket"],
     ("plan_split.py", None): ["config_prefix"],
     ("create_glue_jobs.py", "create"): list(_CGJ_BUILD),

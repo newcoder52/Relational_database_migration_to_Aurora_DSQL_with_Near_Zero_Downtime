@@ -1,0 +1,1791 @@
+{
+  "Comment": "Shared startup: ONE state machine for every DMS task. Start with {\"taskArn\": \"...\"}. ResolveTask reads s3://<<BUCKET>>/config/pipeline.json, derives the task's folder and Glue job names from the DMS task name, and checks the task before DMS is started. Then: full load -> validate -> resume DMS -> start the CDC job. Driver wheels are checked (and, for the Python-shell CDC job, prepared automatically) BEFORE DMS starts; the run only reports success once the CDC job confirms it reached its poll loop.",
+  "StartAt": "CheckInput",
+  "States": {
+    "CheckInput": {
+      "Type": "Choice",
+      "Comment": "Start input must be {\"taskArn\": \"...\"}; everything else comes from config/pipeline.json and the DMS task.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.taskArn",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.taskArn",
+              "IsString": true
+            }
+          ],
+          "Next": "ResolveTask"
+        }
+      ],
+      "Default": "MissingTaskArn"
+    },
+    "MissingTaskArn": {
+      "Type": "Fail",
+      "Error": "MissingTaskArn",
+      "Cause": "Start this workflow with input {\"taskArn\": \"arn:aws:dms:<region>:<account>:task:<id>\"}. Optional: \"taskSuffix\" (override the folder/job name), \"adoptExistingFolder\": true (startup only)."
+    },
+    "ResolveTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "startup",
+          "bucket": "<<BUCKET>>",
+          "settingsKey": "config/pipeline.json",
+          "input.$": "$",
+          "execution.$": "$$.Execution.Id",
+          "stateMachine.$": "$$.StateMachine.Id"
+        }
+      },
+      "ResultSelector": {
+        "taskArnList.$": "$.Payload.taskArnList",
+        "taskName.$": "$.Payload.taskName",
+        "taskSuffix.$": "$.Payload.taskSuffix",
+        "configPrefix.$": "$.Payload.configPrefix",
+        "override.$": "$.Payload.override",
+        "project.$": "$.Payload.project",
+        "region.$": "$.Payload.region",
+        "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+        "dsqlEndpointCandidates.$": "$.Payload.dsqlEndpointCandidates",
+        "dsqlUser.$": "$.Payload.dsqlUser",
+        "dsqlDatabase.$": "$.Payload.dsqlDatabase",
+        "glueRoleArn.$": "$.Payload.glueRoleArn",
+        "glueConnection.$": "$.Payload.glueConnection",
+        "cdcEngine.$": "$.Payload.cdcEngine",
+        "controlSchema.$": "$.Payload.controlSchema",
+        "cdcJobName.$": "$.Payload.cdcJobName",
+        "dmsS3Base.$": "$.Payload.dmsS3Base",
+        "s3Bucket.$": "$.Payload.s3Bucket",
+        "cdcRoot.$": "$.Payload.cdcRoot",
+        "timestampColumnName.$": "$.Payload.timestampColumnName",
+        "warnings.$": "$.Payload.warnings",
+        "csvNullValue.$": "$.Payload.csvNullValue",
+        "cdcSparkFallback.$": "$.Payload.cdcSparkFallback",
+        "cdcValidation.$": "$.Payload.cdcValidation",
+        "cdcValidationSample.$": "$.Payload.cdcValidationSample",
+        "cdcMaxDeleteFraction.$": "$.Payload.cdcMaxDeleteFraction",
+        "cdcMaxDeleteRows.$": "$.Payload.cdcMaxDeleteRows",
+        "cdcDriftCheckMinutes.$": "$.Payload.cdcDriftCheckMinutes",
+        "cdcDriftTolerance.$": "$.Payload.cdcDriftTolerance",
+        "cdcDriftAction.$": "$.Payload.cdcDriftAction",
+        "guardrailsMode.$": "$.Payload.guardrailsMode",
+        "cdcFileOrderAction.$": "$.Payload.cdcFileOrderAction",
+        "cdcNopkOvermatchAction.$": "$.Payload.cdcNopkOvermatchAction",
+        "validateCountCheck.$": "$.Payload.validateCountCheck",
+        "cutoverCountCheck.$": "$.Payload.cutoverCountCheck",
+        "accountId.$": "$.Payload.accountId",
+        "maxCompositeForks.$": "$.Payload.maxCompositeForks",
+        "maxBigCdcForks.$": "$.Payload.maxBigCdcForks",
+        "bigTableRowThreshold.$": "$.Payload.bigTableRowThreshold",
+        "fileFanoutThreshold.$": "$.Payload.fileFanoutThreshold",
+        "bigTableBytesThreshold.$": "$.Payload.bigTableBytesThreshold",
+        "maxGroups.$": "$.Payload.maxGroups",
+        "mapMaxConcurrency.$": "$.Payload.mapMaxConcurrency",
+        "maxFilesInParallel.$": "$.Payload.maxFilesInParallel",
+        "writersPerFile.$": "$.Payload.writersPerFile",
+        "connBudget.$": "$.Payload.connBudget",
+        "minWritersPerLoader.$": "$.Payload.minWritersPerLoader",
+        "maxWritersPerLoader.$": "$.Payload.maxWritersPerLoader",
+        "glueVersion.$": "$.Payload.glueVersion",
+        "discoveryWorkerType.$": "$.Payload.discoveryWorkerType",
+        "discoveryNumWorkers.$": "$.Payload.discoveryNumWorkers",
+        "discoveryTimeoutMinutes.$": "$.Payload.discoveryTimeoutMinutes",
+        "loadWorkerType.$": "$.Payload.loadWorkerType",
+        "loadNumWorkers.$": "$.Payload.loadNumWorkers",
+        "loadTimeoutMinutes.$": "$.Payload.loadTimeoutMinutes",
+        "loadBigWorkerType.$": "$.Payload.loadBigWorkerType",
+        "loadBigNumWorkers.$": "$.Payload.loadBigNumWorkers",
+        "loadBigTimeoutMinutes.$": "$.Payload.loadBigTimeoutMinutes",
+        "validateWorkerType.$": "$.Payload.validateWorkerType",
+        "validateNumWorkers.$": "$.Payload.validateNumWorkers",
+        "validateTimeoutMinutes.$": "$.Payload.validateTimeoutMinutes",
+        "validateRowsPerRange.$": "$.Payload.validateRowsPerRange",
+        "validateParallelism.$": "$.Payload.validateParallelism",
+        "validateTargetSecondsPerRange.$": "$.Payload.validateTargetSecondsPerRange",
+        "validateHash.$": "$.Payload.validateHash",
+        "maxParallelTables.$": "$.Payload.maxParallelTables",
+        "nullValues.$": "$.Payload.nullValues",
+        "nullRules.$": "$.Payload.nullRules",
+        "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb"
+      },
+      "ResultPath": "$.resolved",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ResolveFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "DriverDiscoveryFullload",
+      "Comment": "Settings + per-task values + pre-start checks + folder-owner safeguard (resolve_task shared mode)."
+    },
+    "ResolveFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the resolve-task error (bad settings, DMS task check, folder owner check).",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
+    "StartDmsTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
+      "Parameters": {
+        "ReplicationTaskArn.$": "$.taskArn",
+        "StartReplicationTaskType": "start-replication"
+      },
+      "ResultPath": "$.startResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "M03: do NOT swallow a real start failure into the ~24h poll. Describe the task and decide: a benign re-run (already running/starting, or stopped at full-load-complete / STOPPED_AFTER_CACHED_EVENTS) continues to the poll; any other state fails fast at DmsStartFailed with the real cause.",
+          "Next": "DescribeAfterStartError",
+          "ResultPath": "$.startError"
+        }
+      ],
+      "Next": "InitPollCount"
+    },
+    "DescribeAfterStartError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+      "Comment": "M03: startReplicationTask raised. Find out whether the task is actually making progress (a benign already-running / already-at-cached-events re-run) or genuinely did not start.",
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "replication-task-arn",
+            "Values.$": "$.resolved.taskArnList"
+          }
+        ]
+      },
+      "ResultPath": "$.startErrorDescribe",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Could not even describe the task after the start error -> report the original start failure.",
+          "Next": "DmsStartFailed",
+          "ResultPath": "$.describeError"
+        }
+      ],
+      "Next": "EvalStartError"
+    },
+    "EvalStartError": {
+      "Type": "Choice",
+      "Comment": "Benign re-run states -> poll as usual. Everything else -> DmsStartFailed with the DMS cause. 'running'/'starting' = the task was already (re)started; 'stopped' + FullLoadProgressPercent=100 or StopReason STOPPED_AFTER_CACHED_EVENTS = full load already finished (the earlier real test's benign re-run case).",
+      "Choices": [
+        {
+          "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+          "StringEquals": "running",
+          "Next": "InitPollCount"
+        },
+        {
+          "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+          "StringEquals": "starting",
+          "Next": "InitPollCount"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "NumericEquals": 100
+            }
+          ],
+          "Next": "InitPollCount"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].StopReason",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.startErrorDescribe.ReplicationTasks[0].StopReason",
+              "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"
+            }
+          ],
+          "Next": "InitPollCount"
+        }
+      ],
+      "Default": "DmsStartFailed"
+    },
+    "DmsStartFailed": {
+      "Type": "Fail",
+      "Error": "DmsStartFailed",
+      "Comment": "M03: startReplicationTask failed and the task is NOT running/starting and NOT already at a completed full load. This is a real start failure (bad endpoint, bad table mapping, task in an unstartable state, etc.), surfaced immediately with the DMS error instead of being masked by a ~24h poll that would then report the wrong (timeout) cause. See $.startError for the startReplicationTask error and the execution history for the describe result."
+    },
+    "InitPollCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "pollCount": 0
+      },
+      "ResultPath": "$.poll",
+      "Next": "WaitForDms"
+    },
+    "WaitForDms": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "DescribeDmsTask"
+    },
+    "DescribeDmsTask": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:describeReplicationTasks",
+      "Parameters": {
+        "Filters": [
+          {
+            "Name": "replication-task-arn",
+            "Values.$": "$.resolved.taskArnList"
+          }
+        ]
+      },
+      "ResultPath": "$.describeResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DmsFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsDmsDone"
+    },
+    "IsDmsDone": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.TablesErrored",
+              "NumericGreaterThan": 0
+            }
+          ],
+          "Next": "DmsFailed"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].ReplicationTaskStats.FullLoadProgressPercent",
+              "NumericEquals": 100
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "StringMatches": "*STOPPED_AFTER_CACHED_EVENTS*"
+            }
+          ],
+          "Next": "BuildTableList"
+        },
+        {
+          "Variable": "$.describeResult.ReplicationTasks[0].Status",
+          "StringEquals": "failed",
+          "Next": "DmsFailed"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].Status",
+              "StringEquals": "stopped"
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.describeResult.ReplicationTasks[0].StopReason",
+              "StringMatches": "*STOPPED_AFTER_FULL_LOAD*"
+            }
+          ],
+          "Next": "DmsFailed"
+        }
+      ],
+      "Default": "IncrementPollCount"
+    },
+    "IncrementPollCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "pollCount.$": "States.MathAdd($.poll.pollCount, 1)"
+      },
+      "ResultPath": "$.poll",
+      "Next": "PollBudgetLeft"
+    },
+    "PollBudgetLeft": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.poll.pollCount",
+          "NumericLessThan": 2880,
+          "Next": "WaitForDms"
+        }
+      ],
+      "Default": "DmsTimedOut"
+    },
+    "DriverDiscoveryFullload": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket": "<<BUCKET>>",
+          "drivers_prefix": "driver-fullload"
+        }
+      },
+      "ResultSelector": {
+        "extraPyFiles.$": "$.Payload.extraPyFiles"
+      },
+      "ResultPath": "$.driverFullload",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DriversFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "DriverDiscoveryValidation"
+    },
+    "DriverDiscoveryValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket": "<<BUCKET>>",
+          "drivers_prefix": "driver-validation"
+        }
+      },
+      "ResultSelector": {
+        "extraPyFiles.$": "$.Payload.extraPyFiles"
+      },
+      "ResultPath": "$.driverValidation",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DriversFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "DriverDiscoveryCdc"
+    },
+    "DriverDiscoveryCdc": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<DRIVER_DISCOVERY_LAMBDA_ARN>>",
+        "Payload": {
+          "bucket": "<<BUCKET>>",
+          "drivers_prefix": "driver-cdc",
+          "prepare_for.$": "$.resolved.cdcEngine",
+          "spark_fallback.$": "$.resolved.cdcSparkFallback"
+        }
+      },
+      "ResultSelector": {
+        "extraPyFiles.$": "$.Payload.extraPyFiles",
+        "engine.$": "$.Payload.engine",
+        "fallbackReason.$": "$.Payload.fallbackReason"
+      },
+      "ResultPath": "$.driverCdc",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "DriversFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "StartDmsTask",
+      "Comment": "Python-shell CDC engine: the Lambda validates the driver-cdc/ wheels for Python 3.9, strips their Requires-Dist (so Glue's pip never contacts PyPI) into driver-cdc-prepared/<fingerprint>/ once per wheel set, and returns that list. If the wheels fail that check and cdc_spark_fallback is on (the default), it checks the three wheels a Spark CDC job needs (boto3, botocore, s3transfer) and returns engine=spark instead, so the CDC job is built as Spark. Only if neither engine can run does it fail here, before DMS starts. Spark engine: plain driver-cdc/ list."
+    },
+    "BuildTableList": {
+      "Type": "Task",
+      "Comment": "Build this task's table list from DMS (describe_table_statistics + TableMappings) after full load and BEFORE any Glue job; writes config/_task/<suffix>/table_manifest.csv and table_list_source.json. Reuses resolve_task (mode build_table_list).",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "build_table_list",
+          "bucket": "<<BUCKET>>",
+          "taskArn.$": "$.taskArn",
+          "region.$": "$.resolved.region",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "taskSuffix.$": "$.resolved.taskSuffix"
+        }
+      },
+      "ResultSelector": {
+        "count.$": "$.Payload.count",
+        "distinctSchemas.$": "$.Payload.distinctSchemas",
+        "manifestKey.$": "$.Payload.manifestKey",
+        "replacedExisting.$": "$.Payload.replacedExisting"
+      },
+      "ResultPath": "$.tableList",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "BuildTableListFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CreateGlueJobs"
+    },
+    "CreateGlueJobs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "create",
+          "bucket": "<<BUCKET>>",
+          "glue_templates_prefix": "glue-templates",
+          "scripts_prefix": "scripts",
+          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
+          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "timestampColumnName.$": "$.resolved.timestampColumnName",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "glue_role_arn.$": "$.resolved.glueRoleArn",
+          "region.$": "$.resolved.region",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema",
+          "dms_task_arn.$": "$.taskArn",
+          "glue_connections.$": "$.resolved.glueConnection",
+          "cdc_engine.$": "$.driverCdc.engine",
+          "csv_null_value.$": "$.resolved.csvNullValue",
+          "null_values.$": "$.resolved.nullValues",
+          "null_rules.$": "$.resolved.nullRules",
+          "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+          "cdc_max_delete_fraction.$": "$.resolved.cdcMaxDeleteFraction",
+          "cdc_max_delete_rows.$": "$.resolved.cdcMaxDeleteRows",
+          "cdc_drift_check_minutes.$": "$.resolved.cdcDriftCheckMinutes",
+          "cdc_drift_tolerance.$": "$.resolved.cdcDriftTolerance",
+          "cdc_drift_action.$": "$.resolved.cdcDriftAction",
+          "guardrails_mode.$": "$.resolved.guardrailsMode",
+          "cdc_file_order_action.$": "$.resolved.cdcFileOrderAction",
+          "cdc_nopk_overmatch_action.$": "$.resolved.cdcNopkOvermatchAction",
+          "validate_count_check.$": "$.resolved.validateCountCheck",
+          "cutover_count_check.$": "$.resolved.cutoverCountCheck",
+          "glueVersion.$": "$.resolved.glueVersion",
+          "discoveryWorkerType.$": "$.resolved.discoveryWorkerType",
+          "discoveryNumWorkers.$": "$.resolved.discoveryNumWorkers",
+          "discoveryTimeoutMinutes.$": "$.resolved.discoveryTimeoutMinutes",
+          "loadWorkerType.$": "$.resolved.loadWorkerType",
+          "loadNumWorkers.$": "$.resolved.loadNumWorkers",
+          "loadTimeoutMinutes.$": "$.resolved.loadTimeoutMinutes",
+          "loadBigWorkerType.$": "$.resolved.loadBigWorkerType",
+          "loadBigNumWorkers.$": "$.resolved.loadBigNumWorkers",
+          "loadBigTimeoutMinutes.$": "$.resolved.loadBigTimeoutMinutes",
+          "validateWorkerType.$": "$.resolved.validateWorkerType",
+          "validateNumWorkers.$": "$.resolved.validateNumWorkers",
+          "validateTimeoutMinutes.$": "$.resolved.validateTimeoutMinutes",
+          "validateRowsPerRange.$": "$.resolved.validateRowsPerRange",
+          "validateParallelism.$": "$.resolved.validateParallelism",
+          "validateTargetSecondsPerRange.$": "$.resolved.validateTargetSecondsPerRange",
+          "validateHash.$": "$.resolved.validateHash",
+          "maxParallelTables.$": "$.resolved.maxParallelTables",
+          "perWorkerMemBudgetMb.$": "$.resolved.perWorkerMemBudgetMb",
+          "account_id.$": "$.resolved.accountId"
+        }
+      },
+      "ResultSelector": {
+        "jobs.$": "$.Payload.jobs",
+        "cdcEngine.$": "$.Payload.cdcEngine"
+      },
+      "ResultPath": "$.glue",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "RunDiscovery"
+    },
+    "RunDiscovery": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "$.glue.jobs.discovery",
+        "Arguments": {
+          "--config_prefix.$": "$.resolved.configPrefix"
+        }
+      },
+      "ResultPath": "$.discoveryResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PlanSplit"
+    },
+    "PlanSplit": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "<<PLAN_SPLIT_LAMBDA_ARN>>",
+        "Payload": {
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "big_table_row_threshold.$": "$.resolved.bigTableRowThreshold",
+          "file_fanout_threshold.$": "$.resolved.fileFanoutThreshold",
+          "big_table_bytes_threshold.$": "$.resolved.bigTableBytesThreshold",
+          "max_files_in_parallel.$": "$.resolved.maxFilesInParallel",
+          "writers_per_file.$": "$.resolved.writersPerFile",
+          "max_groups.$": "$.resolved.maxGroups",
+          "conn_budget.$": "$.resolved.connBudget",
+          "min_writers_per_loader.$": "$.resolved.minWritersPerLoader",
+          "max_writers_per_loader.$": "$.resolved.maxWritersPerLoader",
+          "map_max_concurrency.$": "$.resolved.mapMaxConcurrency",
+          "config_prefix.$": "$.resolved.configPrefix",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "max_composite_forks.$": "$.resolved.maxCompositeForks",
+          "max_big_cdc_forks.$": "$.resolved.maxBigCdcForks"
+        }
+      },
+      "ResultSelector": {
+        "groups.$": "$.Payload.groups",
+        "group_count.$": "$.Payload.group_count",
+        "forks.$": "$.Payload.forks",
+        "fork_count.$": "$.Payload.fork_count"
+      },
+      "ResultPath": "$.plan",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PlanSplitFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "EnsureForkJobs"
+    },
+    "EnsureForkJobs": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "AFTER plan_split: create/update the per-fork load/validate/cdc Glue jobs for every composite-PK table (ck-<slug>-load/-validate/-cdc), scoped to that one table's config_prefix, tagged with task+fork. Idempotent (re-run updates, never duplicates). No forks -> nothing created.",
+      "Parameters": {
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "ensure_fork_jobs",
+          "bucket": "<<BUCKET>>",
+          "glue_templates_prefix": "glue-templates",
+          "scripts_prefix": "scripts",
+          "forks.$": "$.plan.forks",
+          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
+          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "timestampColumnName.$": "$.resolved.timestampColumnName",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "glue_role_arn.$": "$.resolved.glueRoleArn",
+          "region.$": "$.resolved.region",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema",
+          "dms_task_arn.$": "$.taskArn",
+          "glue_connections.$": "$.resolved.glueConnection",
+          "cdc_engine.$": "$.driverCdc.engine",
+          "csv_null_value.$": "$.resolved.csvNullValue",
+          "null_values.$": "$.resolved.nullValues",
+          "null_rules.$": "$.resolved.nullRules",
+          "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+          "cdc_max_delete_fraction.$": "$.resolved.cdcMaxDeleteFraction",
+          "cdc_max_delete_rows.$": "$.resolved.cdcMaxDeleteRows",
+          "cdc_drift_check_minutes.$": "$.resolved.cdcDriftCheckMinutes",
+          "cdc_drift_tolerance.$": "$.resolved.cdcDriftTolerance",
+          "cdc_drift_action.$": "$.resolved.cdcDriftAction",
+          "guardrails_mode.$": "$.resolved.guardrailsMode",
+          "cdc_file_order_action.$": "$.resolved.cdcFileOrderAction",
+          "cdc_nopk_overmatch_action.$": "$.resolved.cdcNopkOvermatchAction",
+          "validate_count_check.$": "$.resolved.validateCountCheck",
+          "cutover_count_check.$": "$.resolved.cutoverCountCheck",
+          "glueVersion.$": "$.resolved.glueVersion",
+          "loadWorkerType.$": "$.resolved.loadWorkerType",
+          "loadNumWorkers.$": "$.resolved.loadNumWorkers",
+          "loadTimeoutMinutes.$": "$.resolved.loadTimeoutMinutes",
+          "loadBigWorkerType.$": "$.resolved.loadBigWorkerType",
+          "loadBigNumWorkers.$": "$.resolved.loadBigNumWorkers",
+          "loadBigTimeoutMinutes.$": "$.resolved.loadBigTimeoutMinutes",
+          "validateWorkerType.$": "$.resolved.validateWorkerType",
+          "validateNumWorkers.$": "$.resolved.validateNumWorkers",
+          "validateTimeoutMinutes.$": "$.resolved.validateTimeoutMinutes",
+          "validateRowsPerRange.$": "$.resolved.validateRowsPerRange",
+          "validateParallelism.$": "$.resolved.validateParallelism",
+          "validateTargetSecondsPerRange.$": "$.resolved.validateTargetSecondsPerRange",
+          "validateHash.$": "$.resolved.validateHash",
+          "maxParallelTables.$": "$.resolved.maxParallelTables",
+          "perWorkerMemBudgetMb.$": "$.resolved.perWorkerMemBudgetMb",
+          "account_id.$": "$.resolved.accountId"
+        }
+      },
+      "ResultSelector": {
+        "created.$": "$.Payload.created",
+        "updated.$": "$.Payload.updated"
+      },
+      "ResultPath": "$.forkJobs",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "EnsureForkJobsFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "GroupFanOut"
+    },
+    "GroupFanOut": {
+      "Type": "Map",
+      "ItemsPath": "$.plan.groups",
+      "MaxConcurrencyPath": "$.resolved.mapMaxConcurrency",
+      "Parameters": {
+        "group_index.$": "$$.Map.Item.Value.group_index",
+        "config_prefix.$": "$$.Map.Item.Value.config_prefix",
+        "kind.$": "$$.Map.Item.Value.kind",
+        "load_args.$": "$$.Map.Item.Value.load_args",
+        "extraPyFilesFullload.$": "$.driverFullload.extraPyFiles",
+        "extraPyFilesValidation.$": "$.driverValidation.extraPyFiles",
+        "loadJob.$": "$$.Map.Item.Value.loadJobName",
+        "loadBigJob.$": "$$.Map.Item.Value.loadBigJobName",
+        "validateJob.$": "$$.Map.Item.Value.validateJobName"
+      },
+      "ResultPath": "$.mapResult",
+      "Iterator": {
+        "StartAt": "PickLoaderBySize",
+        "States": {
+          "PickLoaderBySize": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Or": [
+                  {
+                    "Variable": "$.kind",
+                    "StringEquals": "big"
+                  },
+                  {
+                    "Variable": "$.kind",
+                    "StringEquals": "composite-big"
+                  }
+                ],
+                "Next": "GroupLoadBig"
+              }
+            ],
+            "Default": "GroupLoad"
+          },
+          "GroupLoad": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName.$": "$.loadJob",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--extra-py-files.$": "$.extraPyFilesFullload",
+                "--max_files_in_parallel.$": "$.load_args['--max_files_in_parallel']",
+                "--writers_per_file.$": "$.load_args['--writers_per_file']",
+                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']",
+                "--startup_execution.$": "$$.Execution.Name",
+                "--startup_execution_arn.$": "$$.Execution.Id"
+              }
+            },
+            "ResultPath": "$.loadResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "GroupFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "GroupValidate"
+          },
+          "GroupLoadBig": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName.$": "$.loadBigJob",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--extra-py-files.$": "$.extraPyFilesFullload",
+                "--max_files_in_parallel.$": "$.load_args['--max_files_in_parallel']",
+                "--writers_per_file.$": "$.load_args['--writers_per_file']",
+                "--max_write_concurrency.$": "$.load_args['--max_write_concurrency']",
+                "--startup_execution.$": "$$.Execution.Name",
+                "--startup_execution_arn.$": "$$.Execution.Id"
+              }
+            },
+            "ResultPath": "$.loadResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "GroupFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "GroupValidate"
+          },
+          "GroupValidate": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Parameters": {
+              "JobName.$": "$.validateJob",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--extra-py-files.$": "$.extraPyFilesValidation"
+              }
+            },
+            "ResultPath": "$.validateResult",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "GroupValidateFailed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "GroupOk"
+          },
+          "GroupOk": {
+            "Type": "Pass",
+            "Parameters": {
+              "group.$": "$.group_index",
+              "status": "ok"
+            },
+            "End": true
+          },
+          "GroupFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "group.$": "$.group_index",
+              "status": "failed"
+            },
+            "End": true
+          },
+          "GroupValidateFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "group.$": "$.group_index",
+              "status": "validate_failed"
+            },
+            "End": true
+          }
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CollectGroupResults"
+    },
+    "CollectGroupResults": {
+      "Type": "Pass",
+      "Comment": "Every group ends with {group, status}: ok | failed (load) | validate_failed.",
+      "Parameters": {
+        "statuses.$": "$.mapResult[*].status"
+      },
+      "ResultPath": "$.groupCheck",
+      "Next": "EvaluateGroupResults"
+    },
+    "EvaluateGroupResults": {
+      "Type": "Pass",
+      "Parameters": {
+        "statuses.$": "$.groupCheck.statuses",
+        "anyLoadFailed.$": "States.ArrayContains($.groupCheck.statuses, 'failed')",
+        "anyValidateFailed.$": "States.ArrayContains($.groupCheck.statuses, 'validate_failed')"
+      },
+      "ResultPath": "$.groupCheck",
+      "Next": "AllGroupsSucceeded"
+    },
+    "AllGroupsSucceeded": {
+      "Type": "Choice",
+      "Comment": "override is a FULL BYPASS. A LOAD failure OR a validation failure stops the run at GroupsFailed UNLESS the run was started with override=true, in which case it continues (MarkOverrideActive -> ResumeDmsToCdc -> StartCdcJob) and ends in TaskSucceededWithOverride. There is NO data-error carve-out and NO DSQL-vs-DMS count check: an operator who passes override=true has manually accepted shared responsibility for the data; the bypassed groups/tables and their failure details (including the load failure kind — data_error vs infra — job2_load records in _load_status.json) are recorded as WARNINGS in the override record and the run output. The override comparison is IsPresent-guarded so the path audit passes and an older execution with no $.resolved.override behaves as the default (no override). Without override the behaviour is byte-identical: a load OR validation failure stops at GroupsFailed.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Variable": "$.groupCheck.anyLoadFailed",
+                  "BooleanEquals": true
+                },
+                {
+                  "Variable": "$.groupCheck.anyValidateFailed",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "Variable": "$.resolved.override",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.resolved.override",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "MarkOverrideActive"
+        },
+        {
+          "Variable": "$.groupCheck.anyLoadFailed",
+          "BooleanEquals": true,
+          "Next": "GroupsFailed"
+        },
+        {
+          "Variable": "$.groupCheck.anyValidateFailed",
+          "BooleanEquals": true,
+          "Next": "GroupsFailed"
+        }
+      ],
+      "Default": "MarkOverrideInactive"
+    },
+    "MarkOverrideActive": {
+      "Type": "Pass",
+      "Comment": "A load and/or validation failure occurred but override=true: carry overrideActive=true so the terminal routes to TaskSucceededWithOverride (which writes the override record with the bypassed groups/tables + failure warnings). DMS is resumed and CDC starts as on the normal path. This is a FULL bypass — no data-error carve-out, no count check.",
+      "Parameters": {
+        "active": true
+      },
+      "ResultPath": "$.overrideResolved",
+      "Next": "ResumeDmsToCdc"
+    },
+    "MarkOverrideInactive": {
+      "Type": "Pass",
+      "Comment": "All groups passed (no override needed). overrideActive=false -> the terminal is the normal TaskSucceeded. Produced on this route too so the terminal Choice's $.overrideResolved.active read is present on every path (ASL path audit).",
+      "Parameters": {
+        "active": false
+      },
+      "ResultPath": "$.overrideResolved",
+      "Next": "ResumeDmsToCdc"
+    },
+    "GroupsFailed": {
+      "Type": "Fail",
+      "Error": "GroupLoadOrValidateFailed",
+      "Cause": "One or more table groups failed load or validation (see $.groupCheck and the GroupFanOut iteration results). DMS was NOT resumed and the CDC job was NOT started. Fix the cause and start a new execution: finished files and tables are skipped on the re-run. If you have reviewed the failures and manually accept shared responsibility for the data, start a NEW execution with input {\"taskArn\": \"...\", \"override\": true}: override is a FULL BYPASS that lets the run resume DMS, start CDC and end in TaskSucceededWithOverride for BOTH load and validation failures. The bypassed groups/tables and their failure details are recorded as warnings in the override record."
+    },
+    "ResumeDmsToCdc": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:databasemigration:startReplicationTask",
+      "Parameters": {
+        "ReplicationTaskArn.$": "$.taskArn",
+        "StartReplicationTaskType": "resume-processing"
+      },
+      "ResultPath": "$.resumeResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "StartCdcJob"
+    },
+    "StartCdcJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun",
+      "Parameters": {
+        "JobName.$": "$.glue.jobs.cdc",
+        "Arguments": {
+          "--config_prefix.$": "$.resolved.configPrefix",
+          "--dms_task_arn.$": "$.taskArn",
+          "--cdc_root.$": "$.resolved.cdcRoot",
+          "--timestamp_column.$": "$.resolved.timestampColumnName",
+          "--startup_execution.$": "$$.Execution.Name"
+        }
+      },
+      "ResultPath": "$.cdcStart",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ConcurrentRunsExceededException",
+            "Glue.ThrottlingException"
+          ],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "InitCdcCheck",
+      "Comment": "No --extra-py-files here: CreateGlueJobs just saved the right driver setup on the job (Python shell: the driver-cdc/ wheel list; Spark: driver-fullload/ + boto3 via --additional-python-modules). --config_prefix is a RUN argument so cutover can find this run. --startup_execution (this execution's name) tells the CDC run where to write its start marker."
+    },
+    "TaskSucceeded": {
+      "Type": "Succeed"
+    },
+    "DmsFailed": {
+      "Type": "Fail",
+      "Error": "DmsTaskFailed",
+      "Cause": "DMS task failed / stopped without cached changes / errored tables at completion."
+    },
+    "DmsTimedOut": {
+      "Type": "Fail",
+      "Error": "DmsPollBudgetExceeded",
+      "Cause": "DMS did not reach STOPPED_AFTER_CACHED_EVENTS within the poll budget."
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineFailed",
+      "Cause": "A Glue/Lambda step failed. See execution history."
+    },
+    "BuildTableListFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the build-table-list error (a table failed to load, an unsupported TableMappings transformation, or more than 9 distinct DSQL schemas). No Glue jobs were created.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
+    "EnsureForkJobsFailed": {
+      "Type": "Fail",
+      "Error": "EnsureForkJobsFailed",
+      "Comment": "Creating a composite fork's load/validate/cdc jobs failed (template/engine/role problem). No CDC was started; investigate before retrying.",
+      "CausePath": "$.error.Cause"
+    },
+    "PlanSplitFailed": {
+      "Type": "Fail",
+      "Error": "PlanSplitFailed",
+      "Comment": "plan_split failed \u2014 e.g. the task has more composite-PK tables than max_composite_forks (the cause lists them), or the master index is unreadable. No Glue jobs were created.",
+      "CausePath": "$.error.Cause"
+    },
+    "DriversFailed": {
+      "Type": "Fail",
+      "Comment": "Shows the driver error (wrong/missing wheel for the CDC job, no pg8000). DMS was NOT started.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
+    "InitCdcCheck": {
+      "Type": "Pass",
+      "Comment": "Confirm the CDC run really started: the CDC script writes config/_task/<task>/_cdc_started/<execution name>.json when it enters its poll loop (after Glue installed the drivers, connected to DSQL and loaded the manifest).",
+      "Parameters": {
+        "checks": 0
+      },
+      "ResultPath": "$.cdcCheck",
+      "Next": "WaitForCdcStart"
+    },
+    "WaitForCdcStart": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetCdcRun"
+    },
+    "GetCdcRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "Parameters": {
+        "JobName.$": "$.glue.jobs.cdc",
+        "RunId.$": "$.cdcStart.JobRunId"
+      },
+      "ResultSelector": {
+        "run.$": "$.JobRun"
+      },
+      "ResultPath": "$.cdcRun",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException",
+            "S3.SdkClientException",
+            "S3.S3Exception"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsCdcRunAlive"
+    },
+    "IsCdcRunAlive": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "FAILED"
+                },
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "ERROR"
+                }
+              ]
+            },
+            {
+              "Variable": "$.cdcRun.run.ErrorMessage",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.glue.cdcEngine",
+              "StringEquals": "pythonshell"
+            },
+            {
+              "Variable": "$.resolved.cdcSparkFallback",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CdcDriverFallback"
+        },
+        {
+          "And": [
+            {
+              "Or": [
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "FAILED"
+                },
+                {
+                  "Variable": "$.cdcRun.run.JobRunState",
+                  "StringEquals": "ERROR"
+                }
+              ]
+            },
+            {
+              "Variable": "$.cdcRun.run.ErrorMessage",
+              "IsPresent": true
+            }
+          ],
+          "Next": "CdcRunFailed"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "FAILED"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "ERROR"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "TIMEOUT"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "STOPPED"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "STOPPING"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "SUCCEEDED"
+            },
+            {
+              "Variable": "$.cdcRun.run.JobRunState",
+              "StringEquals": "EXPIRED"
+            }
+          ],
+          "Next": "CdcRunEnded"
+        }
+      ],
+      "Default": "CheckCdcStarted",
+      "Comment": "A Python-shell CDC run that failed goes to CdcDriverFallback first (when cdc_spark_fallback is on): if Glue's error is a driver problem the job is re-created as Spark and started again, once."
+    },
+    "CdcRunFailed": {
+      "Type": "Fail",
+      "Error": "CdcRunFailed",
+      "CausePath": "$.cdcRun.run.ErrorMessage",
+      "Comment": "The CDC run failed right after starting (Glue's error message is the cause), and either it wasn't a driver problem, the job was already Spark, or cdc_spark_fallback is off. Full load is done and DMS is capturing changes; fix the cause and start the CDC job again with --config_prefix."
+    },
+    "CdcDriverFallback": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "The Python-shell CDC run failed. create-glue-jobs reads Glue's error: if the drivers failed (pip/PyPI, a missing or wrong wheel, a driver module that won't import, a boto3 too old for DSQL) it deletes the CDC job and re-creates it with the same name as a Spark job (drivers on sys.path, no pip), records that in config/_task/<task>/_cdc_engine.json and returns switched=true. Any other error: switched=false and nothing changes.",
+      "Parameters": {
+        "FunctionName": "<<CREATE_GLUE_JOBS_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "cdc_fallback",
+          "bucket": "<<BUCKET>>",
+          "glue_templates_prefix": "glue-templates",
+          "scripts_prefix": "scripts",
+          "extraPyFiles.$": "$.driverFullload.extraPyFiles",
+          "cdcExtraPyFiles.$": "$.driverCdc.extraPyFiles",
+          "cdc_root.$": "$.resolved.cdcRoot",
+          "timestampColumnName.$": "$.resolved.timestampColumnName",
+          "project.$": "$.resolved.project",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "configPrefix.$": "$.resolved.configPrefix",
+          "glue_role_arn.$": "$.resolved.glueRoleArn",
+          "region.$": "$.resolved.region",
+          "dsql_endpoint.$": "$.resolved.dsqlEndpoint",
+          "dsql_endpoint_candidates.$": "$.resolved.dsqlEndpointCandidates",
+          "dsql_user.$": "$.resolved.dsqlUser",
+          "dsql_database.$": "$.resolved.dsqlDatabase",
+          "control_schema.$": "$.resolved.controlSchema",
+          "dms_task_arn.$": "$.taskArn",
+          "glue_connections.$": "$.resolved.glueConnection",
+          "csv_null_value.$": "$.resolved.csvNullValue",
+          "null_values.$": "$.resolved.nullValues",
+          "null_rules.$": "$.resolved.nullRules",
+          "error_message.$": "$.cdcRun.run.ErrorMessage",
+          "failed_run_id.$": "$.cdcStart.JobRunId",
+          "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+          "cdc_validation.$": "$.resolved.cdcValidation",
+          "cdc_validation_sample.$": "$.resolved.cdcValidationSample"
+        }
+      },
+      "ResultSelector": {
+        "switched.$": "$.Payload.switched",
+        "reason.$": "$.Payload.reason",
+        "cdcEngine.$": "$.Payload.cdcEngine"
+      },
+      "ResultPath": "$.cdcFallback",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CdcFallbackFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsCdcFallbackSwitched"
+    },
+    "IsCdcFallbackSwitched": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cdcFallback.switched",
+          "BooleanEquals": true,
+          "Next": "UseSparkCdcJob"
+        }
+      ],
+      "Default": "CdcRunFailed"
+    },
+    "UseSparkCdcJob": {
+      "Type": "Pass",
+      "Comment": "The CDC job is Spark from now on; a second failure goes to CdcRunFailed (no loop). Start it again.",
+      "Parameters": {
+        "jobs.$": "$.glue.jobs",
+        "cdcEngine.$": "$.cdcFallback.cdcEngine"
+      },
+      "ResultPath": "$.glue",
+      "Next": "StartCdcJob"
+    },
+    "CdcFallbackFailed": {
+      "Type": "Fail",
+      "Comment": "The Python-shell CDC run failed on its drivers, and re-creating the job as Spark failed too (e.g. another run of the CDC job is active). Full load is done and DMS is capturing changes. Fix the cause, then switch the job (tools/switch_cdc_engine.py) or start it again with --config_prefix.",
+      "ErrorPath": "$.error.Error",
+      "CausePath": "$.error.Cause"
+    },
+    "CdcRunEnded": {
+      "Type": "Fail",
+      "Error": "CdcRunEnded",
+      "Cause": "The CDC run stopped, timed out or ended right after starting. Full load is done and DMS is capturing changes. See the CDC job's run and logs, then start it again with --config_prefix."
+    },
+    "CheckCdcStarted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+      "Parameters": {
+        "Bucket": "<<BUCKET>>",
+        "Prefix.$": "States.Format('config/_task/{}/_cdc_started/{}.json', $.resolved.taskSuffix, $$.Execution.Name)"
+      },
+      "ResultSelector": {
+        "keyCount.$": "$.KeyCount"
+      },
+      "ResultPath": "$.cdcMarker",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ServiceException",
+            "States.Timeout",
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException",
+            "S3.SdkClientException",
+            "S3.S3Exception"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "IsCdcStarted"
+    },
+    "IsCdcStarted": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cdcMarker.keyCount",
+          "NumericGreaterThan": 0,
+          "Next": "StartForkCdcMap"
+        }
+      ],
+      "Default": "CountCdcCheck"
+    },
+    "StartForkCdcMap": {
+      "Type": "Map",
+      "Comment": "Start EACH composite (ck) and big-table (bg) fork's CDC job next to the main CDC job, and confirm each wrote its own start marker under the fork's OWN config_prefix (<config_prefix_key>_cdc_started/<exec>-ck-<slug>.json). Empty $.plan.forks (no fork tables) -> no iterations, straight to TaskSucceeded. Any fork that does not confirm -> ForkCdcStartNotConfirmed. B23: the marker is polled under the fork prefix (where the fork CDC script writes it), not the task-level _cdc_started/.",
+      "ItemsPath": "$.plan.forks",
+      "MaxConcurrency": 4,
+      "Parameters": {
+        "fork_slug.$": "$$.Map.Item.Value.fork_slug",
+        "cdcJobName.$": "$$.Map.Item.Value.cdcJobName",
+        "config_prefix.$": "$$.Map.Item.Value.config_prefix",
+        "config_prefix_key.$": "$$.Map.Item.Value.config_prefix_key",
+        "taskArn.$": "$.taskArn",
+        "cdcRoot.$": "$.resolved.cdcRoot",
+        "timestampColumnName.$": "$.resolved.timestampColumnName",
+        "taskSuffix.$": "$.resolved.taskSuffix",
+        "execName.$": "$$.Execution.Name"
+      },
+      "Iterator": {
+        "StartAt": "StartForkCdcJob",
+        "States": {
+          "StartForkCdcJob": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun",
+            "Comment": "Start this fork's composite CDC job, scoped to its one-table config_prefix, with a distinct --startup_execution (<exec>-ck-<slug>) so its start marker never collides.",
+            "Parameters": {
+              "JobName.$": "$.cdcJobName",
+              "Arguments": {
+                "--config_prefix.$": "$.config_prefix",
+                "--dms_task_arn.$": "$.taskArn",
+                "--cdc_root.$": "$.cdcRoot",
+                "--timestamp_column.$": "$.timestampColumnName",
+                "--startup_execution.$": "States.Format('{}-ck-{}', $.execName, $.fork_slug)"
+              }
+            },
+            "ResultPath": "$.forkCdcStart",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ConcurrentRunsExceededException",
+                  "Glue.ThrottlingException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ForkCdcNotConfirmed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "InitForkCheck"
+          },
+          "InitForkCheck": {
+            "Type": "Pass",
+            "Parameters": {
+              "checks": 0
+            },
+            "ResultPath": "$.forkCheck",
+            "Next": "WaitForForkStart"
+          },
+          "WaitForForkStart": {
+            "Type": "Wait",
+            "Seconds": 30,
+            "Next": "CheckForkStarted"
+          },
+          "CheckForkStarted": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+            "Comment": "B23: confirm this fork's CDC run reached its poll loop by polling the marker under the fork's OWN config_prefix (<config_prefix_key>_cdc_started/<exec>-ck-<slug>.json) — the SAME prefix the fork CDC script writes it to (its CONFIG_PREFIX is the fork prefix). The old check polled the TASK-level _cdc_started/, which the fork never writes, so every fork fell to ForkCdcStartNotConfirmed after 45 min while the fork CDC job was actually running.",
+            "Parameters": {
+              "Bucket": "<<BUCKET>>",
+              "Prefix.$": "States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug)"
+            },
+            "ResultSelector": {
+              "keyCount.$": "$.KeyCount"
+            },
+            "ResultPath": "$.forkMarker",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "States.ServiceException",
+                  "States.Timeout",
+                  "Glue.ThrottlingException",
+                  "Glue.InternalServiceException",
+                  "S3.SdkClientException",
+                  "S3.S3Exception"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "ForkCdcNotConfirmed",
+                "ResultPath": "$.error"
+              }
+            ],
+            "Next": "IsForkStarted"
+          },
+          "IsForkStarted": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.forkMarker.keyCount",
+                "NumericGreaterThan": 0,
+                "Next": "ForkStarted"
+              }
+            ],
+            "Default": "CountForkCheck"
+          },
+          "CountForkCheck": {
+            "Type": "Pass",
+            "Parameters": {
+              "checks.$": "States.MathAdd($.forkCheck.checks, 1)"
+            },
+            "ResultPath": "$.forkCheck",
+            "Next": "ForkCheckBudgetLeft"
+          },
+          "ForkCheckBudgetLeft": {
+            "Type": "Choice",
+            "Comment": "90 checks x 30 s = 45 min, same budget as the main CDC confirmation.",
+            "Choices": [
+              {
+                "Variable": "$.forkCheck.checks",
+                "NumericLessThan": 90,
+                "Next": "WaitForForkStart"
+              }
+            ],
+            "Default": "ForkCdcNotConfirmed"
+          },
+          "ForkStarted": {
+            "Type": "Pass",
+            "Parameters": {
+              "fork_slug.$": "$.fork_slug",
+              "status": "started"
+            },
+            "End": true
+          },
+          "ForkCdcNotConfirmed": {
+            "Type": "Fail",
+            "Error": "ForkCdcStartNotConfirmed",
+            "Cause": "A fork's CDC run did not start/confirm within the 45-min budget. The main CDC job is running; investigate this fork CDC job before cutover. Its start marker is written under the fork's OWN prefix (<fork config_prefix>_cdc_started/<exec>-ck-<slug>.json), e.g. .../_orchestrator/ck-<slug>/_cdc_started/, NOT the task-level _cdc_started/. Confirm the fork CDC job run is RUNNING in Glue; if it is, the task is fine (full load is done) and the fleet does NOT need re-triggering — cutover finds the fork jobs by tag."
+          }
+        }
+      },
+      "ResultPath": "$.forkStartResult",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ForkCdcStartNotConfirmed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "OverrideTerminal"
+    },
+    "OverrideTerminal": {
+      "Type": "Choice",
+      "Comment": "CDC (and every fork) confirmed. If this run carried a validation failure past the gate (overrideActive=true, set at MarkOverrideActive), write the override record and end in the distinct TaskSucceededWithOverride; otherwise end in the normal TaskSucceeded. $.overrideResolved.active is produced on every route here (MarkOverrideActive / MarkOverrideInactive), so the read is audit-safe.",
+      "Choices": [
+        {
+          "Variable": "$.overrideResolved.active",
+          "BooleanEquals": true,
+          "Next": "WriteStartupOverrideRecord"
+        }
+      ],
+      "Default": "TaskSucceeded"
+    },
+    "WriteStartupOverrideRecord": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Write the override audit record to config/_task/<suffix>/_overrides/<execution>.json (who=execution ARN, when, overridden groups + tables, reason, validation report paths, bypassed gate) AND the stable startup-override marker _startup_override.json, which makes a later cutover refuse unless cutover is also started with override. Reuses resolve_task (mode write_override_record).",
+      "Parameters": {
+        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
+        "Payload": {
+          "mode": "write_override_record",
+          "bucket": "<<BUCKET>>",
+          "taskSuffix.$": "$.resolved.taskSuffix",
+          "workflow": "startup",
+          "execution.$": "$$.Execution.Id",
+          "executionName.$": "$$.Execution.Name",
+          "planGroups.$": "$.plan.groups",
+          "groupStatuses.$": "$.groupCheck.statuses",
+          "bypassedGates": [
+            "GroupsFailed (load and/or validation failure)"
+          ]
+        }
+      },
+      "ResultSelector": {
+        "recordKey.$": "$.Payload.recordKey",
+        "markerKey.$": "$.Payload.markerKey",
+        "markerWritten.$": "$.Payload.markerWritten",
+        "overriddenGroups.$": "$.Payload.overriddenGroups",
+        "overriddenTables.$": "$.Payload.overriddenTables",
+        "validationReportPaths.$": "$.Payload.validationReportPaths",
+        "warnings.$": "$.Payload.warnings",
+        "who.$": "$.Payload.who",
+        "when.$": "$.Payload.when"
+      },
+      "ResultPath": "$.overrideRecord",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "OverrideRecordFailed",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "TaskSucceededWithOverride"
+    },
+    "OverrideRecordFailed": {
+      "Type": "Fail",
+      "Error": "OverrideRecordNotWritten",
+      "Comment": "CDC started with override, but writing the override audit record / startup-override marker failed. The data was accepted past a validation failure yet the marker that forces an explicit cutover was not written. Investigate (Glue/Lambda S3 permissions on config/_task/<suffix>/_overrides/) before cutting over.",
+      "CausePath": "$.error.Cause"
+    },
+    "TaskSucceededWithOverride": {
+      "Type": "Succeed",
+      "Comment": "Startup finished WITH override: one or more groups were validate_failed, but override=true let the run resume DMS and start CDC. The output's $.overrideRecord lists the overridden groups and tables, the validation report paths, and the record/marker keys. A later cutover of this task MUST be started with override=true (the startup-override marker is set)."
+    },
+    "ForkCdcStartNotConfirmed": {
+      "Type": "Fail",
+      "Error": "ForkCdcStartNotConfirmed",
+      "Comment": "One or more composite fork CDC jobs did not start/confirm. See the StartForkCdcMap iteration that failed.",
+      "CausePath": "$.error.Cause"
+    },
+    "CountCdcCheck": {
+      "Type": "Pass",
+      "Parameters": {
+        "checks.$": "States.MathAdd($.cdcCheck.checks, 1)"
+      },
+      "ResultPath": "$.cdcCheck",
+      "Next": "CdcCheckBudgetLeft"
+    },
+    "CdcCheckBudgetLeft": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.cdcCheck.checks",
+          "NumericLessThan": 90,
+          "Next": "WaitForCdcStart"
+        }
+      ],
+      "Default": "CdcStartNotConfirmed",
+      "Comment": "90 checks x 30 s = 45 min (longer than Glue's ~20 min pip timeout, so a driver install failure shows up as CdcRunFailed first)."
+    },
+    "CdcStartNotConfirmed": {
+      "Type": "Fail",
+      "Error": "CdcStartNotConfirmed",
+      "Cause": "The CDC run is still running but never reported that it reached its poll loop within 45 minutes. Check the CDC job's log (it prints '[startup] entering poll loop.') and that the Glue role can write to config/_task/<task>/_cdc_started/ in the bucket."
+    }
+  }
+}

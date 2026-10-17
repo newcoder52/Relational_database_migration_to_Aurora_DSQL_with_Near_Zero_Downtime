@@ -1,0 +1,44 @@
+--- a/lambdas/preflight_tasks.py
++++ b/lambdas/preflight_tasks.py
+@@ -315,6 +315,16 @@
+     # override on for EVERY task's child execution (a per-task CSV column can also turn it on for
+     # one task). Normalized the same way the per-task workflow does.
+     fleet_override = rt._normalize_override(fleet_input)
++    # Fleet-wide stopAfterLoad: top-level {"stopAfterLoad": true} in the fleet start input makes
++    # EVERY task's child execution stop after the full load (no validation, no DMS resume, no
++    # CDC). STRICT: only boolean true/false or the strings "true"/"false" (any case); anything
++    # else (e.g. "yes", 1, "") is REJECTED HERE, in preflight, before any task is started, with a
++    # message naming the field. Normalized by resolve_task._normalize_stop_after_load, the same
++    # function the per-task ResolveTask uses, so the fleet and per-task rules can never diverge.
++    try:
++        fleet_stop_after_load = rt._normalize_stop_after_load(fleet_input)
++    except rt.TaskCheckError as e:
++        raise PreflightError(f"Fleet start input rejected, nothing was started: {e}")
+     s3 = boto3.client("s3", region_name=REGION)
+     dms = boto3.client("dms", region_name=REGION)
+     errors, warnings = [], []
+@@ -402,6 +412,24 @@
+         row_override = rt._normalize_override({"override": row.get("override")})
+         if fleet_override or row_override:
+             child_input["override"] = True
++        # stopAfterLoad: the fleet-wide flag OR an optional per-task CSV "stop_after_load" column
++        # turns load-only on for this task's child execution. RULE: TRUE WINS. The flag is a
++        # safety reduction (stop earlier, never resume DMS / start CDC), so it is ON when EITHER
++        # source asks for it; a fleet-level false can NOT turn off a per-task true, and a
++        # per-task blank/false can NOT turn off a fleet-level true. Only added when true, so the
++        # default (no load-only) child input is byte-identical to before. The per-task cell is
++        # validated with the SAME strict normalizer; an invalid cell is rejected here (naming the
++        # row and field) before any task starts.
++        row_stop_after_load = False
++        if "stop_after_load" in (reader.fieldnames or []):
++            _cell = row.get("stop_after_load")
++            if str(_cell or "").strip() != "":
++                try:
++                    row_stop_after_load = rt._normalize_stop_after_load({"stopAfterLoad": _cell})
++                except rt.TaskCheckError as e:
++                    errors.append(f"{where}: stop_after_load column: {e}"); continue
++        if fleet_stop_after_load or row_stop_after_load:
++            child_input["stopAfterLoad"] = True
+         try:
+             suffix, source, _rec, _ = rt._pick_suffix(s3, bucket, child_input, task, ids)
+             rt._validate_suffix(suffix, project)

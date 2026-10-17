@@ -1,0 +1,23 @@
+# sha256 OLD (main) -> NEW (patched) for each repo file this patch changes
+lambdas/resolve_task.py
+  old: 3829b01a22f3d5e50e5ee7c40c371fe0a5fe5d549078a6c85b567fa4c55d8ca6
+  new: 0ca313996fb37d1b4e7074122eb26303520ef43993c9c68ffed2457ae9018ce5
+lambdas/preflight_tasks.py
+  old: b60cf38676783ea0f6ee207e6804fc993efa39438713379198e0e77f84ff8a4c
+  new: cb2197bd13574aa0e800d4215f3b06c40a425894c4787ae2e6d7c5b79e58284e
+stepfunctions/startup.asl.json
+  old: ba25e3d2ef3d34bbd8ad28ca5f59517b8a924630b8f6b165674f728dde54f90d
+  new: b002ffa5f73c102bc384b286a13b92747ab934a0b6f4755ffa2d4cada9c323e0
+tests/test_asl_payload_contract.py
+  old: 735d1ff693d6c358a2a968e8cc4c3766c535f4bd2dac54ef2276b286c0f53f60
+  new: b80c69949df19c46a6857200fbbdcec80fe2f0500793d9f5c646337427e8b779
+stepfunctions/fleet-startup.asl.json
+  old: 284d39a3bf00799c714e6c9fa684ae18742f79e60010cbbacd0059e9c7c12224
+  new: 284d39a3bf00799c714e6c9fa684ae18742f79e60010cbbacd0059e9c7c12224
+# (fleet-startup.asl.json: old==new, UNCHANGED by this patch)
+
+# sha256 of this patch's own deliverables:
+  d94103bdd751ca69a652d58250c663e49374aa17fa9ff90bea0cef0b6a3e00a3  apply_stop_after_load_patch.py
+  4a5d1faef8dbf2d8d4c9ee1e6d0a04d2faebcf0f5d8dc4bc1fa29926e29378a1  stop_after_load_transform.py
+  b70cb5b460095934fc19472b7c750393626baa031f1ad88ff527fa8b383aac7b  test_stop_after_load_patch.py
+  122f84b4beea96ae0dcadac6b177b7443aa43a53c6600eac3fa81106b5507f79  startup_stop_after_load.repo.diff

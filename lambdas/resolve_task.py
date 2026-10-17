@@ -88,6 +88,8 @@ def handler(event, context):
         return handler_build_table_list(event, context)
     if event.get("mode") == "write_override_record":
         return handler_write_override_record(event, context)
+    if event.get("mode") == "write_load_only_record":
+        return handler_write_load_only_record(event, context)
     task_arn = event["taskArn"]
     dms = boto3.client("dms", region_name=REGION)
 
@@ -257,6 +259,49 @@ def _normalize_override(inp):
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         return raw == 1
     return str(raw).strip().lower() in _OVERRIDE_TRUE
+
+
+# ── STOP-AFTER-LOAD (startup/fleet run input "stopAfterLoad": true) ───────────────────────
+# A RUN input, spelled exactly like the top-level "override" / "tasksFile" keys, never a
+# pipeline.json/params.csv setting, so the default (absent / null / false) run is BYTE-IDENTICAL
+# to before. It makes the startup workflow STOP AFTER THE FULL LOAD: every group loads (GroupLoad
+# / GroupLoadBig, all retries + resume semantics unchanged), but the path to GroupValidate is
+# skipped, no validation Glue job runs, DMS is NOT resumed and CDC is NOT started. It applies to
+# EVERY task of a fleet run (preflight passes it through to each child, like override).
+#
+# STRICT — unlike _normalize_override (which is lenient: "yes"/1/"on" are all truthy), this field
+# accepts ONLY a real boolean true/false or the strings "true"/"false" (any case). It mirrors the
+# string-casing of _normalize_override but REJECTS anything else (e.g. "yes", 1, "") so a typo can
+# never silently turn load-only on or off. Rejection raises TaskCheckError, which the fleet
+# PREFLIGHT turns into a PreflightError (nothing is started) and the per-task ResolveTask turns
+# into a failed execution before any Glue job — both name the field.
+_STOP_AFTER_LOAD_FIELD = "stopAfterLoad"
+_STOP_AFTER_LOAD_TRUE = {"true"}
+_STOP_AFTER_LOAD_FALSE = {"false"}
+
+
+def _normalize_stop_after_load(inp):
+    """bool: read the run input's "stopAfterLoad". Absent / null -> False (default run is
+    byte-identical). A real boolean -> that boolean. A string "true"/"false" (any case,
+    surrounding spaces ignored) -> that boolean. ANY OTHER value (e.g. "yes", 1, 1.0, "",
+    "on", [], {}) -> TaskCheckError naming the field. Strict on purpose: a load-only run must
+    never be turned on or off by a typo."""
+    raw = (inp or {}).get(_STOP_AFTER_LOAD_FIELD, None)
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in _STOP_AFTER_LOAD_TRUE:
+            return True
+        if s in _STOP_AFTER_LOAD_FALSE:
+            return False
+    raise TaskCheckError(
+        f"{_STOP_AFTER_LOAD_FIELD!r} must be a boolean true/false (or the string \"true\"/\"false\", "
+        f"any case); got {raw!r}. Remove the field for a normal run, or set it to exactly "
+        f"true/false. {_STOP_AFTER_LOAD_FIELD} stops the startup workflow after the full load "
+        f"(no validation, no DMS resume, no CDC).")
 
 
 def _startup_override_marker_key(suffix):
@@ -451,6 +496,51 @@ def handler_write_override_record(event, context):
         "warnings": warnings,
         "bypassedGates": bypassed,
     }
+
+
+# ── STOP-AFTER-LOAD marker ─────────────────────────────────────────────
+# A small operator-visibility marker written at the end of a load-only startup run (one that
+# finished the full load with every group loaded OK and stopped WITHOUT validation / DMS resume
+# / CDC). It mirrors the override-record mechanism (same _put_json helper, same config/_task/
+# <suffix>/ home) so an operator can see, from S3 alone, that a task stopped after load and what
+# to do next. Best-effort: the ASL RecordLoadOnly state catches a write failure and still ends
+# in TaskLoadOnlySucceeded, because the load itself succeeded — the marker is informational.
+_LOAD_ONLY_MARKER = "_load_only.json"
+
+
+def _load_only_marker_key(suffix):
+    return f"config/_task/{suffix}/{_LOAD_ONLY_MARKER}"
+
+
+def handler_write_load_only_record(event, context):
+    """Write config/_task/<suffix>/_load_only.json recording that this task's startup stopped
+    after the full load (stopAfterLoad=true). Event: { mode:"write_load_only_record", bucket,
+    taskSuffix, execution (ARN), executionName }. Returns {markerKey, when, who}. Never raises
+    for a normal write; a genuine S3 error propagates so the ASL RecordLoadOnly Catch can log it
+    (the run still succeeds)."""
+    bucket = event["bucket"]
+    suffix = event["taskSuffix"]
+    exec_arn = str(event.get("execution") or "").strip()
+    exec_name = str(event.get("executionName") or "").strip() or _execution_name(event)
+    when = _now()
+    s3 = boto3.client("s3", region_name=REGION)
+    marker_key = _load_only_marker_key(suffix)
+    doc = {
+        "stopAfterLoad": True,
+        "when": when,
+        "executionArn": exec_arn,
+        "executionName": exec_name,
+        "taskSuffix": suffix,
+        "note": ("Startup stopped after the full load: validation and CDC were NOT run and DMS "
+                 "was NOT resumed (left STOPPED_AFTER_CACHED_EVENTS). To continue, start the "
+                 "normal startup for this task WITHOUT stopAfterLoad; it skips already-loaded "
+                 "tables, validates, resumes DMS and starts CDC."),
+    }
+    _put_json(s3, bucket, marker_key, doc)
+    print(f"(info) load-only marker written: s3://{bucket}/{marker_key} "
+          f"(execution={exec_name})")
+    return {"markerKey": f"s3://{bucket}/{marker_key}", "when": when,
+            "who": exec_arn or exec_name}
 
 
 SETTINGS_REQUIRED = ("project", "region", "dsql_endpoint", "glue_role_arn")
@@ -1203,6 +1293,11 @@ def handler_shared(event, context):
     task_arn = str(inp.get("taskArn") or "").strip()
     warnings = []
     override = _normalize_override(inp)
+    # stopAfterLoad: strict boolean (see _normalize_stop_after_load). Absent/null/false ->
+    # False, so the resolved dict (and the whole run) is byte-identical to before. An invalid
+    # value raises TaskCheckError here, failing ResolveTask before any Glue job is created (the
+    # fleet preflight rejects it even earlier, before any task starts).
+    stop_after_load = _normalize_stop_after_load(inp)
 
     ids = _parse_task_arn(task_arn)
     s3 = boto3.client("s3", region_name=REGION)
@@ -1275,6 +1370,7 @@ def handler_shared(event, context):
         "configPrefix": f"s3://{bucket}/config/_task/{suffix}/",
         "ownerRecord": f"s3://{bucket}/{marker_key}",
         "override": override,
+        "stopAfterLoad": stop_after_load,
         "startupOverrideUsed": startup_override_used,
         "overrideMarkerKey": _startup_override_marker_key(suffix),
         "overrideRecordKey": _override_record_key(suffix, _execution_name(event)),
