@@ -2770,6 +2770,23 @@ def _nn_register_cdc(dsql_schema, dsql_table, config):
             pass
 
 
+def _nn_reregister_after_ddl(cur, dsql_schema, dsql_table):
+    """F8: after handle_schema_changes applies ADD/RENAME/DROP DDL mid-CDC, the table's column
+    set changed, so the nullability map registered at build_table_context is stale (a new column
+    would be UNKNOWN -> _nn_is_notnull raises NullRulesError). Under --null_notnull_text=keep_text,
+    re-read is_nullable for the whole table from the SAME already-open catalog connection and
+    re-register it, so the keep_text decision is correct for added/changed columns. No-op when the
+    arg is off (so default runs are byte-identical). CDC-specific (NOT in the shared NULL block)."""
+    if NULL_NOTNULL_TEXT != "keep_text":
+        return
+    cur.execute(
+        "SELECT column_name, is_nullable FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s",
+        (dsql_schema, dsql_table))
+    _nn_register_nullability(dsql_schema, dsql_table,
+                             {r[0]: r[1] for r in cur.fetchall()})
+
+
 def build_table_context(entry):
     """Assemble everything a table's CDC worker needs from Job 1 config."""
     config = load_table_config(entry)
@@ -3071,6 +3088,9 @@ def handle_schema_changes(ctx, header, data_rows):
                       f"(kept in DSQL, will be NULL)")
             # Re-read the schema after any DDL so active_cols reflects reality.
             final_schema = load_dsql_schema(cur, dsql_schema, dsql_table)
+            # F8: refresh keep_text nullability from the same post-DDL catalog read so a newly
+            # ADDed/renamed column is known (no NullRulesError). No-op unless keep_text.
+            _nn_reregister_after_ddl(cur, dsql_schema, dsql_table)
         # Cache (header -> resolved schema) so an identical next header skips the catalog.
         _schema_cache[label] = (header_key, final_schema)
         return final_schema
