@@ -31,6 +31,14 @@ It follows the existing `override` path exactly:
 `fleet start input -> preflight_tasks -> child startup input -> resolve_task (resolved dict)
 -> startup.asl.json ($.resolved.stopAfterLoad, IsPresent-guarded)`.
 
+> **Wiring note (fixed after the live smoke test).** `resolve_task` RETURNS `stopAfterLoad` in its
+> payload, **but the value only reaches `$.resolved.stopAfterLoad` if the `ResolveTask` state's
+> `ResultSelector` forwards it** — `"stopAfterLoad.$": "$.Payload.stopAfterLoad"`, right next to the
+> existing `"override.$"` entry. An earlier build added the Lambda return and the ASL states but
+> **not** that ResultSelector entry, so `$.resolved.stopAfterLoad` was always absent and every run
+> took the normal path. Both the repo integration and `patch_startup_asl` now add it (and
+> `patch_startup_asl` repairs a definition that has the load-only states but is missing this entry).
+
 > ## ⚠️ DO NOT CUT OVER A LOAD-ONLY TASK
 >
 > **Never run cutover on a task whose startup ended in `TaskLoadOnlySucceeded`** (i.e. a task that
@@ -186,6 +194,25 @@ as `.json`, Lambda code as `.zip`) to `s3://<bucket>/scripts/backup/startup_stop
 ```
 python3 apply_stop_after_load_patch.py --project <project> --region <region> --bucket <bucket> --apply
 ```
+
+> ### ⚠️ DEPLOY ORDER HAZARD (ResultSelector vs Lambda)
+>
+> The patched `<project>-startup` definition reads **`$.Payload.stopAfterLoad`** in the `ResolveTask`
+> `ResultSelector`. **A ResultSelector path the invoked Lambda does not return FAILS the state**, so a
+> NEW state machine deployed against an OLD `resolve-task` Lambda would fail **every** run at
+> `ResolveTask`. The apply script therefore (a) updates **Lambdas first**, and (b) before updating the
+> startup state machine runs an explicit **pre-check** that the DEPLOYED `<project>-resolve-task`
+> Lambda code already contains `stopAfterLoad` (it downloads the code zip and greps `resolve_task.py`)
+> — if not, it **fails closed** with a clear message and changes **no** state machine.
+>
+> ### ROLLBACK ORDER (reverse of deploy)
+>
+> On rollback restore the **state machine FIRST, then the Lambda** — never the reverse. Restoring the
+> OLD startup definition first removes the `$.Payload.stopAfterLoad` ResultSelector read, so there is
+> no window where a NEW state machine (reading that path) is pointed at a rolled-back OLD Lambda (which
+> no longer returns it). `--restore <dir>` already restores Lambdas before state machines for the
+> forward patch; for a manual rollback of THIS field, restore `<project>-startup` before
+> `<project>-resolve-task`.
 
 `--restore <local-backup-dir>` puts everything back from a backup dir:
 

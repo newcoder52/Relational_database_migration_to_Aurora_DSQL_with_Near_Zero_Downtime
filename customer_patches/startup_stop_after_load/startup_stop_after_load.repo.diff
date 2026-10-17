@@ -1,6 +1,6 @@
 --- a/lambdas/resolve_task.py
 +++ b/lambdas/resolve_task.py
-@@ -88,6 +88,8 @@
+@@ -88,6 +88,8 @@ def handler(event, context):
          return handler_build_table_list(event, context)
      if event.get("mode") == "write_override_record":
          return handler_write_override_record(event, context)
@@ -9,12 +9,10 @@
      task_arn = event["taskArn"]
      dms = boto3.client("dms", region_name=REGION)
  
-@@ -257,6 +259,49 @@
-     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-         return raw == 1
+@@ -259,6 +261,49 @@ def _normalize_override(inp):
      return str(raw).strip().lower() in _OVERRIDE_TRUE
-+
-+
+ 
+ 
 +# ── STOP-AFTER-LOAD (startup/fleet run input "stopAfterLoad": true) ───────────────────────
 +# A RUN input, spelled exactly like the top-level "override" / "tasksFile" keys, never a
 +# pipeline.json/params.csv setting, so the default (absent / null / false) run is BYTE-IDENTICAL
@@ -56,16 +54,15 @@
 +        f"any case); got {raw!r}. Remove the field for a normal run, or set it to exactly "
 +        f"true/false. {_STOP_AFTER_LOAD_FIELD} stops the startup workflow after the full load "
 +        f"(no validation, no DMS resume, no CDC).")
- 
- 
++
++
  def _startup_override_marker_key(suffix):
-@@ -450,7 +495,52 @@
-         "validationReportPaths": report_paths,
-         "warnings": warnings,
-         "bypassedGates": bypassed,
-+    }
-+
-+
+     return f"config/_task/{suffix}/{_OVERRIDES_SUBPREFIX}/{_STARTUP_OVERRIDE_MARKER}"
+ 
+@@ -453,6 +498,51 @@ def handler_write_override_record(event, context):
+     }
+ 
+ 
 +# ── STOP-AFTER-LOAD marker ─────────────────────────────────────────────
 +# A small operator-visibility marker written at the end of a load-only startup run (one that
 +# finished the full load with every group loaded OK and stopped WITHOUT validation / DMS resume
@@ -103,16 +100,64 @@
 +                 "was NOT resumed (left STOPPED_AFTER_CACHED_EVENTS). To continue, start the "
 +                 "normal startup for this task WITHOUT stopAfterLoad; it skips already-loaded "
 +                 "tables, validates, resumes DMS and starts CDC."),
-     }
++    }
 +    _put_json(s3, bucket, marker_key, doc)
 +    print(f"(info) load-only marker written: s3://{bucket}/{marker_key} "
 +          f"(execution={exec_name})")
 +    return {"markerKey": f"s3://{bucket}/{marker_key}", "when": when,
 +            "who": exec_arn or exec_name}
- 
- 
++
++
  SETTINGS_REQUIRED = ("project", "region", "dsql_endpoint", "glue_role_arn")
-@@ -1203,6 +1293,11 @@
+ SETTINGS_DEFAULTS = {
+     "dsql_user": "admin",
+@@ -556,6 +646,10 @@ SETTINGS_DEFAULTS = {
+     #                 FAILS naming the bad entry).
+     "null_values": "",
+     "null_rules": "",
++    # Optional automatic NOT NULL char/text keep-text rule (--null_notnull_text). "off"
++    # (default) = today's behaviour. "keep_text" keeps a text value in a NOT NULL char/text
++    # column as data. Validated below (invalid -> warn and treat as off).
++    "null_notnull_text": "off",
+ }
+ SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
+ GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
+@@ -882,11 +976,11 @@ def _validate_settings(cfg, warnings):
+     # preflight naming the bad entry; wrong data, not a typo to ignore). The scripts own the
+     # runtime parse (shared null-rules block); this mirrors its rules so a bad setting is caught
+     # before any job is created. Normalised to a trimmed string ("" = unset = today's behaviour).
+-    _validate_null_settings(cfg)
++    _validate_null_settings(cfg, warnings)
+     return cfg
+ 
+ 
+-def _validate_null_settings(cfg):
++def _validate_null_settings(cfg, warnings=None):
+     """Validate the FORMAT of the null_values / null_rules settings (customer-controlled NULL
+     handling), raising SettingsError naming the bad entry on any problem. Mirrors the parse rules
+     of the shared null-rules block copied into the four Glue scripts (scripts/job2_load.py,
+@@ -901,6 +995,20 @@ def _validate_null_settings(cfg):
+                 f"list exact, non-empty strings (an empty field is already treated as NULL).")
+     nr = str(cfg.get("null_rules", "") or "").strip()
+     cfg["null_rules"] = nr
++    # Optional automatic NOT NULL char/text keep-text rule. "off" (default) | "keep_text".
++    # Blank / the __NULL_UNSET__ sentinel -> off. An invalid value is a WARNING + off (never
++    # a hard preflight failure, since off is always safe and byte-identical to today).
++    nnt = str(cfg.get("null_notnull_text", "") or "").strip().lower()
++    if nnt in ("", "__null_unset__"):
++        nnt = "off"
++    if nnt not in ("off", "keep_text"):
++        _msg = (f"null_notnull_text {cfg.get('null_notnull_text')!r} is not off|keep_text; using off")
++        if warnings is not None:
++            warnings.append(_msg)
++        else:
++            print(f"(warn) {_msg}")
++        nnt = "off"
++    cfg["null_notnull_text"] = nnt
+     if nr:
+         seen = set()
+         for entry in nr.split(";"):
+@@ -1203,6 +1311,11 @@ def handler_shared(event, context):
      task_arn = str(inp.get("taskArn") or "").strip()
      warnings = []
      override = _normalize_override(inp)
@@ -124,7 +169,7 @@
  
      ids = _parse_task_arn(task_arn)
      s3 = boto3.client("s3", region_name=REGION)
-@@ -1275,6 +1370,7 @@
+@@ -1275,6 +1388,7 @@ def handler_shared(event, context):
          "configPrefix": f"s3://{bucket}/config/_task/{suffix}/",
          "ownerRecord": f"s3://{bucket}/{marker_key}",
          "override": override,
@@ -132,9 +177,17 @@
          "startupOverrideUsed": startup_override_used,
          "overrideMarkerKey": _startup_override_marker_key(suffix),
          "overrideRecordKey": _override_record_key(suffix, _execution_name(event)),
+@@ -1339,6 +1453,7 @@ def handler_shared(event, context):
+         # as --null_values / --null_rules by create_glue_jobs, exactly like --csv_null_value.
+         "nullValues": cfg["null_values"],
+         "nullRules": cfg["null_rules"],
++        "nullNotnullText": cfg["null_notnull_text"],
+         "warnings": warnings,
+     })
+     for w in warnings:
 --- a/lambdas/preflight_tasks.py
 +++ b/lambdas/preflight_tasks.py
-@@ -315,6 +315,16 @@
+@@ -315,6 +315,16 @@ def handler(event, context):
      # override on for EVERY task's child execution (a per-task CSV column can also turn it on for
      # one task). Normalized the same way the per-task workflow does.
      fleet_override = rt._normalize_override(fleet_input)
@@ -151,7 +204,7 @@
      s3 = boto3.client("s3", region_name=REGION)
      dms = boto3.client("dms", region_name=REGION)
      errors, warnings = [], []
-@@ -402,6 +412,24 @@
+@@ -402,6 +412,24 @@ def handler(event, context):
          row_override = rt._normalize_override({"override": row.get("override")})
          if fleet_override or row_override:
              child_input["override"] = True
@@ -178,7 +231,39 @@
              rt._validate_suffix(suffix, project)
 --- a/stepfunctions/startup.asl.json
 +++ b/stepfunctions/startup.asl.json
-@@ -831,7 +831,7 @@
+@@ -47,6 +47,7 @@
+         "taskSuffix.$": "$.Payload.taskSuffix",
+         "configPrefix.$": "$.Payload.configPrefix",
+         "override.$": "$.Payload.override",
++        "stopAfterLoad.$": "$.Payload.stopAfterLoad",
+         "project.$": "$.Payload.project",
+         "region.$": "$.Payload.region",
+         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+@@ -110,6 +111,7 @@
+         "maxParallelTables.$": "$.Payload.maxParallelTables",
+         "nullValues.$": "$.Payload.nullValues",
+         "nullRules.$": "$.Payload.nullRules",
++        "nullNotnullText.$": "$.Payload.nullNotnullText",
+         "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb"
+       },
+       "ResultPath": "$.resolved",
+@@ -591,6 +593,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+           "cdc_validation.$": "$.resolved.cdcValidation",
+@@ -775,6 +778,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+           "cdc_validation.$": "$.resolved.cdcValidation",
+           "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+@@ -831,7 +835,7 @@
            "ResultPath": "$.error"
          }
        ],
@@ -187,7 +272,7 @@
      },
      "GroupFanOut": {
        "Type": "Map",
-@@ -846,7 +846,8 @@
+@@ -846,7 +850,8 @@
          "extraPyFilesValidation.$": "$.driverValidation.extraPyFiles",
          "loadJob.$": "$$.Map.Item.Value.loadJobName",
          "loadBigJob.$": "$$.Map.Item.Value.loadBigJobName",
@@ -197,7 +282,7 @@
        },
        "ResultPath": "$.mapResult",
        "Iterator": {
-@@ -909,7 +910,7 @@
+@@ -909,7 +914,7 @@
                  "ResultPath": "$.error"
                }
              ],
@@ -206,7 +291,7 @@
            },
            "GroupLoadBig": {
              "Type": "Task",
-@@ -949,7 +950,7 @@
+@@ -949,7 +954,7 @@
                  "ResultPath": "$.error"
                }
              ],
@@ -215,7 +300,7 @@
            },
            "GroupValidate": {
              "Type": "Task",
-@@ -1009,6 +1010,26 @@
+@@ -1009,6 +1014,26 @@
                "status": "validate_failed"
              },
              "End": true
@@ -242,7 +327,7 @@
            }
          }
        },
-@@ -1040,11 +1061,11 @@
+@@ -1040,11 +1065,11 @@
          "anyValidateFailed.$": "States.ArrayContains($.groupCheck.statuses, 'validate_failed')"
        },
        "ResultPath": "$.groupCheck",
@@ -256,7 +341,7 @@
        "Choices": [
          {
            "And": [
-@@ -1086,7 +1107,7 @@
+@@ -1086,7 +1111,7 @@
      },
      "MarkOverrideActive": {
        "Type": "Pass",
@@ -265,7 +350,15 @@
        "Parameters": {
          "active": true
        },
-@@ -1585,7 +1606,7 @@
+@@ -1394,6 +1419,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "error_message.$": "$.cdcRun.run.ErrorMessage",
+           "failed_run_id.$": "$.cdcStart.JobRunId",
+           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+@@ -1585,7 +1611,7 @@
            "CheckForkStarted": {
              "Type": "Task",
              "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
@@ -274,7 +367,7 @@
              "Parameters": {
                "Bucket": "<<BUCKET>>",
                "Prefix.$": "States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug)"
-@@ -1662,7 +1683,7 @@
+@@ -1662,7 +1688,7 @@
            "ForkCdcNotConfirmed": {
              "Type": "Fail",
              "Error": "ForkCdcStartNotConfirmed",
@@ -283,7 +376,7 @@
            }
          }
        },
-@@ -1786,6 +1807,130 @@
+@@ -1786,6 +1812,130 @@
        "Type": "Fail",
        "Error": "CdcStartNotConfirmed",
        "Cause": "The CDC run is still running but never reported that it reached its poll loop within 45 minutes. Check the CDC job's log (it prints '[startup] entering poll loop.') and that the Glue role can write to config/_task/<task>/_cdc_started/ in the bucket."
@@ -416,7 +509,7 @@
  }
 --- a/tests/test_asl_payload_contract.py
 +++ b/tests/test_asl_payload_contract.py
-@@ -95,6 +95,7 @@
+@@ -95,6 +95,7 @@ MODE_RETURN_FUNCS = {
      ("resolve_task.py", "cutover"): ["handler_shared", "_endpoint_contract"],
      ("resolve_task.py", "build_table_list"): ["handler_build_table_list"],
      ("resolve_task.py", "write_override_record"): ["handler_write_override_record"],
@@ -424,7 +517,7 @@
      # driver_discovery: one handler; plain dict + `.update(engine=..., fallbackReason=...)`.
      ("driver_discovery.py", None): ["handler"],
      # plan_split: one handler, single terminal `return {...}`.
-@@ -539,6 +540,7 @@
+@@ -539,6 +540,7 @@ MODE_REQUIRED_INPUT = {
      ("resolve_task.py", "cutover"): ["bucket"],
      ("resolve_task.py", "build_table_list"): [],          # all event.get(...) with fallbacks
      ("resolve_task.py", "write_override_record"): ["bucket", "taskSuffix"],

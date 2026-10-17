@@ -252,6 +252,31 @@ def _iterator_states(sm):
     return gfo, it["States"]
 
 
+def _ensure_resolvetask_stopafterload(states):
+    """EDIT 0 (fixes the HIGH defect found in the live smoke test): the ResolveTask state copies the
+    resolve_task Lambda payload into $.resolved via a ResultSelector. resolve_task RETURNS
+    stopAfterLoad (next to override), but the ResultSelector did NOT forward it, so
+    $.resolved.stopAfterLoad was always ABSENT and IsLoadOnly's IsPresent guard routed every run to
+    MarkNotLoadOnly (the normal path). Add "stopAfterLoad.$": "$.Payload.stopAfterLoad" right after
+    the existing "override.$" entry. Fail closed if the recognised ResolveTask/ResultSelector shape
+    (with override.$) is missing. Idempotent: a no-op if the entry is already present. Mutates in
+    place; returns True if it added the entry."""
+    rt = states.get("ResolveTask")
+    _require(isinstance(rt, dict), "startup ASL: ResolveTask state not found")
+    rs = rt.get("ResultSelector")
+    _require(isinstance(rs, dict), "startup ASL: ResolveTask has no ResultSelector")
+    _require("override.$" in rs,
+             "startup ASL: ResolveTask ResultSelector has no 'override.$' (not the recognised "
+             "shape; refusing to guess where to add 'stopAfterLoad.$')")
+    if "stopAfterLoad.$" in rs:
+        _require(rs["stopAfterLoad.$"] == "$.Payload.stopAfterLoad",
+                 "startup ASL: ResolveTask ResultSelector 'stopAfterLoad.$' present but does not map "
+                 "to '$.Payload.stopAfterLoad'")
+        return False
+    rs["stopAfterLoad.$"] = "$.Payload.stopAfterLoad"
+    return True
+
+
 def _resolve_task_lambda_ref(states):
     w = states.get("WriteStartupOverrideRecord")
     _require(isinstance(w, dict) and w.get("Parameters", {}).get("FunctionName"),
@@ -280,6 +305,13 @@ def patch_startup_asl(obj):
                 "GroupsFailed", "WriteStartupOverrideRecord"):
         _require(req in states, f"startup ASL: expected state {req!r} not found "
                  f"(not the recognised startup workflow)")
+
+    # EDIT 0 (ALWAYS, even on an already-states-patched definition): forward stopAfterLoad from the
+    # resolve_task payload through the ResolveTask ResultSelector into $.resolved. Without this the
+    # IsLoadOnly guard never sees the flag. Done before the idempotency gate so a definition patched
+    # by an OLDER transform (load-only states present but this ResultSelector entry missing — the
+    # exact live-smoke defect) is still repaired.
+    _ensure_resolvetask_stopafterload(states)
 
     if "IsLoadOnly" in states and "TaskLoadOnlySucceeded" in states:
         _require(states["EnsureForkJobs"].get("Next") == "IsLoadOnly",

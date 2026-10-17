@@ -262,11 +262,52 @@ def apply_plan(aws, project, account, plan):
         if sm["unchanged"] or _is_noop(sm["diff"]):
             results.append((sm["name"], "verified" if sm["unchanged"] else "noop"))
             continue
+        # DEPLOY-ORDER PRE-CHECK (fixes the live-smoke HIGH defect's deploy hazard): the patched
+        # startup definition adds a ResultSelector path "$.Payload.stopAfterLoad". A ResultSelector
+        # path that the Lambda does NOT return FAILS the ResolveTask state on every run. So before
+        # updating the startup state machine, CONFIRM the DEPLOYED resolve-task Lambda code already
+        # emits stopAfterLoad (download its zip and grep the .py). Fail closed with a clear message
+        # otherwise — never leave a NEW state machine pointing at an OLD Lambda.
+        if sm["name"].endswith("-startup") and not sm["name"].endswith("-fleet-startup"):
+            _require_resolve_task_has_stopafterload(aws, project)
         aws.update_sm(sm["arn"], sm["new_def"])
         if not _read_back_sm(aws, sm["name"], account, sm["new_def"]):
             raise X.PatchError(f"read-back mismatch after updating state machine {sm['name']}")
         results.append((sm["name"], "updated"))
     return results
+
+
+def _require_resolve_task_has_stopafterload(aws, project):
+    """Fail closed unless the DEPLOYED <project>-resolve-task Lambda code contains 'stopAfterLoad'.
+    The patched startup ASL reads $.Payload.stopAfterLoad in the ResolveTask ResultSelector; if the
+    deployed Lambda does not return it, every ResolveTask invocation fails. apply_plan updates the
+    Lambdas BEFORE the state machine, so this should already hold — this is the explicit guard."""
+    fn = f"{project}-resolve-task"
+    try:
+        zb, _ = _download_code_zip(aws, fn)
+    except Exception as e:
+        raise X.PatchError(
+            f"deploy-order pre-check: could not read the deployed {fn!r} Lambda code to confirm it "
+            f"emits stopAfterLoad before patching the startup state machine ({type(e).__name__}: "
+            f"{e}). Refusing to update the state machine (a ResultSelector path the Lambda does not "
+            f"return would fail every ResolveTask).")
+    src = ""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zb))
+        for n in zf.namelist():
+            if n.endswith("resolve_task.py"):
+                src = zf.read(n).decode("utf-8", "replace")
+                break
+    except Exception as e:
+        raise X.PatchError(f"deploy-order pre-check: could not open {fn!r} code zip "
+                           f"({type(e).__name__}: {e}).")
+    if "stopAfterLoad" not in src:
+        raise X.PatchError(
+            f"deploy-order pre-check FAILED: the deployed {fn!r} Lambda code does NOT contain "
+            f"'stopAfterLoad'. The patched startup state machine reads $.Payload.stopAfterLoad in "
+            f"the ResolveTask ResultSelector, so updating it now would fail EVERY run at ResolveTask. "
+            f"Update the resolve-task Lambda FIRST (this script does Lambdas before the state "
+            f"machine; re-run --apply), then retry. No state machine was changed.")
 
 
 def restore(aws, project, account, backup_dir):

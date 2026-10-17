@@ -7,7 +7,7 @@ lambdas/preflight_tasks.py
   new: cb2197bd13574aa0e800d4215f3b06c40a425894c4787ae2e6d7c5b79e58284e
 stepfunctions/startup.asl.json
   old: ba25e3d2ef3d34bbd8ad28ca5f59517b8a924630b8f6b165674f728dde54f90d
-  new: b002ffa5f73c102bc384b286a13b92747ab934a0b6f4755ffa2d4cada9c323e0
+  new: dbc963f88790bdab9a872cc3b78260ba70ec4e840e8acf9723e4b5c0d980e24a
 tests/test_asl_payload_contract.py
   old: 735d1ff693d6c358a2a968e8cc4c3766c535f4bd2dac54ef2276b286c0f53f60
   new: b80c69949df19c46a6857200fbbdcec80fe2f0500793d9f5c646337427e8b779
@@ -17,7 +17,7 @@ stepfunctions/fleet-startup.asl.json
 # (fleet-startup.asl.json: old==new, UNCHANGED by this patch)
 
 # sha256 of this patch's own deliverables:
-  d94103bdd751ca69a652d58250c663e49374aa17fa9ff90bea0cef0b6a3e00a3  apply_stop_after_load_patch.py
-  4a5d1faef8dbf2d8d4c9ee1e6d0a04d2faebcf0f5d8dc4bc1fa29926e29378a1  stop_after_load_transform.py
+  bbcddfc10a17d79e753ee0b701c6515748673588258294d0cae601a92389db0e  apply_stop_after_load_patch.py
+  6ddfa05d32cdc02f5f40880a2c2006877c1a1d732c554e54bb7265c6e4f760f3  stop_after_load_transform.py
   b70cb5b460095934fc19472b7c750393626baa031f1ad88ff527fa8b383aac7b  test_stop_after_load_patch.py
-  122f84b4beea96ae0dcadac6b177b7443aa43a53c6600eac3fa81106b5507f79  startup_stop_after_load.repo.diff
+  d867c3377c4a379c33a032da77e6e23a6d9ff26c319e31cef6772d049fee6f02  startup_stop_after_load.repo.diff

@@ -47,6 +47,7 @@
         "taskSuffix.$": "$.Payload.taskSuffix",
         "configPrefix.$": "$.Payload.configPrefix",
         "override.$": "$.Payload.override",
+        "stopAfterLoad.$": "$.Payload.stopAfterLoad",
         "project.$": "$.Payload.project",
         "region.$": "$.Payload.region",
         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
