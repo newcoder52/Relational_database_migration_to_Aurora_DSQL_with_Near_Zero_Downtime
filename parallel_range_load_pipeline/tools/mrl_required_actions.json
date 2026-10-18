@@ -1,0 +1,55 @@
+{
+  "_README": "SINGLE SOURCE OF TRUTH for the IAM actions the MRL route needs, per role. Generated/verified by tests/test_existing_iam_covers_mrl.py (a drift test fails if the scanner finds a boto3 call or ASL integration not represented here) and consumed by tools/mrl_iam_check.sh (aws iam simulate-principal-policy). Placeholders <<PROJECT>>/<<BUCKET>>/<<REGION>>/<<ACCOUNT_ID>>/<<DSQL_CLUSTER_ID>> are substituted at check time. 'default' = what a deployment WITHOUT the optional fleet state machine needs (must be covered by the EXISTING roles = ZERO new IAM). 'fleet_sm_optional' = the ADDITIONAL SFN-role grants ONLY needed if you deploy the optional fleet state machine (see iam/mrl-fleet-sm-optional.json).",
+  "default": {
+    "lambda": [
+      {"action": "s3:GetObject", "resource": "arn:aws:s3:::<<BUCKET>>/*", "why": "mrl_settings/preflight/plan/reconcile/etc read config + mrl state"},
+      {"action": "s3:PutObject", "resource": "arn:aws:s3:::<<BUCKET>>/*", "why": "publish config/pipeline_parallel_load.json + write mrl/ state + fork handoff"},
+      {"action": "s3:ListBucket", "resource": "arn:aws:s3:::<<BUCKET>>", "why": "list table folders + config/_task prefixes"},
+      {"action": "glue:CreateJob", "resource": "*", "why": "mrl_ensure_job creates the per-task <project>-<suffix>-mrl-load job"},
+      {"action": "glue:UpdateJob", "resource": "*", "why": "mrl_ensure_job updates the range-load job"},
+      {"action": "glue:GetJob", "resource": "*", "why": "mrl_ensure_job existence check"},
+      {"action": "glue:TagResource", "resource": "*", "why": "mrl_ensure_job tags the range-load job"},
+      {"action": "glue:GetTags", "resource": "*", "why": "mrl_ensure_job reads existing tags"},
+      {"action": "iam:PassRole", "resource": "arn:aws:iam::<<ACCOUNT_ID>>:role/<<PROJECT>>-glue-exec-role", "why": "pass the glue role to the created range-load job"},
+      {"action": "states:ListExecutions", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-startup", "why": "route-conflict guard lists the original startup machine's RUNNING executions"},
+      {"action": "states:ListExecutions", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-cutover", "why": "route-conflict guard lists the original cutover machine"},
+      {"action": "states:DescribeExecution", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-startup:*", "why": "route-conflict guard describes original startup executions"},
+      {"action": "states:DescribeExecution", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-cutover:*", "why": "route-conflict guard describes original cutover executions"},
+      {"action": "dms:DescribeReplicationTasks", "resource": "*", "why": "preflight/fleet-preflight read the DMS task"},
+      {"action": "dms:DescribeEndpoints", "resource": "*", "why": "preflight reads the S3 target endpoint contract"},
+      {"action": "dms:DescribeTableStatistics", "resource": "*", "why": "preflight reads FullLoadRows for the count basis"},
+      {"action": "dsql:GetVpcEndpointServiceName", "resource": "*", "why": "preflight resolves the DSQL private endpoint (best-effort)"}
+    ],
+    "glue": [
+      {"action": "s3:GetObject", "resource": "arn:aws:s3:::<<BUCKET>>/*", "why": "range-load + count jobs read LOAD files / manifests / scripts"},
+      {"action": "s3:PutObject", "resource": "arn:aws:s3:::<<BUCKET>>/*", "why": "range-load writes range-private progress under mrl/ + merged status"},
+      {"action": "s3:DeleteObject", "resource": "arn:aws:s3:::<<BUCKET>>/*", "why": "range-load best-effort cleanup under mrl/ only"},
+      {"action": "s3:ListBucket", "resource": "arn:aws:s3:::<<BUCKET>>", "why": "list LOAD files + progress"},
+      {"action": "dsql:DbConnectAdmin", "resource": "arn:aws:dsql:<<REGION>>:<<ACCOUNT_ID>>:cluster/<<DSQL_CLUSTER_ID>>", "why": "range-load + count jobs connect to DSQL via pg8000"},
+      {"action": "dms:DescribeTableStatistics", "resource": "*", "why": "count job reads FullLoadRows to verify the target count"},
+      {"action": "states:DescribeExecution", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-*:*", "why": "R4-4: job2_load_manual_range's startup-execution blank guard calls sfn.describe_execution"}
+    ],
+    "stepfunctions": [
+      {"action": "lambda:InvokeFunction", "resource": "arn:aws:lambda:<<REGION>>:<<ACCOUNT_ID>>:function:<<PROJECT>>-mrl-settings", "why": "mrl-task invokes mrl-settings (and every other mrl-* Lambda) - matched by <<PROJECT>>-*"},
+      {"action": "glue:StartJobRun", "resource": "*", "why": "mrl-task starts the range-load, count and (cdc) CDC Glue jobs"},
+      {"action": "glue:GetJobRun", "resource": "*", "why": "mrl-task polls Glue run state"},
+      {"action": "glue:BatchStopJobRun", "resource": "*", "why": "mrl-task can stop a run on failure"},
+      {"action": "dms:StartReplicationTask", "resource": "*", "why": "mrl-task starts/resumes DMS"},
+      {"action": "dms:DescribeReplicationTasks", "resource": "*", "why": "mrl-task polls DMS"},
+      {"action": "s3:ListBucket", "resource": "arn:aws:s3:::<<BUCKET>>", "condition_prefix": "config/_task/*", "why": "mrl-task confirms the CDC start marker under config/_task/*"},
+      {"action": "events:PutTargets", "resource": "arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForGlueJobRule", "why": "glue:startJobRun.sync managed event rule"},
+      {"action": "events:PutRule", "resource": "arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForGlueJobRule", "why": "glue:startJobRun.sync managed event rule"},
+      {"action": "events:DescribeRule", "resource": "arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForGlueJobRule", "why": "glue:startJobRun.sync managed event rule"}
+    ]
+  },
+  "fleet_sm_optional": {
+    "stepfunctions": [
+      {"action": "states:StartExecution", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:stateMachine:<<PROJECT>>-mrl-task", "why": "the OPTIONAL fleet state machine starts child mrl-task executions (startExecution.sync:2)"},
+      {"action": "states:DescribeExecution", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-mrl-task:*", "why": "fleet SM waits on the child execution (sync)"},
+      {"action": "states:StopExecution", "resource": "arn:aws:states:<<REGION>>:<<ACCOUNT_ID>>:execution:<<PROJECT>>-mrl-task:*", "why": "fleet SM can stop a child on abort (sync integration)"},
+      {"action": "events:PutTargets", "resource": "arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule", "why": "the nested-execution sync managed event rule"},
+      {"action": "events:PutRule", "resource": "arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule", "why": "nested-execution sync managed event rule"},
+      {"action": "events:DescribeRule", "resource": "arn:aws:events:<<REGION>>:<<ACCOUNT_ID>>:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule", "why": "nested-execution sync managed event rule"}
+    ]
+  }
+}

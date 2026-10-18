@@ -1,0 +1,42 @@
+{
+  "_README": "OPTIONAL — attach these SFN-role statements ONLY IF you deploy the optional MRL fleet state machine (deploy_mrl.sh --with-fleet-sm). The DEFAULT MRL deployment needs NO IAM change: the existing <project>-lambda-exec-role / <project>-sfn-exec-role / <project>-glue-exec-role already cover every call the MRL Lambdas, Glue jobs and the mrl-task state machine make (proven by tests/test_existing_iam_covers_mrl.py). The ONLY thing the existing SFN role does NOT grant is the fleet machine's parent->child hand-off (states:startExecution.sync:2 on <project>-mrl-task) and its nested-execution managed event rule. If you instead start tasks with tools/mrl_fleet_run.py (the default), you do not need this file at all. Fill <account-id>, <region>, <project>.",
+  "SfnRoleFleetSmAdditions": {
+    "_attachTo": "<project>-sfn-exec-role",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "MrlFleetStartChild",
+        "Effect": "Allow",
+        "Action": [
+          "states:StartExecution"
+        ],
+        "Resource": [
+          "arn:aws:states:<region>:<account-id>:stateMachine:<project>-mrl-task"
+        ]
+      },
+      {
+        "Sid": "MrlFleetWaitOnChild",
+        "Effect": "Allow",
+        "Action": [
+          "states:DescribeExecution",
+          "states:StopExecution"
+        ],
+        "Resource": [
+          "arn:aws:states:<region>:<account-id>:execution:<project>-mrl-task:*"
+        ]
+      },
+      {
+        "Sid": "MrlFleetNestedExecutionSyncEventRule",
+        "Effect": "Allow",
+        "Action": [
+          "events:PutTargets",
+          "events:PutRule",
+          "events:DescribeRule"
+        ],
+        "Resource": [
+          "arn:aws:events:<region>:<account-id>:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+        ]
+      }
+    ]
+  }
+}
