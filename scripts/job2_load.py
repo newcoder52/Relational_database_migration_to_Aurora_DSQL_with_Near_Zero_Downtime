@@ -1677,18 +1677,27 @@ LOB_MAX_COLUMN_BYTES = 1024 * 1024       # ~1 MiB DSQL non-index column limit
 # Categories that are NOT length-bounded by varchar_max_len and can hold a large LOB.
 _LOB_GUARD_CATEGORIES = frozenset({"text", "json", "jsonb", "bytea", "varchar"})
 
-MAX_CHUNK_RETRIES = 3
-CHUNK_RETRY_BACKOFF_SECONDS = 2
+MAX_CHUNK_RETRIES = 10
+# AMENDMENT 5 (R12a): network-class (broken pipe / class 08 / SSL EOF / reset) chunk retry uses
+# EXPONENTIAL FULL-JITTER backoff (base 1 s, cap 60 s) for up to MAX_CHUNK_RETRIES attempts
+# (>= ~5 min total tolerance for a multi-minute DSQL blip), copied from the parallel loader
+# job2_load_manual_range.py (was 3 attempts / linear 2/4/6 s). Full jitter so concurrent writers
+# never reconnect in lockstep (R12b). Counters are PER CHUNK and reset after each committed chunk.
+CHUNK_RETRY_BASE_BACKOFF_SECONDS = 1.0
+CHUNK_RETRY_MAX_BACKOFF_SECONDS = 60.0
+CHUNK_RETRY_BACKOFF_SECONDS = 2   # DEPRECATED (old linear step); kept for reference only
 # Bounded retry for the INITIAL DSQL open (connect_dsql). Each failed attempt on a
 # connection-class/transient error invalidates the cached IAM token + backs off so the next
 # attempt mints a fresh token — heals a token/endpoint blip at open time instead of failing
 # a whole writer/table. On exhaustion the last error is raised (caller's guard handles it).
-CONNECT_MAX_RETRIES = 4
+# AMENDMENT 5 (R12a): 4 -> 8 attempts, exponential full-jitter (base 1 s, cap 60 s).
+CONNECT_MAX_RETRIES = 8
 # Socket connect timeout (seconds) on EVERY pg8000.connect — without it a refused/half-open
 # DSQL socket blocks the connect indefinitely (silent hang; the retry path never runs).
 
 # ---- OCC (optimistic concurrency) retry on COMMIT ---------------------------
-OCC_MAX_RETRIES = 5
+# AMENDMENT 5 (R12a): 5 -> 8 attempts (same full-jitter backoff ladder).
+OCC_MAX_RETRIES = 8
 OCC_BASE_BACKOFF_SECONDS = 0.05   # 50 ms
 OCC_MAX_BACKOFF_SECONDS = 5.0     # 5 s cap
 # DSQL concurrency-conflict SQLSTATEs (per the Aurora DSQL troubleshooting doc):
@@ -1705,9 +1714,10 @@ OCC_SQLSTATES = {"40001", "OC000", "OC001"}
 # RETRIABLE after a reconnect + backoff — distinct from a deterministic data error (which
 # XX000 could also be, hence we gate on the MESSAGE too). Concurrent writers make transient
 # XX000 more likely, so without this branch a single blip would fail the whole worker.
-SERVER_MAX_RETRIES = 6
+# AMENDMENT 5 (R12a): 6 -> 10 attempts, cap 30 -> 60 s (live: 182/158 XX000 on one chunk run).
+SERVER_MAX_RETRIES = 10
 SERVER_BASE_BACKOFF_SECONDS = 0.5
-SERVER_MAX_BACKOFF_SECONDS = 30.0
+SERVER_MAX_BACKOFF_SECONDS = 60.0
 # XX000 = internal_error (broad). Only treat as transient when the message matches one
 # of these fragments, so we never retry a genuine internal bug indefinitely.
 SERVER_TRANSIENT_FRAGMENTS = (
@@ -2024,6 +2034,17 @@ def server_backoff_seconds(attempt):
     import random
     capped = min(SERVER_MAX_BACKOFF_SECONDS,
                  SERVER_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    return random.uniform(0, capped)
+
+
+def pipe_backoff_seconds(attempt):
+    """AMENDMENT 5 (R12a): full-jitter exponential backoff for network-class (broken pipe /
+    class 08 / SSL EOF / reset) chunk retries (1-based). base 1 s, doubling, capped at 60 s;
+    jittered in [0, capped] so concurrent writers do not reconnect in lockstep. Copied from the
+    parallel loader job2_load_manual_range.py."""
+    import random
+    capped = min(CHUNK_RETRY_MAX_BACKOFF_SECONDS,
+                 CHUNK_RETRY_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
     return random.uniform(0, capped)
 
 # How DMS marks a real NULL in its CSV files: the S3 target endpoint's CsvNullValue (DMS
@@ -3219,7 +3240,7 @@ def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=
                         continue
                     if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                         pipe_attempt += 1
-                        time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                        time.sleep(pipe_backoff_seconds(pipe_attempt))  # AMENDMENT 5 (R12a) full-jitter
                         try:
                             conn.close()
                         except Exception:
@@ -3337,7 +3358,7 @@ def blank_whole_table_composite(dsql_schema, dsql_table, key_cols, batch=2000):
                         continue
                     if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                         pipe_attempt += 1
-                        time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                        time.sleep(pipe_backoff_seconds(pipe_attempt))  # AMENDMENT 5 (R12a) full-jitter
                         try:
                             conn.close()
                         except Exception:
@@ -3692,7 +3713,7 @@ def blank_pk_range(conn, dsql_schema, dsql_table, pk_col, lo, hi, batch=2000,
                     continue
                 if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                     pipe_attempt += 1
-                    time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                    time.sleep(pipe_backoff_seconds(pipe_attempt))  # AMENDMENT 5 (R12a) full-jitter
                     try:
                         conn.close()
                     except Exception:
@@ -4659,22 +4680,29 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
 
                 if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                     pipe_attempt += 1
-                    wait = CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt
+                    wait = pipe_backoff_seconds(pipe_attempt)   # AMENDMENT 5 (R12a) full-jitter
                     print(f"    ↻ chunk @row {total_written} broken-pipe/conn error "
                           f"({type(e).__name__}: {e}); reconnect + retry "
-                          f"{pipe_attempt}/{MAX_CHUNK_RETRIES} after {wait}s")
+                          f"{pipe_attempt}/{MAX_CHUNK_RETRIES} after {wait:.2f}s")
                     time.sleep(wait)
                     rebuild_conn(ws, fresh_token=True)   # drop => mint a fresh token (heals 08006)
                     continue
 
+                # EXHAUSTION — fail loud (R12a): name the class and the per-class attempt counts.
                 if is_transient_server_error(e):
-                    kind = "DSQL server-unavailable (retries exhausted)"
+                    kind = "DSQL server-unavailable"
                 elif is_broken_pipe_error(e):
-                    kind = "broken-pipe (retries exhausted)"
+                    kind = "network/broken-pipe"
+                elif is_occ_conflict(e):
+                    kind = "OCC concurrency-conflict"
                 else:
                     kind = "non-retriable"
                 raise Exception(
-                    f"Write failed at row {total_written} for {dsql_table} [{kind}]: {e}"
+                    f"Write failed at row {total_written} for {dsql_table} "
+                    f"[{kind} retries exhausted]: attempts "
+                    f"network={pipe_attempt}/{MAX_CHUNK_RETRIES}, "
+                    f"server_unavailable={server_attempt}/{SERVER_MAX_RETRIES}, "
+                    f"occ={occ_attempt}/{OCC_MAX_RETRIES}: {e}"
                 )
 
             elapsed = time.monotonic() - t0
