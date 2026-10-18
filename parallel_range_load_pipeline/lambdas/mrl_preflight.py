@@ -43,6 +43,11 @@ REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 _FULL_LOAD_ONLY = "full_load_only"
 _FULL_LOAD_AND_CDC = "full_load_and_cdc"
+# AMENDMENT 2 (R3): documented DSQL per-cluster connection ceiling. The repo already cites the
+# "10,000-connection cluster limit"; preflight now FAILS CLOSED when the planned total DSQL
+# writers exceed it (override=true downgrades to a loud warning). This is distinct from the
+# operator's soft conn_budget (which only warns on the multi-run total).
+DSQL_CLUSTER_CONNECTION_LIMIT = 10000
 _MODES = (_FULL_LOAD_ONLY, _FULL_LOAD_AND_CDC)
 _START = "start"
 _ADOPT = "adopt_stopped"
@@ -130,9 +135,15 @@ def _check_adopt_stopped(task):
             "failed table(s) and reload before adopting." % (arn, errored))
 
 
-def _capacity(runs, mfip, wpf, conn_budget, workers, warnings):
+def _capacity(runs, mfip, wpf, conn_budget, workers, warnings, override=False):
     """Print the DSQL/driver/DPU/IP arithmetic and WARN on a tight budget. Fail ONLY on a
-    provably impossible single setting. All inputs are the EFFECTIVE resolved values."""
+    provably impossible single setting. All inputs are the EFFECTIVE resolved values.
+
+    AMENDMENT 2 (R3): `conn_budget` is the operator's SOFT budget (a tight one only warns on the
+    multi-run total). Independently, DSQL documents a HARD per-cluster ceiling of
+    DSQL_CLUSTER_CONNECTION_LIMIT connections; the planned total writers exceeding that is a
+    provably-will-throttle setting, so it FAILS CLOSED unless override=true (operator accepts the
+    risk). full-jitter reconnect backoff (loader) keeps the herd from retrying in lockstep."""
     runs = int(runs)
     mfip = int(mfip)
     wpf = int(wpf)
@@ -148,6 +159,7 @@ def _capacity(runs, mfip, wpf, conn_budget, workers, warnings):
         "per_run_dsql_writers": per_run_dsql, "total_dsql_writers": total_dsql,
         "conn_budget": conn_budget, "total_dpu_estimate": total_dpu,
         "total_subnet_ips_estimate": total_ips,
+        "dsql_cluster_connection_limit": DSQL_CLUSTER_CONNECTION_LIMIT,
     }
     print("(info) mrl capacity: %d run(s) x %d files x %d writers = %d DSQL writers "
           "(budget %d); ~%d DPU; ~%d subnet IPs"
@@ -158,11 +170,26 @@ def _capacity(runs, mfip, wpf, conn_budget, workers, warnings):
             "writers_per_file %d) but the connection budget is only %d. Lower "
             "max_files_in_parallel or writers_per_file, or raise conn_budget." %
             (per_run_dsql, mfip, wpf, conn_budget))
+    # HARD DSQL per-cluster connection ceiling (R3): fail closed above it unless overridden.
+    if total_dsql > DSQL_CLUSTER_CONNECTION_LIMIT:
+        msg = ("capacity: planned %d concurrent DSQL writers (%d runs x %d files x %d writers) "
+               "exceeds the documented DSQL per-cluster connection limit of %d. The cluster "
+               "will throttle/refuse connections. Lower max_concurrency / max_files_in_parallel "
+               "/ writers_per_file." % (total_dsql, runs, mfip, wpf,
+                                        DSQL_CLUSTER_CONNECTION_LIMIT))
+        if override:
+            warnings.append("OVERRIDE: %s Proceeding because override=true - you accept the "
+                            "connection-throttling risk." % msg)
+        else:
+            raise MrlPreflightError(
+                "FAIL CLOSED (R3): %s Set override=true to proceed anyway (accepting the risk)."
+                % msg)
     if total_dsql > conn_budget:
         warnings.append(
             "capacity: %d concurrent runs x %d writers/run = %d DSQL writers exceeds conn_budget "
             "%d. Lower max_concurrency or writers_per_file, or raise conn_budget (watch the DSQL "
-            "10,000-connection cluster limit)." % (runs, per_run_dsql, total_dsql, conn_budget))
+            "%d-connection cluster limit)." % (runs, per_run_dsql, total_dsql, conn_budget,
+                                               DSQL_CLUSTER_CONNECTION_LIMIT))
     return cap
 
 
@@ -617,7 +644,8 @@ def handler(event, context):
     override = rt._normalize_override(inp)
 
     # Capacity arithmetic uses the EFFECTIVE values (fail only on a provably impossible setting).
-    capacity = _capacity(max_concurrency, mfip, wpf, conn_budget, load_workers, warnings)
+    capacity = _capacity(max_concurrency, mfip, wpf, conn_budget, load_workers, warnings,
+                         override=override)
 
     out = {
         "ok": True,

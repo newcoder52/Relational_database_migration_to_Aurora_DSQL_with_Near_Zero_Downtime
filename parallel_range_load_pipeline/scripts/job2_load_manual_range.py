@@ -954,7 +954,27 @@ _MANUAL_RANGE = {
     "all_sorted": None,     # whole-table sorted [(uri,size),...]
     "has_single_pk": None,
     "result_written": False,
+    # AMENDMENT 2 (R1e): accumulated DSQL-resilience retry telemetry for THIS range (summed
+    # across every file the range loads via load_one_table), persisted into the range result.
+    "retry_stats": {"network_retries": 0, "server_unavailable_retries": 0, "occ_retries": 0,
+                    "reconnects": 0, "ambiguous_commit_recoveries": 0, "longest_backoff_s": 0.0},
 }
+
+
+def _mr_merge_retry_stats(res):
+    """AMENDMENT 2 (R1e): fold a load_one_table result's retry_stats into the per-range total
+    (manual-range mode). No-op when range mode is off or the result carries no stats."""
+    if not _MANUAL_RANGE["on"] or not isinstance(res, dict):
+        return
+    rs = res.get("retry_stats")
+    if not isinstance(rs, dict):
+        return
+    agg = _MANUAL_RANGE["retry_stats"]
+    for k in ("network_retries", "server_unavailable_retries", "occ_retries", "reconnects",
+              "ambiguous_commit_recoveries"):
+        agg[k] = int(agg.get(k, 0)) + int(rs.get(k, 0))
+    agg["longest_backoff_s"] = round(max(float(agg.get("longest_backoff_s", 0.0)),
+                                         float(rs.get("longest_backoff_s", 0.0))), 3)
 
 def _apply_manual_range_overrides():
     """Parse the two optional Glue args. Absent both -> range mode OFF (byte-identical).
@@ -1406,18 +1426,26 @@ LOB_MAX_COLUMN_BYTES = 1024 * 1024       # ~1 MiB DSQL non-index column limit
 # Categories that are NOT length-bounded by varchar_max_len and can hold a large LOB.
 _LOB_GUARD_CATEGORIES = frozenset({"text", "json", "jsonb", "bytea", "varchar"})
 
-MAX_CHUNK_RETRIES = 3
-CHUNK_RETRY_BACKOFF_SECONDS = 2
+MAX_CHUNK_RETRIES = 10
+# AMENDMENT 2 (R1a): network-class (broken pipe / class 08 / SSL EOF / reset) chunk retry uses
+# EXPONENTIAL FULL-JITTER backoff (base 1 s, cap 60 s) for up to MAX_CHUNK_RETRIES attempts
+# (>= ~5 min total tolerance for a multi-minute DSQL network blip), replacing the old 3-attempt
+# linear 2/4/6 s ladder. Full jitter so N concurrent writers never retry in lockstep (R3).
+CHUNK_RETRY_BASE_BACKOFF_SECONDS = 1.0
+CHUNK_RETRY_MAX_BACKOFF_SECONDS = 60.0
+CHUNK_RETRY_BACKOFF_SECONDS = 2   # DEPRECATED (old linear step); kept for reference only
 # Bounded retry for the INITIAL DSQL open (connect_dsql). Each failed attempt on a
 # connection-class/transient error invalidates the cached IAM token + backs off so the next
 # attempt mints a fresh token — heals a token/endpoint blip at open time instead of failing
 # a whole writer/table. On exhaustion the last error is raised (caller's guard handles it).
-CONNECT_MAX_RETRIES = 4
+# AMENDMENT 2 (R1a): 4 -> 8 attempts, exponential full-jitter (base 1 s, cap 60 s).
+CONNECT_MAX_RETRIES = 8
 # Socket connect timeout (seconds) on EVERY pg8000.connect — without it a refused/half-open
 # DSQL socket blocks the connect indefinitely (silent hang; the retry path never runs).
 
 # ---- OCC (optimistic concurrency) retry on COMMIT ---------------------------
-OCC_MAX_RETRIES = 5
+# AMENDMENT 2 (R1a): 5 -> 8 attempts (same full-jitter backoff ladder).
+OCC_MAX_RETRIES = 8
 OCC_BASE_BACKOFF_SECONDS = 0.05   # 50 ms
 OCC_MAX_BACKOFF_SECONDS = 5.0     # 5 s cap
 # DSQL concurrency-conflict SQLSTATEs (per the Aurora DSQL troubleshooting doc):
@@ -1434,9 +1462,9 @@ OCC_SQLSTATES = {"40001", "OC000", "OC001"}
 # RETRIABLE after a reconnect + backoff — distinct from a deterministic data error (which
 # XX000 could also be, hence we gate on the MESSAGE too). Concurrent writers make transient
 # XX000 more likely, so without this branch a single blip would fail the whole worker.
-SERVER_MAX_RETRIES = 6
+SERVER_MAX_RETRIES = 10
 SERVER_BASE_BACKOFF_SECONDS = 0.5
-SERVER_MAX_BACKOFF_SECONDS = 30.0
+SERVER_MAX_BACKOFF_SECONDS = 60.0
 # XX000 = internal_error (broad). Only treat as transient when the message matches one
 # of these fragments, so we never retry a genuine internal bug indefinitely.
 SERVER_TRANSIENT_FRAGMENTS = (
@@ -1735,6 +1763,16 @@ def server_backoff_seconds(attempt):
     import random
     capped = min(SERVER_MAX_BACKOFF_SECONDS,
                  SERVER_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    return random.uniform(0, capped)
+
+
+def pipe_backoff_seconds(attempt):
+    """AMENDMENT 2 (R1a): full-jitter exponential backoff for network-class (broken pipe /
+    class 08 / SSL EOF / reset) chunk retries (1-based). base 1 s, doubling, capped at 60 s;
+    jittered in [0, capped] so concurrent writers do not reconnect in lockstep (R3)."""
+    import random
+    capped = min(CHUNK_RETRY_MAX_BACKOFF_SECONDS,
+                 CHUNK_RETRY_BASE_BACKOFF_SECONDS * (2 ** (attempt - 1)))
     return random.uniform(0, capped)
 
 # How DMS marks a real NULL in its CSV files: the S3 target endpoint's CsvNullValue (DMS
@@ -2930,7 +2968,7 @@ def blank_whole_table(dsql_schema, dsql_table, pk_col=None, batch=2000, any_col=
                         continue
                     if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                         pipe_attempt += 1
-                        time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                        time.sleep(pipe_backoff_seconds(pipe_attempt))  # AMENDMENT 2 (R1a) full-jitter
                         try:
                             conn.close()
                         except Exception:
@@ -3048,7 +3086,7 @@ def blank_whole_table_composite(dsql_schema, dsql_table, key_cols, batch=2000):
                         continue
                     if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                         pipe_attempt += 1
-                        time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                        time.sleep(pipe_backoff_seconds(pipe_attempt))  # AMENDMENT 2 (R1a) full-jitter
                         try:
                             conn.close()
                         except Exception:
@@ -3403,7 +3441,7 @@ def blank_pk_range(conn, dsql_schema, dsql_table, pk_col, lo, hi, batch=2000,
                     continue
                 if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                     pipe_attempt += 1
-                    time.sleep(CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt)
+                    time.sleep(pipe_backoff_seconds(pipe_attempt))  # AMENDMENT 2 (R1a) full-jitter
                     try:
                         conn.close()
                     except Exception:
@@ -4133,6 +4171,20 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     _wk_start = time.time()
 
     total_written = 0
+    # AMENDMENT 2 (R1e): per-range retry telemetry, accumulated across all chunks/writers of
+    # this range worker and returned in the result so _mr_write_result can persist it and the
+    # run can print one summary line. Lock-guarded (intra-file parallel writers share it).
+    _retry_stats = {"network_retries": 0, "server_unavailable_retries": 0, "occ_retries": 0,
+                    "reconnects": 0, "ambiguous_commit_recoveries": 0, "longest_backoff_s": 0.0}
+
+    def _bump(key, inc=1):
+        with _write_lock:
+            _retry_stats[key] += inc
+
+    def _note_backoff(sec):
+        with _write_lock:
+            if sec > _retry_stats["longest_backoff_s"]:
+                _retry_stats["longest_backoff_s"] = round(float(sec), 3)
     # INTRA-FILE PARALLEL WRITERS: shared, lock-guarded counters so N writer threads can commit
     # DISJOINT chunks of ONE file concurrently. total_written SUMS all writers (keeps the
     # rows_read==total_written no-loss gate exact); chunk_state["size"] is a shared tuning signal
@@ -4299,6 +4351,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                         print(f"    ✓ chunk @row {total_written} UNIQUE-violation on retry "
                               f"=> prior interrupted commit LANDED; treating as committed "
                               f"(no re-insert, no dup)")
+                        _bump("ambiguous_commit_recoveries")
                         with _write_lock:
                             total_written += len(chunk_rows)
                         return pending_tail
@@ -4314,11 +4367,14 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                         wait = occ_backoff_seconds(occ_attempt)
                         print(f"    ⟲ OCC 40001 @row {total_written}; retry "
                               f"{occ_attempt}/{OCC_MAX_RETRIES} after {wait:.3f}s")
+                        _bump("occ_retries"); _note_backoff(wait)
                         time.sleep(wait)
                         continue
                     raise Exception(
                         f"Write failed at row {total_written} for {dsql_table} "
-                        f"[OCC 40001 retries exhausted]: {e}"
+                        f"[OCC 40001 retries exhausted after {occ_attempt} attempt(s); "
+                        f"file={_range_tag} chunk@row={total_written}; range can be RE-RUN "
+                        f"safely (resume)]: {e}"
                     )
 
                 if is_txn_timeout(e) and len(chunk_rows) > MIN_CHUNK_SIZE:
@@ -4364,28 +4420,41 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
                     print(f"    ↻ chunk @row {total_written} DSQL server unavailable "
                           f"(XX000); re-insert retry {server_attempt}/{SERVER_MAX_RETRIES} "
                           f"after {wait:.2f}s (PK 23505 on retry => already committed, no dup)")
+                    _bump("server_unavailable_retries"); _note_backoff(wait)
                     time.sleep(wait)
                     # Connection remains active per DSQL guidance — do NOT rebuild_conn().
                     continue
 
                 if is_broken_pipe_error(e) and pipe_attempt < MAX_CHUNK_RETRIES:
                     pipe_attempt += 1
-                    wait = CHUNK_RETRY_BACKOFF_SECONDS * pipe_attempt
+                    wait = pipe_backoff_seconds(pipe_attempt)   # AMENDMENT 2 (R1a) full-jitter
                     print(f"    ↻ chunk @row {total_written} broken-pipe/conn error "
                           f"({type(e).__name__}: {e}); reconnect + retry "
-                          f"{pipe_attempt}/{MAX_CHUNK_RETRIES} after {wait}s")
+                          f"{pipe_attempt}/{MAX_CHUNK_RETRIES} after {wait:.2f}s")
+                    _bump("network_retries"); _bump("reconnects"); _note_backoff(wait)
                     time.sleep(wait)
                     rebuild_conn(ws, fresh_token=True)   # drop => mint a fresh token (heals 08006)
                     continue
 
+                # EXHAUSTION — fail loud (R1d): name the class, the attempt counts, the file +
+                # chunk, and that the range can be RE-RUN safely (per-file/per-chunk resume).
                 if is_transient_server_error(e):
-                    kind = "DSQL server-unavailable (retries exhausted)"
+                    kind = "DSQL server-unavailable"
                 elif is_broken_pipe_error(e):
-                    kind = "broken-pipe (retries exhausted)"
+                    kind = "network/broken-pipe"
+                elif is_occ_conflict(e):
+                    kind = "OCC concurrency-conflict"
                 else:
                     kind = "non-retriable"
                 raise Exception(
-                    f"Write failed at row {total_written} for {dsql_table} [{kind}]: {e}"
+                    f"Write failed at row {total_written} for {dsql_schema}.{dsql_table} "
+                    f"[{kind} retries exhausted] on {_range_tag}: attempts "
+                    f"network={pipe_attempt}/{MAX_CHUNK_RETRIES}, "
+                    f"server_unavailable={server_attempt}/{SERVER_MAX_RETRIES}, "
+                    f"occ={occ_attempt}/{OCC_MAX_RETRIES}. This range can be RE-RUN safely "
+                    f"(the loader checkpoints per file and per chunk; a re-run resumes, skips "
+                    f"done files, and the commit-probe skips already-committed chunks — no "
+                    f"duplicates, no loss): {e}"
                 )
 
             elapsed = time.monotonic() - t0
@@ -4521,6 +4590,9 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     # per-worker SUMMARY — the high-signal answer to "which connection loaded how
     # much per worker": thread + connection tag + slice + chunk count + rows + seconds.
     _wk_secs = max(0.001, time.time() - _wk_start)
+    # AMENDMENT 2 (R1e): fold this file/slice's retry telemetry into the manual-range per-range
+    # accumulator (no-op when range mode is off), so the range result doc + summary reflect it.
+    _mr_merge_retry_stats({"retry_stats": dict(_retry_stats)})
     print(f"    ✓ Wrote {total_written:,} rows")
     print(f"    ⇠ [WORKER] DONE {dsql_schema}.{dsql_table} {_range_tag} "
           f"thread={_wk_thread} conn={_primary_ws['tag']} chunks={_chunk_count['n']} "
@@ -4551,6 +4623,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
             "range": [pk_range[1], pk_range[2]],
             "target_columns": len(target_columns),
             "skipped_columns": len(skip_columns),
+            "retry_stats": dict(_retry_stats),
         }
 
     # CHUNK FAN-OUT worker: same as the range path — skip whole-table validation
@@ -4566,6 +4639,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
             "pk_max": pk_minmax["max"],
             "target_columns": len(target_columns),
             "skipped_columns": len(skip_columns),
+            "retry_stats": dict(_retry_stats),
         }
 
     # ---- Post-load validation ----
@@ -4623,11 +4697,22 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     if errors:
         raise Exception("VALIDATION FAILED: " + "; ".join(errors))
 
+    # AMENDMENT 2 (R1e): one-line retry summary so operators see how rough the ride was.
+    _rs = _retry_stats
+    if any(_rs[k] for k in ("network_retries", "server_unavailable_retries", "occ_retries",
+                            "reconnects", "ambiguous_commit_recoveries")):
+        print(f"    ⓘ retry summary {dsql_schema}.{dsql_table} {_range_tag}: "
+              f"network={_rs['network_retries']} server_unavailable={_rs['server_unavailable_retries']} "
+              f"occ={_rs['occ_retries']} reconnects={_rs['reconnects']} "
+              f"ambiguous_commit_recoveries={_rs['ambiguous_commit_recoveries']} "
+              f"longest_backoff={_rs['longest_backoff_s']}s", flush=True)
+
     return {
         "table": f"{dsql_schema}.{dsql_table}",
         "rows": total_written,
         "target_columns": len(target_columns),
         "skipped_columns": len(skip_columns),
+        "retry_stats": dict(_retry_stats),
     }
 
 
@@ -5593,6 +5678,7 @@ def _mr_write_result(s3_client, label, failed, error_text=None):
         "rows_written_by_this_range": int(rows_total), "bytes_assigned": bytes_total,
         "failed": bool(failed), "error": (str(error_text)[:2000] if error_text else None),
         "finished_at": utc_now_iso(), "files": files_detail,
+        "retry_summary": dict(_MANUAL_RANGE.get("retry_stats") or {}),
     }
     path = _mr_result_path(label, first, last)
     bucket, key = split_s3(path)
