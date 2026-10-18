@@ -1964,10 +1964,28 @@ def is_broken_pipe_error(exc):
         "ssl connection has been closed", "ssl syscall",
         "could not receive data", "could not send data",
         "socket is closed", "socket closed", "unable to connect",
+        # AMENDMENT 5 (V3B HIGH-2): a transient SSL EOF mid-INSERT surfaces as this plaintext
+        # (and as ssl.SSLEOFError / OSError errno 8, handled below). It is NOT a ConnectionError
+        # subclass and matched no fragment, so a load lost files to it; the parallel loader
+        # already wraps it. ADDITIVE only — treat it as a dropped connection so the chunk retry
+        # ladder reconnects with a fresh token and retries the chunk.
+        "eof occurred in violation of protocol",
     )
     if any(f in msg for f in fragments):
         return True
+    # AMENDMENT 5 (V3B HIGH-2): ssl.SSLEOFError is not a ConnectionError subclass; recognize it
+    # directly. (Mirrors the parallel loader job2_load_manual_range.py wrapper.)
+    try:
+        import ssl as _ssl
+        if isinstance(exc, _ssl.SSLEOFError):
+            return True
+    except Exception:
+        pass
     if isinstance(exc, OSError) and getattr(exc, "errno", None) in (errno.EPIPE, errno.ECONNRESET):
+        return True
+    # AMENDMENT 5 (V3B HIGH-2): OSError errno 8 ("EOF occurred ...") from a dropped TLS socket.
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 8 \
+            and "eof occurred" in msg:
         return True
     return False
 
