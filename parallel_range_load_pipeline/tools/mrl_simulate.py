@@ -318,15 +318,20 @@ class Sim:
         rkey = "%s_range_result/%s.range-%s-%s.json" % (cp_key, safe, first, last)
         # per-file rows (deterministic: 10 rows/file) unless the scenario fails this range
         fail = self.sc.get("fail_range")
-        if fail and fail[0] == label and fail[1] == first and \
-                self.glue._active.get(args.get("--_jobname", ""), 0) >= 0 and \
-                not self.sc.get("_failed_once"):
-            # fail the first attempt of the targeted range; resume (rerun) succeeds
-            self.sc["_failed_once"] = True
-            self.s3.put_object(Bucket=b, Key=rkey, Body=json.dumps(
-                {"label": label, "first": first, "last": last, "failed": True}).encode())
-            raise sim.ASLError("States.TaskFailed", "range %s..%s failed (injected)"
-                               % (first, last))
+        if fail and fail[0] == label and fail[1] == first:
+            # AMENDMENT 2 (R2d): fail the targeted range up to fail_range_times times (default 1),
+            # then let the resume (re-run) succeed. fail_range_error injects a custom terminal
+            # (e.g. an operator kill -> Glue ABORTED -> States.TaskFailed). The ORIGINAL cause
+            # text is what the Catch surfaces after the bounded retries are exhausted.
+            want_fails = int(self.sc.get("fail_range_times", 1))
+            seen = int(self.sc.get("_fail_count", 0))
+            if seen < want_fails:
+                self.sc["_fail_count"] = seen + 1
+                self.s3.put_object(Bucket=b, Key=rkey, Body=json.dumps(
+                    {"label": label, "first": first, "last": last, "failed": True}).encode())
+                err_name = self.sc.get("fail_range_error", "States.TaskFailed")
+                raise sim.ASLError(err_name, "range %s..%s failed (injected attempt %d/%d)"
+                                   % (first, last, seen + 1, want_fails))
         files_doc = {}
         for uri, _s in assigned:
             files_doc[uri] = {"state": "done", "rows": 10}
@@ -674,12 +679,48 @@ def scenarios():
               "endpoint": _base_endpoint(), "dsql_counts": {}, "empties": {"s.t": True},
               "expect_status": "FAILED", "expect_state": "DmsFailed"})
 
-    # 8: a range fails, siblings finish, task fails; (resume is a separate run - tested in pytest)
-    S.append({"name": "8_range_fails", "mode": "full_load_only", "dms_start_mode": "start",
+    # 8: a range fails ONCE, then the bounded automatic re-run (AMENDMENT 2 R2a,
+    # States.TaskFailed Retry on RunRange) resumes it and the task SUCCEEDS.
+    S.append({"name": "8_range_fails_once_then_retry_succeeds", "mode": "full_load_only",
+              "dms_start_mode": "start",
               "max_concurrency": 3, "tables": [tbl("s.t", 6, rows=60)],
               "timeline": _task_timeline("full_load_only", "start"), "endpoint": _base_endpoint(),
               "dsql_counts": {"s.t": 60}, "empties": {"s.t": True},
-              "fail_range": ("s.t", "LOAD00000001.csv"),
+              "fail_range": ("s.t", "LOAD00000001.csv"), "fail_range_times": 1,
+              "expect_status": "SUCCEEDED", "expect_state": "TaskSucceeded"})
+
+    # 8c: a range fails TWICE, then the third attempt (within MaxAttempts=3) resumes and SUCCEEDS.
+    S.append({"name": "8c_range_fails_twice_then_retry_succeeds", "mode": "full_load_only",
+              "dms_start_mode": "start",
+              "max_concurrency": 3, "tables": [tbl("s.t", 6, rows=60)],
+              "timeline": _task_timeline("full_load_only", "start"), "endpoint": _base_endpoint(),
+              "dsql_counts": {"s.t": 60}, "empties": {"s.t": True},
+              "fail_range": ("s.t", "LOAD00000001.csv"), "fail_range_times": 2,
+              "expect_status": "SUCCEEDED", "expect_state": "TaskSucceeded"})
+
+    # 8d: a range fails 4 times (> MaxAttempts=3) -> the bounded re-run is exhausted and the task
+    # ends MrlLoadFailed; the Catch surfaces the ORIGINAL injected cause (not just "retries
+    # exhausted"). expect_cause_substr is asserted against the execution's failure cause.
+    S.append({"name": "8d_range_fails_4x_exhausts_to_MrlLoadFailed", "mode": "full_load_only",
+              "dms_start_mode": "start",
+              "max_concurrency": 3, "tables": [tbl("s.t", 6, rows=60)],
+              "timeline": _task_timeline("full_load_only", "start"), "endpoint": _base_endpoint(),
+              "dsql_counts": {"s.t": 60}, "empties": {"s.t": True},
+              "fail_range": ("s.t", "LOAD00000001.csv"), "fail_range_times": 4,
+              "expect_status": "FAILED", "expect_state": "MrlLoadFailed",
+              "expect_cause_substr": "failed (injected"})
+
+    # 8e: an operator KILLS a range's Glue run (ABORTED -> States.TaskFailed). The bounded re-run
+    # treats it like any failure and RETRIES it (up to 3x) -> here the kill recurs 4x so it ends
+    # MrlLoadFailed. DOC/RUNBOOK: to truly stop a table, stop the Step Functions EXECUTION (the
+    # per-range kill is now auto-retried). This scenario documents that behaviour change.
+    S.append({"name": "8e_operator_kill_is_auto_retried", "mode": "full_load_only",
+              "dms_start_mode": "start",
+              "max_concurrency": 3, "tables": [tbl("s.t", 6, rows=60)],
+              "timeline": _task_timeline("full_load_only", "start"), "endpoint": _base_endpoint(),
+              "dsql_counts": {"s.t": 60}, "empties": {"s.t": True},
+              "fail_range": ("s.t", "LOAD00000001.csv"), "fail_range_times": 4,
+              "fail_range_error": "States.TaskFailed",
               "expect_status": "FAILED", "expect_state": "MrlLoadFailed"})
 
     # 10: count mismatch by 1 row -> fail
@@ -829,6 +870,15 @@ def run_scenario(sc):
     ok = out["status"] == sc["expect_status"]
     if "expect_state" in sc:
         ok = ok and out.get("state") == sc["expect_state"]
+    if ok and sc.get("expect_cause_substr"):
+        # AMENDMENT 2 (R2d): after the bounded re-run exhausts, the ORIGINAL cause must survive
+        # (not just "retries exhausted"). The RunRange Catch stores it at $.rangeError, which the
+        # Map carries into the failed output. Assert the substring appears in the serialized out.
+        _blob = json.dumps(out, default=str)
+        ok = ok and (sc["expect_cause_substr"] in _blob)
+        if sc["expect_cause_substr"] not in _blob:
+            print("  R2d FAIL: original cause %r not in failed output: %s"
+                  % (sc["expect_cause_substr"], _blob[:400]))
     if ok and sc.get("expect_sizes"):
         plan = s.s3.get_json("mrl/state/%s/plan.json" % TASK_ID)
         for label, want in sc["expect_sizes"].items():
@@ -946,26 +996,30 @@ def _child_input(mode="full_load_only", dsm="start", conc=3, **extra):
 
 
 def scenario_resume():
-    """8b: a range fails; a SECOND run of the same input resumes ONLY the failed range (done
-    files are already recorded) and the task succeeds. We reuse one Sim (shared S3) across two
-    child runs so the first run's done docs persist."""
+    """8b (R2b): the in-execution bounded auto-retry (3x) is EXHAUSTED (range fails 4x) so the
+    first execution ends MrlLoadFailed; a SECOND execution (manual resume) of the same input
+    resumes ONLY the still-incomplete range (done files are already recorded) and succeeds. This
+    proves the resume path the operator uses when the automatic retries are exhausted, and that
+    already-done files are skipped (rows counted exactly once)."""
     sc = {"name": "8b", "mode": "full_load_only", "dms_start_mode": "start", "max_concurrency": 3,
           "tables": [{"label": "s.t", "files": list(range(1, 7)), "single_pk": True, "rows": 60}],
           "timeline": _task_timeline("full_load_only", "start"), "endpoint": _base_endpoint(),
           "dsql_counts": {"s.t": 60}, "empties": {"s.t": True},
-          "fail_range": ("s.t", "LOAD00000001.csv")}
+          "fail_range": ("s.t", "LOAD00000001.csv"), "fail_range_times": 4}
     s = Sim(sc)
     out1, _ = s.run_child(_child_input(conc=3))
     if out1["status"] != "FAILED" or out1.get("state") != "MrlLoadFailed":
-        return False, "first run should fail at MrlLoadFailed, got %s/%s" % (out1["status"], out1.get("state"))
-    # second run: the injected failure only fires once (sc['_failed_once'] set), so the resumed
-    # range succeeds. The gate must still pass (table non-empty now, but has recorded progress).
+        return False, ("first run should exhaust the 3x auto-retry and fail at MrlLoadFailed, "
+                       "got %s/%s" % (out1["status"], out1.get("state")))
+    # second run (manual resume): the injected failure budget is used up (4 fired), so the
+    # resumed range now succeeds. The gate must still pass (table non-empty now, recorded
+    # progress). Done files from the prior attempts are skipped -> rows counted exactly once.
     s.sc["empties"] = {"s.t": False}       # the first run loaded some rows -> now non-empty
     s.sc["dsql_counts"] = {"s.t": 60}
     out2, _ = s.run_child(_child_input(conc=3))
     if out2["status"] != "SUCCEEDED":
         return False, "resume run should succeed, got %s/%s" % (out2["status"], out2.get("state"))
-    return True, "first run fails, resume completes only the failed range"
+    return True, "auto-retry exhausts -> MrlLoadFailed; manual resume completes the failed range"
 
 
 def scenario_listing_drift():

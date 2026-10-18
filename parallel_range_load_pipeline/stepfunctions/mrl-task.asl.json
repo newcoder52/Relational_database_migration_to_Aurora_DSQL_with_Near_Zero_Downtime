@@ -1032,6 +1032,15 @@
      "IntervalSeconds": 10,
      "MaxAttempts": 3,
      "BackoffRate": 2.0
+    },
+    {
+     "Comment": "AMENDMENT 2 (R2c): read-only Glue run; a States.TaskFailed is auto-retried a bounded 2x (60s, backoff 2.0). AFTER the Glue-class entry so ConcurrentRuns/Throttling keep their own counters. Safe because this state only READS (COUNT(*) verify / emptiness probe) \u2014 a re-run has no side effect to duplicate.",
+     "ErrorEquals": [
+      "States.TaskFailed"
+     ],
+     "IntervalSeconds": 60,
+     "MaxAttempts": 2,
+     "BackoffRate": 2.0
     }
    ],
    "Catch": [
@@ -1194,6 +1203,15 @@
         ],
         "IntervalSeconds": 15,
         "MaxAttempts": 4,
+        "BackoffRate": 2.0
+       },
+       {
+        "Comment": "AMENDMENT 2 (R2a): bounded automatic RE-RUN of a failed range. A Glue run that FAILED (e.g. the loader exhausted its in-process DSQL retries during a multi-minute outage) surfaces as States.TaskFailed; re-running the SAME range is a safe RESUME (the loader checkpoints per file and per chunk; the commit-probe skips already-committed chunks, done files are skipped, the overlap-guard treats an identical range as a resume). This entry is AFTER the Glue-class entry above, and Step Functions matches Retry entries in order with a SEPARATE attempt counter each, so Glue.ConcurrentRunsExceeded/Throttling keep their own 4-attempt counts here and are NEVER swallowed by this one. Waits 2/4/8 min. A DETERMINISTIC failure (NOT NULL violation, type cast, no-PK refusal, overlap guard, bad args) re-fails fast after a quick resume (done files skipped), and after exhaustion the ORIGINAL Glue error text is surfaced by the Catch below (RangeFailed carries $.rangeError).",
+        "ErrorEquals": [
+         "States.TaskFailed"
+        ],
+        "IntervalSeconds": 120,
+        "MaxAttempts": 3,
         "BackoffRate": 2.0
        }
       ],
@@ -1379,6 +1397,15 @@
      ],
      "IntervalSeconds": 10,
      "MaxAttempts": 3,
+     "BackoffRate": 2.0
+    },
+    {
+     "Comment": "AMENDMENT 2 (R2c): read-only Glue run; a States.TaskFailed is auto-retried a bounded 2x (60s, backoff 2.0). AFTER the Glue-class entry so ConcurrentRuns/Throttling keep their own counters. Safe because this state only READS (COUNT(*) verify / emptiness probe) \u2014 a re-run has no side effect to duplicate.",
+     "ErrorEquals": [
+      "States.TaskFailed"
+     ],
+     "IntervalSeconds": 60,
+     "MaxAttempts": 2,
      "BackoffRate": 2.0
     }
    ],

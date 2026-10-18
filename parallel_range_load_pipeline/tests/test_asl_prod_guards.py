@@ -118,6 +118,36 @@ def test_history_event_budget():
     assert worst < 25000, "worst-case history events %d is not below 25000" % worst
 
 
+def test_history_event_budget_with_runrange_retries():
+    """AMENDMENT 2 (R2d): the RunRange Map now retries a failed range up to the Glue-class
+    entry (MaxAttempts 4) PLUS the new States.TaskFailed entry (MaxAttempts 3) = up to 7 total
+    task-run attempts per range in the pathological case. Each RunRange ATTEMPT is a bounded set
+    of history events (TaskStateEntered + TaskScheduled + TaskStarted + TaskFailed/Succeeded +
+    the retry's wait) ~= 6 events; plus the per-range RangeOk/RangeFailed Pass (~3). Confirm the
+    worst case for 6 ranges and for 40 ranges stays well below the 25,000 hard limit, AND the
+    combined worst case with the (separate-phase) DMS poll still fits.
+
+    Note: a full-load-ONLY run (the primary path) does NOT run the CDC-start poll, and the heavy
+    DMS poll runs in a DIFFERENT phase than the load Map; we still sum them for a conservative
+    bound. In practice a single range almost never exhausts all 7 attempts."""
+    max_attempts_per_range = 4 + 3          # Glue-class entry + new TaskFailed entry
+    events_per_attempt = 6                  # entered/scheduled/started/failed(+wait) upper bound
+    per_range_overhead = 3                  # RangeOk/RangeFailed Pass + Map item framing
+    def map_cost(n_ranges):
+        return n_ranges * (max_attempts_per_range * events_per_attempt + per_range_overhead)
+    # Map framing (MapStateEntered/Iteration events) ~ small constant per range already counted.
+    dms_poll = 1440 * 15
+    linear = 60 * 10
+    for n in (6, 40):
+        worst = dms_poll + map_cost(n) + linear
+        margin = 25000 - worst
+        assert worst < 25000, ("worst-case history events for %d ranges x %d attempts = %d "
+                               "(>= 25000; margin %d)" % (n, max_attempts_per_range, worst, margin))
+    # Report the 40-range margin explicitly (the tighter case).
+    worst40 = dms_poll + map_cost(40) + linear
+    assert (25000 - worst40) > 0, "40-range worst case must retain positive margin: %d" % worst40
+
+
 def test_payload_size_range_items_have_no_file_lists():
     """Build a 3,000-file, 1-table plan with the REAL mrl_plan and assert the Map input
     (rangeItems) never carries a file list and is well under 256 KiB."""
