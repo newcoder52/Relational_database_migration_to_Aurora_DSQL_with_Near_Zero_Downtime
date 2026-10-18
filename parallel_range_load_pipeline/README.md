@@ -247,6 +247,27 @@ the count Glue job and the two state machines, and greps for any leftover `<<` p
 
 ---
 
+## 6b. Development / running the tests
+
+The offline test suite needs a few Python packages that are NOT in a bare interpreter (finding
+F1): `boto3` / `botocore` / `pg8000` are imported at the top of the real Lambdas, and `pyflakes`
+is required by the undefined-name scan. Install them from the pinned dev requirements, then run the
+suite (no AWS, no Spark — `pyspark`/`awsglue` are stubbed by the tests and come from the Glue
+runtime in production):
+
+```
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest tests/ -q
+python3 tools/mrl_simulate.py          # scenario simulator
+```
+
+> **`pyflakes` is REQUIRED (finding F2).** `tests/test_pyflakes_undefined.py` does
+> `pytest.importorskip("pyflakes.api")`, so if `pyflakes` is not installed the undefined-name
+> static scan is **silently skipped** rather than run. `requirements-dev.txt` pins it; install it
+> so the scan actually executes.
+
+---
+
 ## 7. Run, monitor, rerun
 
 Upload `config/fleet_task_parallel_load.csv` (and optional `config/params_parallel_load.csv`), then start the fleet:

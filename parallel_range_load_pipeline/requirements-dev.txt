@@ -1,0 +1,16 @@
+# Development / test dependencies for the parallel_range_load_pipeline offline test suite.
+# (Finding F1/F2, review A.) The runtime Glue job dependencies — pyspark and awsglue — are
+# NOT listed here: the suite STUBS them (see tests/test_import_smoke.py), and they are provided
+# by the Glue 4.0 runtime in production, not by pip.
+#
+# Install with:   python3 -m pip install -r requirements-dev.txt
+# Then run:       python3 -m pytest tests/ -q
+#
+# Pinned to the versions the suite is validated against (review A / release-2).
+pytest==8.4.2
+boto3==1.42.97
+botocore==1.42.97
+pg8000==1.31.5
+pyflakes==3.4.0        # REQUIRED: tests/test_pyflakes_undefined.py importorskip()s it; without it
+                       # the undefined-name static scan is SILENTLY SKIPPED (finding F2).
+PyYAML==6.0.3

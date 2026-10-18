@@ -28,7 +28,9 @@ for the operator guide.
 
 ## Verified by EXECUTION (offline; no AWS, no Spark, no network)
 
-- **pytest suite: 79 passed, 0 failed** (`python3 -m pytest tests/ -q`). Covers:
+- **pytest suite: 79 passed, 0 failed** (`python3 -m pytest tests/ -q`) _(historical count for
+  this build record; the suite has since grown — current release-2 count is **268 passed**, see
+  "Stale counts (F3)" at the end of this file)_. Covers:
   - Splitter property tests: n in 0..300 × c in 1..64 exhaustively (sizes, balance,
     contiguity, inclusivity, determinism), the required examples
     (`5,3→2,2,1`; `7,3→3,2,2`; `4,4→1,1,1,1`; `3,5→1,1,1`; `1,10→1`; `406,4→102,102,101,101`;
@@ -72,7 +74,8 @@ for the operator guide.
 - **ASL interpreter self-check (5 passed)** including a replay of the EXISTING
   `stepfunctions/startup.asl.json` on a happy path that reaches `TaskSucceeded` — this validates
   the interpreter itself against the real production machine.
-- **THE TESTER SCRIPT `tools/mrl_simulate.py`: 21 scenarios, 21 passed** — complete runs through
+- **THE TESTER SCRIPT `tools/mrl_simulate.py`: 21 scenarios, 21 passed** _(historical; current
+  release-2 count is **27 scenarios, 27 passed** — see "Stale counts (F3)" at the end)_ — complete runs through
   BOTH MRL machines against fakes (fake DMS stop-reason timeline, fake S3 with real-looking LOAD
   listings, fake Glue recording every started run + Arguments and able to fail a run, simulated
   DSQL counts), driving the REAL MRL child ASL and the REAL MRL Lambda handlers. Covers brief
@@ -170,7 +173,23 @@ for the operator guide.
 
 ```
 cd parallel_range_load_pipeline
-python3 -m pytest tests/ -q                 # 79 passed
-python3 tools/mrl_simulate.py               # 21 scenarios, all PASS (prints transcripts)
+python3 -m pytest tests/ -q                 # historical: 79 passed (current release-2: 268 passed)
+python3 tools/mrl_simulate.py               # historical: 21 scenarios (current release-2: 27), all PASS (prints transcripts)
 python3 tests/test_asl_sim_selfcheck.py     # interpreter self-check + startup.asl.json replay
 ```
+
+
+---
+
+## Stale counts (F3, review A — corrected release-2)
+
+The per-build counts above are **historical** snapshots from earlier amendments. The current,
+authoritative counts for the published folder (release-2) are:
+
+- `python3 -m pytest tests/ -q` → **268 passed** (was 249 on main 340b328; release-2 adds the
+  keep_text range-load behavioural tests and the ≥300 hex-file scale tests).
+- `python3 tools/mrl_simulate.py` → **27 scenarios, 27 passed**.
+
+Install the dev/test dependencies first (`python3 -m pip install -r requirements-dev.txt`) — the
+documented `pytest` command needs `boto3`/`botocore`/`pg8000`, and `pyflakes` for the
+undefined-name scan (findings F1/F2).

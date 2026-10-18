@@ -52,9 +52,11 @@ parsing, and zero leaked secrets/ids.
 
 ## 4. Verified BY EXECUTION (this build)
 
-- **`python3 -m pytest tests/ -q` → 114 passed, 0 failed** (incl. `test_deploy_iam.py`,
+- **`python3 -m pytest tests/ -q` → 114 passed, 0 failed** _(historical build-record count;
+  current release-2 count is **268 passed** — see "Stale counts (F3)" below)_ (incl. `test_deploy_iam.py`,
   `test_cdc_handoff.py`, `test_vetter_findings.py`, `test_amendments.py`, mutation/ASL-guard tests).
-- **`python3 tools/mrl_simulate.py` → 22 scenarios, 22 passed** (incl. #19 CDC-ignored).
+- **`python3 tools/mrl_simulate.py` → 22 scenarios, 22 passed** _(historical; current release-2:
+  **27 scenarios, 27 passed**)_ (incl. #19 CDC-ignored).
 - ASL audits (string-arg Glue args, history/payload budget, startup-state byte-identity diff) pass.
 - `deploy_mrl.sh --dry-run` clean; `bash -n` clean; `py_compile` on all `.py`; `json.load` on all
   `.json`.
@@ -113,7 +115,8 @@ python3 tools/mrl_simulate.py
 Three independent round-2 reviewers returned **SAFE WITH THESE FIXES**. Every item is fixed with an
 executing fail-before / pass-after test. Suite is **137 passed** (was 114) twice (PYTHONHASHSEED=0
 and TZ=UTC LANG=C); simulator **23 scenarios** (adds `3b_cdc_fork_handoff`). All fixes committed
-after `19a745b`.
+after `19a745b`. _(All counts in this file are historical build-record snapshots; the current
+authoritative release-2 counts are **268 passed** and **27 scenarios** — see "Stale counts (F3)" below.)_
 
 | finding | severity | fixed at | evidence (executing) |
 |---|---|---|---|
@@ -438,3 +441,12 @@ TimeoutSecondsPath, module-top import-safe, ResultSelector carries referenced pa
 success without range artifacts). Post-Reconcile states (CountVerify/StateCounted/CDC tail) are
 exercised end-to-end through the real handlers by the simulator (cdc=false + cdc=true scenarios); no
 `$.X` read without a producer. `split_allow_hex` kept as a strict-validated opt-out in the params file.
+
+---
+
+## Stale counts (F3, review A — corrected release-2)
+
+All suite/scenario counts in this historical build record predate release-2. The current,
+authoritative counts for the published folder are **268 passed** (`python3 -m pytest tests/ -q`)
+and **27 scenarios, 27 passed** (`python3 tools/mrl_simulate.py`). Install the dev/test
+dependencies first: `python3 -m pip install -r requirements-dev.txt` (findings F1/F2).
