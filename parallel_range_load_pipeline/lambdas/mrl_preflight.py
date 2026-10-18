@@ -547,9 +547,14 @@ def handler(event, context):
     null_notnull_text = str(event.get("nullNotnullText") if event.get("nullNotnullText") is not None
                             else cfg.get("null_notnull_text", "") or "")
     try:
-        _nullcfg = {"null_values": null_values, "null_rules": null_rules}
+        # AMENDMENT 3 (R9): include null_notnull_text so a MISTYPED value fails closed at
+        # preflight (before any DMS/Glue call), the same way null_values/null_rules do. The
+        # validator normalizes absent/blank/sentinel -> "off" (byte-identical to today).
+        _nullcfg = {"null_values": null_values, "null_rules": null_rules,
+                    "null_notnull_text": null_notnull_text}
         rt._validate_null_settings(_nullcfg)
         null_values, null_rules = _nullcfg["null_values"], _nullcfg["null_rules"]
+        null_notnull_text = _nullcfg["null_notnull_text"]
     except rt.SettingsError as e:
         raise MrlPreflightError("NULL options invalid (fix at preflight): %s" % e)
 

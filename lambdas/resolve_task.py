@@ -996,18 +996,19 @@ def _validate_null_settings(cfg, warnings=None):
     nr = str(cfg.get("null_rules", "") or "").strip()
     cfg["null_rules"] = nr
     # Optional automatic NOT NULL char/text keep-text rule. "off" (default) | "keep_text".
-    # Blank / the __NULL_UNSET__ sentinel -> off. An invalid value is a WARNING + off (never
-    # a hard preflight failure, since off is always safe and byte-identical to today).
+    # Blank / the __NULL_UNSET__ sentinel / absent -> off (byte-identical to today). AMENDMENT 3
+    # (R9 / R2-1): keep_text is the PRIMARY full-load-only path, so a MISTYPED value (e.g.
+    # "keep_txt") must FAIL CLOSED here — before any DMS or Glue call — exactly like a malformed
+    # null_values/null_rules, instead of silently reverting to off (which would surface only as a
+    # late 23502 load failure). The Glue loaders keep their own defensive downgrade as a last line.
     nnt = str(cfg.get("null_notnull_text", "") or "").strip().lower()
     if nnt in ("", "__null_unset__"):
         nnt = "off"
     if nnt not in ("off", "keep_text"):
-        _msg = (f"null_notnull_text {cfg.get('null_notnull_text')!r} is not off|keep_text; using off")
-        if warnings is not None:
-            warnings.append(_msg)
-        else:
-            print(f"(warn) {_msg}")
-        nnt = "off"
+        raise SettingsError(
+            f"pipeline.json 'null_notnull_text' {cfg.get('null_notnull_text')!r} is invalid; it "
+            f"must be 'off' or 'keep_text' (case-insensitive). Refusing before any DMS/Glue call "
+            f"so a typo cannot silently revert to 'off' and load literal NULL text as SQL NULL.")
     cfg["null_notnull_text"] = nnt
     if nr:
         seen = set()

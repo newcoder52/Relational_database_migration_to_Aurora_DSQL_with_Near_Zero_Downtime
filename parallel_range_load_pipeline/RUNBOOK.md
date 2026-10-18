@@ -328,6 +328,13 @@ Every MRL failure is **fail closed** (never a silent success). Common classes:
 | **count no basis** (`NO COMPARISON BASIS`, `count_no_basis_action=fail`) | a loaded table has no DMS/discovery row count to check against | confirm the load another way; `count_no_basis_action=warn` to downgrade |
 | **cdc handoff** (`MrlCdcHandoffError` — forked table has no clean reconcile count) | a forked table was not clean when CDC was about to start | fix the failed ranges / reconcile; re-run |
 | **Glue throttle** (`ConcurrentRunsExceededException`) | too many concurrent Glue runs | the state machine retries automatically; if persistent, lower concurrency or raise the Glue quota |
+
+> **⚠️ Keep `count_timeout_action` and `count_no_basis_action` at the default `fail`.** Setting
+> either to `warn` turns a count that NEVER COMPLETED (`unverifiable`) or a table with NO comparison
+> basis (`no_basis`) from a fail-closed error into verdict `ok` — the load is reported successful
+> **without the row count being verified** (a potential false pass). A true `mismatch` always fails
+> regardless. For a production full-load-only run on 100M+ row tables, leave both at `fail`.
+
 | **target-generated primary key** (`TARGET-GENERATED PRIMARY KEY refused` / `FAIL CLOSED (R6)`) | a primary-key column is NOT supplied by the source (not in the mapping's loaded columns), so the target DEFAULT (e.g. `gen_random_uuid()`) would generate it | make the source/mapping supply every PK column, or use a key the source provides; this is refused because a re-run would silently duplicate |
 
 **Target-generated primary keys are refused (R6).** The parallel range pipeline REQUIRES every

@@ -1556,6 +1556,13 @@ analysis): a **mismatch always fails**; a count that could not complete is `unve
 **fails closed** when `count_timeout_action=fail` (the default); a loaded table with no comparison
 basis is `no_basis` and **fails closed** when `count_no_basis_action=fail` (the default).
 
+> **⚠️ Do NOT set `count_timeout_action=warn` or `count_no_basis_action=warn` for a production
+> full-load-only run.** Those downgrades turn a count that NEVER COMPLETED (timed out /
+> `unverifiable`) or a table with NO comparison basis (`no_basis`) from a fail-closed error into a
+> **verdict `ok` — the load is reported successful without the row count ever being verified**
+> (a potential false pass). Keep **both at the default `fail`** so an un-run count always fails
+> closed. Only a true `mismatch` fails regardless of these settings.
+
 ## 15. Full-load-only workflow end to end
 
 Full-load-only = **load the data, verify it, stop.** No CDC, no cutover. There are two pipelines; use

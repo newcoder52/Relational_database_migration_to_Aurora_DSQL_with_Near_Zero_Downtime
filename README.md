@@ -21,17 +21,17 @@ no CDC, no cutover), which is the primary mode for large reference tables (100M+
 - **`stopAfterLoad=true`** (original pipeline): after the full load, SKIP validation, do not resume
   DMS, do not start CDC; the task ends in `TaskLoadOnlySucceeded` with a
   `config/_task/<suffix>/_load_only.json` marker. See
-  [RUNBOOK §13 Full-load-only (stopAfterLoad)](RUNBOOK.md#full-load-only-stopafterload).
+  [RUNBOOK §13 Full-load-only (stopAfterLoad)](RUNBOOK.md#13-full-load-only-stopafterload).
 - **`post_load_check=count_only`** (opt-in via a Glue job `default_argument`): the post-load check
   verifies by `COUNT(*)` against the DMS/discovery row count instead of the per-range aggregate
-  validation. See [RUNBOOK §14 Post-load count-only check](RUNBOOK.md#post-load-count-only-check).
+  validation. See [RUNBOOK §14 Post-load count-only check](RUNBOOK.md#14-post-load-count-only-check).
 - **`null_notnull_text=keep_text`** (default `off`): keep the literal text `NULL`/`NA`/… as data in
   NOT NULL text columns (detailed under **Limitations** below). Works on the parallel range loader
   for 100M+ row tables too.
 
 For the end-to-end full-load-only workflow (original pipeline with `stopAfterLoad` vs the parallel
 range pipeline with `cdc=false`), see
-[RUNBOOK §15 Full-load-only workflow end to end](RUNBOOK.md#full-load-only-workflow-end-to-end).
+[RUNBOOK §15 Full-load-only workflow end to end](RUNBOOK.md#15-full-load-only-workflow-end-to-end).
 
 ## How it works
 

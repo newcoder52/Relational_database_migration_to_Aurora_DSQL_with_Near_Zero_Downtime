@@ -777,6 +777,16 @@ def scenarios():
               "nullRules": "s.t",   # malformed: no '='
               "expect_status": "FAILED", "expect_state": "PreflightFailed"})
 
+    # 13b (AMENDMENT 3 R9): a MISTYPED null_notnull_text now FAILS CLOSED at preflight (before any
+    # DMS start or Glue job), ending PreflightFailed — not a silent downgrade to off.
+    S.append({"name": "13b_bad_null_notnull_text", "mode": "full_load_only",
+              "dms_start_mode": "start",
+              "max_concurrency": 2, "tables": [tbl("s.t", 3)],
+              "timeline": _task_timeline("full_load_only", "start"), "endpoint": _base_endpoint(),
+              "dsql_counts": {}, "empties": {"s.t": True},
+              "nullNotnullText": "keep_txt",   # typo: must be off|keep_text
+              "expect_status": "FAILED", "expect_state": "PreflightFailed"})
+
     # 4: two tasks in one fleet (exercised via the fleet harness in pytest); here as child x2 is
     # covered by scenario 1+2. The fleet-level test is test_fleet_two_tasks.
 
@@ -862,6 +872,8 @@ def run_scenario(sc):
         child_input["nullRules"] = sc["nullRules"]
     if "nullValues" in sc:
         child_input["nullValues"] = sc["nullValues"]
+    if "nullNotnullText" in sc:
+        child_input["nullNotnullText"] = sc["nullNotnullText"]
     if "count_timeout_action" in sc:
         child_input["countTimeoutAction"] = sc["count_timeout_action"]
     out, interp = s.run_child(child_input)
