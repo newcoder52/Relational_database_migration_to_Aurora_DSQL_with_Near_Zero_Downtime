@@ -980,7 +980,7 @@ POST_LOAD_COUNT_RETRY_WAIT = 20           # seconds between those retries
 # in KEY RANGES when a single integer/uuid PK exists and the table is large.
 POST_LOAD_COUNT_STATEMENT_TIMEOUT_MS = 240000                               # 240 s server cap
 POST_LOAD_COUNT_SOCKET_READ_TIMEOUT = int(POST_LOAD_COUNT_STATEMENT_TIMEOUT_MS / 1000) + 60  # 300s
-POST_LOAD_COUNT_RANGE_THRESHOLD_ROWS = 2_000_000    # range-count at/above this with a usable key
+POST_LOAD_COUNT_RANGE_THRESHOLD_ROWS = 30_000_000  # range-count only ABOVE this (R11); at/below: whole-table COUNT(*)
 POST_LOAD_COUNT_RANGE_ROWS = 4_000_000              # ~rows per sub-range (2-5M band)
 
 
@@ -1158,9 +1158,12 @@ def _post_count_one(dsql_schema, dsql_table, config=None, expected_total=None):
     KEY RANGES when a single integer/uuid PK exists and the table is large (>= the range
     threshold); otherwise ONE whole-table COUNT(*). Both use the B14 count connection so a long
     count is bounded by statement_timeout, not a client read timeout. Always opens and closes."""
-    # R8: ranged count for a large table with a usable single-column integer/uuid key.
+    # R8/R11: ranged count only ABOVE 30M rows with a usable single-column integer/uuid key; at or
+    # below 30M a single whole-table COUNT(*) on the B14 connection. Per the owner's R11
+    # correction, NO timeout->ranges fallback is added here: a plain whole-table COUNT(*) handles
+    # DSQL at this scale, and on an infra error/timeout count_only WARNs (today's behaviour).
     if config is not None and expected_total is not None \
-            and int(expected_total) >= POST_LOAD_COUNT_RANGE_THRESHOLD_ROWS:
+            and int(expected_total) > POST_LOAD_COUNT_RANGE_THRESHOLD_ROWS:
         ranged = _post_count_ranged(dsql_schema, dsql_table, config, int(expected_total))
         if ranged is not None:
             return ranged

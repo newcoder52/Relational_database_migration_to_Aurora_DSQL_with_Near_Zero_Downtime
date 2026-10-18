@@ -74,11 +74,13 @@ DSQL_CANDIDATE_CONNECT_TIMEOUT = 10
 COUNT_RETRIES = 3
 COUNT_RETRY_WAIT = 20
 # AMENDMENT 3 (R7b): use RANGED counting whenever a usable single-column integer/identity/uuid
-# key exists and the table is >= COUNT_SPLIT_ROWS. Lowered from 100,000,000 to 2,000,000 so the
-# 10M/20M tables that FAILED in the live run (whole-table COUNT(*) that read-timed-out) are
-# range-counted instead. Sub-ranges target ~4M rows (2-5M band), each a short query well under
-# DSQL's 300 s txn limit.
-COUNT_SPLIT_ROWS = 2_000_000
+# key exists and the table is ABOVE COUNT_SPLIT_ROWS. AMENDMENT 3 (R11, owner 2026-10-18): range
+# counting starts ONLY above 30,000,000 rows (was 2,000,000; owner: a plain whole-table COUNT(*)
+# handles up to ~30M comfortably on DSQL, and the B14 connection bounds it). At or below 30M: ONE
+# whole-table COUNT(*) on the B14 connection (300 s client read / 240 s server statement_timeout).
+# The existing CountSplit fallback (a whole-table count that still times out -> ranges) is kept.
+# Sub-ranges target ~4M rows, each a short query well under DSQL's 300 s txn limit.
+COUNT_SPLIT_ROWS = 30_000_000
 COUNT_RANGE_ROWS = 4_000_000
 COUNT_RANGE_THREADS = 4
 COUNT_MAX_HALVINGS = 40
@@ -483,8 +485,9 @@ def _count_one(entry, dms):
     ctx = {"abort": threading.Event(), "deadline": time.time() + COUNT_TABLE_BUDGET_SECONDS}
     tgt, err, detail = None, None, {"method": None}
     try:
-        if can_range and expected is not None and expected >= COUNT_SPLIT_ROWS:
-            # R7b: ranged counting for any table >= 2M rows with a usable single-column key.
+        if can_range and expected is not None and expected > COUNT_SPLIT_ROWS:
+            # R11: ranged counting only ABOVE 30M rows with a usable single-column key (at/below
+            # 30M a single whole-table COUNT(*) on the B14 connection is used).
             tgt, detail = _ranged(dsql_schema, dsql_table, ck, kk, expected, ctx)
         else:
             try:

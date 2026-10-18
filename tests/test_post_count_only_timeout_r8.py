@@ -207,23 +207,31 @@ def test_ranged_count_planner_and_whole_table_fallback():
         return {"metadata": {"dsql_schema": "s", "dsql_table": "t",
                              "primary_key": {"columns": ["id"], "pk_kind": kind}}}
 
-    # large uuid table -> ranged (the count connection sees sub-range WHERE COUNT(*) queries)
-    recorded.update(rows=20_000_000, kind="uuid")
-    ns["_post_count_one"]("s", "t", config=_cfg("uuid"), expected_total=20_000_000)
+    # large uuid table (ABOVE 30M, R11) -> ranged (sub-range WHERE COUNT(*) queries)
+    recorded.update(rows=40_000_000, kind="uuid")
+    ns["_post_count_one"]("s", "t", config=_cfg("uuid"), expected_total=40_000_000)
     where_counts = [q for q in recorded["conn"].queries if "COUNT(*)" in q.upper() and "WHERE" in q.upper()]
-    assert len(where_counts) >= 2, "large uuid table should be counted in multiple key sub-ranges"
+    assert len(where_counts) >= 2, "a >30M uuid table should be counted in multiple key sub-ranges"
 
-    # small table -> ONE whole-table COUNT(*), no WHERE sub-ranges
-    recorded.update(rows=1_000_000, kind="uuid")
-    ns["_post_count_one"]("s", "t", config=_cfg("uuid"), expected_total=1_000_000)
+    # table at/below 30M -> ONE whole-table COUNT(*), no WHERE sub-ranges (R11)
+    recorded.update(rows=25_000_000, kind="uuid")
+    ns["_post_count_one"]("s", "t", config=_cfg("uuid"), expected_total=25_000_000)
     whole = [q for q in recorded["conn"].queries if "COUNT(*)" in q.upper() and "WHERE" not in q.upper()]
-    assert whole, "small table should use a whole-table COUNT(*)"
+    assert whole, "a <=30M table should use a whole-table COUNT(*)"
+    assert not [q for q in recorded["conn"].queries if "COUNT(*)" in q.upper() and "WHERE" in q.upper()], \
+        "a <=30M table must NOT be range-counted (R11 threshold is 30M)"
+
+    # exactly at the 30M boundary -> whole-table (strict > threshold)
+    recorded.update(rows=30_000_000, kind="integer")
+    ns["_post_count_one"]("s", "t", config=_cfg("integer"), expected_total=30_000_000)
+    assert not [q for q in recorded["conn"].queries if "COUNT(*)" in q.upper() and "WHERE" in q.upper()], \
+        "30,000,000 rows is the boundary -> whole-table (ranged only ABOVE 30M)"
 
     # no usable key (composite) -> whole-table even if large
-    recorded.update(rows=20_000_000, kind="text")
+    recorded.update(rows=40_000_000, kind="text")
     cfg_txt = {"metadata": {"dsql_schema": "s", "dsql_table": "t",
                             "primary_key": {"columns": ["a", "b"], "pk_kind": None}}}
-    ns["_post_count_one"]("s", "t", config=cfg_txt, expected_total=20_000_000)
+    ns["_post_count_one"]("s", "t", config=cfg_txt, expected_total=40_000_000)
     whole2 = [q for q in recorded["conn"].queries if "COUNT(*)" in q.upper() and "WHERE" not in q.upper()]
     assert whole2, "no-usable-key table should fall back to whole-table COUNT(*)"
 

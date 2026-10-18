@@ -35,9 +35,14 @@ _CONSTS = {"COUNT_RETRIES", "COUNT_RETRY_WAIT", "COUNT_SPLIT_ROWS", "COUNT_RANGE
            "COUNT_RANGE_THREADS", "COUNT_MAX_HALVINGS", "COUNT_UNKNOWN_TOTAL_ROWS",
            "COUNT_TABLE_BUDGET_SECONDS", "COUNT_TOLERANCE"}
 
-# The fake DB's calibration: whole-table 20M exceeds this read deadline; ~4M sub-ranges don't.
-READ_TIMEOUT_S = 10.0           # models the old pg8000 10 s client read timeout
-SECONDS_PER_ROW = 10.0 / 15_000_000    # 15M rows ~= 10 s -> 20M whole-table ~13 s (> timeout)
+# The fake DB's calibration. OLD pg8000 bug: a 10 s client read timeout. The B14 count connection
+# raises it to the server statement cap (modelled here at B14_READ_DEADLINE_S = 240 s). With
+# SECONDS_PER_ROW below, a 30M whole-table count ~= 20 s (well under 240 s, so a <=30M table counts
+# whole-table fine), a 300M whole-table would be ~200 s, and ~4M sub-ranges are ~2.7 s each. After
+# AMENDMENT 3 (R11) ranged counting is chosen by THRESHOLD (> 30M), not by a whole-table timeout.
+READ_TIMEOUT_S = 10.0           # models the OLD pg8000 10 s client read timeout (historical bug)
+B14_READ_DEADLINE_S = 240.0     # models the B14 connection's server statement_timeout cap
+SECONDS_PER_ROW = 10.0 / 15_000_000    # 15M rows ~= 10 s
 
 
 class _FakeClock:
@@ -55,7 +60,7 @@ class _FakeClock:
             return self.t
 
 
-def _build_planner(fake_db, clock, skew=False):
+def _build_planner(fake_db, clock, skew=False, read_deadline=B14_READ_DEADLINE_S):
     """AST-extract the planner into a namespace, wiring fake DB leaves + the virtual clock."""
     src = open(COUNT).read()
     tree = ast.parse(src)
@@ -102,8 +107,8 @@ def _build_planner(fake_db, clock, skew=False):
         # model the query time: proportional to rows scanned (range width), + tiny base.
         secs = 0.05 + n * SECONDS_PER_ROW
         clock.advance(secs)
-        if secs > READ_TIMEOUT_S:
-            # the old 10 s client read timeout: pg8000 raises this text; planner maps to CountSplit
+        if secs > read_deadline:
+            # the client read timeout: pg8000 raises this text; planner maps to CountSplit
             raise Exception("('The read operation timed out',)")
         return (n,)
     ns["_target_query"] = _fake_target_query
@@ -188,8 +193,10 @@ class FakeTable:
         return int(frac * self._space)
 
     def count_pred(self, pred):
-        # parse the planner's predicate: either "col IS NOT NULL" (whole table), "col IS NULL",
-        # or ">= <lit> AND < <lit>" / ">= <lit>" / "< <lit>".
+        # parse the planner's predicate: None (whole-table COUNT(*)), "col IS NOT NULL" (whole
+        # table), "col IS NULL", or ">= <lit> AND < <lit>" / ">= <lit>" / "< <lit>".
+        if pred is None:
+            return self.n_rows - self.short_by     # whole-table COUNT(*)
         if "IS NULL" in pred and "NOT NULL" not in pred:
             return 0
         if "IS NOT NULL" in pred:
@@ -214,10 +221,11 @@ class FakeTable:
         return int(tok)
 
 
-def _run_count_one(table, kind, n_rows, short_by=0, skew=False, budget=None):
+def _run_count_one(table, kind, n_rows, short_by=0, skew=False, budget=None,
+                   read_deadline=B14_READ_DEADLINE_S):
     clock = _FakeClock()
     db = FakeTable(kind, n_rows, short_by=short_by, skew=skew)
-    ns = _build_planner(db, clock, skew=skew)
+    ns = _build_planner(db, clock, skew=skew, read_deadline=read_deadline)
     if budget is not None:
         ns["COUNT_TABLE_BUDGET_SECONDS"] = budget
     entry = {"dsql_schema": "s", "dsql_table": table,
@@ -229,11 +237,12 @@ def _run_count_one(table, kind, n_rows, short_by=0, skew=False, budget=None):
 
 # =============================================================================== tests
 def test_old_whole_table_20M_would_time_out():
-    """Calibration sanity: a single whole-table COUNT(*) of 20M rows exceeds the modelled 10 s read
-    timeout (this is the live failure). Proven by asking the fake directly."""
+    """Calibration sanity: a single whole-table COUNT(*) of 20M rows exceeds the modelled OLD 10 s
+    read timeout (this is the live failure). Proven by asking the fake directly with the 10 s
+    deadline (the B14 connection raises this to 240 s; see test_whole_table_at_30M_boundary)."""
     clock = _FakeClock()
     db = FakeTable("uuid", 20_000_000)
-    ns = _build_planner(db, clock)
+    ns = _build_planner(db, clock, read_deadline=READ_TIMEOUT_S)
     # simulate the OLD behaviour: whole-table count at once
     try:
         ns["_target_query"]("s", "t", ns["_pred"]("id", "uuid", None, None), [])
@@ -242,27 +251,40 @@ def test_old_whole_table_20M_would_time_out():
         assert "read operation timed out" in str(e)
 
 
-def test_ranged_verifies_10M_20M_100M_300M_integer_and_uuid():
+def test_ranged_verifies_above_30M_integer_and_uuid():
+    """R11: ranged counting is used ABOVE 30M. Verify 40M/50M/100M/300M with int and uuid keys."""
     for kind in ("integer", "uuid"):
-        for n in (10_000_000, 20_000_000, 100_000_000, 300_000_000):
+        for n in (40_000_000, 50_000_000, 100_000_000, 300_000_000):
             res, ns = _run_count_one("t_%s_%d" % (kind, n), kind, n)
             assert res["status"] == "match", (kind, n, res)
             assert res["target"] == n, (kind, n, res["target"])
             assert res["method"].startswith("ranged"), (kind, n, res["method"])
-            # every sub-range stayed under the read timeout (no leaf exceeded it)
             det = res["detail"]
-            assert max(det.get("sub_range_seconds", [0])) <= READ_TIMEOUT_S, det
+            assert max(det.get("sub_range_seconds", [0])) <= B14_READ_DEADLINE_S, det
+
+
+def test_whole_table_at_30M_boundary_and_ranged_just_above():
+    """R11 boundary: 30,000,000 rows -> ONE whole-table COUNT(*) (method 'whole_table'); a table of
+    30,000,001 rows -> ranged. Both verify exactly on the B14 (240 s) deadline."""
+    for kind in ("integer", "uuid"):
+        res_lo, _ = _run_count_one("boundary_lo", kind, 30_000_000)
+        assert res_lo["status"] == "match" and res_lo["target"] == 30_000_000, res_lo
+        assert res_lo["method"] == "whole_table", (kind, res_lo["method"])
+        res_hi, _ = _run_count_one("boundary_hi", kind, 30_000_001)
+        assert res_hi["status"] == "match" and res_hi["target"] == 30_000_001, res_hi
+        assert res_hi["method"].startswith("ranged"), (kind, res_hi["method"])
 
 
 def test_slow_sub_range_is_halved():
     """A skewed uuid distribution puts most rows in the low end, so an initial equal-width
-    sub-range is too big and must be HALVED to fit under the read timeout -> still verifies."""
-    res, ns = _run_count_one("skewed", "uuid", 60_000_000, skew=True)
+    sub-range is too big and must be HALVED to fit under the read timeout -> still verifies.
+    Uses a tight 10 s modelled deadline so a dense low band genuinely exceeds it and halves."""
+    res, ns = _run_count_one("skewed", "uuid", 60_000_000, skew=True, read_deadline=10.0)
     assert res["status"] == "match", res
     det = res["detail"]
     # halving produced MORE counted leaves than the planned equal-width sub-ranges
     assert det["counted_leaves"] >= det["planned_sub_ranges"], det
-    assert max(det["sub_range_seconds"]) <= READ_TIMEOUT_S, det
+    assert max(det["sub_range_seconds"]) <= 10.0, det
 
 
 def test_mismatch_short_by_one_fails():
@@ -300,7 +322,7 @@ def test_no_false_pass_randomized_soak():
     for seed in range(300):
         rng = random.Random(seed)
         kind = rng.choice(["integer", "uuid"])
-        n = rng.choice([2_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000])
+        n = rng.choice([5_000_000, 20_000_000, 30_000_000, 30_000_001, 50_000_000, 100_000_000])
         short = rng.choice([0, 0, 0, 1, 2])
         try:
             res, _ = _run_count_one("soak", kind, n, short_by=short)
@@ -313,8 +335,8 @@ def test_no_false_pass_randomized_soak():
     assert not bad, "false-pass / wrong-status seeds (first 15): %s" % bad[:15]
 
 
-def test_threshold_lowered_below_the_live_failure_sizes():
-    """The 10M/20M live-failure sizes now take the ranged path (expected >= COUNT_SPLIT_ROWS)."""
+def test_threshold_is_30M():
+    """R11 (owner): range counting starts ONLY above 30,000,000 rows."""
     src = open(COUNT).read()
     tree = ast.parse(src)
     val = None
@@ -323,7 +345,7 @@ def test_threshold_lowered_below_the_live_failure_sizes():
             for t in n.targets:
                 if isinstance(t, ast.Name) and t.id == "COUNT_SPLIT_ROWS":
                     val = ast.literal_eval(n.value)
-    assert val is not None and val <= 2_000_000, "COUNT_SPLIT_ROWS must be <= 2M (got %r)" % val
+    assert val == 30_000_000, "COUNT_SPLIT_ROWS must be 30,000,000 (R11); got %r" % val
 
 
 if __name__ == "__main__":
