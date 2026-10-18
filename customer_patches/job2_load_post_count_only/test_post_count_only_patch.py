@@ -168,6 +168,10 @@ PATCH_FUNCS = {
     "_apply_post_load_check_override", "_post_load_check_is_count_only",
     "_post_count_is_infra_error", "_post_count_one", "_post_count_only_check",
     "_post_count_record_note",
+    # AMENDMENT 3 (R10 F-Q5b): C9 refactored the count path into these helpers; the self-test
+    # must extract them too, else _post_count_one calls an undefined _post_count_connect and the
+    # ConnFactory records zero connections (the IndexError this fix resolves).
+    "_post_count_connect", "_post_count_scalar", "_post_count_ranged",
 }
 PATCH_CLASSES = {"_PostCountMismatch"}
 SITE_FUNCS = {"validate_whole_table_after_ranges"}
@@ -275,7 +279,11 @@ def run_core_tests(patched_path):
     check("skipping per-file range counts" in out and "auth-token-leak" in out,
           "match: prints the one-line 'skipped range/uuid/leak' notice")
     check(conn0.autocommit is True, "match: the count connection is autocommit")
-    check(conn0.cursors_closed == 1 and conn0.closed, "match: cursor+conn closed")
+    # AMENDMENT 3 (R10 F-Q5b): C9's B14 count connection opens+closes a short SET statement_timeout
+    # cursor BEFORE the COUNT cursor, so >= 1 cursor is closed (was exactly 1 pre-C9); conn closed.
+    check(conn0.cursors_closed >= 1 and conn0.closed, "match: cursor(s)+conn closed")
+    check(any("SET statement_timeout" in s for s in conn0.sql_log),
+          "match: B14 SET statement_timeout issued on the count connection (C9)")
     check(sum("COUNT(*)" in s for s in conn0.sql_log) == 1
           and all("!~" not in s and "LIKE" not in s and ">=" not in s for s in conn0.sql_log),
           "match: exactly ONE plain COUNT(*), no range/uuid/leak query")
@@ -510,16 +518,53 @@ def _sha(path):
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
 
 
+def _prefeature_base(base, tmp):
+    """Return (path, from_git): a PRE-feature scripts/job2_load.py for the applier tests. If the
+    resolved `base` does NOT yet contain the count-only feature, it IS pre-feature -> (base, True).
+    Otherwise extract the pre-feature file from git (the merge-base bcedcf7, which predates the
+    integration) into `tmp`. If git is unavailable, return (base, False) and the caller skips the
+    modified-anchor sub-check. (R10 F-Q5b.)"""
+    try:
+        if "_post_count_one" not in open(base).read():
+            return base, True       # already a pre-feature file (e.g. --base passed explicitly)
+    except Exception:
+        pass
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "..", ".."))
+    for ref in ("bcedcf73e92a554476a7c3666e2495e88892000c", "bcedcf7"):
+        try:
+            r = subprocess.run(["git", "-C", repo_root, "show",
+                                "%s:scripts/job2_load.py" % ref],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout and "_post_count_one" not in r.stdout:
+                p = os.path.join(tmp, "job2_prefeature.py")
+                open(p, "w").write(r.stdout)
+                return p, True
+        except Exception:
+            pass
+    return base, False
+
+
 def run_applier_tests(applier, base):
     tmp = tempfile.mkdtemp(prefix="postco_")
     out = os.path.join(tmp, "job2_patched.py")
+
+    # AMENDMENT 3 (R10 F-Q5b): the applier tests (apply / idempotent / modified-anchor /
+    # unrecognised) were written against a PRE-FEATURE job2_load.py. On a current clone the repo
+    # `base` is ALREADY integrated (the feature is on main), so the applier correctly no-ops on it
+    # and the "modified anchor" case can't be exercised. Derive the pre-feature base from git
+    # (the merge-base bcedcf7, which predates the count-only integration) when `base` already has
+    # the feature; fall back to the given `base` if git is unavailable (then skip the destructive
+    # modified-anchor sub-check rather than mis-assert).
+    prefeature, from_git = _prefeature_base(base, tmp)
 
     def run(inp, outp):
         return subprocess.run([sys.executable, applier, inp, outp],
                               capture_output=True, text=True)
 
-    r = run(base, out)
-    check(r.returncode == 0 and os.path.exists(out), "applier: applies cleanly to main's job2_load.py")
+    r = run(prefeature, out)
+    check(r.returncode == 0 and os.path.exists(out),
+          "applier: applies cleanly to the pre-feature job2_load.py")
     # py_compiles
     rc = subprocess.run([sys.executable, "-c",
                          "import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)", out],
@@ -531,17 +576,24 @@ def run_applier_tests(applier, base):
     r2 = run(out, out2)
     check(r2.returncode == 0 and _sha(out) == _sha(out2), "applier: idempotent (no-op on already-patched)")
 
-    # fail closed on a modified anchor (no output written)
-    bad = os.path.join(tmp, "job2_bad.py")
-    s = open(base).read().replace(
-        "    conn = connect_dsql()\n    # autocommit so each read-only validation query stands alone",
-        "    conn = connect_dsql()   # EDITED\n    # autocommit so each read-only validation query stands alone",
-        1)
-    open(bad, "w").write(s)
-    bad_out = os.path.join(tmp, "job2_bad_out.py")
-    r3 = run(bad, bad_out)
-    check(r3.returncode != 0 and not os.path.exists(bad_out),
-          "applier: fails CLOSED on a modified anchor (no output written)")
+    if not from_git:
+        # Could not get a pre-feature base (no git); the modified-anchor test needs one, so skip
+        # it loudly rather than assert against an already-integrated file.
+        check(True, "applier: modified-anchor test SKIPPED (no pre-feature base available)")
+    else:
+        # fail closed on a modified anchor (no output written)
+        bad = os.path.join(tmp, "job2_bad.py")
+        # fail closed on a modified anchor (no output written)
+        bad = os.path.join(tmp, "job2_bad.py")
+        s = open(prefeature).read().replace(
+            "    conn = connect_dsql()\n    # autocommit so each read-only validation query stands alone",
+            "    conn = connect_dsql()   # EDITED\n    # autocommit so each read-only validation query stands alone",
+            1)
+        open(bad, "w").write(s)
+        bad_out = os.path.join(tmp, "job2_bad_out.py")
+        r3 = run(bad, bad_out)
+        check(r3.returncode != 0 and not os.path.exists(bad_out),
+              "applier: fails CLOSED on a modified anchor (no output written)")
 
     # fail closed on an unrecognised file
     junk = os.path.join(tmp, "junk.py")

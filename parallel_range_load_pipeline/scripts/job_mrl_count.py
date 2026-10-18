@@ -148,21 +148,33 @@ def connect_dsql(autocommit=True):
         # query too. Raise it ABOVE the server statement_timeout (+ cushion) so a long COUNT(*)
         # is ended by the server's deterministic 57014 (a re-split trigger), not a client read
         # timeout at 10 s. Best-effort (internals differ across pg8000 versions); keep finite.
+        # AMENDMENT 3 (R10 F-Q2): a SKIP is now LOUD — a silent skip would revert to the 10 s
+        # connect-probe read timeout and reintroduce the exact bug with no signal.
         try:
             _usock = getattr(getattr(conn, "_c", None), "_usock", None) \
                 or getattr(conn, "_usock", None)
             if _usock is not None:
                 _usock.settimeout(float(COUNT_SOCKET_READ_TIMEOUT))
-        except Exception:
-            pass
+            else:
+                print("WARN B14: could not apply the socket read-timeout reset (pg8000 _usock "
+                      "not found; internals changed). The count read timeout may revert to the "
+                      "%ds connect-probe value — a long COUNT(*) could time out early."
+                      % DSQL_CANDIDATE_CONNECT_TIMEOUT, flush=True)
+        except Exception as _e:
+            print("WARN B14: socket read-timeout reset FAILED (%s: %s); the count read timeout "
+                  "may revert to the %ds connect-probe value." % (type(_e).__name__, _e,
+                                                                  DSQL_CANDIDATE_CONNECT_TIMEOUT),
+                  flush=True)
         # Bound every statement under DSQL's 300 s txn-age limit so a too-big count fails fast
         # and deterministically (then range-splits) instead of running ~300 s and raising 54000.
         try:
             _c = conn.cursor()
             _c.execute("SET statement_timeout = %d" % int(COUNT_STATEMENT_TIMEOUT_MS))
             _c.close()
-        except Exception:
-            pass
+        except Exception as _e:
+            print("WARN B14: SET statement_timeout FAILED (%s: %s); the count is bounded only by "
+                  "the client socket read timeout (still finite)." % (type(_e).__name__, _e),
+                  flush=True)
         return conn
 
     if _PINNED_HOST["host"]:
@@ -429,8 +441,6 @@ def _ranged(schema, table, col, kind, expected, ctx, after_timeout=False):
     grand = sum(x[4] for x in leaves) + nulls
     # R7-4: per-sub-range counts + durations (sorted by key), plus the halved-count (leaves may
     # exceed the planned sub-ranges when a slow one was halved).
-    sub = sorted(({"count": x[4], "seconds": x[5]} for x in leaves),
-                 key=lambda d: -d["seconds"])
     detail = {"method": "ranged", "key_kind": kind, "planned_sub_ranges": len(rngs),
               "counted_leaves": len(leaves), "null_rows": nulls,
               "longest_sub_range_seconds": max((x[5] for x in leaves), default=0.0),

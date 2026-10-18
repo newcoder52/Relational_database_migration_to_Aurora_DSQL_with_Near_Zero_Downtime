@@ -1052,19 +1052,27 @@ def _post_count_connect():
     count-only post-load check; the INSERT path's connect_dsql() is unchanged."""
     conn = connect_dsql()
     conn.autocommit = True
+    # AMENDMENT 3 (R10 F-Q2): a SKIP is now LOUD (a silent skip reverts the count read timeout to
+    # the connect-probe value and reintroduces the bug with no signal).
     try:
         _usock = getattr(getattr(conn, "_c", None), "_usock", None) \
             or getattr(conn, "_usock", None)
         if _usock is not None:
             _usock.settimeout(float(POST_LOAD_COUNT_SOCKET_READ_TIMEOUT))
-    except Exception:
-        pass
+        else:
+            print("WARN B14 (count-only): socket read-timeout reset not applied (pg8000 _usock "
+                  "not found; internals changed). The COUNT read timeout may revert to the "
+                  "connect value and a large table's count could time out early.", flush=True)
+    except Exception as _e:
+        print("WARN B14 (count-only): socket read-timeout reset FAILED (%s: %s)."
+              % (type(_e).__name__, _e), flush=True)
     try:
         _c = conn.cursor()
         _c.execute("SET statement_timeout = %d" % int(POST_LOAD_COUNT_STATEMENT_TIMEOUT_MS))
         _c.close()
-    except Exception:
-        pass
+    except Exception as _e:
+        print("WARN B14 (count-only): SET statement_timeout FAILED (%s: %s); the count is bounded "
+              "only by the client socket read timeout." % (type(_e).__name__, _e), flush=True)
     return conn
 
 
