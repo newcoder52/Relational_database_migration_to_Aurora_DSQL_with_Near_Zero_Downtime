@@ -160,6 +160,13 @@ text/char column. If DMS wrote the literal word `NULL` and the endpoint marker i
 value becomes a real SQL NULL and a NOT NULL column rejects the row. Fix with
 `null_rules=<schema>.<table>.<column>=none` to keep the text as data for that column.
 
+- `null_notnull_text` (`off` default | `keep_text`): a fleet-wide switch — with `keep_text`,
+  any NOT NULL `char`/`varchar`/`text` column keeps a text value (the endpoint marker or a
+  `null_values` entry) as data instead of converting it to SQL NULL, so you need not list
+  hundreds of columns in `null_rules`. Precedence: an explicit `null_rules` entry > this >
+  `null_values` > the endpoint marker. Reaches the MRL range-load and count jobs like the
+  other NULL settings.
+
 **The danger of `null_values`:** setting it REPLACES the endpoint marker, so a real NULL that DMS
 wrote as the word `NULL` would then load as the literal text `NULL` in a nullable text column
 (and break a typed column). Prefer `null_rules` for a specific column over a blanket
@@ -189,6 +196,7 @@ The keys MRL actually reads from `config/params.csv` are just these:
 | `glue_connection` | VPC Connections on every MRL Glue job |
 | `glue_role_arn` | Role on every MRL Glue job (range-load, count, reused discovery/CDC) |
 | `glue_version` | GlueVersion of the MRL Glue jobs |
+| `null_notnull_text` | range-load + count job arg --null_notnull_text (NULL handling) |
 | `null_rules` | range-load + count job arg --null_rules (NULL handling) |
 | `null_values` | range-load + count job arg --null_values (NULL handling) |
 | `project` | name prefix of the MRL Glue jobs and state machines |

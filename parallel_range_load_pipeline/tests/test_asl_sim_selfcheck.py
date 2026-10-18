@@ -72,7 +72,8 @@ def test_startup_happy_path_reaches_success():
             # shared startup resolve
             return {"Payload": {
                 "taskArnList": ["arn:task"], "taskName": "t", "taskSuffix": "t",
-                "configPrefix": "s3://b/config/_task/t/", "override": False, "project": "p",
+                "configPrefix": "s3://b/config/_task/t/", "override": False,
+                "stopAfterLoad": False, "project": "p",
                 "region": "us-east-1", "dsqlEndpoint": "e", "dsqlEndpointCandidates": "e",
                 "dsqlUser": "admin", "dsqlDatabase": "postgres", "glueRoleArn": "r",
                 "glueConnection": "", "cdcEngine": "pythonshell", "controlSchema": "cdc_control",
@@ -96,6 +97,7 @@ def test_startup_happy_path_reaches_success():
                 "validateRowsPerRange": 10000, "validateParallelism": 0,
                 "validateTargetSecondsPerRange": 12, "validateHash": "all",
                 "maxParallelTables": 20, "nullValues": "", "nullRules": "",
+                "nullNotnullText": "off",
                 "perWorkerMemBudgetMb": 1500}}
         if "DRIVER_DISCOVERY" in fn:
             return {"Payload": {"extraPyFiles": "s3://b/d/pg8000.whl", "engine": "pythonshell",

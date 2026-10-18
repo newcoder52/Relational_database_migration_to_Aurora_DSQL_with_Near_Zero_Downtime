@@ -109,6 +109,15 @@ team already owns the three roles, set `manage_iam=false` (plus `lambda_role_arn
   **`CHANGE DATA TYPE`** isn't detected. Every DDL must be followed by DML.
 - **NULL marker:** only an empty field or the DMS endpoint's `CsvNullValue` (default `NULL`) is
   stored as NULL; `NA`, `NONE`, `N/A` are stored as text. Don't change `CsvNullValue` mid-migration.
+- **Optional `null_notnull_text=keep_text`** (default `off`): for a NOT NULL `char`/`varchar`/
+  `text` column, a text value (the endpoint marker or a `null_values` entry) is kept AS DATA
+  rather than converted to SQL NULL — so data that legitimately holds the text `NULL`/`NA` in
+  NOT NULL columns loads as-is without listing every column in `null_rules`. Precedence: a
+  `null_rules` entry > `null_notnull_text` > `null_values` > the endpoint marker. It is SAFE on
+  CDC because DMS S3 CSV (`AddColumnName=true`) sends a FULL after-image on every change row —
+  an unchanged column in an UPDATE carries its real value, never the marker — so it cannot
+  overwrite a NOT NULL text column with the literal `NULL`. Empty field is always NULL. `off`
+  is byte-identical to today.
 - **Validation** compares per-range summaries, not individual rows.
 - **CDC Glue runs stop after 7 days** (the Glue maximum) — restart by hand, or cut over before 7 days.
 - **A DMS task can be loaded only once:** a clean-slate reload needs a new DMS task (new name → new

@@ -525,6 +525,22 @@ CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
 # distinct from an empty list. Set once at startup by _apply_null_settings().
 NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
 NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
+# --- OPT-IN automatic NOT NULL char/text keep-text rule (--null_notnull_text). ----------
+# "off" (default) == byte-identical to today. "keep_text": for a NOT NULL char/text column
+# NO text value (endpoint marker OR a null_values entry) becomes SQL NULL - it is stored as
+# the literal text. An explicit null_rules entry for that exact column STILL wins. Empty
+# field stays NULL in every mode. Nullable columns and non-text types are unchanged.
+NULL_NOTNULL_TEXT = "off"          # "off" | "keep_text"
+# Per-table nullability the rule needs: {(schema_l, table_l): {col_l: 'YES'|'NO'}}. Filled
+# by _nn_register_nullability() from the Job 1 mapping (is_nullable per column) or, for an
+# OLDER mapping without it, from ONE catalog query the caller runs. A registered table whose
+# column is absent here is treated as UNKNOWN -> the rule FAILS LOUD (never silently skips).
+_NN_NULLABILITY = {}
+# The char/text categories the rule applies to. categorize_type() maps character varying,
+# character and length-limited varchar (DSQL varchar(n)) all to 'varchar', and text to
+# 'text'; every other category (int/numeric/date/timestamp/uuid/bool/bytea/json...) is
+# excluded, so only these two are protected.
+_NN_TEXT_CATEGORIES = frozenset({"varchar", "text"})
 
 
 class NullRulesError(Exception):
@@ -601,36 +617,121 @@ def _parse_null_rules(raw):
     return rules
 
 
-def _effective_null_markers(schema, table, column):
+def _effective_null_markers(schema, table, column, category=None):
     """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
-    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
-    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
-    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
-    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
+    precedence: an explicit null_rules entry for the column (which may be [] for 'none'), THEN
+    the automatic NOT NULL char/text keep-text rule (--null_notnull_text=keep_text), THEN
+    null_values (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field
+    handling is separate (always NULL) and NOT included here. Names are matched case-
+    insensitively. With every setting unset/off this returns [CSV_NULL_VALUE] (if non-empty) or
+    [] — i.e. today's behaviour. `category` is the column's type_category; it is only consulted
+    for the automatic rule (which applies to 'varchar'/'text' only). When it is None the
+    automatic rule is inert, so an un-wired caller keeps today's behaviour exactly."""
     if NULL_RULES is not None:
         key = (str(schema).lower(), str(table).lower(), str(column).lower())
         if key in NULL_RULES:
-            return list(NULL_RULES[key])
+            return list(NULL_RULES[key])   # explicit per-column rule wins over everything
+    if NULL_NOTNULL_TEXT == "keep_text" and category in _NN_TEXT_CATEGORIES:
+        if _nn_is_notnull(schema, table, column):
+            return []   # NOT NULL char/text: no text value becomes NULL (keep as data)
     if NULL_VALUES is not None:
         return list(NULL_VALUES)
     return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
 
 
-def _apply_null_settings(null_values_arg, null_rules_arg):
+def _nn_register_nullability(schema, table, colmap):
+    """Record this table's column nullability for the automatic NOT NULL char/text rule.
+    `colmap` is {column_name: 'YES'|'NO'} (information_schema.columns.is_nullable). Names are
+    lower-cased. Idempotent; call once per table at startup (loader/validate) or when the CDC
+    worker builds/refreshes its table context. A no-op unless null_notnull_text=keep_text."""
+    if not colmap:
+        return
+    key = (str(schema).lower(), str(table).lower())
+    _NN_NULLABILITY[key] = {str(c).lower(): str(n).upper() for c, n in colmap.items()}
+
+
+def _nn_is_notnull(schema, table, column):
+    """True iff the column is known NOT NULL. Raises NullRulesError (fail loud, never silently
+    skip) if the table was registered but this column's nullability is unknown — the caller
+    must register from the Job 1 mapping or, for an OLDER mapping, from one catalog query."""
+    key = (str(schema).lower(), str(table).lower())
+    tbl = _NN_NULLABILITY.get(key)
+    if tbl is None:
+        raise NullRulesError(
+            f"null_notnull_text=keep_text needs column nullability for {key[0]}.{key[1]} but it "
+            f"was never registered. The job must call _nn_register_nullability() for the table "
+            f"(from the Job 1 mapping is_nullable, or one information_schema query for an older "
+            f"mapping). Refusing to guess.")
+    col = str(column).lower()
+    if col not in tbl:
+        raise NullRulesError(
+            f"null_notnull_text=keep_text: nullability of column {col!r} in {key[0]}.{key[1]} is "
+            f"unknown (not in the registered mapping/catalog). Refusing to guess whether it is "
+            f"NOT NULL; re-run Job 1 discovery for this table or check the column name.")
+    return tbl[col] == "NO"
+
+
+def _nn_register_from_mapping(schema, table, config):
+    """Register nullability from the Job 1 mapping if it carries is_nullable per column.
+    The current discovery writes is_nullable on each column_mapping entry (action=='map').
+    Returns True if it registered (new mapping), False if NO mapped entry carried is_nullable
+    (an OLDER mapping) — in which case the caller MUST register from one catalog query (or
+    fail loud). A no-op that returns True when null_notnull_text=off (nothing to do)."""
+    if NULL_NOTNULL_TEXT != "keep_text":
+        return True
+    colmap = {}
+    saw_flag = False
+    for m in (config.get("column_mapping") or []):
+        if isinstance(m, dict) and m.get("action") == "map":
+            tgt = m.get("target_column")
+            nn = m.get("is_nullable")
+            if tgt and nn is not None:
+                saw_flag = True
+                colmap[tgt] = nn
+    if not saw_flag:
+        return False
+    _nn_register_nullability(schema, table, colmap)
+    return True
+
+
+def _apply_null_notnull_text(raw):
+    """Parse the optional --null_notnull_text arg into the NULL_NOTNULL_TEXT global.
+    off (default) | keep_text. Blank / absent / the '__NULL_UNSET__' sentinel -> "off"
+    (byte-identical to today). An invalid value -> WARN and use "off" (same contract as other
+    optional args). Returns the resolved value."""
+    global NULL_NOTNULL_TEXT
+    val = str(raw).strip().lower() if isinstance(raw, str) else ""
+    if val in ("", "__null_unset__", "off"):
+        NULL_NOTNULL_TEXT = "off"
+    elif val == "keep_text":
+        NULL_NOTNULL_TEXT = "keep_text"
+    else:
+        print(f"  WARNING ignoring invalid null_notnull_text={raw!r} (use off|keep_text); "
+              f"keeping off")
+        NULL_NOTNULL_TEXT = "off"
+    return NULL_NOTNULL_TEXT
+
+
+def _apply_null_settings(null_values_arg, null_rules_arg, null_notnull_text_arg=None):
     """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
     globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
     empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
-    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
+    NullRulesError on a malformed setting. Returns a short human summary for the startup log.
+    null_notnull_text_arg (optional) sets the automatic NOT NULL char/text keep-text rule;
+    absent/None leaves it off (today's behaviour)."""
     global NULL_VALUES, NULL_RULES
     NULL_VALUES = _parse_null_values(null_values_arg)
     NULL_RULES = _parse_null_rules(null_rules_arg)
+    if null_notnull_text_arg is not None:
+        _apply_null_notnull_text(null_notnull_text_arg)
     nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
     if NULL_RULES is None:
         nr = "unset"
     else:
         nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
                        for k, v in NULL_RULES.items()) or "(empty)"
-    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
+    return (f"null_values={nv}; null_rules={nr}; null_notnull_text={NULL_NOTNULL_TEXT}; "
+            f"endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}")
 
 
 def _null_rules_unknown_warnings(schema, table, columns):
@@ -682,7 +783,8 @@ def _apply_v6_arg_overrides():
                 "blank_guard_enabled", "blank_expected_margin", "allow_manual_destructive",
                 "guardrails_mode",
                 "verbose_chunks", "verbose_chunk_every", "csv_null_value",
-                "null_values", "null_rules"]
+                "null_values", "null_rules", "null_notnull_text",
+                "post_load_check"]
     present = [a for a in optional if f"--{a}" in sys.argv]
     if not present:
         return
@@ -772,8 +874,10 @@ def _apply_v6_arg_overrides():
     # effective rules are logged for every run.
     _nvl = ov.get("null_values") if "null_values" in ov else None
     _nrl = ov.get("null_rules") if "null_rules" in ov else None
-    if _nvl is not None or _nrl is not None:
-        _summary = _apply_null_settings(_nvl, _nrl)
+    _nnt_present = "null_notnull_text" in ov
+    if _nvl is not None or _nrl is not None or _nnt_present:
+        _nnt = ov.get("null_notnull_text") if "null_notnull_text" in ov else None
+        _summary = _apply_null_settings(_nvl, _nrl, _nnt)
         print(f"  ↪ NULL rules: {_summary}")
     if "v6_parallel_enabled" in ov:
         V6_PARALLEL_ENABLED = str(ov["v6_parallel_enabled"]).strip().lower() in ("true", "1", "yes")
@@ -833,7 +937,194 @@ def _apply_v6_arg_overrides():
             print(f"  ⚠️ ignoring invalid verbose_chunk_every={ov['verbose_chunk_every']!r}")
 
 
+# =============================================================================
+# POST-LOAD COUNT-ONLY PATCH (optional Glue arg --post_load_check full|count_only)
+#
+# PROBLEM. After a big table's files are loaded, the post-load checks can hang for an hour
+# and then FAIL the whole load on a network / DSQL error, although the rows ARE loaded (the
+# operator can verify with one COUNT(*) in seconds). The expensive, failure-prone steps are:
+#   * validate_whole_table_after_ranges (3 call sites): hundreds of per-file index-range
+#     COUNT(*) queries when files are PK-disjoint, then two FULL-TABLE regex/LIKE scans
+#     (uuid-format + auth-token-leak). A non-timeout error (network / SSL EOF) is appended to
+#     `errors` and FAILS the load.
+#   * the single-table block in load_one_table: a bounded probe/COUNT(*) then the same scans.
+#
+# THIS PATCH. --post_load_check count_only replaces ALL of that, at every site, with ONE plain
+# `SELECT COUNT(*) FROM schema.table` on a FRESH autocommit connection, under a hard time
+# budget, that NEVER hangs the load and NEVER fails it on an infrastructure error:
+#   (1) no per-file range counts; (2) no uuid-format scan and no auth-token-leak scan (the
+#   per-row uuid guard already validated every uuid before insert; the leak scan is a full
+#   scan) - one line says they were skipped; (3) ONE COUNT(*); (4) total budget =
+#   POST_LOAD_COUNT_BUDGET_SECONDS (600s), a failed non-mismatch attempt retried up to
+#   POST_LOAD_COUNT_RETRIES times, POST_LOAD_COUNT_RETRY_WAIT seconds apart, only while budget
+#   remains; (5) equal -> OK; differs -> table FAILS exactly as today (same text, both numbers);
+#   cannot complete (txn-age 300s / network / SSL EOF / connection reset / XX000 / any other
+#   infra error / budget exhausted) -> loud WARNING "row count NOT verified by the load job -
+#   verify manually" and the load CONTINUES. (6) nothing else changes.
+#
+# Absent / empty / "full" => POST_LOAD_CHECK is "full" and NONE of this runs: the guards are
+# no-ops and every post-load site behaves BYTE-IDENTICALLY to today. An invalid value prints a
+# warning and uses "full" (same contract as job3_validate's --checksum_mode).
+# =============================================================================
+POST_LOAD_CHECK = "full"                  # "full" (default) | "count_only"
+POST_LOAD_COUNT_BUDGET_SECONDS = 600      # hard wall-clock budget for the whole count step
+POST_LOAD_COUNT_RETRIES = 3               # retries of a non-mismatch failure, within budget
+POST_LOAD_COUNT_RETRY_WAIT = 20           # seconds between those retries
+
+
+def _apply_post_load_check_override():
+    """Read the optional --post_load_check arg with the SAME mechanism the script already uses
+    for other optional overrides (present-filter + getResolvedOptions). Absent / empty / 'full'
+    -> 'full' (byte-identical to today). An invalid value -> warn and use 'full'."""
+    global POST_LOAD_CHECK
+    if "--post_load_check" not in sys.argv:
+        return
+    ov = getResolvedOptions(sys.argv, ["post_load_check"])
+    raw = ov.get("post_load_check")
+    val = str(raw).strip().lower() if isinstance(raw, str) else ""
+    if val in ("", "full"):
+        POST_LOAD_CHECK = "full"
+    elif val == "count_only":
+        POST_LOAD_CHECK = "count_only"
+        print("  post_load_check=count_only: post-load verification is ONE COUNT(*) per table "
+              "(no per-file range counts, no uuid/leak scans); an infrastructure failure WARNS "
+              "and does NOT fail the load.")
+    else:
+        print("  WARNING ignoring invalid post_load_check=%r (use full|count_only); keeping full"
+              % (raw,))
+        POST_LOAD_CHECK = "full"
+
+
+def _post_load_check_is_count_only():
+    return POST_LOAD_CHECK == "count_only"
+
+
+def _post_count_is_infra_error(exc):
+    """For post_load_check=count_only, ANY exception raised by the COUNT(*) attempt is 'cannot
+    complete' (the only non-error outcome is a returned integer). This helper only classifies
+    WHICH kind of infrastructure error it is, for the log line; it is never used to turn an
+    error into a failure. It explicitly recognises ssl.SSLEOFError / 'EOF occurred in violation
+    of protocol' (which is_transient_server_error alone does not), the DSQL 300s txn-age limit,
+    connection resets / broken pipes, and XX000 'server unavailable'."""
+    try:
+        if isinstance(exc, ssl.SSLEOFError):
+            return "ssl.SSLEOFError"
+    except Exception:
+        pass
+    msg = str(exc).lower()
+    if "eof occurred in violation of protocol" in msg:
+        return "ssl.SSLEOFError"
+    try:
+        if is_txn_timeout(exc):
+            return "DSQL 300s transaction-age limit"
+    except Exception:
+        pass
+    try:
+        if is_broken_pipe_error(exc):
+            return "dropped/broken connection"
+    except Exception:
+        pass
+    try:
+        if is_transient_server_error(exc):
+            return "XX000 server unavailable / transient"
+    except Exception:
+        pass
+    return type(exc).__name__
+
+
+def _post_count_one(dsql_schema, dsql_table):
+    """Run exactly ONE `SELECT COUNT(*) FROM schema.table` on a FRESH autocommit connection and
+    return the integer. The caller owns retries/budget; this opens, counts, and always closes."""
+    conn = connect_dsql()
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        try:
+            cur.execute(f"SELECT COUNT(*) FROM {dsql_schema}.{dsql_table}")
+            return int(cur.fetchone()[0])
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+class _PostCountMismatch(Exception):
+    """The COUNT(*) completed and DIFFERED from the expected rows (a real data problem)."""
+
+
+def _post_count_only_check(dsql_schema, dsql_table, expected_total, site="post-load"):
+    """COUNT-ONLY post-load verification for ONE table. NEVER hangs and NEVER fails the load on
+    an infrastructure error; raises ONLY on a completed-but-different count (so the table fails
+    exactly as it does today). Returns a short note string (also used in the per-table status).
+
+    Budget: POST_LOAD_COUNT_BUDGET_SECONDS total. A non-mismatch attempt is retried up to
+    POST_LOAD_COUNT_RETRIES times, POST_LOAD_COUNT_RETRY_WAIT apart, only while budget remains.
+    For count_only, ANY exception from the count means 'cannot complete' -> WARN, do not fail."""
+    label = f"{dsql_schema}.{dsql_table}"
+    print(f"    post_load_check=count_only [{label}] @ {site}: skipping per-file range counts, "
+          f"uuid-format scan and auth-token-leak scan (per-row uuid guard already validated "
+          f"uuids before insert; leak scan is a full-table scan).")
+    deadline = time.time() + POST_LOAD_COUNT_BUDGET_SECONDS
+    attempt = 0
+    last_err = None
+    while True:
+        attempt += 1
+        try:
+            actual = _post_count_one(dsql_schema, dsql_table)
+        except Exception as e:
+            last_err = e
+            kind = _post_count_is_infra_error(e)
+            remaining = deadline - time.time()
+            if attempt <= POST_LOAD_COUNT_RETRIES and remaining > POST_LOAD_COUNT_RETRY_WAIT:
+                wait = min(POST_LOAD_COUNT_RETRY_WAIT, max(0.0, remaining))
+                print(f"    post_load_check=count_only [{label}]: COUNT(*) attempt {attempt} "
+                      f"failed ({kind}: {str(e)[:150]}); retrying in {wait:.0f}s "
+                      f"({remaining:.0f}s budget left).")
+                time.sleep(wait)
+                continue
+            note = (f"WARNING post_load_check=count_only [{label}]: COUNT(*) could not complete "
+                    f"({kind}: {str(e)[:200]}) within the {POST_LOAD_COUNT_BUDGET_SECONDS}s "
+                    f"budget after {attempt} attempt(s); row count NOT verified by the load job "
+                    f"- verify manually. The load CONTINUES and the table is marked loaded.")
+            print("    " + note)
+            _post_count_record_note(label, note)
+            return note
+        # count completed
+        if actual == expected_total:
+            note = (f"post_load_check=count_only [{label}]: OK - COUNT(*) {actual:,} == "
+                    f"loaded {expected_total:,}.")
+            print("    " + note)
+            _post_count_record_note(label, note)
+            return note
+        # count completed and DIFFERS -> fail exactly as today (same text style, both numbers)
+        _ = last_err
+        raise _PostCountMismatch(
+            f"VALIDATION FAILED: ROW COUNT: loaded {expected_total}, target has {actual} "
+            f"(post_load_check=count_only whole-table COUNT(*)).")
+
+
+def _post_count_record_note(label, note):
+    """Make the count-only warning/OK note visible in whatever per-table status/summary the job
+    already writes, IF that needs no schema change (append to an existing in-memory list keyed by
+    table); otherwise just log (already done by the caller). Best-effort and never raises."""
+    try:
+        store = globals().get("_POST_LOAD_COUNT_NOTES")
+        if store is None:
+            store = {}
+            globals()["_POST_LOAD_COUNT_NOTES"] = store
+        store.setdefault(label, []).append(note)
+    except Exception:
+        pass
+
+
 _apply_v6_arg_overrides()
+_apply_post_load_check_override()
 # Global cap on TOTAL concurrent range writers across all tables (see comment above).
 _DSQL_RANGE_WRITER_SEM = threading.Semaphore(max(1, MAX_WRITE_CONCURRENCY))
 print(f"[v16] write_mode={V6_WRITE_MODE} parallel_enabled={V6_PARALLEL_ENABLED} "
@@ -1600,6 +1891,35 @@ _TYPED_CATEGORIES = frozenset({
     'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
 
 
+def _nn_register_for_table(dsql_schema, dsql_table, config):
+    """Register this table's column nullability for --null_notnull_text=keep_text. Uses the
+    Job 1 mapping's per-column is_nullable when present; for an OLDER mapping without it,
+    runs ONE information_schema.columns query (cached by _nn_register_nullability). A no-op
+    when the arg is off. Fails loud later (in _nn_is_notnull) only if nullability is truly
+    unobtainable."""
+    if NULL_NOTNULL_TEXT != "keep_text":
+        return
+    if _nn_register_from_mapping(dsql_schema, dsql_table, config):
+        return
+    print(f"    ↪ null_notnull_text=keep_text: {dsql_schema}.{dsql_table} mapping predates "
+          f"is_nullable; reading nullability from information_schema (one query).")
+    _conn = connect_dsql()
+    try:
+        _cur = _conn.cursor()
+        _cur.execute(
+            "SELECT column_name, is_nullable FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s",
+            (dsql_schema, dsql_table))
+        _nn_register_nullability(dsql_schema, dsql_table,
+                                 {r[0]: r[1] for r in _cur.fetchall()})
+        _cur.close()
+    finally:
+        try:
+            _conn.close()
+        except Exception:
+            pass
+
+
 def null_marker_expr(c, category, schema=None, table=None):
     """Spark expression for column c: NULL for a real NULL (Spark null, empty field, or an
     exact null marker), else the value. Text columns keep the value exactly (whitespace too);
@@ -1616,7 +1936,7 @@ def null_marker_expr(c, category, schema=None, table=None):
         if CSV_NULL_VALUE:
             is_null = is_null | (raw == lit(CSV_NULL_VALUE))
     else:
-        for _m in _effective_null_markers(schema, table, c):
+        for _m in _effective_null_markers(schema, table, c, category):
             is_null = is_null | (raw == lit(_m))
     if category in _TYPED_CATEGORIES:
         t = trim(raw)
@@ -3501,6 +3821,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     #     keeps it), so a value is stored the same whether it arrived in the full load or CDC.
     for _w in _null_rules_unknown_warnings(dsql_schema, dsql_table, df.columns):
         print(f"    ⚠️ {_w}")
+    _nn_register_for_table(dsql_schema, dsql_table, config)
     for c in df.columns:
         df = df.withColumn(c, null_marker_expr(c, type_categories.get(c), dsql_schema, dsql_table))
 
@@ -4392,6 +4713,15 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
         }
 
     # ---- Post-load validation ----
+    if _post_load_check_is_count_only():
+        _post_count_only_check(dsql_schema, dsql_table, total_written,
+                               site='load_one_table')
+        return {
+            "table": f"{dsql_schema}.{dsql_table}",
+            "rows": total_written,
+            "target_columns": len(target_columns),
+            "skipped_columns": len(skip_columns),
+        }
     conn = connect_dsql()
     # autocommit so each read-only check stands alone: if one scan errors (e.g. XX000 on a
     # large table, caught+warned in _run_uuid_and_leak_checks) it can't poison a transaction
@@ -4691,6 +5021,10 @@ def validate_whole_table_after_ranges(dsql_schema, dsql_table, uuid_cols,
       - Else fall back to a single whole-table exact COUNT(*) == expected_total (viable on
         DSQL: ~60s/30M). Only if COUNT(*) itself exceeds the txn limit -> reltuples INFO.
     NO-DUP: guaranteed by the target PRIMARY KEY (23505 at insert); no distinct scan."""
+    if _post_load_check_is_count_only():
+        _post_count_only_check(dsql_schema, dsql_table, expected_total,
+                               site='validate_whole_table_after_ranges')
+        return
     conn = connect_dsql()
     # autocommit so each read-only validation query stands alone: if one scan errors (e.g.
     # XX000 on a large table) it can't poison a transaction and break the remaining checks.

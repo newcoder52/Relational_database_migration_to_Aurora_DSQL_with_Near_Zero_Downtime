@@ -29,6 +29,7 @@ CLASSIFICATION = {
     "control_schema": (PASSED_THROUGH, "reused CDC jobs arg --control_schema (cdc=true only)"),
     "null_values": (USED, "range-load + count job arg --null_values (NULL handling)"),
     "null_rules": (USED, "range-load + count job arg --null_rules (NULL handling)"),
+    "null_notnull_text": (USED, "range-load + count job arg --null_notnull_text (NULL handling)"),
     # --- concurrency / sizing: Amendment 10 A.1 - MRL no longer reads these from params.csv.
     #     They are still VALID keys here (the shared parser accepts/validates them exactly like
     #     the original), but MRL takes sizing/parallelism ONLY from the fleet row / execution

@@ -519,6 +519,7 @@ Generated from `tools/mrl_settings_classification.py` (a drift test keeps it in 
 | `max_parallel_tables` | IGNORED HERE | original job2 how-many-tables-at-once; MRL loads one table's ranges with its own max_concurrency (one table per task) |
 | `max_writers_per_loader` | PASSED THROUGH | reused PlanSplit writer sizing (cdc=true) |
 | `min_writers_per_loader` | PASSED THROUGH | reused PlanSplit writer sizing (cdc=true) |
+| `null_notnull_text` | USED | range-load + count job arg --null_notnull_text (NULL handling) |
 | `null_rules` | USED | range-load + count job arg --null_rules (NULL handling) |
 | `null_values` | USED | range-load + count job arg --null_values (NULL handling) |
 | `per_worker_mem_budget_mb` | IGNORED HERE | original job2 driver-memory auto-throttle; MRL sizes the range-load job by worker type/count directly |

@@ -136,6 +136,9 @@ def handler(event, context):
     if event.get("null_rules") is not None:
         v = str(event["null_rules"])
         args["--null_rules"] = v if v != "" else "__NULL_UNSET__"
+    if event.get("null_notnull_text") is not None:
+        v = str(event["null_notnull_text"])
+        args["--null_notnull_text"] = v if v != "" else "__NULL_UNSET__"
     # Merge template default_arguments (e.g. --TempDir) + placeholder substitution.
     args.update(tmpl.get("default_arguments", {}) or {})
     subs = {"<<BUCKET>>": bucket, "<<REGION>>": region, "<<ACCOUNT_ID>>": account,

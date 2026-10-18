@@ -162,6 +162,14 @@ per_worker_mem_budget_mb,1500
 # keep the old values until the jobs are recreated (CreateGlueJobs) or the args are passed at run.
 null_values,
 null_rules,
+# null_notnull_text: off (default) | keep_text. keep_text makes a NOT NULL char/varchar/text
+#   column keep a text value (the endpoint marker or a null_values entry) AS DATA instead of
+#   converting it to SQL NULL - for data that legitimately contains the text 'NULL','NA',...
+#   in NOT NULL columns. Nullable columns and non-text types are unchanged. Precedence:
+#   a null_rules entry > null_notnull_text > null_values > the endpoint marker. SET BEFORE
+#   THE FULL LOAD. Off = byte-identical to today. While 'off' it is NOT written to pipeline.json
+#   (F20), so a default run and a rollback to an older build are unaffected; set keep_text to use it.
+null_notnull_text,off
 
 # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
 # Only set it if your Glue role name differs from <project>-glue-exec-role.

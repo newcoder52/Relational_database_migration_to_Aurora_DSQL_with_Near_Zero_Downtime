@@ -129,12 +129,15 @@ def test_all_glue_run_args_nonempty_strings_blank_and_nonblank():
 
 def test_runrange_does_not_pass_null_args():
     """A15.1: RunRange must NOT pass --null_values/--null_rules/--csv_null_value as run args (the
-    sentinel-aware DefaultArguments handle them, like the original pipeline)."""
+    sentinel-aware DefaultArguments handle them, like the original pipeline). release-2: the same
+    must hold for --null_notnull_text (reviewer finding 2d(i): Glue DROPS a blank run-arg value,
+    so null_notnull_text must ride on DefaultArguments via the sentinel, never as a RunRange arg)."""
     d = json.load(open(os.path.join(SF_DIR, "mrl-task.asl.json")))
     args = d["States"]["LoadRangeMap"]["Iterator"]["States"]["RunRange"]["Parameters"]["Arguments"]
     for bad in ("--null_values.$", "--null_rules.$", "--csv_null_value.$",
-                "--null_values", "--null_rules", "--csv_null_value"):
-        assert bad not in args, "RunRange must not pass %s as a run argument (A15)" % bad
+                "--null_values", "--null_rules", "--csv_null_value",
+                "--null_notnull_text.$", "--null_notnull_text"):
+        assert bad not in args, "RunRange must not pass %s as a run argument (A15 / 2d(i))" % bad
 
 
 def test_mutation_blank_null_values_arg_is_caught():

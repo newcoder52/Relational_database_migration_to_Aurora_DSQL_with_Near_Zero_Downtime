@@ -1,0 +1,1651 @@
+diff --git a/README.md b/README.md
+index f00224a..901124c 100644
+--- a/README.md
++++ b/README.md
+@@ -109,6 +109,15 @@ team already owns the three roles, set `manage_iam=false` (plus `lambda_role_arn
+   **`CHANGE DATA TYPE`** isn't detected. Every DDL must be followed by DML.
+ - **NULL marker:** only an empty field or the DMS endpoint's `CsvNullValue` (default `NULL`) is
+   stored as NULL; `NA`, `NONE`, `N/A` are stored as text. Don't change `CsvNullValue` mid-migration.
++- **Optional `null_notnull_text=keep_text`** (default `off`): for a NOT NULL `char`/`varchar`/
++  `text` column, a text value (the endpoint marker or a `null_values` entry) is kept AS DATA
++  rather than converted to SQL NULL — so data that legitimately holds the text `NULL`/`NA` in
++  NOT NULL columns loads as-is without listing every column in `null_rules`. Precedence: a
++  `null_rules` entry > `null_notnull_text` > `null_values` > the endpoint marker. It is SAFE on
++  CDC because DMS S3 CSV (`AddColumnName=true`) sends a FULL after-image on every change row —
++  an unchanged column in an UPDATE carries its real value, never the marker — so it cannot
++  overwrite a NOT NULL text column with the literal `NULL`. Empty field is always NULL. `off`
++  is byte-identical to today.
+ - **Validation** compares per-range summaries, not individual rows.
+ - **CDC Glue runs stop after 7 days** (the Glue maximum) — restart by hand, or cut over before 7 days.
+ - **A DMS task can be loaded only once:** a clean-slate reload needs a new DMS task (new name → new
+diff --git a/RUNBOOK.md b/RUNBOOK.md
+index 3389fe5..b0d4ee6 100644
+--- a/RUNBOOK.md
++++ b/RUNBOOK.md
+@@ -193,6 +193,12 @@ phase under the bold sub-headings below.
+   to Glue jobs created after the change. Already-created jobs keep their old values** until those
+   jobs are deleted and re-created (new task startup, or a manual job re-create). See the
+   "Which settings affect a running task?" note after the tables.
++- **`null_notnull_text` (optional automatic NOT NULL char/text keep-text rule)** is baked into the
++  SAME jobs as `--null_notnull_text` (`off` default | `keep_text`). `keep_text` stops a NOT NULL
++  char/varchar/text column from converting any text value (endpoint marker or `null_values` entry)
++  to NULL — it stores the text. Precedence: a `null_rules` entry > `null_notnull_text` >
++  `null_values` > endpoint. CDC-safe: DMS S3 CSV sends a full after-image per change row
++  (`AddColumnName=true`), so an unchanged UPDATE column carries its real value, never the marker.
+ - **`null_values` / `null_rules` (customer NULL handling)** are also baked into the load/load-big/
+   validate/CDC (incl. `ck`/`bg` fork) job args as `--null_values` / `--null_rules` at job creation
+   (CreateGlueJobs / EnsureForkJobs). A change takes effect only for jobs **created after** it —
+diff --git a/config/params.example.csv b/config/params.example.csv
+index bb0f2a7..88f7b77 100644
+--- a/config/params.example.csv
++++ b/config/params.example.csv
+@@ -162,6 +162,13 @@ per_worker_mem_budget_mb,1500
+ # keep the old values until the jobs are recreated (CreateGlueJobs) or the args are passed at run.
+ null_values,
+ null_rules,
++# null_notnull_text: off (default) | keep_text. keep_text makes a NOT NULL char/varchar/text
++#   column keep a text value (the endpoint marker or a null_values entry) AS DATA instead of
++#   converting it to SQL NULL - for data that legitimately contains the text 'NULL','NA',...
++#   in NOT NULL columns. Nullable columns and non-text types are unchanged. Precedence:
++#   a null_rules entry > null_notnull_text > null_values > the endpoint marker. SET BEFORE
++#   THE FULL LOAD. Off = byte-identical to today.
++null_notnull_text,off
+ 
+ # glue_role_arn: defaults to arn:aws:iam::<account_id>:role/<project>-glue-exec-role when omitted.
+ # Only set it if your Glue role name differs from <project>-glue-exec-role.
+diff --git a/config/pipeline.example.json b/config/pipeline.example.json
+index 975c105..92e11ac 100644
+--- a/config/pipeline.example.json
++++ b/config/pipeline.example.json
+@@ -54,5 +54,6 @@
+   "max_parallel_tables": 20,
+   "per_worker_mem_budget_mb": 1500,
+   "null_values": "",
+-  "null_rules": ""
++  "null_rules": "",
++  "null_notnull_text": "off"
+ }
+diff --git a/lambdas/create_glue_jobs.py b/lambdas/create_glue_jobs.py
+index f175c68..d2562b7 100644
+--- a/lambdas/create_glue_jobs.py
++++ b/lambdas/create_glue_jobs.py
+@@ -66,6 +66,9 @@ Input event: {
+   "null_rules",        # optional: per-column NULL overrides, 'schema.table.column=none|V1|V2'
+                        # entries joined by ';'; set as --null_rules ("" -> "__NULL_UNSET__").
+                        # Blank = today. (Both set on the SAME jobs as --csv_null_value.)
++  "null_notnull_text", # optional: "off" (default) | "keep_text". keep_text makes a NOT NULL
++                       # char/varchar/text column keep a text value as data (never SQL NULL).
++                       # Set on the SAME jobs as --null_values ("" -> "__NULL_UNSET__").
+   "cdc_engine"         # optional: "pythonshell" (default, glue-templates/cdc.json) or "spark"
+                        # (the shared startup workflow passes pipeline.json's cdc_engine)
+                        # (glue-templates/cdc-spark.json). Also settable with the Lambda env var
+@@ -800,6 +803,10 @@ def handler(event, context):
+             if _nrv is not None:
+                 _nrv = str(_nrv)
+                 args["--null_rules"] = _nrv if _nrv != "" else "__NULL_UNSET__"
++            _nnt = event.get("null_notnull_text")
++            if _nnt is not None:
++                _nnt = str(_nnt)
++                args["--null_notnull_text"] = _nnt if _nnt != "" else "__NULL_UNSET__"
+         if role in ("load", "load-big"):
+             # job2 driver-side parallelism tuning (how many tables load at once + the per-table
+             # driver-memory budget the auto-throttle uses). Passed as RUN defaults; absent ->
+diff --git a/lambdas/params_csv.py b/lambdas/params_csv.py
+index d30da7c..42024d2 100644
+--- a/lambdas/params_csv.py
++++ b/lambdas/params_csv.py
+@@ -205,6 +205,11 @@ OPTIONAL_DEFAULTS = {
+     #                 rules between loaded and CDC-applied rows.
+     "null_values": "",
+     "null_rules": "",
++    # Optional automatic NOT NULL char/text keep-text rule. "off" (default) = today's
++    # behaviour EXACTLY. "keep_text": a NOT NULL char/varchar/text column never converts a
++    # text value (endpoint marker or a null_values entry) to SQL NULL - it stores the text.
++    # Precedence: null_rules > this > null_values > endpoint. Set BEFORE the full load.
++    "null_notnull_text": "off",
+ }
+ # Setup-only keys: consumed by tools/setup.sh, never written to pipeline.json.
+ #   subnet_id / security_group_id : Glue network connection (both-or-neither).
+@@ -265,7 +270,7 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
+                  "load_big_worker_type", "load_big_num_workers", "load_big_timeout_minutes",
+                  "validate_worker_type", "validate_num_workers", "validate_timeout_minutes",
+                  "max_parallel_tables", "per_worker_mem_budget_mb",
+-                 "null_values", "null_rules")
++                 "null_values", "null_rules", "null_notnull_text")
+ 
+ _ACCOUNT_RE = re.compile(r"^\d{12}$")
+ 
+diff --git a/lambdas/resolve_task.py b/lambdas/resolve_task.py
+index 9b99813..938bebf 100644
+--- a/lambdas/resolve_task.py
++++ b/lambdas/resolve_task.py
+@@ -556,6 +556,10 @@ SETTINGS_DEFAULTS = {
+     #                 FAILS naming the bad entry).
+     "null_values": "",
+     "null_rules": "",
++    # Optional automatic NOT NULL char/text keep-text rule (--null_notnull_text). "off"
++    # (default) = today's behaviour. "keep_text" keeps a text value in a NOT NULL char/text
++    # column as data. Validated below (invalid -> warn and treat as off).
++    "null_notnull_text": "off",
+ }
+ SETTINGS_KNOWN = set(SETTINGS_REQUIRED) | set(SETTINGS_DEFAULTS) | {"description", "settings_version"}
+ GLUE_ROLES = ("discovery", "load", "load-big", "validate", "cdc")
+@@ -882,11 +886,11 @@ def _validate_settings(cfg, warnings):
+     # preflight naming the bad entry; wrong data, not a typo to ignore). The scripts own the
+     # runtime parse (shared null-rules block); this mirrors its rules so a bad setting is caught
+     # before any job is created. Normalised to a trimmed string ("" = unset = today's behaviour).
+-    _validate_null_settings(cfg)
++    _validate_null_settings(cfg, warnings)
+     return cfg
+ 
+ 
+-def _validate_null_settings(cfg):
++def _validate_null_settings(cfg, warnings=None):
+     """Validate the FORMAT of the null_values / null_rules settings (customer-controlled NULL
+     handling), raising SettingsError naming the bad entry on any problem. Mirrors the parse rules
+     of the shared null-rules block copied into the four Glue scripts (scripts/job2_load.py,
+@@ -901,6 +905,20 @@ def _validate_null_settings(cfg):
+                 f"list exact, non-empty strings (an empty field is already treated as NULL).")
+     nr = str(cfg.get("null_rules", "") or "").strip()
+     cfg["null_rules"] = nr
++    # Optional automatic NOT NULL char/text keep-text rule. "off" (default) | "keep_text".
++    # Blank / the __NULL_UNSET__ sentinel -> off. An invalid value is a WARNING + off (never
++    # a hard preflight failure, since off is always safe and byte-identical to today).
++    nnt = str(cfg.get("null_notnull_text", "") or "").strip().lower()
++    if nnt in ("", "__null_unset__"):
++        nnt = "off"
++    if nnt not in ("off", "keep_text"):
++        _msg = (f"null_notnull_text {cfg.get('null_notnull_text')!r} is not off|keep_text; using off")
++        if warnings is not None:
++            warnings.append(_msg)
++        else:
++            print(f"(warn) {_msg}")
++        nnt = "off"
++    cfg["null_notnull_text"] = nnt
+     if nr:
+         seen = set()
+         for entry in nr.split(";"):
+@@ -1339,6 +1357,7 @@ def handler_shared(event, context):
+         # as --null_values / --null_rules by create_glue_jobs, exactly like --csv_null_value.
+         "nullValues": cfg["null_values"],
+         "nullRules": cfg["null_rules"],
++        "nullNotnullText": cfg["null_notnull_text"],
+         "warnings": warnings,
+     })
+     for w in warnings:
+diff --git a/manual_range_pipeline/README.md b/manual_range_pipeline/README.md
+index 3c53767..ebc748a 100644
+--- a/manual_range_pipeline/README.md
++++ b/manual_range_pipeline/README.md
+@@ -156,6 +156,13 @@ text/char column. If DMS wrote the literal word `NULL` and the endpoint marker i
+ value becomes a real SQL NULL and a NOT NULL column rejects the row. Fix with
+ `null_rules=<schema>.<table>.<column>=none` to keep the text as data for that column.
+ 
++- `null_notnull_text` (`off` default | `keep_text`): a fleet-wide switch — with `keep_text`,
++  any NOT NULL `char`/`varchar`/`text` column keeps a text value (the endpoint marker or a
++  `null_values` entry) as data instead of converting it to SQL NULL, so you need not list
++  hundreds of columns in `null_rules`. Precedence: an explicit `null_rules` entry > this >
++  `null_values` > the endpoint marker. Reaches the MRL range-load and count jobs like the
++  other NULL settings.
++
+ **The danger of `null_values`:** setting it REPLACES the endpoint marker, so a real NULL that DMS
+ wrote as the word `NULL` would then load as the literal text `NULL` in a nullable text column
+ (and break a typed column). Prefer `null_rules` for a specific column over a blanket
+@@ -217,6 +224,7 @@ This table (generated from `tools/mrl_settings_classification.py`; a test fails
+ | `max_parallel_tables` | IGNORED HERE | original job2 how-many-tables-at-once; MRL loads one table's ranges with its own max_concurrency (one table per task) |
+ | `max_writers_per_loader` | PASSED THROUGH | reused PlanSplit writer sizing (cdc=true) |
+ | `min_writers_per_loader` | PASSED THROUGH | reused PlanSplit writer sizing (cdc=true) |
++| `null_notnull_text` | USED | range-load + count job arg --null_notnull_text (NULL handling) |
+ | `null_rules` | USED | range-load + count job arg --null_rules (NULL handling) |
+ | `null_values` | USED | range-load + count job arg --null_values (NULL handling) |
+ | `per_worker_mem_budget_mb` | IGNORED HERE | original job2 driver-memory auto-throttle; MRL sizes the range-load job by worker type/count directly |
+diff --git a/manual_range_pipeline/lambdas/mrl_ensure_job.py b/manual_range_pipeline/lambdas/mrl_ensure_job.py
+index d8a5faf..a2690df 100644
+--- a/manual_range_pipeline/lambdas/mrl_ensure_job.py
++++ b/manual_range_pipeline/lambdas/mrl_ensure_job.py
+@@ -102,6 +102,9 @@ def handler(event, context):
+     if event.get("null_rules") is not None:
+         v = str(event["null_rules"])
+         args["--null_rules"] = v if v != "" else "__NULL_UNSET__"
++    if event.get("null_notnull_text") is not None:
++        v = str(event["null_notnull_text"])
++        args["--null_notnull_text"] = v if v != "" else "__NULL_UNSET__"
+     # Merge template default_arguments (e.g. --TempDir) + placeholder substitution.
+     args.update(tmpl.get("default_arguments", {}) or {})
+     subs = {"<<BUCKET>>": bucket, "<<REGION>>": region, "<<ACCOUNT_ID>>": account,
+diff --git a/manual_range_pipeline/lambdas/mrl_params_csv.py b/manual_range_pipeline/lambdas/mrl_params_csv.py
+index d30da7c..42024d2 100644
+--- a/manual_range_pipeline/lambdas/mrl_params_csv.py
++++ b/manual_range_pipeline/lambdas/mrl_params_csv.py
+@@ -205,6 +205,11 @@ OPTIONAL_DEFAULTS = {
+     #                 rules between loaded and CDC-applied rows.
+     "null_values": "",
+     "null_rules": "",
++    # Optional automatic NOT NULL char/text keep-text rule. "off" (default) = today's
++    # behaviour EXACTLY. "keep_text": a NOT NULL char/varchar/text column never converts a
++    # text value (endpoint marker or a null_values entry) to SQL NULL - it stores the text.
++    # Precedence: null_rules > this > null_values > endpoint. Set BEFORE the full load.
++    "null_notnull_text": "off",
+ }
+ # Setup-only keys: consumed by tools/setup.sh, never written to pipeline.json.
+ #   subnet_id / security_group_id : Glue network connection (both-or-neither).
+@@ -265,7 +270,7 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
+                  "load_big_worker_type", "load_big_num_workers", "load_big_timeout_minutes",
+                  "validate_worker_type", "validate_num_workers", "validate_timeout_minutes",
+                  "max_parallel_tables", "per_worker_mem_budget_mb",
+-                 "null_values", "null_rules")
++                 "null_values", "null_rules", "null_notnull_text")
+ 
+ _ACCOUNT_RE = re.compile(r"^\d{12}$")
+ 
+diff --git a/manual_range_pipeline/lambdas/mrl_plan.py b/manual_range_pipeline/lambdas/mrl_plan.py
+index b6201e6..c715e87 100644
+--- a/manual_range_pipeline/lambdas/mrl_plan.py
++++ b/manual_range_pipeline/lambdas/mrl_plan.py
+@@ -425,7 +425,8 @@ def handler(event, context):
+         "load_args_defaults": load_defaults,
+         "null": {"csv_null_value": event.get("csv_null_value"),
+                  "null_values": event.get("null_values"),
+-                 "null_rules": event.get("null_rules")},
++                 "null_rules": event.get("null_rules"),
++                 "null_notnull_text": event.get("null_notnull_text")},
+         "maxTotalConcurrentRuns": max_total_conc,
+         "resolver_proved": resolver_proved,
+         "tables": plan_tables,
+diff --git a/manual_range_pipeline/lambdas/mrl_preflight.py b/manual_range_pipeline/lambdas/mrl_preflight.py
+index 7b8e416..e71e18b 100644
+--- a/manual_range_pipeline/lambdas/mrl_preflight.py
++++ b/manual_range_pipeline/lambdas/mrl_preflight.py
+@@ -515,6 +515,8 @@ def handler(event, context):
+                       else cfg.get("null_values", "") or "")
+     null_rules = str(event.get("nullRules") if event.get("nullRules") is not None
+                      else cfg.get("null_rules", "") or "")
++    null_notnull_text = str(event.get("nullNotnullText") if event.get("nullNotnullText") is not None
++                            else cfg.get("null_notnull_text", "") or "")
+     try:
+         _nullcfg = {"null_values": null_values, "null_rules": null_rules}
+         rt._validate_null_settings(_nullcfg)
+@@ -635,6 +637,7 @@ def handler(event, context):
+         "csvNullValue": contract.get("csvNullValue", "NULL"),
+         "nullValues": null_values,
+         "nullRules": null_rules,
++        "nullNotnullText": null_notnull_text,
+         "cdcRoot": contract.get("cdcRoot", "."),
+         "capacity": capacity,
+         "override": override,
+diff --git a/manual_range_pipeline/scripts/job2_load_manual_range.py b/manual_range_pipeline/scripts/job2_load_manual_range.py
+index 1215a7b..0e7ffa6 100644
+--- a/manual_range_pipeline/scripts/job2_load_manual_range.py
++++ b/manual_range_pipeline/scripts/job2_load_manual_range.py
+@@ -525,6 +525,22 @@ CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
+ # distinct from an empty list. Set once at startup by _apply_null_settings().
+ NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
+ NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
++# --- OPT-IN automatic NOT NULL char/text keep-text rule (--null_notnull_text). ----------
++# "off" (default) == byte-identical to today. "keep_text": for a NOT NULL char/text column
++# NO text value (endpoint marker OR a null_values entry) becomes SQL NULL - it is stored as
++# the literal text. An explicit null_rules entry for that exact column STILL wins. Empty
++# field stays NULL in every mode. Nullable columns and non-text types are unchanged.
++NULL_NOTNULL_TEXT = "off"          # "off" | "keep_text"
++# Per-table nullability the rule needs: {(schema_l, table_l): {col_l: 'YES'|'NO'}}. Filled
++# by _nn_register_nullability() from the Job 1 mapping (is_nullable per column) or, for an
++# OLDER mapping without it, from ONE catalog query the caller runs. A registered table whose
++# column is absent here is treated as UNKNOWN -> the rule FAILS LOUD (never silently skips).
++_NN_NULLABILITY = {}
++# The char/text categories the rule applies to. categorize_type() maps character varying,
++# character and length-limited varchar (DSQL varchar(n)) all to 'varchar', and text to
++# 'text'; every other category (int/numeric/date/timestamp/uuid/bool/bytea/json...) is
++# excluded, so only these two are protected.
++_NN_TEXT_CATEGORIES = frozenset({"varchar", "text"})
+ 
+ 
+ class NullRulesError(Exception):
+@@ -601,36 +617,121 @@ def _parse_null_rules(raw):
+     return rules
+ 
+ 
+-def _effective_null_markers(schema, table, column):
++def _effective_null_markers(schema, table, column, category=None):
+     """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
+-    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
+-    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
+-    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
+-    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
++    precedence: an explicit null_rules entry for the column (which may be [] for 'none'), THEN
++    the automatic NOT NULL char/text keep-text rule (--null_notnull_text=keep_text), THEN
++    null_values (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field
++    handling is separate (always NULL) and NOT included here. Names are matched case-
++    insensitively. With every setting unset/off this returns [CSV_NULL_VALUE] (if non-empty) or
++    [] — i.e. today's behaviour. `category` is the column's type_category; it is only consulted
++    for the automatic rule (which applies to 'varchar'/'text' only). When it is None the
++    automatic rule is inert, so an un-wired caller keeps today's behaviour exactly."""
+     if NULL_RULES is not None:
+         key = (str(schema).lower(), str(table).lower(), str(column).lower())
+         if key in NULL_RULES:
+-            return list(NULL_RULES[key])
++            return list(NULL_RULES[key])   # explicit per-column rule wins over everything
++    if NULL_NOTNULL_TEXT == "keep_text" and category in _NN_TEXT_CATEGORIES:
++        if _nn_is_notnull(schema, table, column):
++            return []   # NOT NULL char/text: no text value becomes NULL (keep as data)
+     if NULL_VALUES is not None:
+         return list(NULL_VALUES)
+     return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
+ 
+ 
+-def _apply_null_settings(null_values_arg, null_rules_arg):
++def _nn_register_nullability(schema, table, colmap):
++    """Record this table's column nullability for the automatic NOT NULL char/text rule.
++    `colmap` is {column_name: 'YES'|'NO'} (information_schema.columns.is_nullable). Names are
++    lower-cased. Idempotent; call once per table at startup (loader/validate) or when the CDC
++    worker builds/refreshes its table context. A no-op unless null_notnull_text=keep_text."""
++    if not colmap:
++        return
++    key = (str(schema).lower(), str(table).lower())
++    _NN_NULLABILITY[key] = {str(c).lower(): str(n).upper() for c, n in colmap.items()}
++
++
++def _nn_is_notnull(schema, table, column):
++    """True iff the column is known NOT NULL. Raises NullRulesError (fail loud, never silently
++    skip) if the table was registered but this column's nullability is unknown — the caller
++    must register from the Job 1 mapping or, for an OLDER mapping, from one catalog query."""
++    key = (str(schema).lower(), str(table).lower())
++    tbl = _NN_NULLABILITY.get(key)
++    if tbl is None:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text needs column nullability for {key[0]}.{key[1]} but it "
++            f"was never registered. The job must call _nn_register_nullability() for the table "
++            f"(from the Job 1 mapping is_nullable, or one information_schema query for an older "
++            f"mapping). Refusing to guess.")
++    col = str(column).lower()
++    if col not in tbl:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text: nullability of column {col!r} in {key[0]}.{key[1]} is "
++            f"unknown (not in the registered mapping/catalog). Refusing to guess whether it is "
++            f"NOT NULL; re-run Job 1 discovery for this table or check the column name.")
++    return tbl[col] == "NO"
++
++
++def _nn_register_from_mapping(schema, table, config):
++    """Register nullability from the Job 1 mapping if it carries is_nullable per column.
++    The current discovery writes is_nullable on each column_mapping entry (action=='map').
++    Returns True if it registered (new mapping), False if NO mapped entry carried is_nullable
++    (an OLDER mapping) — in which case the caller MUST register from one catalog query (or
++    fail loud). A no-op that returns True when null_notnull_text=off (nothing to do)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return True
++    colmap = {}
++    saw_flag = False
++    for m in (config.get("column_mapping") or []):
++        if isinstance(m, dict) and m.get("action") == "map":
++            tgt = m.get("target_column")
++            nn = m.get("is_nullable")
++            if tgt and nn is not None:
++                saw_flag = True
++                colmap[tgt] = nn
++    if not saw_flag:
++        return False
++    _nn_register_nullability(schema, table, colmap)
++    return True
++
++
++def _apply_null_notnull_text(raw):
++    """Parse the optional --null_notnull_text arg into the NULL_NOTNULL_TEXT global.
++    off (default) | keep_text. Blank / absent / the '__NULL_UNSET__' sentinel -> "off"
++    (byte-identical to today). An invalid value -> WARN and use "off" (same contract as other
++    optional args). Returns the resolved value."""
++    global NULL_NOTNULL_TEXT
++    val = str(raw).strip().lower() if isinstance(raw, str) else ""
++    if val in ("", "__null_unset__", "off"):
++        NULL_NOTNULL_TEXT = "off"
++    elif val == "keep_text":
++        NULL_NOTNULL_TEXT = "keep_text"
++    else:
++        print(f"  WARNING ignoring invalid null_notnull_text={raw!r} (use off|keep_text); "
++              f"keeping off")
++        NULL_NOTNULL_TEXT = "off"
++    return NULL_NOTNULL_TEXT
++
++
++def _apply_null_settings(null_values_arg, null_rules_arg, null_notnull_text_arg=None):
+     """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
+     globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
+     empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
+-    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
++    NullRulesError on a malformed setting. Returns a short human summary for the startup log.
++    null_notnull_text_arg (optional) sets the automatic NOT NULL char/text keep-text rule;
++    absent/None leaves it off (today's behaviour)."""
+     global NULL_VALUES, NULL_RULES
+     NULL_VALUES = _parse_null_values(null_values_arg)
+     NULL_RULES = _parse_null_rules(null_rules_arg)
++    if null_notnull_text_arg is not None:
++        _apply_null_notnull_text(null_notnull_text_arg)
+     nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
+     if NULL_RULES is None:
+         nr = "unset"
+     else:
+         nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
+                        for k, v in NULL_RULES.items()) or "(empty)"
+-    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
++    return (f"null_values={nv}; null_rules={nr}; null_notnull_text={NULL_NOTNULL_TEXT}; "
++            f"endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}")
+ 
+ 
+ def _null_rules_unknown_warnings(schema, table, columns):
+@@ -682,7 +783,7 @@ def _apply_v6_arg_overrides():
+                 "blank_guard_enabled", "blank_expected_margin", "allow_manual_destructive",
+                 "guardrails_mode",
+                 "verbose_chunks", "verbose_chunk_every", "csv_null_value",
+-                "null_values", "null_rules",
++                "null_values", "null_rules", "null_notnull_text",
+                 "load_file_start", "load_file_end"]
+     present = [a for a in optional if f"--{a}" in sys.argv]
+     if not present:
+@@ -773,8 +874,10 @@ def _apply_v6_arg_overrides():
+     # effective rules are logged for every run.
+     _nvl = ov.get("null_values") if "null_values" in ov else None
+     _nrl = ov.get("null_rules") if "null_rules" in ov else None
+-    if _nvl is not None or _nrl is not None:
+-        _summary = _apply_null_settings(_nvl, _nrl)
++    _nnt_present = "null_notnull_text" in ov
++    if _nvl is not None or _nrl is not None or _nnt_present:
++        _nnt = ov.get("null_notnull_text") if "null_notnull_text" in ov else None
++        _summary = _apply_null_settings(_nvl, _nrl, _nnt)
+         print(f"  ↪ NULL rules: {_summary}")
+     if "v6_parallel_enabled" in ov:
+         V6_PARALLEL_ENABLED = str(ov["v6_parallel_enabled"]).strip().lower() in ("true", "1", "yes")
+@@ -1602,6 +1705,35 @@ _TYPED_CATEGORIES = frozenset({
+     'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
+ 
+ 
++def _nn_register_for_table(dsql_schema, dsql_table, config):
++    """Register this table's column nullability for --null_notnull_text=keep_text. Uses the
++    Job 1 mapping's per-column is_nullable when present; for an OLDER mapping without it,
++    runs ONE information_schema.columns query (cached by _nn_register_nullability). A no-op
++    when the arg is off. Fails loud later (in _nn_is_notnull) only if nullability is truly
++    unobtainable."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return
++    if _nn_register_from_mapping(dsql_schema, dsql_table, config):
++        return
++    print(f"    ↪ null_notnull_text=keep_text: {dsql_schema}.{dsql_table} mapping predates "
++          f"is_nullable; reading nullability from information_schema (one query).")
++    _conn = connect_dsql()
++    try:
++        _cur = _conn.cursor()
++        _cur.execute(
++            "SELECT column_name, is_nullable FROM information_schema.columns "
++            "WHERE table_schema = %s AND table_name = %s",
++            (dsql_schema, dsql_table))
++        _nn_register_nullability(dsql_schema, dsql_table,
++                                 {r[0]: r[1] for r in _cur.fetchall()})
++        _cur.close()
++    finally:
++        try:
++            _conn.close()
++        except Exception:
++            pass
++
++
+ def null_marker_expr(c, category, schema=None, table=None):
+     """Spark expression for column c: NULL for a real NULL (Spark null, empty field, or an
+     exact null marker), else the value. Text columns keep the value exactly (whitespace too);
+@@ -1618,7 +1750,7 @@ def null_marker_expr(c, category, schema=None, table=None):
+         if CSV_NULL_VALUE:
+             is_null = is_null | (raw == lit(CSV_NULL_VALUE))
+     else:
+-        for _m in _effective_null_markers(schema, table, c):
++        for _m in _effective_null_markers(schema, table, c, category):
+             is_null = is_null | (raw == lit(_m))
+     if category in _TYPED_CATEGORIES:
+         t = trim(raw)
+@@ -3503,6 +3635,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
+     #     keeps it), so a value is stored the same whether it arrived in the full load or CDC.
+     for _w in _null_rules_unknown_warnings(dsql_schema, dsql_table, df.columns):
+         print(f"    ⚠️ {_w}")
++    _nn_register_for_table(dsql_schema, dsql_table, config)
+     for c in df.columns:
+         df = df.withColumn(c, null_marker_expr(c, type_categories.get(c), dsql_schema, dsql_table))
+ 
+diff --git a/manual_range_pipeline/stepfunctions/mrl-task.asl.json b/manual_range_pipeline/stepfunctions/mrl-task.asl.json
+index c89956a..e5f1c79 100644
+--- a/manual_range_pipeline/stepfunctions/mrl-task.asl.json
++++ b/manual_range_pipeline/stepfunctions/mrl-task.asl.json
+@@ -99,6 +99,7 @@
+     "minWritersPerLoader.$": "$.Payload.minWritersPerLoader",
+     "mrlMode.$": "$.Payload.mrlMode",
+     "nullRules.$": "$.Payload.nullRules",
++    "nullNotnullText.$": "$.Payload.nullNotnullText",
+     "nullValues.$": "$.Payload.nullValues",
+     "override.$": "$.Payload.override",
+     "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb",
+@@ -723,6 +724,7 @@
+      "csv_null_value.$": "$.resolved.csvNullValue",
+      "null_values.$": "$.resolved.nullValues",
+      "null_rules.$": "$.resolved.nullRules",
++     "null_notnull_text.$": "$.resolved.nullNotnullText",
+      "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+      "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+      "cdc_validation.$": "$.resolved.cdcValidation",
+@@ -847,6 +849,7 @@
+      "csv_null_value.$": "$.resolved.csvNullValue",
+      "null_values.$": "$.resolved.nullValues",
+      "null_rules.$": "$.resolved.nullRules",
++     "null_notnull_text.$": "$.resolved.nullNotnullText",
+      "load_args_defaults": {
+       "max_files_in_parallel.$": "$.resolved.maxFilesInParallel",
+       "writers_per_file.$": "$.resolved.writersPerFile"
+@@ -916,6 +919,7 @@
+      "csv_null_value.$": "$.resolved.csvNullValue",
+      "null_values.$": "$.resolved.nullValues",
+      "null_rules.$": "$.resolved.nullRules",
++     "null_notnull_text.$": "$.resolved.nullNotnullText",
+      "maxTotalConcurrentRuns.$": "$.plan.maxTotalConcurrentRuns",
+      "loadWorkerType.$": "$.resolved.loadWorkerType",
+      "loadWorkers.$": "$.resolved.loadWorkers"
+@@ -1523,6 +1527,7 @@
+      "csv_null_value.$": "$.resolved.csvNullValue",
+      "null_values.$": "$.resolved.nullValues",
+      "null_rules.$": "$.resolved.nullRules",
++     "null_notnull_text.$": "$.resolved.nullNotnullText",
+      "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+      "cdc_validation.$": "$.resolved.cdcValidation",
+      "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+@@ -1875,6 +1880,7 @@
+      "csv_null_value.$": "$.resolved.csvNullValue",
+      "null_values.$": "$.resolved.nullValues",
+      "null_rules.$": "$.resolved.nullRules",
++     "null_notnull_text.$": "$.resolved.nullNotnullText",
+      "error_message.$": "$.cdcRun.run.ErrorMessage",
+      "failed_run_id.$": "$.cdcStart.JobRunId",
+      "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+diff --git a/manual_range_pipeline/tests/test_asl_audit.py b/manual_range_pipeline/tests/test_asl_audit.py
+index f473b95..248b3f3 100644
+--- a/manual_range_pipeline/tests/test_asl_audit.py
++++ b/manual_range_pipeline/tests/test_asl_audit.py
+@@ -29,7 +29,7 @@ _MRL_TOP_ROOTS = {
+     ("$", "maxFilesInParallel"), ("$", "writersPerFile"), ("$", "splitBy"),
+     ("$", "splitAllowHex"), ("$", "includeTables"), ("$", "countTolerance"),
+     ("$", "countTimeoutAction"), ("$", "writeMergedStatus"), ("$", "connBudget"),
+-    ("$", "nullValues"), ("$", "nullRules"),
++    ("$", "nullValues"), ("$", "nullRules"), ("$", "nullNotnullText"),
+ }
+ _FLEET_TOP_ROOTS = {("$", "bucket"), ("$", "tasksFile"), ("$", "paramsFile")}
+ 
+diff --git a/manual_range_pipeline/tests/test_asl_prod_guards.py b/manual_range_pipeline/tests/test_asl_prod_guards.py
+index c09f9db..2322394 100644
+--- a/manual_range_pipeline/tests/test_asl_prod_guards.py
++++ b/manual_range_pipeline/tests/test_asl_prod_guards.py
+@@ -37,7 +37,8 @@ _DATA = {
+         "taskArn": "arn:aws:dms:us-east-1:123456789012:task:ABC",
+         "configPrefix": "s3://bkt/config/_task/t/",
+         "region": "us-east-1", "cdcRoot": ".", "csvNullValue": "NULL",
+-        "nullValues": "", "nullRules": "", "maxFilesInParallel": 20, "writersPerFile": 8,
++        "nullValues": "", "nullRules": "", "nullNotnullText": "off",
++        "maxFilesInParallel": 20, "writersPerFile": 8,
+         "countTolerance": 0, "countTimeoutAction": "fail", "taskSuffix": "t",
+         "timestampColumnName": "dms_timestamp",
+     },
+diff --git a/manual_range_pipeline/tests/test_asl_sim_selfcheck.py b/manual_range_pipeline/tests/test_asl_sim_selfcheck.py
+index 82c6c01..b272274 100644
+--- a/manual_range_pipeline/tests/test_asl_sim_selfcheck.py
++++ b/manual_range_pipeline/tests/test_asl_sim_selfcheck.py
+@@ -96,6 +96,7 @@ def test_startup_happy_path_reaches_success():
+                 "validateRowsPerRange": 10000, "validateParallelism": 0,
+                 "validateTargetSecondsPerRange": 12, "validateHash": "all",
+                 "maxParallelTables": 20, "nullValues": "", "nullRules": "",
++                "nullNotnullText": "off",
+                 "perWorkerMemBudgetMb": 1500}}
+         if "DRIVER_DISCOVERY" in fn:
+             return {"Payload": {"extraPyFiles": "s3://b/d/pg8000.whl", "engine": "pythonshell",
+diff --git a/manual_range_pipeline/tools/mrl_settings_classification.py b/manual_range_pipeline/tools/mrl_settings_classification.py
+index b0cd46e..4894794 100644
+--- a/manual_range_pipeline/tools/mrl_settings_classification.py
++++ b/manual_range_pipeline/tools/mrl_settings_classification.py
+@@ -29,6 +29,7 @@ CLASSIFICATION = {
+     "control_schema": (PASSED_THROUGH, "reused CDC jobs arg --control_schema (cdc=true only)"),
+     "null_values": (USED, "range-load + count job arg --null_values (NULL handling)"),
+     "null_rules": (USED, "range-load + count job arg --null_rules (NULL handling)"),
++    "null_notnull_text": (USED, "range-load + count job arg --null_notnull_text (NULL handling)"),
+     # --- concurrency / sizing used by the range-load job ---
+     "map_max_concurrency": (USED, "the DEFAULT number of parallel range loads per table "
+                             "(Amendment 5; explicit key only, else built-in default 3); a fleet "
+diff --git a/scripts/glue_cdc_composite.py b/scripts/glue_cdc_composite.py
+index 059e656..9b06d34 100644
+--- a/scripts/glue_cdc_composite.py
++++ b/scripts/glue_cdc_composite.py
+@@ -498,7 +498,7 @@ def _apply_cdc_arg_overrides():
+                 "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
+                 "guardrails_mode", "cdc_file_order_action", "cdc_nopk_overmatch_action",
+                 "cdc_owner_self", "cdc_owners_key", "csv_null_value",
+-                "null_values", "null_rules"]
++                "null_values", "null_rules", "null_notnull_text"]
+     present = [a for a in optional if f"--{a}" in sys.argv]
+     if not present:
+         return
+@@ -514,8 +514,10 @@ def _apply_cdc_arg_overrides():
+     # task is only a WARNING (checked per-table as files are processed).
+     _nvl = ov.get("null_values") if "null_values" in ov else None
+     _nrl = ov.get("null_rules") if "null_rules" in ov else None
+-    if _nvl is not None or _nrl is not None:
+-        _summary = _apply_null_settings(_nvl, _nrl)
++    _nnt_present = "null_notnull_text" in ov
++    if _nvl is not None or _nrl is not None or _nnt_present:
++        _nnt = ov.get("null_notnull_text") if "null_notnull_text" in ov else None
++        _summary = _apply_null_settings(_nvl, _nrl, _nnt)
+         print(f"  ↪ NULL rules: {_summary}")
+ 
+     def _s(key):
+@@ -807,6 +809,22 @@ CSV_NULL_VALUE = "NULL"
+ # distinct from an empty list. Set once at startup by _apply_null_settings().
+ NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
+ NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
++# --- OPT-IN automatic NOT NULL char/text keep-text rule (--null_notnull_text). ----------
++# "off" (default) == byte-identical to today. "keep_text": for a NOT NULL char/text column
++# NO text value (endpoint marker OR a null_values entry) becomes SQL NULL - it is stored as
++# the literal text. An explicit null_rules entry for that exact column STILL wins. Empty
++# field stays NULL in every mode. Nullable columns and non-text types are unchanged.
++NULL_NOTNULL_TEXT = "off"          # "off" | "keep_text"
++# Per-table nullability the rule needs: {(schema_l, table_l): {col_l: 'YES'|'NO'}}. Filled
++# by _nn_register_nullability() from the Job 1 mapping (is_nullable per column) or, for an
++# OLDER mapping without it, from ONE catalog query the caller runs. A registered table whose
++# column is absent here is treated as UNKNOWN -> the rule FAILS LOUD (never silently skips).
++_NN_NULLABILITY = {}
++# The char/text categories the rule applies to. categorize_type() maps character varying,
++# character and length-limited varchar (DSQL varchar(n)) all to 'varchar', and text to
++# 'text'; every other category (int/numeric/date/timestamp/uuid/bool/bytea/json...) is
++# excluded, so only these two are protected.
++_NN_TEXT_CATEGORIES = frozenset({"varchar", "text"})
+ 
+ 
+ class NullRulesError(Exception):
+@@ -883,36 +901,121 @@ def _parse_null_rules(raw):
+     return rules
+ 
+ 
+-def _effective_null_markers(schema, table, column):
++def _effective_null_markers(schema, table, column, category=None):
+     """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
+-    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
+-    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
+-    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
+-    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
++    precedence: an explicit null_rules entry for the column (which may be [] for 'none'), THEN
++    the automatic NOT NULL char/text keep-text rule (--null_notnull_text=keep_text), THEN
++    null_values (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field
++    handling is separate (always NULL) and NOT included here. Names are matched case-
++    insensitively. With every setting unset/off this returns [CSV_NULL_VALUE] (if non-empty) or
++    [] — i.e. today's behaviour. `category` is the column's type_category; it is only consulted
++    for the automatic rule (which applies to 'varchar'/'text' only). When it is None the
++    automatic rule is inert, so an un-wired caller keeps today's behaviour exactly."""
+     if NULL_RULES is not None:
+         key = (str(schema).lower(), str(table).lower(), str(column).lower())
+         if key in NULL_RULES:
+-            return list(NULL_RULES[key])
++            return list(NULL_RULES[key])   # explicit per-column rule wins over everything
++    if NULL_NOTNULL_TEXT == "keep_text" and category in _NN_TEXT_CATEGORIES:
++        if _nn_is_notnull(schema, table, column):
++            return []   # NOT NULL char/text: no text value becomes NULL (keep as data)
+     if NULL_VALUES is not None:
+         return list(NULL_VALUES)
+     return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
+ 
+ 
+-def _apply_null_settings(null_values_arg, null_rules_arg):
++def _nn_register_nullability(schema, table, colmap):
++    """Record this table's column nullability for the automatic NOT NULL char/text rule.
++    `colmap` is {column_name: 'YES'|'NO'} (information_schema.columns.is_nullable). Names are
++    lower-cased. Idempotent; call once per table at startup (loader/validate) or when the CDC
++    worker builds/refreshes its table context. A no-op unless null_notnull_text=keep_text."""
++    if not colmap:
++        return
++    key = (str(schema).lower(), str(table).lower())
++    _NN_NULLABILITY[key] = {str(c).lower(): str(n).upper() for c, n in colmap.items()}
++
++
++def _nn_is_notnull(schema, table, column):
++    """True iff the column is known NOT NULL. Raises NullRulesError (fail loud, never silently
++    skip) if the table was registered but this column's nullability is unknown — the caller
++    must register from the Job 1 mapping or, for an OLDER mapping, from one catalog query."""
++    key = (str(schema).lower(), str(table).lower())
++    tbl = _NN_NULLABILITY.get(key)
++    if tbl is None:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text needs column nullability for {key[0]}.{key[1]} but it "
++            f"was never registered. The job must call _nn_register_nullability() for the table "
++            f"(from the Job 1 mapping is_nullable, or one information_schema query for an older "
++            f"mapping). Refusing to guess.")
++    col = str(column).lower()
++    if col not in tbl:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text: nullability of column {col!r} in {key[0]}.{key[1]} is "
++            f"unknown (not in the registered mapping/catalog). Refusing to guess whether it is "
++            f"NOT NULL; re-run Job 1 discovery for this table or check the column name.")
++    return tbl[col] == "NO"
++
++
++def _nn_register_from_mapping(schema, table, config):
++    """Register nullability from the Job 1 mapping if it carries is_nullable per column.
++    The current discovery writes is_nullable on each column_mapping entry (action=='map').
++    Returns True if it registered (new mapping), False if NO mapped entry carried is_nullable
++    (an OLDER mapping) — in which case the caller MUST register from one catalog query (or
++    fail loud). A no-op that returns True when null_notnull_text=off (nothing to do)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return True
++    colmap = {}
++    saw_flag = False
++    for m in (config.get("column_mapping") or []):
++        if isinstance(m, dict) and m.get("action") == "map":
++            tgt = m.get("target_column")
++            nn = m.get("is_nullable")
++            if tgt and nn is not None:
++                saw_flag = True
++                colmap[tgt] = nn
++    if not saw_flag:
++        return False
++    _nn_register_nullability(schema, table, colmap)
++    return True
++
++
++def _apply_null_notnull_text(raw):
++    """Parse the optional --null_notnull_text arg into the NULL_NOTNULL_TEXT global.
++    off (default) | keep_text. Blank / absent / the '__NULL_UNSET__' sentinel -> "off"
++    (byte-identical to today). An invalid value -> WARN and use "off" (same contract as other
++    optional args). Returns the resolved value."""
++    global NULL_NOTNULL_TEXT
++    val = str(raw).strip().lower() if isinstance(raw, str) else ""
++    if val in ("", "__null_unset__", "off"):
++        NULL_NOTNULL_TEXT = "off"
++    elif val == "keep_text":
++        NULL_NOTNULL_TEXT = "keep_text"
++    else:
++        print(f"  WARNING ignoring invalid null_notnull_text={raw!r} (use off|keep_text); "
++              f"keeping off")
++        NULL_NOTNULL_TEXT = "off"
++    return NULL_NOTNULL_TEXT
++
++
++def _apply_null_settings(null_values_arg, null_rules_arg, null_notnull_text_arg=None):
+     """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
+     globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
+     empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
+-    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
++    NullRulesError on a malformed setting. Returns a short human summary for the startup log.
++    null_notnull_text_arg (optional) sets the automatic NOT NULL char/text keep-text rule;
++    absent/None leaves it off (today's behaviour)."""
+     global NULL_VALUES, NULL_RULES
+     NULL_VALUES = _parse_null_values(null_values_arg)
+     NULL_RULES = _parse_null_rules(null_rules_arg)
++    if null_notnull_text_arg is not None:
++        _apply_null_notnull_text(null_notnull_text_arg)
+     nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
+     if NULL_RULES is None:
+         nr = "unset"
+     else:
+         nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
+                        for k, v in NULL_RULES.items()) or "(empty)"
+-    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
++    return (f"null_values={nv}; null_rules={nr}; null_notnull_text={NULL_NOTNULL_TEXT}; "
++            f"endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}")
+ 
+ 
+ def _null_rules_unknown_warnings(schema, table, columns):
+@@ -2639,6 +2742,34 @@ class SingleKeyTable(Exception):
+     touches them (their cdc_control rows stay free for the main job)."""
+ 
+ 
++def _nn_register_cdc(dsql_schema, dsql_table, config):
++    """Register a CDC table's column nullability for --null_notnull_text=keep_text (once per
++    table, at context build). Mapping first; OLDER mapping -> ONE information_schema query via
++    connect_dsql(). No-op when the arg is off. Re-registers after DDL via the same catalog read
++    the CDC job already does (handle_schema_changes -> _nn_register_nullability on refresh)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return
++    if _nn_register_from_mapping(dsql_schema, dsql_table, config):
++        return
++    print(f"  ↪ null_notnull_text=keep_text: {dsql_schema}.{dsql_table} mapping predates "
++          f"is_nullable; reading nullability from information_schema (one query).")
++    _conn = connect_dsql()
++    try:
++        _cur = _conn.cursor()
++        _cur.execute(
++            "SELECT column_name, is_nullable FROM information_schema.columns "
++            "WHERE table_schema = %s AND table_name = %s",
++            (dsql_schema, dsql_table))
++        _nn_register_nullability(dsql_schema, dsql_table,
++                                 {r[0]: r[1] for r in _cur.fetchall()})
++        _cur.close()
++    finally:
++        try:
++            _conn.close()
++        except Exception:
++            pass
++
++
+ def build_table_context(entry):
+     """Assemble everything a table's CDC worker needs from Job 1 config."""
+     config = load_table_config(entry)
+@@ -2725,6 +2856,7 @@ def build_table_context(entry):
+     # missed. Absent for most tables.
+     rename_hints = meta.get('rename_hints') or {}
+     label = f"{dsql_schema}.{dsql_table}"
++    _nn_register_cdc(dsql_schema, dsql_table, config)
+     for _w in _null_rules_unknown_warnings(
+             dsql_schema, dsql_table, set(type_categories) | set(target_columns)):
+         print(f"  ⚠️ {label}: {_w}")
+@@ -3350,7 +3482,7 @@ def collapse_net_ops(rows, header, ctx, insert_cols, col_category):
+         for ki, kcat in zip(key_idxs, key_cats):
+             kraw = row[ki] if ki < len(row) else None
+             _kcol = apply_keys[len(key_vals)]
+-            _km = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], _kcol)
++            _km = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], _kcol, kcat)
+             kval = hex_to_canonical_uuid(kraw) if kcat == 'uuid' else _coerce_null(kraw, _km)
+             if kval is None:
+                 raise TableBlocked(f"CDC row with empty key '{apply_keys[len(key_vals)]}' in "
+@@ -3368,7 +3500,7 @@ def collapse_net_ops(rows, header, ctx, insert_cols, col_category):
+             values = {}
+             for c, idx in col_idx.items():
+                 raw = row[idx] if idx < len(row) else None
+-                _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c)
++                _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c, col_category.get(c, 'varchar'))
+                 values[c] = convert_value(raw, col_category.get(c, 'varchar'), _m)
+             net[key_tuple] = {"op": "INSERT", "pk": pk_val, "keys": key_tuple, "values": values}
+     netops = [net[k] for k in ordered_pks]
+@@ -4030,7 +4162,7 @@ def collapse_net_ops_nonpk(rows, header, ctx, insert_cols, col_category):
+         vals = {}
+         for c, idx in col_idx.items():
+             raw = row[idx] if idx < len(row) else None
+-            _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c)
++            _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c, col_category.get(c, 'varchar'))
+             vals[c] = convert_value(raw, col_category.get(c, 'varchar'), _m)
+         return vals
+ 
+diff --git a/scripts/glue_cdc_continuous.py b/scripts/glue_cdc_continuous.py
+index 6f899b9..df95290 100644
+--- a/scripts/glue_cdc_continuous.py
++++ b/scripts/glue_cdc_continuous.py
+@@ -524,6 +524,22 @@ CSV_NULL_VALUE = "NULL"
+ # distinct from an empty list. Set once at startup by _apply_null_settings().
+ NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
+ NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
++# --- OPT-IN automatic NOT NULL char/text keep-text rule (--null_notnull_text). ----------
++# "off" (default) == byte-identical to today. "keep_text": for a NOT NULL char/text column
++# NO text value (endpoint marker OR a null_values entry) becomes SQL NULL - it is stored as
++# the literal text. An explicit null_rules entry for that exact column STILL wins. Empty
++# field stays NULL in every mode. Nullable columns and non-text types are unchanged.
++NULL_NOTNULL_TEXT = "off"          # "off" | "keep_text"
++# Per-table nullability the rule needs: {(schema_l, table_l): {col_l: 'YES'|'NO'}}. Filled
++# by _nn_register_nullability() from the Job 1 mapping (is_nullable per column) or, for an
++# OLDER mapping without it, from ONE catalog query the caller runs. A registered table whose
++# column is absent here is treated as UNKNOWN -> the rule FAILS LOUD (never silently skips).
++_NN_NULLABILITY = {}
++# The char/text categories the rule applies to. categorize_type() maps character varying,
++# character and length-limited varchar (DSQL varchar(n)) all to 'varchar', and text to
++# 'text'; every other category (int/numeric/date/timestamp/uuid/bool/bytea/json...) is
++# excluded, so only these two are protected.
++_NN_TEXT_CATEGORIES = frozenset({"varchar", "text"})
+ 
+ 
+ class NullRulesError(Exception):
+@@ -600,36 +616,121 @@ def _parse_null_rules(raw):
+     return rules
+ 
+ 
+-def _effective_null_markers(schema, table, column):
++def _effective_null_markers(schema, table, column, category=None):
+     """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
+-    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
+-    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
+-    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
+-    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
++    precedence: an explicit null_rules entry for the column (which may be [] for 'none'), THEN
++    the automatic NOT NULL char/text keep-text rule (--null_notnull_text=keep_text), THEN
++    null_values (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field
++    handling is separate (always NULL) and NOT included here. Names are matched case-
++    insensitively. With every setting unset/off this returns [CSV_NULL_VALUE] (if non-empty) or
++    [] — i.e. today's behaviour. `category` is the column's type_category; it is only consulted
++    for the automatic rule (which applies to 'varchar'/'text' only). When it is None the
++    automatic rule is inert, so an un-wired caller keeps today's behaviour exactly."""
+     if NULL_RULES is not None:
+         key = (str(schema).lower(), str(table).lower(), str(column).lower())
+         if key in NULL_RULES:
+-            return list(NULL_RULES[key])
++            return list(NULL_RULES[key])   # explicit per-column rule wins over everything
++    if NULL_NOTNULL_TEXT == "keep_text" and category in _NN_TEXT_CATEGORIES:
++        if _nn_is_notnull(schema, table, column):
++            return []   # NOT NULL char/text: no text value becomes NULL (keep as data)
+     if NULL_VALUES is not None:
+         return list(NULL_VALUES)
+     return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
+ 
+ 
+-def _apply_null_settings(null_values_arg, null_rules_arg):
++def _nn_register_nullability(schema, table, colmap):
++    """Record this table's column nullability for the automatic NOT NULL char/text rule.
++    `colmap` is {column_name: 'YES'|'NO'} (information_schema.columns.is_nullable). Names are
++    lower-cased. Idempotent; call once per table at startup (loader/validate) or when the CDC
++    worker builds/refreshes its table context. A no-op unless null_notnull_text=keep_text."""
++    if not colmap:
++        return
++    key = (str(schema).lower(), str(table).lower())
++    _NN_NULLABILITY[key] = {str(c).lower(): str(n).upper() for c, n in colmap.items()}
++
++
++def _nn_is_notnull(schema, table, column):
++    """True iff the column is known NOT NULL. Raises NullRulesError (fail loud, never silently
++    skip) if the table was registered but this column's nullability is unknown — the caller
++    must register from the Job 1 mapping or, for an OLDER mapping, from one catalog query."""
++    key = (str(schema).lower(), str(table).lower())
++    tbl = _NN_NULLABILITY.get(key)
++    if tbl is None:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text needs column nullability for {key[0]}.{key[1]} but it "
++            f"was never registered. The job must call _nn_register_nullability() for the table "
++            f"(from the Job 1 mapping is_nullable, or one information_schema query for an older "
++            f"mapping). Refusing to guess.")
++    col = str(column).lower()
++    if col not in tbl:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text: nullability of column {col!r} in {key[0]}.{key[1]} is "
++            f"unknown (not in the registered mapping/catalog). Refusing to guess whether it is "
++            f"NOT NULL; re-run Job 1 discovery for this table or check the column name.")
++    return tbl[col] == "NO"
++
++
++def _nn_register_from_mapping(schema, table, config):
++    """Register nullability from the Job 1 mapping if it carries is_nullable per column.
++    The current discovery writes is_nullable on each column_mapping entry (action=='map').
++    Returns True if it registered (new mapping), False if NO mapped entry carried is_nullable
++    (an OLDER mapping) — in which case the caller MUST register from one catalog query (or
++    fail loud). A no-op that returns True when null_notnull_text=off (nothing to do)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return True
++    colmap = {}
++    saw_flag = False
++    for m in (config.get("column_mapping") or []):
++        if isinstance(m, dict) and m.get("action") == "map":
++            tgt = m.get("target_column")
++            nn = m.get("is_nullable")
++            if tgt and nn is not None:
++                saw_flag = True
++                colmap[tgt] = nn
++    if not saw_flag:
++        return False
++    _nn_register_nullability(schema, table, colmap)
++    return True
++
++
++def _apply_null_notnull_text(raw):
++    """Parse the optional --null_notnull_text arg into the NULL_NOTNULL_TEXT global.
++    off (default) | keep_text. Blank / absent / the '__NULL_UNSET__' sentinel -> "off"
++    (byte-identical to today). An invalid value -> WARN and use "off" (same contract as other
++    optional args). Returns the resolved value."""
++    global NULL_NOTNULL_TEXT
++    val = str(raw).strip().lower() if isinstance(raw, str) else ""
++    if val in ("", "__null_unset__", "off"):
++        NULL_NOTNULL_TEXT = "off"
++    elif val == "keep_text":
++        NULL_NOTNULL_TEXT = "keep_text"
++    else:
++        print(f"  WARNING ignoring invalid null_notnull_text={raw!r} (use off|keep_text); "
++              f"keeping off")
++        NULL_NOTNULL_TEXT = "off"
++    return NULL_NOTNULL_TEXT
++
++
++def _apply_null_settings(null_values_arg, null_rules_arg, null_notnull_text_arg=None):
+     """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
+     globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
+     empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
+-    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
++    NullRulesError on a malformed setting. Returns a short human summary for the startup log.
++    null_notnull_text_arg (optional) sets the automatic NOT NULL char/text keep-text rule;
++    absent/None leaves it off (today's behaviour)."""
+     global NULL_VALUES, NULL_RULES
+     NULL_VALUES = _parse_null_values(null_values_arg)
+     NULL_RULES = _parse_null_rules(null_rules_arg)
++    if null_notnull_text_arg is not None:
++        _apply_null_notnull_text(null_notnull_text_arg)
+     nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
+     if NULL_RULES is None:
+         nr = "unset"
+     else:
+         nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
+                        for k, v in NULL_RULES.items()) or "(empty)"
+-    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
++    return (f"null_values={nv}; null_rules={nr}; null_notnull_text={NULL_NOTNULL_TEXT}; "
++            f"endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}")
+ 
+ 
+ def _null_rules_unknown_warnings(schema, table, columns):
+@@ -673,7 +774,7 @@ def _apply_cdc_arg_overrides():
+                 "dms_task_arn", "control_schema",
+                 "max_parallel_tables", "require_full_load_done", "poll_interval",
+                 "timestamp_column", "single_swap_is_rename", "csv_null_value",
+-                "null_values", "null_rules",
++                "null_values", "null_rules", "null_notnull_text",
+                 "cdc_validation", "cdc_validation_sample",
+                 "cdc_max_delete_fraction", "cdc_max_delete_rows",
+                 "cdc_drift_check_minutes", "cdc_drift_tolerance", "cdc_drift_action",
+@@ -718,8 +819,10 @@ def _apply_cdc_arg_overrides():
+     # task is only a WARNING (checked per-table as files are processed).
+     _nvl = ov.get("null_values") if "null_values" in ov else None
+     _nrl = ov.get("null_rules") if "null_rules" in ov else None
+-    if _nvl is not None or _nrl is not None:
+-        _summary = _apply_null_settings(_nvl, _nrl)
++    _nnt_present = "null_notnull_text" in ov
++    if _nvl is not None or _nrl is not None or _nnt_present:
++        _nnt = ov.get("null_notnull_text") if "null_notnull_text" in ov else None
++        _summary = _apply_null_settings(_nvl, _nrl, _nnt)
+         print(f"  ↪ NULL rules: {_summary}")
+     if _s("single_swap_is_rename"):
+         SINGLE_SWAP_IS_RENAME = _s("single_swap_is_rename").strip().lower() in ("true", "1", "yes")
+@@ -2765,6 +2868,34 @@ class MultiColumnKeyTable(Exception):
+     multi-column keys. main() lists them at startup and never touches them."""
+ 
+ 
++def _nn_register_cdc(dsql_schema, dsql_table, config):
++    """Register a CDC table's column nullability for --null_notnull_text=keep_text (once per
++    table, at context build). Mapping first; OLDER mapping -> ONE information_schema query via
++    connect_dsql(). No-op when the arg is off. Re-registers after DDL via the same catalog read
++    the CDC job already does (handle_schema_changes -> _nn_register_nullability on refresh)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return
++    if _nn_register_from_mapping(dsql_schema, dsql_table, config):
++        return
++    print(f"  ↪ null_notnull_text=keep_text: {dsql_schema}.{dsql_table} mapping predates "
++          f"is_nullable; reading nullability from information_schema (one query).")
++    _conn = connect_dsql()
++    try:
++        _cur = _conn.cursor()
++        _cur.execute(
++            "SELECT column_name, is_nullable FROM information_schema.columns "
++            "WHERE table_schema = %s AND table_name = %s",
++            (dsql_schema, dsql_table))
++        _nn_register_nullability(dsql_schema, dsql_table,
++                                 {r[0]: r[1] for r in _cur.fetchall()})
++        _cur.close()
++    finally:
++        try:
++            _conn.close()
++        except Exception:
++            pass
++
++
+ def build_table_context(entry):
+     """Assemble everything a table's CDC worker needs from Job 1 config."""
+     config = load_table_config(entry)
+@@ -2830,6 +2961,7 @@ def build_table_context(entry):
+     # missed. Absent for most tables.
+     rename_hints = meta.get('rename_hints') or {}
+     label = f"{dsql_schema}.{dsql_table}"
++    _nn_register_cdc(dsql_schema, dsql_table, config)
+     for _w in _null_rules_unknown_warnings(
+             dsql_schema, dsql_table, set(type_categories) | set(target_columns)):
+         print(f"  ⚠️ {label}: {_w}")
+@@ -3730,7 +3862,7 @@ def collapse_net_ops(rows, header, ctx, insert_cols, col_category):
+         raw_rows += 1
+         op = (row[op_idx].upper() if op_idx < len(row) else 'I')
+         pk_raw = row[pk_idx] if pk_idx < len(row) else None
+-        pk_markers = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], pk_col)
++        pk_markers = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], pk_col, pk_category)
+         pk_val = hex_to_canonical_uuid(pk_raw) if pk_category == 'uuid' else _coerce_null(pk_raw, pk_markers)
+         if pk_val is None:
+             raise TableBlocked(f"CDC row with empty PK '{pk_col}' in {ctx['label']} "
+@@ -3743,7 +3875,7 @@ def collapse_net_ops(rows, header, ctx, insert_cols, col_category):
+             values = {}
+             for c, idx in col_idx.items():
+                 raw = row[idx] if idx < len(row) else None
+-                _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c)
++                _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c, col_category.get(c, 'varchar'))
+                 values[c] = convert_value(raw, col_category.get(c, 'varchar'), _m)
+             net[pk_val] = {"op": "INSERT", "pk": pk_val, "values": values}
+     netops = [net[pk] for pk in ordered_pks]
+@@ -4385,7 +4517,7 @@ def collapse_net_ops_nonpk(rows, header, ctx, insert_cols, col_category):
+         vals = {}
+         for c, idx in col_idx.items():
+             raw = row[idx] if idx < len(row) else None
+-            _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c)
++            _m = _effective_null_markers(ctx["dsql_schema"], ctx["dsql_table"], c, col_category.get(c, 'varchar'))
+             vals[c] = convert_value(raw, col_category.get(c, 'varchar'), _m)
+         return vals
+ 
+diff --git a/scripts/job1_discovery.py b/scripts/job1_discovery.py
+index f54752f..dcf66d4 100644
+--- a/scripts/job1_discovery.py
++++ b/scripts/job1_discovery.py
+@@ -702,6 +702,10 @@ def build_mapping_for_table(spec, target_columns, dms_columns, pk_columns):
+                 "type_category": type_categories[target_name],
+                 "ordinal_position": target_col['ordinal_position'],
+                 "max_length": target_col['max_length'],
++                # is_nullable ('YES'/'NO') lets the load/validate/CDC jobs apply the optional
++                # --null_notnull_text rule without a catalog query. Older mappings omit it and
++                # the jobs fall back to one information_schema read per table.
++                "is_nullable": target_col.get('is_nullable'),
+             })
+             target_column_names.append(target_name)
+         else:
+diff --git a/scripts/job2_load.py b/scripts/job2_load.py
+index b94e095..d9d168b 100644
+--- a/scripts/job2_load.py
++++ b/scripts/job2_load.py
+@@ -525,6 +525,22 @@ CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
+ # distinct from an empty list. Set once at startup by _apply_null_settings().
+ NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
+ NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
++# --- OPT-IN automatic NOT NULL char/text keep-text rule (--null_notnull_text). ----------
++# "off" (default) == byte-identical to today. "keep_text": for a NOT NULL char/text column
++# NO text value (endpoint marker OR a null_values entry) becomes SQL NULL - it is stored as
++# the literal text. An explicit null_rules entry for that exact column STILL wins. Empty
++# field stays NULL in every mode. Nullable columns and non-text types are unchanged.
++NULL_NOTNULL_TEXT = "off"          # "off" | "keep_text"
++# Per-table nullability the rule needs: {(schema_l, table_l): {col_l: 'YES'|'NO'}}. Filled
++# by _nn_register_nullability() from the Job 1 mapping (is_nullable per column) or, for an
++# OLDER mapping without it, from ONE catalog query the caller runs. A registered table whose
++# column is absent here is treated as UNKNOWN -> the rule FAILS LOUD (never silently skips).
++_NN_NULLABILITY = {}
++# The char/text categories the rule applies to. categorize_type() maps character varying,
++# character and length-limited varchar (DSQL varchar(n)) all to 'varchar', and text to
++# 'text'; every other category (int/numeric/date/timestamp/uuid/bool/bytea/json...) is
++# excluded, so only these two are protected.
++_NN_TEXT_CATEGORIES = frozenset({"varchar", "text"})
+ 
+ 
+ class NullRulesError(Exception):
+@@ -601,36 +617,121 @@ def _parse_null_rules(raw):
+     return rules
+ 
+ 
+-def _effective_null_markers(schema, table, column):
++def _effective_null_markers(schema, table, column, category=None):
+     """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
+-    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
+-    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
+-    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
+-    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
++    precedence: an explicit null_rules entry for the column (which may be [] for 'none'), THEN
++    the automatic NOT NULL char/text keep-text rule (--null_notnull_text=keep_text), THEN
++    null_values (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field
++    handling is separate (always NULL) and NOT included here. Names are matched case-
++    insensitively. With every setting unset/off this returns [CSV_NULL_VALUE] (if non-empty) or
++    [] — i.e. today's behaviour. `category` is the column's type_category; it is only consulted
++    for the automatic rule (which applies to 'varchar'/'text' only). When it is None the
++    automatic rule is inert, so an un-wired caller keeps today's behaviour exactly."""
+     if NULL_RULES is not None:
+         key = (str(schema).lower(), str(table).lower(), str(column).lower())
+         if key in NULL_RULES:
+-            return list(NULL_RULES[key])
++            return list(NULL_RULES[key])   # explicit per-column rule wins over everything
++    if NULL_NOTNULL_TEXT == "keep_text" and category in _NN_TEXT_CATEGORIES:
++        if _nn_is_notnull(schema, table, column):
++            return []   # NOT NULL char/text: no text value becomes NULL (keep as data)
+     if NULL_VALUES is not None:
+         return list(NULL_VALUES)
+     return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
+ 
+ 
+-def _apply_null_settings(null_values_arg, null_rules_arg):
++def _nn_register_nullability(schema, table, colmap):
++    """Record this table's column nullability for the automatic NOT NULL char/text rule.
++    `colmap` is {column_name: 'YES'|'NO'} (information_schema.columns.is_nullable). Names are
++    lower-cased. Idempotent; call once per table at startup (loader/validate) or when the CDC
++    worker builds/refreshes its table context. A no-op unless null_notnull_text=keep_text."""
++    if not colmap:
++        return
++    key = (str(schema).lower(), str(table).lower())
++    _NN_NULLABILITY[key] = {str(c).lower(): str(n).upper() for c, n in colmap.items()}
++
++
++def _nn_is_notnull(schema, table, column):
++    """True iff the column is known NOT NULL. Raises NullRulesError (fail loud, never silently
++    skip) if the table was registered but this column's nullability is unknown — the caller
++    must register from the Job 1 mapping or, for an OLDER mapping, from one catalog query."""
++    key = (str(schema).lower(), str(table).lower())
++    tbl = _NN_NULLABILITY.get(key)
++    if tbl is None:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text needs column nullability for {key[0]}.{key[1]} but it "
++            f"was never registered. The job must call _nn_register_nullability() for the table "
++            f"(from the Job 1 mapping is_nullable, or one information_schema query for an older "
++            f"mapping). Refusing to guess.")
++    col = str(column).lower()
++    if col not in tbl:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text: nullability of column {col!r} in {key[0]}.{key[1]} is "
++            f"unknown (not in the registered mapping/catalog). Refusing to guess whether it is "
++            f"NOT NULL; re-run Job 1 discovery for this table or check the column name.")
++    return tbl[col] == "NO"
++
++
++def _nn_register_from_mapping(schema, table, config):
++    """Register nullability from the Job 1 mapping if it carries is_nullable per column.
++    The current discovery writes is_nullable on each column_mapping entry (action=='map').
++    Returns True if it registered (new mapping), False if NO mapped entry carried is_nullable
++    (an OLDER mapping) — in which case the caller MUST register from one catalog query (or
++    fail loud). A no-op that returns True when null_notnull_text=off (nothing to do)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return True
++    colmap = {}
++    saw_flag = False
++    for m in (config.get("column_mapping") or []):
++        if isinstance(m, dict) and m.get("action") == "map":
++            tgt = m.get("target_column")
++            nn = m.get("is_nullable")
++            if tgt and nn is not None:
++                saw_flag = True
++                colmap[tgt] = nn
++    if not saw_flag:
++        return False
++    _nn_register_nullability(schema, table, colmap)
++    return True
++
++
++def _apply_null_notnull_text(raw):
++    """Parse the optional --null_notnull_text arg into the NULL_NOTNULL_TEXT global.
++    off (default) | keep_text. Blank / absent / the '__NULL_UNSET__' sentinel -> "off"
++    (byte-identical to today). An invalid value -> WARN and use "off" (same contract as other
++    optional args). Returns the resolved value."""
++    global NULL_NOTNULL_TEXT
++    val = str(raw).strip().lower() if isinstance(raw, str) else ""
++    if val in ("", "__null_unset__", "off"):
++        NULL_NOTNULL_TEXT = "off"
++    elif val == "keep_text":
++        NULL_NOTNULL_TEXT = "keep_text"
++    else:
++        print(f"  WARNING ignoring invalid null_notnull_text={raw!r} (use off|keep_text); "
++              f"keeping off")
++        NULL_NOTNULL_TEXT = "off"
++    return NULL_NOTNULL_TEXT
++
++
++def _apply_null_settings(null_values_arg, null_rules_arg, null_notnull_text_arg=None):
+     """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
+     globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
+     empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
+-    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
++    NullRulesError on a malformed setting. Returns a short human summary for the startup log.
++    null_notnull_text_arg (optional) sets the automatic NOT NULL char/text keep-text rule;
++    absent/None leaves it off (today's behaviour)."""
+     global NULL_VALUES, NULL_RULES
+     NULL_VALUES = _parse_null_values(null_values_arg)
+     NULL_RULES = _parse_null_rules(null_rules_arg)
++    if null_notnull_text_arg is not None:
++        _apply_null_notnull_text(null_notnull_text_arg)
+     nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
+     if NULL_RULES is None:
+         nr = "unset"
+     else:
+         nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
+                        for k, v in NULL_RULES.items()) or "(empty)"
+-    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
++    return (f"null_values={nv}; null_rules={nr}; null_notnull_text={NULL_NOTNULL_TEXT}; "
++            f"endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}")
+ 
+ 
+ def _null_rules_unknown_warnings(schema, table, columns):
+@@ -682,7 +783,7 @@ def _apply_v6_arg_overrides():
+                 "blank_guard_enabled", "blank_expected_margin", "allow_manual_destructive",
+                 "guardrails_mode",
+                 "verbose_chunks", "verbose_chunk_every", "csv_null_value",
+-                "null_values", "null_rules"]
++                "null_values", "null_rules", "null_notnull_text"]
+     present = [a for a in optional if f"--{a}" in sys.argv]
+     if not present:
+         return
+@@ -772,8 +873,10 @@ def _apply_v6_arg_overrides():
+     # effective rules are logged for every run.
+     _nvl = ov.get("null_values") if "null_values" in ov else None
+     _nrl = ov.get("null_rules") if "null_rules" in ov else None
+-    if _nvl is not None or _nrl is not None:
+-        _summary = _apply_null_settings(_nvl, _nrl)
++    _nnt_present = "null_notnull_text" in ov
++    if _nvl is not None or _nrl is not None or _nnt_present:
++        _nnt = ov.get("null_notnull_text") if "null_notnull_text" in ov else None
++        _summary = _apply_null_settings(_nvl, _nrl, _nnt)
+         print(f"  ↪ NULL rules: {_summary}")
+     if "v6_parallel_enabled" in ov:
+         V6_PARALLEL_ENABLED = str(ov["v6_parallel_enabled"]).strip().lower() in ("true", "1", "yes")
+@@ -1600,6 +1703,35 @@ _TYPED_CATEGORIES = frozenset({
+     'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
+ 
+ 
++def _nn_register_for_table(dsql_schema, dsql_table, config):
++    """Register this table's column nullability for --null_notnull_text=keep_text. Uses the
++    Job 1 mapping's per-column is_nullable when present; for an OLDER mapping without it,
++    runs ONE information_schema.columns query (cached by _nn_register_nullability). A no-op
++    when the arg is off. Fails loud later (in _nn_is_notnull) only if nullability is truly
++    unobtainable."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return
++    if _nn_register_from_mapping(dsql_schema, dsql_table, config):
++        return
++    print(f"    ↪ null_notnull_text=keep_text: {dsql_schema}.{dsql_table} mapping predates "
++          f"is_nullable; reading nullability from information_schema (one query).")
++    _conn = connect_dsql()
++    try:
++        _cur = _conn.cursor()
++        _cur.execute(
++            "SELECT column_name, is_nullable FROM information_schema.columns "
++            "WHERE table_schema = %s AND table_name = %s",
++            (dsql_schema, dsql_table))
++        _nn_register_nullability(dsql_schema, dsql_table,
++                                 {r[0]: r[1] for r in _cur.fetchall()})
++        _cur.close()
++    finally:
++        try:
++            _conn.close()
++        except Exception:
++            pass
++
++
+ def null_marker_expr(c, category, schema=None, table=None):
+     """Spark expression for column c: NULL for a real NULL (Spark null, empty field, or an
+     exact null marker), else the value. Text columns keep the value exactly (whitespace too);
+@@ -1616,7 +1748,7 @@ def null_marker_expr(c, category, schema=None, table=None):
+         if CSV_NULL_VALUE:
+             is_null = is_null | (raw == lit(CSV_NULL_VALUE))
+     else:
+-        for _m in _effective_null_markers(schema, table, c):
++        for _m in _effective_null_markers(schema, table, c, category):
+             is_null = is_null | (raw == lit(_m))
+     if category in _TYPED_CATEGORIES:
+         t = trim(raw)
+@@ -3501,6 +3633,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
+     #     keeps it), so a value is stored the same whether it arrived in the full load or CDC.
+     for _w in _null_rules_unknown_warnings(dsql_schema, dsql_table, df.columns):
+         print(f"    ⚠️ {_w}")
++    _nn_register_for_table(dsql_schema, dsql_table, config)
+     for c in df.columns:
+         df = df.withColumn(c, null_marker_expr(c, type_categories.get(c), dsql_schema, dsql_table))
+ 
+diff --git a/scripts/job3_validate.py b/scripts/job3_validate.py
+index bf4bd73..2708dad 100644
+--- a/scripts/job3_validate.py
++++ b/scripts/job3_validate.py
+@@ -260,6 +260,22 @@ CSV_NULL_VALUE = "NULL"   # DMS null marker; see null_marker_expr
+ # distinct from an empty list. Set once at startup by _apply_null_settings().
+ NULL_VALUES = None   # None | list[str]  (replacement marker list for ALL columns)
+ NULL_RULES = None    # None | dict[(schema,table,col) -> list[str]]  ([] == 'none': no markers)
++# --- OPT-IN automatic NOT NULL char/text keep-text rule (--null_notnull_text). ----------
++# "off" (default) == byte-identical to today. "keep_text": for a NOT NULL char/text column
++# NO text value (endpoint marker OR a null_values entry) becomes SQL NULL - it is stored as
++# the literal text. An explicit null_rules entry for that exact column STILL wins. Empty
++# field stays NULL in every mode. Nullable columns and non-text types are unchanged.
++NULL_NOTNULL_TEXT = "off"          # "off" | "keep_text"
++# Per-table nullability the rule needs: {(schema_l, table_l): {col_l: 'YES'|'NO'}}. Filled
++# by _nn_register_nullability() from the Job 1 mapping (is_nullable per column) or, for an
++# OLDER mapping without it, from ONE catalog query the caller runs. A registered table whose
++# column is absent here is treated as UNKNOWN -> the rule FAILS LOUD (never silently skips).
++_NN_NULLABILITY = {}
++# The char/text categories the rule applies to. categorize_type() maps character varying,
++# character and length-limited varchar (DSQL varchar(n)) all to 'varchar', and text to
++# 'text'; every other category (int/numeric/date/timestamp/uuid/bool/bytea/json...) is
++# excluded, so only these two are protected.
++_NN_TEXT_CATEGORIES = frozenset({"varchar", "text"})
+ 
+ 
+ class NullRulesError(Exception):
+@@ -336,36 +352,121 @@ def _parse_null_rules(raw):
+     return rules
+ 
+ 
+-def _effective_null_markers(schema, table, column):
++def _effective_null_markers(schema, table, column, category=None):
+     """The ORDERED list of exact text values that mean SQL NULL for this one column, applying
+-    precedence: a null_rules entry for the column (which may be [] for 'none'), THEN null_values
+-    (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field handling is
+-    separate (always NULL) and NOT included here. Names are matched case-insensitively. With both
+-    settings unset this returns [CSV_NULL_VALUE] (if non-empty) or [] — i.e. today's behaviour."""
++    precedence: an explicit null_rules entry for the column (which may be [] for 'none'), THEN
++    the automatic NOT NULL char/text keep-text rule (--null_notnull_text=keep_text), THEN
++    null_values (replaces for all columns), THEN the endpoint marker CSV_NULL_VALUE. Empty-field
++    handling is separate (always NULL) and NOT included here. Names are matched case-
++    insensitively. With every setting unset/off this returns [CSV_NULL_VALUE] (if non-empty) or
++    [] — i.e. today's behaviour. `category` is the column's type_category; it is only consulted
++    for the automatic rule (which applies to 'varchar'/'text' only). When it is None the
++    automatic rule is inert, so an un-wired caller keeps today's behaviour exactly."""
+     if NULL_RULES is not None:
+         key = (str(schema).lower(), str(table).lower(), str(column).lower())
+         if key in NULL_RULES:
+-            return list(NULL_RULES[key])
++            return list(NULL_RULES[key])   # explicit per-column rule wins over everything
++    if NULL_NOTNULL_TEXT == "keep_text" and category in _NN_TEXT_CATEGORIES:
++        if _nn_is_notnull(schema, table, column):
++            return []   # NOT NULL char/text: no text value becomes NULL (keep as data)
+     if NULL_VALUES is not None:
+         return list(NULL_VALUES)
+     return [CSV_NULL_VALUE] if CSV_NULL_VALUE else []
+ 
+ 
+-def _apply_null_settings(null_values_arg, null_rules_arg):
++def _nn_register_nullability(schema, table, colmap):
++    """Record this table's column nullability for the automatic NOT NULL char/text rule.
++    `colmap` is {column_name: 'YES'|'NO'} (information_schema.columns.is_nullable). Names are
++    lower-cased. Idempotent; call once per table at startup (loader/validate) or when the CDC
++    worker builds/refreshes its table context. A no-op unless null_notnull_text=keep_text."""
++    if not colmap:
++        return
++    key = (str(schema).lower(), str(table).lower())
++    _NN_NULLABILITY[key] = {str(c).lower(): str(n).upper() for c, n in colmap.items()}
++
++
++def _nn_is_notnull(schema, table, column):
++    """True iff the column is known NOT NULL. Raises NullRulesError (fail loud, never silently
++    skip) if the table was registered but this column's nullability is unknown — the caller
++    must register from the Job 1 mapping or, for an OLDER mapping, from one catalog query."""
++    key = (str(schema).lower(), str(table).lower())
++    tbl = _NN_NULLABILITY.get(key)
++    if tbl is None:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text needs column nullability for {key[0]}.{key[1]} but it "
++            f"was never registered. The job must call _nn_register_nullability() for the table "
++            f"(from the Job 1 mapping is_nullable, or one information_schema query for an older "
++            f"mapping). Refusing to guess.")
++    col = str(column).lower()
++    if col not in tbl:
++        raise NullRulesError(
++            f"null_notnull_text=keep_text: nullability of column {col!r} in {key[0]}.{key[1]} is "
++            f"unknown (not in the registered mapping/catalog). Refusing to guess whether it is "
++            f"NOT NULL; re-run Job 1 discovery for this table or check the column name.")
++    return tbl[col] == "NO"
++
++
++def _nn_register_from_mapping(schema, table, config):
++    """Register nullability from the Job 1 mapping if it carries is_nullable per column.
++    The current discovery writes is_nullable on each column_mapping entry (action=='map').
++    Returns True if it registered (new mapping), False if NO mapped entry carried is_nullable
++    (an OLDER mapping) — in which case the caller MUST register from one catalog query (or
++    fail loud). A no-op that returns True when null_notnull_text=off (nothing to do)."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return True
++    colmap = {}
++    saw_flag = False
++    for m in (config.get("column_mapping") or []):
++        if isinstance(m, dict) and m.get("action") == "map":
++            tgt = m.get("target_column")
++            nn = m.get("is_nullable")
++            if tgt and nn is not None:
++                saw_flag = True
++                colmap[tgt] = nn
++    if not saw_flag:
++        return False
++    _nn_register_nullability(schema, table, colmap)
++    return True
++
++
++def _apply_null_notnull_text(raw):
++    """Parse the optional --null_notnull_text arg into the NULL_NOTNULL_TEXT global.
++    off (default) | keep_text. Blank / absent / the '__NULL_UNSET__' sentinel -> "off"
++    (byte-identical to today). An invalid value -> WARN and use "off" (same contract as other
++    optional args). Returns the resolved value."""
++    global NULL_NOTNULL_TEXT
++    val = str(raw).strip().lower() if isinstance(raw, str) else ""
++    if val in ("", "__null_unset__", "off"):
++        NULL_NOTNULL_TEXT = "off"
++    elif val == "keep_text":
++        NULL_NOTNULL_TEXT = "keep_text"
++    else:
++        print(f"  WARNING ignoring invalid null_notnull_text={raw!r} (use off|keep_text); "
++              f"keeping off")
++        NULL_NOTNULL_TEXT = "off"
++    return NULL_NOTNULL_TEXT
++
++
++def _apply_null_settings(null_values_arg, null_rules_arg, null_notnull_text_arg=None):
+     """Parse the --null_values / --null_rules Glue args into the NULL_VALUES / NULL_RULES
+     globals. The sentinel '__NULL_UNSET__' (and blank/absent) means "unset" (Glue cannot pass an
+     empty arg value, so create_glue_jobs sends the sentinel for a blank setting). Raises
+-    NullRulesError on a malformed setting. Returns a short human summary for the startup log."""
++    NullRulesError on a malformed setting. Returns a short human summary for the startup log.
++    null_notnull_text_arg (optional) sets the automatic NOT NULL char/text keep-text rule;
++    absent/None leaves it off (today's behaviour)."""
+     global NULL_VALUES, NULL_RULES
+     NULL_VALUES = _parse_null_values(null_values_arg)
+     NULL_RULES = _parse_null_rules(null_rules_arg)
++    if null_notnull_text_arg is not None:
++        _apply_null_notnull_text(null_notnull_text_arg)
+     nv = "unset (endpoint marker)" if NULL_VALUES is None else f"{NULL_VALUES!r} (ALL columns)"
+     if NULL_RULES is None:
+         nr = "unset"
+     else:
+         nr = "; ".join(f"{'.'.join(k)}=" + ("none" if v == [] else "|".join(v))
+                        for k, v in NULL_RULES.items()) or "(empty)"
+-    return f"null_values={nv}; null_rules={nr}; endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}"
++    return (f"null_values={nv}; null_rules={nr}; null_notnull_text={NULL_NOTNULL_TEXT}; "
++            f"endpoint CSV_NULL_VALUE={CSV_NULL_VALUE!r}")
+ 
+ 
+ def _null_rules_unknown_warnings(schema, table, columns):
+@@ -404,7 +505,7 @@ def _apply_job3_arg_overrides():
+                 "dsql_database", "region", "dsql_endpoint_candidates",
+                 "checksum_mode", "max_parallel_tables", "validate_rows_per_range",
+                 "max_query_concurrency", "require_full_load_done", "csv_null_value",
+-                "null_values", "null_rules",
++                "null_values", "null_rules", "null_notnull_text",
+                 "validate_parallelism", "conn_budget", "validate_hash",
+                 "validate_target_seconds_per_range",
+                 "dms_task_arn", "count_mismatch_tolerance",
+@@ -489,8 +590,10 @@ def _apply_job3_arg_overrides():
+     # effective rules are logged for every run.
+     _nvl = ov.get("null_values") if "null_values" in ov else None
+     _nrl = ov.get("null_rules") if "null_rules" in ov else None
+-    if _nvl is not None or _nrl is not None:
+-        _summary = _apply_null_settings(_nvl, _nrl)
++    _nnt_present = "null_notnull_text" in ov
++    if _nvl is not None or _nrl is not None or _nnt_present:
++        _nnt = ov.get("null_notnull_text") if "null_notnull_text" in ov else None
++        _summary = _apply_null_settings(_nvl, _nrl, _nnt)
+         print(f"  ↪ NULL rules: {_summary}")
+     if "require_full_load_done" in ov:
+         REQUIRE_FULL_LOAD_DONE = str(ov["require_full_load_done"]).strip().lower() in ("true", "1", "yes")
+@@ -566,6 +669,35 @@ _TYPED_CATEGORIES = frozenset({
+     'float', 'double', 'real', 'json', 'jsonb', 'bytea'})
+ 
+ 
++def _nn_register_for_table(dsql_schema, dsql_table, config):
++    """Register this table's column nullability for --null_notnull_text=keep_text. Uses the
++    Job 1 mapping's per-column is_nullable when present; for an OLDER mapping without it,
++    runs ONE information_schema.columns query (cached by _nn_register_nullability). A no-op
++    when the arg is off. Fails loud later (in _nn_is_notnull) only if nullability is truly
++    unobtainable."""
++    if NULL_NOTNULL_TEXT != "keep_text":
++        return
++    if _nn_register_from_mapping(dsql_schema, dsql_table, config):
++        return
++    print(f"    ↪ null_notnull_text=keep_text: {dsql_schema}.{dsql_table} mapping predates "
++          f"is_nullable; reading nullability from information_schema (one query).")
++    _conn = connect_dsql()
++    try:
++        _cur = _conn.cursor()
++        _cur.execute(
++            "SELECT column_name, is_nullable FROM information_schema.columns "
++            "WHERE table_schema = %s AND table_name = %s",
++            (dsql_schema, dsql_table))
++        _nn_register_nullability(dsql_schema, dsql_table,
++                                 {r[0]: r[1] for r in _cur.fetchall()})
++        _cur.close()
++    finally:
++        try:
++            _conn.close()
++        except Exception:
++            pass
++
++
+ def null_marker_expr(c, category, schema=None, table=None):
+     """Spark expression for column c: NULL for a real NULL (Spark null, empty field, or an
+     exact null marker), else the value. Text columns keep the value exactly (whitespace too);
+@@ -582,7 +714,7 @@ def null_marker_expr(c, category, schema=None, table=None):
+         if CSV_NULL_VALUE:
+             is_null = is_null | (raw == lit(CSV_NULL_VALUE))
+     else:
+-        for _m in _effective_null_markers(schema, table, c):
++        for _m in _effective_null_markers(schema, table, c, category):
+             is_null = is_null | (raw == lit(_m))
+     if category in _TYPED_CATEGORIES:
+         t = trim(raw)
+@@ -1858,6 +1990,7 @@ def validate_one_table(s3, entry):
+     for old, new in rename.items():
+         if old != new and old in df.columns:
+             df = df.withColumnRenamed(old, new)
++    _nn_register_for_table(dsql_schema, dsql_table, config)
+     df_t = apply_transform(df, target_columns, type_categories, dsql_schema, dsql_table)
+     if rangeable and pk_col not in df_t.columns:
+         # The chosen key column isn't in the DMS CSV. For a single-column rangeable PK that's a
+diff --git a/stepfunctions/startup.asl.json b/stepfunctions/startup.asl.json
+index 2bea2cf..c031f06 100644
+--- a/stepfunctions/startup.asl.json
++++ b/stepfunctions/startup.asl.json
+@@ -110,6 +110,7 @@
+         "maxParallelTables.$": "$.Payload.maxParallelTables",
+         "nullValues.$": "$.Payload.nullValues",
+         "nullRules.$": "$.Payload.nullRules",
++        "nullNotnullText.$": "$.Payload.nullNotnullText",
+         "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb"
+       },
+       "ResultPath": "$.resolved",
+@@ -591,6 +592,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+           "cdc_validation.$": "$.resolved.cdcValidation",
+@@ -775,6 +777,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+           "cdc_validation.$": "$.resolved.cdcValidation",
+           "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+@@ -1394,6 +1397,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "error_message.$": "$.cdcRun.run.ErrorMessage",
+           "failed_run_id.$": "$.cdcStart.JobRunId",
+           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+diff --git a/tests/test_null_rules.py b/tests/test_null_rules.py
+index 88a4a25..83f624d 100644
+--- a/tests/test_null_rules.py
++++ b/tests/test_null_rules.py
+@@ -84,13 +84,16 @@ def _extract_block(path):
+ # ------------------------------------------------------------------------------------------
+ _WANT = {"NullRulesError", "_parse_null_values", "_parse_null_rules",
+          "_effective_null_markers", "_apply_null_settings", "_null_rules_unknown_warnings",
+-         "_coerce_null"}
++         "_coerce_null", "_apply_null_notnull_text", "_nn_register_nullability",
++         "_nn_is_notnull", "_nn_register_from_mapping"}
+ 
+ 
+ def _load_ns(path, csv_null_value="NULL"):
+     src = open(path).read()
+     tree = ast.parse(src)
+-    ns = {"CSV_NULL_VALUE": csv_null_value, "NULL_VALUES": None, "NULL_RULES": None}
++    ns = {"CSV_NULL_VALUE": csv_null_value, "NULL_VALUES": None, "NULL_RULES": None,
++          "NULL_NOTNULL_TEXT": "off", "_NN_NULLABILITY": {},
++          "_NN_TEXT_CATEGORIES": frozenset({"varchar", "text"})}
+     for node in tree.body:
+         name = getattr(node, "name", None)
+         if isinstance(node, ast.ClassDef) and name in _WANT:

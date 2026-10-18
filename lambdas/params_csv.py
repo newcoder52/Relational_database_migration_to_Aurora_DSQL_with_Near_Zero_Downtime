@@ -205,6 +205,11 @@ OPTIONAL_DEFAULTS = {
     #                 rules between loaded and CDC-applied rows.
     "null_values": "",
     "null_rules": "",
+    # Optional automatic NOT NULL char/text keep-text rule. "off" (default) = today's
+    # behaviour EXACTLY. "keep_text": a NOT NULL char/varchar/text column never converts a
+    # text value (endpoint marker or a null_values entry) to SQL NULL - it stores the text.
+    # Precedence: null_rules > this > null_values > endpoint. Set BEFORE the full load.
+    "null_notnull_text": "off",
 }
 # Setup-only keys: consumed by tools/setup.sh, never written to pipeline.json.
 #   subnet_id / security_group_id : Glue network connection (both-or-neither).
@@ -265,7 +270,7 @@ PIPELINE_KEYS = ("project", "region", "dsql_endpoint", "dsql_user", "dsql_databa
                  "load_big_worker_type", "load_big_num_workers", "load_big_timeout_minutes",
                  "validate_worker_type", "validate_num_workers", "validate_timeout_minutes",
                  "max_parallel_tables", "per_worker_mem_budget_mb",
-                 "null_values", "null_rules")
+                 "null_values", "null_rules", "null_notnull_text")
 
 _ACCOUNT_RE = re.compile(r"^\d{12}$")
 
@@ -568,6 +573,12 @@ def to_pipeline_settings(params):
         cfg = rt._validate_settings(dict(cfg), warnings)
     except rt.SettingsError as e:
         raise ParamsError(str(e))
+    # F20: _validate_settings normalises and re-adds null_notnull_text; drop it from the emitted
+    # pipeline.json when it is 'off' (the default) so a plain params.csv yields a pipeline.json
+    # byte-identical to main and rollback to the OLD build needs nothing stripped. keep_text is
+    # kept. An absent key defaults to 'off' in resolve_task + the shared NULL block (unchanged).
+    if str(cfg.get("null_notnull_text", "") or "").strip().lower() in ("", "off"):
+        cfg.pop("null_notnull_text", None)
     return cfg
 
 

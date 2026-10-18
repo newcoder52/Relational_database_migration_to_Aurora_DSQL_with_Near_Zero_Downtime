@@ -84,13 +84,16 @@ def _extract_block(path):
 # ------------------------------------------------------------------------------------------
 _WANT = {"NullRulesError", "_parse_null_values", "_parse_null_rules",
          "_effective_null_markers", "_apply_null_settings", "_null_rules_unknown_warnings",
-         "_coerce_null"}
+         "_coerce_null", "_apply_null_notnull_text", "_nn_register_nullability",
+         "_nn_is_notnull", "_nn_register_from_mapping"}
 
 
 def _load_ns(path, csv_null_value="NULL"):
     src = open(path).read()
     tree = ast.parse(src)
-    ns = {"CSV_NULL_VALUE": csv_null_value, "NULL_VALUES": None, "NULL_RULES": None}
+    ns = {"CSV_NULL_VALUE": csv_null_value, "NULL_VALUES": None, "NULL_RULES": None,
+          "NULL_NOTNULL_TEXT": "off", "_NN_NULLABILITY": {},
+          "_NN_TEXT_CATEGORIES": frozenset({"varchar", "text"})}
     for node in tree.body:
         name = getattr(node, "name", None)
         if isinstance(node, ast.ClassDef) and name in _WANT:

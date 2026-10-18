@@ -1,0 +1,278 @@
+--- a/stepfunctions/startup.asl.json
++++ b/stepfunctions/startup.asl.json
+@@ -47,6 +47,7 @@
+         "taskSuffix.$": "$.Payload.taskSuffix",
+         "configPrefix.$": "$.Payload.configPrefix",
+         "override.$": "$.Payload.override",
++        "stopAfterLoad.$": "$.Payload.stopAfterLoad",
+         "project.$": "$.Payload.project",
+         "region.$": "$.Payload.region",
+         "dsqlEndpoint.$": "$.Payload.dsqlEndpoint",
+@@ -110,6 +111,7 @@
+         "maxParallelTables.$": "$.Payload.maxParallelTables",
+         "nullValues.$": "$.Payload.nullValues",
+         "nullRules.$": "$.Payload.nullRules",
++        "nullNotnullText.$": "$.Payload.nullNotnullText",
+         "perWorkerMemBudgetMb.$": "$.Payload.perWorkerMemBudgetMb"
+       },
+       "ResultPath": "$.resolved",
+@@ -591,6 +593,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+           "cdc_validation.$": "$.resolved.cdcValidation",
+@@ -775,6 +778,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "cdc_fallback_reason.$": "$.driverCdc.fallbackReason",
+           "cdc_validation.$": "$.resolved.cdcValidation",
+           "cdc_validation_sample.$": "$.resolved.cdcValidationSample",
+@@ -831,7 +835,7 @@
+           "ResultPath": "$.error"
+         }
+       ],
+-      "Next": "GroupFanOut"
++      "Next": "IsLoadOnly"
+     },
+     "GroupFanOut": {
+       "Type": "Map",
+@@ -846,7 +850,8 @@
+         "extraPyFilesValidation.$": "$.driverValidation.extraPyFiles",
+         "loadJob.$": "$$.Map.Item.Value.loadJobName",
+         "loadBigJob.$": "$$.Map.Item.Value.loadBigJobName",
+-        "validateJob.$": "$$.Map.Item.Value.validateJobName"
++        "validateJob.$": "$$.Map.Item.Value.validateJobName",
++        "stopAfterLoad.$": "$.loadOnly"
+       },
+       "ResultPath": "$.mapResult",
+       "Iterator": {
+@@ -909,7 +914,7 @@
+                 "ResultPath": "$.error"
+               }
+             ],
+-            "Next": "GroupValidate"
++            "Next": "AfterGroupLoad"
+           },
+           "GroupLoadBig": {
+             "Type": "Task",
+@@ -949,7 +954,7 @@
+                 "ResultPath": "$.error"
+               }
+             ],
+-            "Next": "GroupValidate"
++            "Next": "AfterGroupLoad"
+           },
+           "GroupValidate": {
+             "Type": "Task",
+@@ -1009,6 +1014,26 @@
+               "status": "validate_failed"
+             },
+             "End": true
++          },
++          "AfterGroupLoad": {
++            "Type": "Choice",
++            "Comment": "stopAfterLoad: after a group's LOAD finishes, SKIP the validation Glue job when the run is load-only. $.stopAfterLoad is injected per group by GroupFanOut's Parameters (= the run's $.loadOnly); IsPresent-guarded so an older in-flight execution falls through to GroupValidate (byte-identical). When load-only, go straight to GroupOk: no validate job is ever started.",
++            "Choices": [
++              {
++                "And": [
++                  {
++                    "Variable": "$.stopAfterLoad",
++                    "IsPresent": true
++                  },
++                  {
++                    "Variable": "$.stopAfterLoad",
++                    "BooleanEquals": true
++                  }
++                ],
++                "Next": "GroupOk"
++              }
++            ],
++            "Default": "GroupValidate"
+           }
+         }
+       },
+@@ -1040,11 +1065,11 @@
+         "anyValidateFailed.$": "States.ArrayContains($.groupCheck.statuses, 'validate_failed')"
+       },
+       "ResultPath": "$.groupCheck",
+-      "Next": "AllGroupsSucceeded"
++      "Next": "LoadOnlyOrContinue"
+     },
+     "AllGroupsSucceeded": {
+       "Type": "Choice",
+-      "Comment": "override is a FULL BYPASS. A LOAD failure OR a validation failure stops the run at GroupsFailed UNLESS the run was started with override=true, in which case it continues (MarkOverrideActive -> ResumeDmsToCdc -> StartCdcJob) and ends in TaskSucceededWithOverride. There is NO data-error carve-out and NO DSQL-vs-DMS count check: an operator who passes override=true has manually accepted shared responsibility for the data; the bypassed groups/tables and their failure details (including the load failure kind — data_error vs infra — job2_load records in _load_status.json) are recorded as WARNINGS in the override record and the run output. The override comparison is IsPresent-guarded so the path audit passes and an older execution with no $.resolved.override behaves as the default (no override). Without override the behaviour is byte-identical: a load OR validation failure stops at GroupsFailed.",
++      "Comment": "override is a FULL BYPASS. A LOAD failure OR a validation failure stops the run at GroupsFailed UNLESS the run was started with override=true, in which case it continues (MarkOverrideActive -> ResumeDmsToCdc -> StartCdcJob) and ends in TaskSucceededWithOverride. There is NO data-error carve-out and NO DSQL-vs-DMS count check: an operator who passes override=true has manually accepted shared responsibility for the data; the bypassed groups/tables and their failure details (including the load failure kind \u2014 data_error vs infra \u2014 job2_load records in _load_status.json) are recorded as WARNINGS in the override record and the run output. The override comparison is IsPresent-guarded so the path audit passes and an older execution with no $.resolved.override behaves as the default (no override). Without override the behaviour is byte-identical: a load OR validation failure stops at GroupsFailed.",
+       "Choices": [
+         {
+           "And": [
+@@ -1086,7 +1111,7 @@
+     },
+     "MarkOverrideActive": {
+       "Type": "Pass",
+-      "Comment": "A load and/or validation failure occurred but override=true: carry overrideActive=true so the terminal routes to TaskSucceededWithOverride (which writes the override record with the bypassed groups/tables + failure warnings). DMS is resumed and CDC starts as on the normal path. This is a FULL bypass — no data-error carve-out, no count check.",
++      "Comment": "A load and/or validation failure occurred but override=true: carry overrideActive=true so the terminal routes to TaskSucceededWithOverride (which writes the override record with the bypassed groups/tables + failure warnings). DMS is resumed and CDC starts as on the normal path. This is a FULL bypass \u2014 no data-error carve-out, no count check.",
+       "Parameters": {
+         "active": true
+       },
+@@ -1394,6 +1419,7 @@
+           "csv_null_value.$": "$.resolved.csvNullValue",
+           "null_values.$": "$.resolved.nullValues",
+           "null_rules.$": "$.resolved.nullRules",
++          "null_notnull_text.$": "$.resolved.nullNotnullText",
+           "error_message.$": "$.cdcRun.run.ErrorMessage",
+           "failed_run_id.$": "$.cdcStart.JobRunId",
+           "validationExtraPyFiles.$": "$.driverValidation.extraPyFiles",
+@@ -1585,7 +1611,7 @@
+           "CheckForkStarted": {
+             "Type": "Task",
+             "Resource": "arn:aws:states:::aws-sdk:s3:listObjectsV2",
+-            "Comment": "B23: confirm this fork's CDC run reached its poll loop by polling the marker under the fork's OWN config_prefix (<config_prefix_key>_cdc_started/<exec>-ck-<slug>.json) — the SAME prefix the fork CDC script writes it to (its CONFIG_PREFIX is the fork prefix). The old check polled the TASK-level _cdc_started/, which the fork never writes, so every fork fell to ForkCdcStartNotConfirmed after 45 min while the fork CDC job was actually running.",
++            "Comment": "B23: confirm this fork's CDC run reached its poll loop by polling the marker under the fork's OWN config_prefix (<config_prefix_key>_cdc_started/<exec>-ck-<slug>.json) \u2014 the SAME prefix the fork CDC script writes it to (its CONFIG_PREFIX is the fork prefix). The old check polled the TASK-level _cdc_started/, which the fork never writes, so every fork fell to ForkCdcStartNotConfirmed after 45 min while the fork CDC job was actually running.",
+             "Parameters": {
+               "Bucket": "<<BUCKET>>",
+               "Prefix.$": "States.Format('{}_cdc_started/{}-ck-{}.json', $.config_prefix_key, $.execName, $.fork_slug)"
+@@ -1662,7 +1688,7 @@
+           "ForkCdcNotConfirmed": {
+             "Type": "Fail",
+             "Error": "ForkCdcStartNotConfirmed",
+-            "Cause": "A fork's CDC run did not start/confirm within the 45-min budget. The main CDC job is running; investigate this fork CDC job before cutover. Its start marker is written under the fork's OWN prefix (<fork config_prefix>_cdc_started/<exec>-ck-<slug>.json), e.g. .../_orchestrator/ck-<slug>/_cdc_started/, NOT the task-level _cdc_started/. Confirm the fork CDC job run is RUNNING in Glue; if it is, the task is fine (full load is done) and the fleet does NOT need re-triggering — cutover finds the fork jobs by tag."
++            "Cause": "A fork's CDC run did not start/confirm within the 45-min budget. The main CDC job is running; investigate this fork CDC job before cutover. Its start marker is written under the fork's OWN prefix (<fork config_prefix>_cdc_started/<exec>-ck-<slug>.json), e.g. .../_orchestrator/ck-<slug>/_cdc_started/, NOT the task-level _cdc_started/. Confirm the fork CDC job run is RUNNING in Glue; if it is, the task is fine (full load is done) and the fleet does NOT need re-triggering \u2014 cutover finds the fork jobs by tag."
+           }
+         }
+       },
+@@ -1786,6 +1812,130 @@
+       "Type": "Fail",
+       "Error": "CdcStartNotConfirmed",
+       "Cause": "The CDC run is still running but never reported that it reached its poll loop within 45 minutes. Check the CDC job's log (it prints '[startup] entering poll loop.') and that the Glue role can write to config/_task/<task>/_cdc_started/ in the bucket."
++    },
++    "IsLoadOnly": {
++      "Type": "Choice",
++      "Comment": "stopAfterLoad: resolve the run's load-only flag ONCE into a guaranteed $.loadOnly boolean, so every route into GroupFanOut produces it (ASL path audit) and the Map can pass it to each group. The read of $.resolved.stopAfterLoad is IsPresent-guarded: a NEW execution always has it; an OLDER execution (no $.resolved.stopAfterLoad) falls through to MarkNotLoadOnly -> loadOnly=false (byte-identical to today). stopAfterLoad only ever stops EARLIER, never adds work, so defaulting a missing value to false is safe.",
++      "Choices": [
++        {
++          "And": [
++            {
++              "Variable": "$.resolved.stopAfterLoad",
++              "IsPresent": true
++            },
++            {
++              "Variable": "$.resolved.stopAfterLoad",
++              "BooleanEquals": true
++            }
++          ],
++          "Next": "MarkLoadOnly"
++        }
++      ],
++      "Default": "MarkNotLoadOnly"
++    },
++    "MarkLoadOnly": {
++      "Type": "Pass",
++      "Comment": "stopAfterLoad=true: carry loadOnly=true into the group fan-out. Each group will LOAD exactly as today (GroupLoad / GroupLoadBig, same retries + resume) but SKIP the path to GroupValidate.",
++      "Result": true,
++      "ResultPath": "$.loadOnly",
++      "Next": "GroupFanOut"
++    },
++    "MarkNotLoadOnly": {
++      "Type": "Pass",
++      "Comment": "Normal run (stopAfterLoad absent/false): loadOnly=false. Produced on this route too so $.loadOnly is present on every path into GroupFanOut (ASL path audit).",
++      "Result": false,
++      "ResultPath": "$.loadOnly",
++      "Next": "GroupFanOut"
++    },
++    "LoadOnlyOrContinue": {
++      "Type": "Choice",
++      "Comment": "stopAfterLoad: when load-only, STOP AFTER THE LOAD instead of continuing to the override/validation/CDC logic. All groups loaded OK -> TaskLoadOnlySucceeded (DMS left STOPPED_AFTER_CACHED_EVENTS, no validation/CDC/resume). ANY load failed -> GroupsFailed as today; override does NOT rescue a failed load when stopAfterLoad is set (load-only never consults $.resolved.override). $.loadOnly produced on every route (MarkLoadOnly / MarkNotLoadOnly) and IsPresent-guarded so an older execution falls through to AllGroupsSucceeded. No group can be validate_failed on a load-only run (the validate job is never started).",
++      "Choices": [
++        {
++          "And": [
++            {
++              "Variable": "$.loadOnly",
++              "IsPresent": true
++            },
++            {
++              "Variable": "$.loadOnly",
++              "BooleanEquals": true
++            },
++            {
++              "Variable": "$.groupCheck.anyLoadFailed",
++              "BooleanEquals": true
++            }
++          ],
++          "Next": "GroupsFailed"
++        },
++        {
++          "And": [
++            {
++              "Variable": "$.loadOnly",
++              "IsPresent": true
++            },
++            {
++              "Variable": "$.loadOnly",
++              "BooleanEquals": true
++            }
++          ],
++          "Next": "RecordLoadOnly"
++        }
++      ],
++      "Default": "AllGroupsSucceeded"
++    },
++    "RecordLoadOnly": {
++      "Type": "Task",
++      "Resource": "arn:aws:states:::lambda:invoke",
++      "Comment": "stopAfterLoad: write the operator-visibility marker config/_task/<suffix>/_load_only.json (reuses resolve_task, mode write_load_only_record). Best-effort: a write failure is caught (RecordLoadOnlyFailedButLoaded) and the run STILL ends in TaskLoadOnlySucceeded, because the load itself succeeded.",
++      "Parameters": {
++        "FunctionName": "<<RESOLVE_TASK_LAMBDA_ARN>>",
++        "Payload": {
++          "mode": "write_load_only_record",
++          "bucket": "<<BUCKET>>",
++          "taskSuffix.$": "$.resolved.taskSuffix",
++          "execution.$": "$$.Execution.Id",
++          "executionName.$": "$$.Execution.Name"
++        }
++      },
++      "ResultSelector": {
++        "markerKey.$": "$.Payload.markerKey",
++        "when.$": "$.Payload.when",
++        "who.$": "$.Payload.who"
++      },
++      "ResultPath": "$.loadOnlyRecord",
++      "Retry": [
++        {
++          "ErrorEquals": [
++            "Lambda.ServiceException",
++            "Lambda.AWSLambdaException",
++            "Lambda.SdkClientException",
++            "Lambda.TooManyRequestsException"
++          ],
++          "IntervalSeconds": 5,
++          "MaxAttempts": 5,
++          "BackoffRate": 2.0
++        }
++      ],
++      "Catch": [
++        {
++          "ErrorEquals": [
++            "States.ALL"
++          ],
++          "Next": "RecordLoadOnlyFailedButLoaded",
++          "ResultPath": "$.loadOnlyRecordError"
++        }
++      ],
++      "Next": "TaskLoadOnlySucceeded"
++    },
++    "RecordLoadOnlyFailedButLoaded": {
++      "Type": "Pass",
++      "Comment": "Writing the _load_only.json marker failed, but every group LOADED OK, so the load-only run still succeeds (marker is operator-visibility only; error kept in $.loadOnlyRecordError). Validation and CDC were still NOT run and DMS was NOT resumed.",
++      "Next": "TaskLoadOnlySucceeded"
++    },
++    "TaskLoadOnlySucceeded": {
++      "Type": "Succeed",
++      "Comment": "stopAfterLoad=true and every group loaded OK. The full load finished and all groups loaded into DSQL, but VALIDATION and CDC were NOT run and DMS was NOT resumed (left STOPPED_AFTER_CACHED_EVENTS). To continue, start the NORMAL startup for this task WITHOUT stopAfterLoad: it is accepted (the task is at STOPPED_AFTER_CACHED_EVENTS, not 'past full load'), skips already-loaded tables, runs validation, resumes DMS and starts CDC. A marker config/_task/<suffix>/_load_only.json is also written (RecordLoadOnly)."
+     }
+   }
+ }
