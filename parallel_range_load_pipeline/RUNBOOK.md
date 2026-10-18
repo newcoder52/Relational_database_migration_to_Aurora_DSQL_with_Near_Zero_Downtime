@@ -467,3 +467,87 @@ does, exactly as the original route would). MRL **never** deletes any key outsid
    and completes the handover (MRL wrote the full-load handoff at every fork prefix first, so each
    fork actually applied its changes).
 3. **Removing MRL** — see the §3a rollback list; the original pipeline is untouched.
+
+---
+
+## 14. DSQL transient errors in the parallel range load (AMENDMENT 2)
+
+Running the parallel range load against Aurora DSQL, you WILL occasionally hit a network blip, a
+"server unavailable" (XX000), or a concurrency conflict (40001/OC000/OC001) — especially with many
+writers. The pipeline absorbs these at two layers so a blip does not fail a 100M-row table.
+
+### What is retried IN-PROCESS (inside the Glue load job, per chunk)
+
+Every chunk is one DSQL transaction. The attempt counters **reset after every successful chunk
+commit** (they are per-chunk, not per-file or per-run), so a long load with the occasional blip
+never exhausts a budget. Per chunk:
+
+| Failure class | Detect | Retries | Backoff | On exhaustion |
+|---|---|---|---|---|
+| Network / broken pipe / class-08 / SSL EOF / reset | `is_broken_pipe_error` | **10** | exponential **full-jitter**, base 1 s, cap 60 s (≈5 min total) + reconnect with a **fresh IAM token** each time | loud failure, range re-runnable |
+| DSQL "server unavailable" (XX000) | `is_transient_server_error` | **10** | exponential full-jitter, base 0.5 s, cap 60 s | loud failure, range re-runnable |
+| Concurrency conflict (40001 / OC000 / OC001) | `is_occ_conflict` | **8** | exponential full-jitter, 50 ms → 5 s cap | loud failure, range re-runnable |
+| Initial DSQL connect | `connect_dsql` | **8** | exponential full-jitter, fresh token each time | the writer's guard surfaces it |
+
+**Ambiguous commit (the connection drops AT COMMIT):** DSQL may or may not have committed. The loader
+simply re-inserts; because the target has a PRIMARY KEY, if the prior commit had landed the re-insert
+hits a unique violation (23505) on a RETRY and is treated as **already committed** (counted, not
+duplicated); if it had not landed, the re-insert succeeds (no loss). A 23505 on the **first** attempt
+(no prior retry) is NOT swallowed — it means a genuine **duplicate PK in the source**, and the job
+**fails loud** rather than skip rows. This is proven offline for every injected failure class by
+`tests/test_dsql_fault_injection.py` (including a 2,000-run randomized soak).
+
+All reconnect backoffs use **full jitter** so a wide fan-out (e.g. 288 writers) never retries in
+lockstep.
+
+### What is retried BY STEP FUNCTIONS (the whole range re-run)
+
+If the Glue run for a range still FAILS after the in-process retries (e.g. a DSQL outage longer than
+~5 min), the state machine automatically **re-runs the same range** up to **3 times** (waiting
+2 / 4 / 8 min, `States.TaskFailed` Retry on `RunRange`). Re-running the same range is a safe
+**resume**: the loader checkpoints per file and per chunk, the commit-probe skips already-committed
+chunks, done files are skipped, and the overlap-guard treats an identical range as a resume (not a
+conflict). This is IN ADDITION to the existing `Glue.ConcurrentRunsExceeded` / `Glue.Throttling` /
+`States.ServiceException` / `States.Timeout` retries, which keep their own separate attempt counts.
+The read-only `CountVerify` and `SafetyProbe` Glue runs also get a bounded 2× `States.TaskFailed`
+re-run (safe — they only read).
+
+### What is NOT retried (deterministic errors)
+
+A **deterministic** failure re-fails at the same file after a quick resume, so the 3 automatic
+re-runs are wasted effort but bounded (done files are skipped each time). These are NOT transient:
+NOT NULL violation, type-cast failure, the no-single-PK resume refusal, the overlap guard, and bad
+arguments. After the re-runs are exhausted, the execution ends at **`MrlLoadFailed`** and the result
+surfaces the **ORIGINAL** error text (not just "retries exhausted"), so you can see the real cause.
+Worst-case wasted time on a deterministic failure ≈ the 3 backoff waits (2 + 4 + 8 = **14 min**) plus
+a quick resume per attempt — bounded and small relative to a multi-hour load.
+
+### Reading the per-range retry summary
+
+Each range's result document (`_range_result/<label>.range-<first>-<last>.json`) carries a
+`retry_summary`: counts of `network_retries`, `server_unavailable_retries`, `occ_retries`,
+`reconnects`, `ambiguous_commit_recoveries`, and the `longest_backoff_s`. The Glue log also prints a
+one-line `ⓘ retry summary …` at the end of each worker, so you can see how rough the ride was. All
+zeros = a clean load.
+
+### Resuming manually if the automatic retries are exhausted
+
+Re-run the **same execution input** (§8 "Re-run / resume after a failure"). It resumes: done files
+are skipped, incomplete ranges reload, the commit-probe prevents duplicates, and the final count
+verifies the whole table. There is nothing to clean up first.
+
+### Killing a range — behaviour change
+
+Because a failed Glue run is now auto-retried, **killing a single range's Glue run no longer stops
+that range** — the state machine just re-runs it (up to 3×). To genuinely stop a table, **stop the
+Step Functions EXECUTION** (not the individual Glue run). An operator kill that recurs past the 3
+re-runs ends the execution at `MrlLoadFailed`.
+
+### Sizing advice (start small, step down on throttling)
+
+DSQL documents a **per-cluster connection limit of 10,000**; preflight now FAILS CLOSED if the
+planned writers (`max_concurrency × max_files_in_parallel × writers_per_file`) exceed it (pass
+`override=true` to proceed anyway, accepting the throttling risk). The soft `conn_budget` still only
+warns. **Start conservative: `max_files_in_parallel=10` and `writers_per_file=8`** per run, and step
+DOWN if you see repeated `server unavailable` / connection throttling in the retry summaries. A tight
+`conn_budget` warning is your cue to lower concurrency before the cluster throttles you.

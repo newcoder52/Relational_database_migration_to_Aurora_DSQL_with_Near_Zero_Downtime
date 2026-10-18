@@ -266,11 +266,25 @@ Per the delivered RESULT.md G.4X math and `resolve_task`/`plan_split` defaults:
 - **Map MaxConcurrency** = `max_total_concurrent_runs` (bounded so sibling ranges don't all
   start at once and trip `Glue.ConcurrentRunsExceededException`). Each item has a Retry for
   `Glue.ConcurrentRunsExceededException`/throttling and a Catch that records the failed range.
+  **Amendment 2 (R2a):** `RunRange` ALSO carries a `States.TaskFailed` Retry (MaxAttempts 3,
+  2/4/8 min, BackoffRate 2.0) AFTER the Glue-class entry, so a range whose Glue run FAILED (e.g.
+  the loader exhausted its in-process DSQL retries during a multi-minute outage) is **re-run
+  automatically** — a safe RESUME (per-file/per-chunk checkpoints + commit-probe + overlap-guard
+  treats an identical range as a resume). Step Functions keeps a SEPARATE attempt counter per
+  Retry entry, so this never swallows the ConcurrentRuns/Throttling cases. A deterministic error
+  (NOT NULL, cast, no-PK refusal, overlap guard, bad args) re-fails fast (done files skipped) and
+  after exhaustion `MrlLoadFailed` surfaces the ORIGINAL cause. Read-only `CountVerify` /
+  `SafetyProbe` get a bounded 2× `States.TaskFailed` re-run. In-process (loader) DSQL resilience
+  — network/server-unavailable/OCC exponential full-jitter retries with per-chunk counters and
+  ambiguous-commit (PK 23505-on-retry = already committed) safety — is described in RUNBOOK §14.
 - **DSQL connection budget**: `runs × max_files_in_parallel × writers_per_file` ≤ `conn_budget`
   (default 900), subnet IPs (≈1/worker+driver), Glue DPU quota (4000 in the customer env), and
   the G.4X driver memory limit (~1500 MB per concurrent file worker). The preflight prints the
-  arithmetic and emits a **WARNING** (fails only on a provably impossible setting, e.g.
-  `max_files_in_parallel × writers_per_file` alone already impossible within one run's budget).
+  arithmetic and emits a **WARNING** on a tight `conn_budget` (fails only on a provably
+  impossible single-run setting). **Amendment 2 (R3):** independently, the planned total writers
+  exceeding the documented DSQL **per-cluster connection limit of 10,000** now **FAILS CLOSED**
+  (override=true downgrades to a loud warning). Sizing advice: start at
+  `max_files_in_parallel=10`, `writers_per_file=8` and step down on throttling (RUNBOOK §14).
 - **History event budget**: DMS poll at 60 s with a `dms_max_wait_hours` budget (default 24 →
   1440 polls). Each poll adds a bounded, small number of history events; a test computes the
   worst-case total stays far below 25,000. Payloads stay < 256 KiB: plans and file lists live in
