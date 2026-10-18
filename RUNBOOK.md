@@ -1482,3 +1482,118 @@ see [`docs/MANUAL_SETUP.md`](docs/MANUAL_SETUP.md) to fill them by hand.
 
 More: [`USAGE_GUIDE.md`](USAGE_GUIDE.md) (monitoring, manual runs) and
 [`ENGINEERING_RECORD.md`](ENGINEERING_RECORD.md) (architecture, limitations, DDL matrix).
+
+
+---
+
+## 13. Full-load-only (stopAfterLoad)
+
+`stopAfterLoad` runs a task through the **full load only** and then stops — no validation Glue job,
+no DMS resume, no CDC. It is the control flag behind the full-load-only workflow (§15).
+
+**Where to set it.** On the fleet or task start input, as a JSON **boolean** `true`/`false` OR the
+**string** `"true"`/`"false"` (both accepted; any other value — `"yes"`, `1`, `"on"`, `""` — is
+REJECTED at resolve, before any DMS call). It is read once at `startup.ResolveTask` into
+`$.resolved.stopAfterLoad` and carried per group as `$.loadOnly`.
+
+- Fleet: `{"bucket": "<bucket>", "stopAfterLoad": true}` (applies to every task in the wave).
+- Single task start input: `{"stopAfterLoad": true, ...}`.
+
+**What happens when `true`:**
+1. DMS starts and runs the full load exactly as normal; startup waits for
+   `STOPPED_AFTER_CACHED_EVENTS`.
+2. Each group LOADs exactly as today (same retries + resume), then goes **straight to GroupOk** —
+   the validation Glue job is **never started**.
+3. The task ends in the terminal state **`TaskLoadOnlySucceeded`** and writes an operator-visibility
+   marker **`config/_task/<suffix>/_load_only.json`**.
+4. **No DMS resume, no CDC.** DMS is left stopped at `STOPPED_AFTER_CACHED_EVENTS` (full load at
+   100%).
+
+**What happens when `false` / absent:** byte-identical to today — load → validate → resume DMS →
+CDC. (`false` and absent produce the same resolved value; the read is `IsPresent`-guarded so an
+older in-flight execution is unaffected.)
+
+**What it is NOT — important.** `stopAfterLoad` is **not a cutover path**. A task left in
+`TaskLoadOnlySucceeded` **never had CDC**: no changes made on the source after the full load are in
+the target, and DMS is not applying any. Do **not** treat a stopped-after-load task as "cut over."
+
+> **⚠️ Danger (finding F10):** the ORIGINAL cutover state machine does **NOT** today refuse or warn
+> on a task that never had CDC. If you point `cutover` (or `fleet-cutover`) at a task left in
+> `TaskLoadOnlySucceeded`, it sees the DMS task already `stopped`
+> (`STOPPED_AFTER_CACHED_EVENTS` reports as status `stopped`) and **proceeds** through the cutover
+> sequence as if CDC had run and caught up — skipping the intended resume + CDC catch-up. Nothing in
+> `cutover.asl.json` / `fleet-cutover.asl.json` reads the `_load_only.json` marker. **Only run
+> cutover on a task that actually went through validate → resume → CDC.** (The refusal is not
+> implemented; the owner has not decided whether cutover should refuse or only warn — see RESULT.md
+> finding F10-now.)
+
+**To continue a stopped-after-load task later (the documented recovery):** re-run the **normal
+startup WITHOUT `stopAfterLoad`**. It skips already-loaded tables, validates, resumes DMS, and
+starts CDC — i.e. it rejoins the normal flow. Do not run cutover first.
+
+**Safe deployment order (same as any Lambda+ASL change):** deploy the **Lambdas first**, then the
+**state machine**. **Roll back in the opposite order** (state machine first, then Lambdas), so the
+running state machine never references a Lambda contract that is not deployed yet.
+
+## 14. Post-load count-only check
+
+`post_load_check=count_only` makes the post-load verification a **`COUNT(*)` comparison** (target
+rows vs the DMS `FullLoadRows` / discovery `full_load_rows`) instead of the per-range aggregate
+validation. Use it for very large tables where a full per-range validation is too slow but you still
+want a row-count gate.
+
+**How to enable (opt-in, per deployment).** It is delivered as a Glue job **`default_argument`** on
+the load job template (`--post_load_check count_only`), NOT emitted by `create_glue_jobs` or the ASL.
+Set it in the load template `default_arguments` **before** running `create_glue_jobs`.
+
+> **⚠️ `create_glue_jobs` `UpdateJob` REPLACES `DefaultArguments`.** A `--post_load_check` you add by
+> editing the Glue job in the console is **lost** the next time startup runs `create_glue_jobs`
+> (UpdateJob overwrites the whole `DefaultArguments` map). Put it in the **template**, not the
+> console, so it survives re-runs.
+
+**Verdict / failure disposition** (see §15 and RESULT.md "AMENDMENT 1" for the count-at-scale
+analysis): a **mismatch always fails**; a count that could not complete is `unverifiable` and
+**fails closed** when `count_timeout_action=fail` (the default); a loaded table with no comparison
+basis is `no_basis` and **fails closed** when `count_no_basis_action=fail` (the default).
+
+## 15. Full-load-only workflow end to end
+
+Full-load-only = **load the data, verify it, stop.** No CDC, no cutover. There are two pipelines; use
+the one that matches the table.
+
+### When to use which pipeline
+
+| Table shape | Pipeline | How to run full-load-only |
+|---|---|---|
+| Normal / small-to-medium tables | **Original** pipeline (`startup` / `fleet-startup`) | `stopAfterLoad=true` (§13) |
+| Very large tables (**100M+ rows**, 400+ hex-named LOAD files) with a single integer/uuid PK | **Parallel range** pipeline (`parallel_range_load_pipeline/`) | `cdc=false` (the parallel pipeline is load+count; it never starts CDC) |
+
+Both do a **full load only** and **neither starts CDC**. `null_notnull_text=keep_text` is available
+in both (keep literal `NULL`/`NA`/… text in NOT NULL text columns; see **README → Limitations** and
+`parallel_range_load_pipeline/README.md §5b`).
+
+### What each leaves behind (end states / markers)
+
+- **Original + `stopAfterLoad=true`:** terminal state `TaskLoadOnlySucceeded`; marker
+  `config/_task/<suffix>/_load_only.json`; DMS left stopped at `STOPPED_AFTER_CACHED_EVENTS`; **no**
+  validation, **no** CDC, **no** resume.
+- **Parallel range (`cdc=false`):** each table is range-loaded in parallel and then **count-checked**
+  by the count Glue job (`job_mrl_count.py`, `COUNT(*)` vs DMS/discovery rows, with per-key-range
+  splitting for 100M+ rows); it never resumes DMS and never starts CDC.
+
+### How to verify counts afterwards
+
+- **Parallel range:** the count job writes `count_result.json` under the MRL result prefix with a
+  per-table `status` (`match` / `mismatch` / `unverifiable` / `no_expected`) and an overall
+  `verdict`. A `mismatch` (or, by default, an `unverifiable` / `no_basis`) **fails the job**.
+- **Original + `stopAfterLoad`:** validation is skipped by design. To get a row-count gate, either
+  re-run normal startup (which validates) later, or use the parallel pipeline's count job / a manual
+  `SELECT count(*)` per table against the DMS `FullLoadRows`.
+
+### Neither starts CDC — and cutover is dangerous on these tasks
+
+Neither full-load-only path starts CDC, so **source changes made after the full load are NOT in the
+target.** As in §13, the ORIGINAL cutover state machine does **not** refuse or warn on a task that
+never had CDC — it would **proceed**. Do not run `cutover` / `fleet-cutover` on a stopped-after-load
+or `cdc=false` task. To move such a task into a real cutover, first bring it through the normal
+validate → resume → CDC flow (re-run startup without `stopAfterLoad`).

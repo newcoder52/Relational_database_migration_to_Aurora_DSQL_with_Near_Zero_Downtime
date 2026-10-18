@@ -18,15 +18,22 @@ run together on real AWS.
 Migrates data from a source database (Oracle in test) to Aurora DSQL, using **DMS → S3
 (CSV) → AWS Glue → DSQL**. DMS never writes to DSQL directly; it lands CSVs in S3 and Glue
 jobs load them into DSQL. One **Step Functions state machine per DMS task** orchestrates the
-flow. Supports **full load** (bulk) + **CDC** (ongoing change capture) + **cutover**.
+flow. Supports **full load** (bulk) + **CDC** (ongoing change capture) + **cutover**, plus an
+optional **full-load-only** branch (`stopAfterLoad=true`): load → stop, skipping validate / resume /
+CDC (terminal `TaskLoadOnlySucceeded`, marker `config/_task/<suffix>/_load_only.json`).
 
 ```
 Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──▶ Aurora DSQL
                                        │                        ▲
               full load: LOAD*.csv ────┤   Job1 discovery       │
               CDC:  <ts>.csv (Op col) ─┘   Job2 load ───────────┤
-                                           Job3 validate ───────┤
-                                           CDC job (continuous) ─┘
+                                           Job3 validate ───────┤   (SKIPPED when stopAfterLoad)
+                                           CDC job (continuous) ─┘   (SKIPPED when stopAfterLoad)
+
+  stopAfterLoad=true:  full load ─▶ (skip validate) ─▶ TaskLoadOnlySucceeded
+                       DMS left STOPPED_AFTER_CACHED_EVENTS — no resume, no CDC, NOT a cutover.
+  Large (100M+) tables: the parallel_range_load_pipeline/ loads by key range (cdc=false) and
+                       verifies by COUNT(*); it also never starts CDC.
 ```
 
 ### Components
@@ -39,9 +46,10 @@ Source DB ──DMS(full-load-and-cdc)──▶ S3 (CSV)  ──AWS Glue──�
   `prepare_cdc_wheels` (not a
   deployed function — it ships inside the `driver-discovery` zip and is run automatically by the
   startup workflow).
-- **State machines** (`stepfunctions/`): `startup.asl.json` (full-load→validate→CDC),
-  `cutover.asl.json` (drain + finalize), shared by every DMS task (started with `{"taskArn"}`);
-  optional `fleet-startup` / `fleet-cutover` launchers start them for a list of tasks.
+- **State machines** (`stepfunctions/`): `startup.asl.json` (full-load→validate→CDC, or
+  full-load→stop when `stopAfterLoad=true`), `cutover.asl.json` (drain + finalize), shared by every
+  DMS task (started with `{"taskArn"}`); optional `fleet-startup` / `fleet-cutover` launchers start
+  them for a list of tasks.
 - **Control tables** in DSQL schema `cdc_control`: `cdc_status`, `cdc_file_status`,
   `cdc_chunk_log`, `cdc_apply_exceptions`, `cdc_skipped_ops`, `cdc_validation_failures`.
 
