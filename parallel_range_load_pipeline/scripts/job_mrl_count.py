@@ -73,12 +73,27 @@ DSQL_CANDIDATE_CONNECT_TIMEOUT = 10
 # count-only algorithm knobs (copied values from the delivered count patch)
 COUNT_RETRIES = 3
 COUNT_RETRY_WAIT = 20
-COUNT_SPLIT_ROWS = 100_000_000
-COUNT_RANGE_ROWS = 20_000_000
+# AMENDMENT 3 (R7b): use RANGED counting whenever a usable single-column integer/identity/uuid
+# key exists and the table is >= COUNT_SPLIT_ROWS. Lowered from 100,000,000 to 2,000,000 so the
+# 10M/20M tables that FAILED in the live run (whole-table COUNT(*) that read-timed-out) are
+# range-counted instead. Sub-ranges target ~4M rows (2-5M band), each a short query well under
+# DSQL's 300 s txn limit.
+COUNT_SPLIT_ROWS = 2_000_000
+COUNT_RANGE_ROWS = 4_000_000
 COUNT_RANGE_THREADS = 4
 COUNT_MAX_HALVINGS = 40
 COUNT_UNKNOWN_TOTAL_ROWS = 600_000_000
 COUNT_TABLE_BUDGET_SECONDS = 900
+# AMENDMENT 3 (R7a) — the B14 fix the count job was missing (present in job3_validate.py only).
+# pg8000's connect `timeout=` is ALSO the socket READ timeout for EVERY query on the connection.
+# Left at the 10 s connect-probe value, a COUNT(*) on a 10M+ row table raises a CLIENT-side
+# "The read operation timed out" after 10 s — BEFORE the server can enforce statement_timeout or
+# DSQL's 300 s cap — which the live run hit (count_result.json reason "CountSplit: The read
+# operation timed out"). Fix: bound each statement server-side with SET statement_timeout, and
+# raise the client socket read timeout ABOVE it (+ cushion) so the server's deterministic 57014
+# fires first (and is treated as a re-split trigger); keep it finite so a truly hung socket errors.
+COUNT_STATEMENT_TIMEOUT_MS = 240000                                  # 240 s server-side cap
+COUNT_SOCKET_READ_TIMEOUT = int(COUNT_STATEMENT_TIMEOUT_MS / 1000) + 60   # 300 s client read
 
 
 def make_boto_client(service):
@@ -129,6 +144,25 @@ def connect_dsql(autocommit=True):
                               password=token, ssl_context=ctx,
                               timeout=DSQL_CANDIDATE_CONNECT_TIMEOUT)
         conn.autocommit = autocommit
+        # AMENDMENT 3 (R7a) B14: pg8000's connect timeout is the socket READ timeout for EVERY
+        # query too. Raise it ABOVE the server statement_timeout (+ cushion) so a long COUNT(*)
+        # is ended by the server's deterministic 57014 (a re-split trigger), not a client read
+        # timeout at 10 s. Best-effort (internals differ across pg8000 versions); keep finite.
+        try:
+            _usock = getattr(getattr(conn, "_c", None), "_usock", None) \
+                or getattr(conn, "_usock", None)
+            if _usock is not None:
+                _usock.settimeout(float(COUNT_SOCKET_READ_TIMEOUT))
+        except Exception:
+            pass
+        # Bound every statement under DSQL's 300 s txn-age limit so a too-big count fails fast
+        # and deterministically (then range-splits) instead of running ~300 s and raising 54000.
+        try:
+            _c = conn.cursor()
+            _c.execute("SET statement_timeout = %d" % int(COUNT_STATEMENT_TIMEOUT_MS))
+            _c.close()
+        except Exception:
+            pass
         return conn
 
     if _PINNED_HOST["host"]:
@@ -323,8 +357,9 @@ def _plan(gmin, gmax, total, per):
 
 def _leaf(schema, table, col, kind, lo, hi, elo, ehi, depth, leaves, ctx):
     try:
+        _t0 = time.time()
         n = _run(schema, table, _pred(col, kind, lo, hi), ctx)
-        leaves.append((elo, ehi, lo, hi, n))
+        leaves.append((elo, ehi, lo, hi, n, round(time.time() - _t0, 2)))   # +duration (R7-4)
         return
     except CountSplit as e:
         too_big = e
@@ -345,7 +380,8 @@ def _verify(leaves, gmin, gmax):
         raise CountRangeError("first range not open at bottom / not at min key")
     if ls[-1][1] != gmax + 1 or ls[-1][3] is not None:
         raise CountRangeError("last range not open at top / not past max key")
-    for i, (elo, ehi, lo, hi, _n) in enumerate(ls):
+    for i, leaf in enumerate(ls):
+        elo, ehi = leaf[0], leaf[1]
         if not (elo < ehi):
             raise CountRangeError("empty/inverted range")
         if i > 0 and ls[i - 1][1] != elo:
@@ -358,7 +394,8 @@ def _ranged(schema, table, col, kind, expected, ctx, after_timeout=False):
     nulls = _run(schema, table, "%s IS NULL" % _q(col), ctx) \
         if _nullable(schema, table, col) else 0
     if lo_raw is None or hi_raw is None:
-        return nulls
+        return nulls, {"method": "ranged", "sub_ranges": 0, "null_rows": nulls,
+                       "note": "no non-null key values; counted NULLs only"}
     gmin, gmax = _to_int(kind, lo_raw), _to_int(kind, hi_raw)
     if gmax < gmin:
         raise CountRangeError("max key below min key")
@@ -389,7 +426,17 @@ def _ranged(schema, table, col, kind, expected, ctx, after_timeout=False):
         raise (real or errs)[0]
     leaves = [x for part in per_range for x in part]
     _verify(leaves, gmin, gmax)
-    return sum(x[4] for x in leaves) + nulls
+    grand = sum(x[4] for x in leaves) + nulls
+    # R7-4: per-sub-range counts + durations (sorted by key), plus the halved-count (leaves may
+    # exceed the planned sub-ranges when a slow one was halved).
+    sub = sorted(({"count": x[4], "seconds": x[5]} for x in leaves),
+                 key=lambda d: -d["seconds"])
+    detail = {"method": "ranged", "key_kind": kind, "planned_sub_ranges": len(rngs),
+              "counted_leaves": len(leaves), "null_rows": nulls,
+              "longest_sub_range_seconds": max((x[5] for x in leaves), default=0.0),
+              "sub_range_counts": [x[4] for x in leaves],
+              "sub_range_seconds": [x[5] for x in leaves]}
+    return grand, detail
 
 
 def _single_pk(entry):
@@ -424,30 +471,39 @@ def _count_one(entry, dms):
     ck, kk = _single_pk(entry)
     can_range = bool(ck) and kk in ("integer", "uuid")
     ctx = {"abort": threading.Event(), "deadline": time.time() + COUNT_TABLE_BUDGET_SECONDS}
-    tgt, err = None, None
+    tgt, err, detail = None, None, {"method": None}
     try:
         if can_range and expected is not None and expected >= COUNT_SPLIT_ROWS:
-            tgt = _ranged(dsql_schema, dsql_table, ck, kk, expected, ctx)
+            # R7b: ranged counting for any table >= 2M rows with a usable single-column key.
+            tgt, detail = _ranged(dsql_schema, dsql_table, ck, kk, expected, ctx)
         else:
             try:
+                _t0 = time.time()
                 tgt = _run(dsql_schema, dsql_table, None, ctx)
+                detail = {"method": "whole_table", "seconds": round(time.time() - _t0, 2)}
             except CountSplit:
                 if not can_range:
                     raise
-                tgt = _ranged(dsql_schema, dsql_table, ck, kk, expected, ctx, after_timeout=True)
+                # a small table whose whole-table COUNT(*) still timed out -> range it
+                tgt, detail = _ranged(dsql_schema, dsql_table, ck, kk, expected, ctx,
+                                      after_timeout=True)
+                detail["method"] = "ranged_after_whole_timeout"
     except Exception as e:
         err = e
 
     if err is not None:
         return {"table": label, "status": "unverifiable", "expected": expected,
-                "target": None, "basis": basis, "reason": "%s: %s" % (type(err).__name__,
-                                                                      str(err)[:200])}
+                "target": None, "basis": basis, "method": detail.get("method"),
+                "can_range": can_range, "key_kind": kk,
+                "reason": "%s: %s" % (type(err).__name__, str(err)[:200])}
     if expected is None:
         return {"table": label, "status": "no_expected", "expected": None, "target": tgt,
-                "basis": None, "reason": "no DMS/discovery row count to compare against"}
+                "basis": None, "method": detail.get("method"), "detail": detail,
+                "reason": "no DMS/discovery row count to compare against"}
     ok = abs(int(tgt) - int(expected)) <= COUNT_TOLERANCE
     return {"table": label, "status": "match" if ok else "mismatch", "expected": int(expected),
-            "target": int(tgt), "basis": basis}
+            "target": int(tgt), "basis": basis, "method": detail.get("method"),
+            "detail": detail}
 
 
 def _probe_one(entry):
@@ -552,8 +608,26 @@ def main():
            "count_no_basis_action": COUNT_NO_BASIS_ACTION, "tables": results, "verdict": verdict}
     _write_result("count_result.json", doc)
     for r in results:
-        print("    count [%s]: %s expected=%s target=%s (%s)"
-              % (r["table"], r["status"], r.get("expected"), r.get("target"), r.get("basis")))
+        _d = r.get("detail") or {}
+        _m = r.get("method") or "?"
+        _extra = ""
+        if _m.startswith("ranged"):
+            _extra = (" via %d sub-range(s), longest %.1fs"
+                      % (_d.get("counted_leaves", _d.get("planned_sub_ranges", 0)),
+                         _d.get("longest_sub_range_seconds", 0.0)))
+        elif _m == "whole_table":
+            _extra = " whole-table %.1fs" % _d.get("seconds", 0.0)
+        print("    count [%s]: %s expected=%s target=%s (%s; method=%s%s)"
+              % (r["table"], r["status"], r.get("expected"), r.get("target"), r.get("basis"),
+                 _m, _extra))
+    # R7-4: one-line summary of how the count went, for the operator.
+    _by_method = {}
+    for r in results:
+        _by_method[r.get("method") or "?"] = _by_method.get(r.get("method") or "?", 0) + 1
+    print("(info) mrl_count summary: verdict=%s; %d table(s); methods=%s; mismatches=%d "
+          "unverifiable=%d no_basis=%d"
+          % (verdict, len(results), _by_method, len(mismatches), len(unverifiable),
+             len(no_expected)))
     if mismatches:
         raise SystemExit("mrl_count: COUNT MISMATCH for %d table(s): %s. Never marking success "
                          "on a mismatch." %
