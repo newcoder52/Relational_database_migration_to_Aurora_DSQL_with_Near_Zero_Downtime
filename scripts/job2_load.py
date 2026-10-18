@@ -970,6 +970,18 @@ POST_LOAD_CHECK = "full"                  # "full" (default) | "count_only"
 POST_LOAD_COUNT_BUDGET_SECONDS = 600      # hard wall-clock budget for the whole count step
 POST_LOAD_COUNT_RETRIES = 3               # retries of a non-mismatch failure, within budget
 POST_LOAD_COUNT_RETRY_WAIT = 20           # seconds between those retries
+# AMENDMENT 3 (R8) — the B14 fix, applied ONLY to the post_load_check=count_only COUNT connection
+# (NOT the INSERT-chunk connection). pg8000's connect timeout is the socket READ timeout for every
+# query; without resetting it a large whole-table COUNT(*) raises a client read timeout (or runs to
+# DSQL's 300s 54000) and, because count_only treats any count error as a WARNING, the load silently
+# completes UNVERIFIED at production scale. Fix: bound each count statement server-side with
+# SET statement_timeout and raise the client socket read timeout above it so the server's
+# deterministic 57014 fires first (then a too-big whole-table count is range-split). R8 also counts
+# in KEY RANGES when a single integer/uuid PK exists and the table is large.
+POST_LOAD_COUNT_STATEMENT_TIMEOUT_MS = 240000                               # 240 s server cap
+POST_LOAD_COUNT_SOCKET_READ_TIMEOUT = int(POST_LOAD_COUNT_STATEMENT_TIMEOUT_MS / 1000) + 60  # 300s
+POST_LOAD_COUNT_RANGE_THRESHOLD_ROWS = 2_000_000    # range-count at/above this with a usable key
+POST_LOAD_COUNT_RANGE_ROWS = 4_000_000              # ~rows per sub-range (2-5M band)
 
 
 def _apply_post_load_check_override():
@@ -1032,21 +1044,123 @@ def _post_count_is_infra_error(exc):
     return type(exc).__name__
 
 
-def _post_count_one(dsql_schema, dsql_table):
-    """Run exactly ONE `SELECT COUNT(*) FROM schema.table` on a FRESH autocommit connection and
-    return the integer. The caller owns retries/budget; this opens, counts, and always closes."""
+def _post_count_connect():
+    """AMENDMENT 3 (R8): open a count connection via the normal connect_dsql(), then apply the
+    B14 fix — raise the socket READ timeout above the server statement_timeout and SET
+    statement_timeout — so a long COUNT(*) is ended deterministically by the server's 57014 (a
+    re-split trigger) instead of a client read timeout or DSQL's 300s cap. Used ONLY by the
+    count-only post-load check; the INSERT path's connect_dsql() is unchanged."""
     conn = connect_dsql()
+    conn.autocommit = True
     try:
-        conn.autocommit = True
+        _usock = getattr(getattr(conn, "_c", None), "_usock", None) \
+            or getattr(conn, "_usock", None)
+        if _usock is not None:
+            _usock.settimeout(float(POST_LOAD_COUNT_SOCKET_READ_TIMEOUT))
+    except Exception:
+        pass
+    try:
+        _c = conn.cursor()
+        _c.execute("SET statement_timeout = %d" % int(POST_LOAD_COUNT_STATEMENT_TIMEOUT_MS))
+        _c.close()
+    except Exception:
+        pass
+    return conn
+
+
+def _post_count_scalar(conn, sql):
+    cur = conn.cursor()
+    try:
+        cur.execute(sql)
+        return int(cur.fetchone()[0])
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def _post_count_ranged(dsql_schema, dsql_table, config, expected_total):
+    """AMENDMENT 3 (R8): count a large table in KEY RANGES when a single integer/uuid PK exists,
+    so no single COUNT(*) approaches DSQL's 300s limit. Reuses the loader's own plan_ranges /
+    plan_ranges_hex (the same range engine the load path uses). Returns the summed count, or
+    None to signal 'cannot range -> caller does whole-table'. Raises on a real count error."""
+    pk = (config or {}).get("metadata", {}).get("primary_key") or {}
+    cols = pk.get("columns") or []
+    kind = pk.get("pk_kind")
+    if len(cols) != 1 or kind not in ("integer", "uuid"):
+        return None
+    pk_col = cols[0]
+    conn = _post_count_connect()
+    try:
+        qcol = '"%s"' % pk_col.replace('"', '""')
         cur = conn.cursor()
         try:
-            cur.execute(f"SELECT COUNT(*) FROM {dsql_schema}.{dsql_table}")
-            return int(cur.fetchone()[0])
+            cur.execute('SELECT MIN(%s), MAX(%s) FROM %s.%s'
+                        % (qcol, qcol, dsql_schema, dsql_table))
+            row = cur.fetchone()
         finally:
-            try:
-                cur.close()
-            except Exception:
-                pass
+            cur.close()
+        if not row or row[0] is None:
+            return 0           # empty table
+        lo_raw, hi_raw = row[0], row[1]
+        if kind == "integer":
+            ranges = plan_ranges(int(lo_raw), int(hi_raw), expected_total or 0,
+                                 POST_LOAD_COUNT_RANGE_ROWS)
+            def _lit(v):
+                return str(int(v))
+        else:
+            lo_hex = str(lo_raw).replace("-", "")
+            hi_hex = str(hi_raw).replace("-", "")
+            ranges = plan_ranges_hex(lo_hex, hi_hex, expected_total or 0,
+                                     POST_LOAD_COUNT_RANGE_ROWS)
+            def _lit(v):
+                h = v if isinstance(v, str) else format(int(v), "032x")
+                h = h.replace("-", "")
+                return "'%s-%s-%s-%s-%s'::uuid" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+        if not ranges:
+            return _post_count_scalar(conn, 'SELECT COUNT(*) FROM %s.%s'
+                                      % (dsql_schema, dsql_table))
+        total = 0
+        n = len(ranges)
+        for i, (rlo, rhi) in enumerate(ranges):
+            is_top = (i == n - 1)
+            preds = ['%s >= %s' % (qcol, _lit(rlo))]
+            if not is_top:
+                preds.append('%s < %s' % (qcol, _lit(rhi)))
+            where = " AND ".join(preds)
+            total += _post_count_scalar(
+                conn, 'SELECT COUNT(*) FROM %s.%s WHERE %s'
+                % (dsql_schema, dsql_table, where))
+        # include NULL-key rows (a nullable PK is unusual but count them so the total is exact)
+        total += _post_count_scalar(conn, 'SELECT COUNT(*) FROM %s.%s WHERE %s IS NULL'
+                                    % (dsql_schema, dsql_table, qcol))
+        print("    post_load_check=count_only [%s.%s]: ranged count over %d sub-range(s) (R8)"
+              % (dsql_schema, dsql_table, n))
+        return total
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _post_count_one(dsql_schema, dsql_table, config=None, expected_total=None):
+    """Run the post-load COUNT for ONE table and return the integer. AMENDMENT 3 (R8): count by
+    KEY RANGES when a single integer/uuid PK exists and the table is large (>= the range
+    threshold); otherwise ONE whole-table COUNT(*). Both use the B14 count connection so a long
+    count is bounded by statement_timeout, not a client read timeout. Always opens and closes."""
+    # R8: ranged count for a large table with a usable single-column integer/uuid key.
+    if config is not None and expected_total is not None \
+            and int(expected_total) >= POST_LOAD_COUNT_RANGE_THRESHOLD_ROWS:
+        ranged = _post_count_ranged(dsql_schema, dsql_table, config, int(expected_total))
+        if ranged is not None:
+            return ranged
+    # whole-table (small table, no usable key, or ranging declined) — with the B14 connection.
+    conn = _post_count_connect()
+    try:
+        return _post_count_scalar(conn, "SELECT COUNT(*) FROM %s.%s"
+                                  % (dsql_schema, dsql_table))
     finally:
         try:
             conn.close()
@@ -1058,7 +1172,8 @@ class _PostCountMismatch(Exception):
     """The COUNT(*) completed and DIFFERED from the expected rows (a real data problem)."""
 
 
-def _post_count_only_check(dsql_schema, dsql_table, expected_total, site="post-load"):
+def _post_count_only_check(dsql_schema, dsql_table, expected_total, site="post-load",
+                           config=None):
     """COUNT-ONLY post-load verification for ONE table. NEVER hangs and NEVER fails the load on
     an infrastructure error; raises ONLY on a completed-but-different count (so the table fails
     exactly as it does today). Returns a short note string (also used in the per-table status).
@@ -1076,7 +1191,8 @@ def _post_count_only_check(dsql_schema, dsql_table, expected_total, site="post-l
     while True:
         attempt += 1
         try:
-            actual = _post_count_one(dsql_schema, dsql_table)
+            actual = _post_count_one(dsql_schema, dsql_table, config=config,
+                                     expected_total=expected_total)
         except Exception as e:
             last_err = e
             kind = _post_count_is_infra_error(e)
@@ -4715,7 +4831,7 @@ def load_one_table(s3_client, entry, pk_range=None, file_subset=None, config=Non
     # ---- Post-load validation ----
     if _post_load_check_is_count_only():
         _post_count_only_check(dsql_schema, dsql_table, total_written,
-                               site='load_one_table')
+                               site='load_one_table', config=config)
         return {
             "table": f"{dsql_schema}.{dsql_table}",
             "rows": total_written,

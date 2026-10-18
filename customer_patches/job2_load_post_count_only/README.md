@@ -1,5 +1,22 @@
 # job2_load.py — post-load count-only check (optional `--post_load_check`)
 
+> **v2 (release-2, Amendment 3 / R8):** the count-only check now fixes a **client read timeout**
+> that made the count **unverifiable on tables with more than a few million rows**. The whole-table
+> `COUNT(*)` ran on a connection whose socket read timeout was never raised above the connect probe
+> and with no server `statement_timeout`, so at scale the count would stall/err; because count-only
+> treats any count error as a WARNING, the load would complete UNVERIFIED. v2 opens the COUNT on a
+> dedicated connection that raises the socket read timeout above a server-side `SET statement_timeout`
+> (so the server's deterministic 57014 fires first), and counts large tables in KEY RANGES when a
+> single integer/uuid primary key exists (reusing the loader's own range planner). The INSERT path
+> is unchanged; `post_load_check=full` and `off` are byte-identical. The folder ALREADY on GitHub
+> `main` predates v2; the fix is in `scripts/job2_load.py` on `release-2`. Because the integration
+> apply-script matches on anchors and the feature is already integrated on `main`, the bundled
+> `.diff` / `apply_post_count_only_patch.py` remain a no-op on a current full-repo clone; the v2
+> read-timeout change lives directly in the repo file (see release2/RESULT.md "AMENDMENT 3 / R8"
+> for the exact edited lines). Regenerating the historical pre-feature binary diff is not done
+> offline here.
+
+
 > **Included in `main` as of the integration commit** _"job2_load: integrate optional
 > --post_load_check full|count_only into scripts/job2_load.py"_. From that commit on, the real
 > repo file `scripts/job2_load.py` already contains this change (content sha256
