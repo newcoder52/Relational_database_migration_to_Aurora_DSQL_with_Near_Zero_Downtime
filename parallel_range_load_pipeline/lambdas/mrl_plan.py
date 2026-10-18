@@ -156,6 +156,30 @@ def _has_single_pk(entry):
     return len(cols) == 1
 
 
+def _r6_target_generated_pk_guard(entry, label):
+    """AMENDMENT 3 (R6): fail closed BEFORE launching any Glue range if a primary-key column is
+    not loaded from the source (not in target_columns). Such a PK is target-generated (a DEFAULT
+    like gen_random_uuid() fires), so a re-run / automatic range re-run / commit-probe resume
+    would re-insert the same rows with NEW keys -> silent duplicates. Mirrors the loader's own
+    _mr_target_generated_pk_guard so the refusal happens at the plan step too."""
+    meta = (entry.get("metadata", {}) or {})
+    pk = meta.get("primary_key") or {}
+    pk_cols = [str(c) for c in (pk.get("columns") or entry.get("pk_columns") or [])]
+    if not pk_cols:
+        return
+    loaded = {str(c).lower() for c in (entry.get("target_columns") or [])}
+    if not loaded:
+        return   # no target_columns in this index entry (slim index) -> the loader guard catches it
+    missing_pk = [c for c in pk_cols if c.lower() not in loaded]
+    if missing_pk:
+        raise MrlPlanError(
+            "FAIL CLOSED (R6): target-generated primary key for %s -- primary-key column(s) %s "
+            "are not loaded from the source (not in target_columns), so a column DEFAULT (e.g. "
+            "gen_random_uuid()) would generate the key and a re-run would create SILENT "
+            "DUPLICATES. The parallel range pipeline requires every primary-key column to come "
+            "from the source. Refusing to launch any range for this table." % (label, missing_pk))
+
+
 def _full_load_rows(entry, rowcounts, label):
     v = entry.get("full_load_rows")
     if v is None:
@@ -214,6 +238,10 @@ def handler(event, context):
         label = _entry_label(entry)
         if include and label not in include:
             continue
+        # AMENDMENT 3 (R6): refuse a TARGET-GENERATED primary key BEFORE any Glue range is
+        # launched. If a PK column is not in target_columns (not loaded from the source), the
+        # target DEFAULT (e.g. gen_random_uuid()) would mint keys and a re-run would duplicate.
+        _r6_target_generated_pk_guard(entry, label)
         dms_schema = entry.get("dms_schema") or entry.get("metadata", {}).get("dms_schema")
         dms_table = entry.get("dms_table") or entry.get("metadata", {}).get("dms_table")
         if not dms_schema or not dms_table:

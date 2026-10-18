@@ -5695,6 +5695,60 @@ def _mr_write_result(s3_client, label, failed, error_text=None):
         _MANUAL_RANGE["result_written"] = True
 
 
+def _mr_target_generated_pk_guard(config):
+    """AMENDMENT 3 (R6): RANGE-MODE guard against a TARGET-GENERATED primary key. If any
+    primary-key column of the target is NOT in the loaded columns (config['target_columns']),
+    that PK column is NOT written from the source -> the target's DEFAULT (e.g.
+    gen_random_uuid()) mints a NEW key for every row. A re-run (manual, the Amendment 2 automatic
+    range re-run, or the commit-probe resume) would then insert the SAME source rows again with
+    NEW keys: SILENT DUPLICATES the PK cannot catch. FAIL CLOSED before the first write (and, via
+    mrl_plan/preflight, before any Glue range is launched).
+
+    Also WARNS (does not fail) for any non-key target column missing from the file that has a
+    column default -- those get default values (expected), but the operator should see it. Default
+    info comes from the mapping (missing_target_columns_detail) when present, else columns are
+    listed by name. Returns the warning list (also printed); raises ManualRangeError on violation.
+    Pure except for printing; callable from a test with a plain config dict."""
+    meta = (config or {}).get("metadata", {}) or {}
+    pk = meta.get("primary_key") or {}
+    pk_cols = [str(c) for c in (pk.get("columns") or [])]
+    loaded = {str(c).lower() for c in ((config or {}).get("target_columns") or [])}
+    label = "%s.%s" % (meta.get("dsql_schema", "?"), meta.get("dsql_table", "?"))
+
+    if not pk_cols:
+        return []     # no-PK is handled by the separate fail-closed-on-resume guard
+
+    missing_pk = [c for c in pk_cols if c.lower() not in loaded]
+    if missing_pk:
+        raise ManualRangeError(
+            "TARGET-GENERATED PRIMARY KEY refused for %s: primary-key column(s) %s are NOT "
+            "loaded from the source file (not in the mapping's target_columns), so the target's "
+            "column DEFAULT (e.g. gen_random_uuid()) would generate the key for every row. A "
+            "re-run / automatic range re-run / commit-probe resume would then re-insert the same "
+            "source rows with NEW keys -> SILENT DUPLICATES the PRIMARY KEY cannot catch. FAILING "
+            "CLOSED before any write. The parallel range pipeline REQUIRES every primary-key "
+            "column to come from the source; fix the source/mapping so %s is present, or use a "
+            "key the source supplies." % (label, missing_pk, missing_pk))
+
+    warnings = []
+    detail = meta.get("missing_target_columns_detail")
+    missing_cols = meta.get("missing_target_columns") or []
+    pk_lower = {p.lower() for p in pk_cols}
+    if isinstance(detail, list) and detail:
+        defaulted = [d.get("name") for d in detail
+                     if isinstance(d, dict) and d.get("column_default") not in (None, "")
+                     and str(d.get("name", "")).lower() not in pk_lower]
+    else:
+        defaulted = [c for c in missing_cols if str(c).lower() not in pk_lower]
+    if defaulted:
+        w = ("R6 note for %s: non-key target column(s) %s are missing from the source file and "
+             "will receive their target column DEFAULT (expected). Verify this is intended."
+             % (label, defaulted))
+        warnings.append(w)
+        print("    \u26a0\ufe0f %s" % w)
+    return warnings
+
+
 def _mr_nopk_fail_closed_guard(s3_client, label, has_single_pk):
     """SHARD/RANGE no-PK fail-closed guard. The loader body, on a started-but-not-done file
     with NO single-column PK, falls into a WHOLE-TABLE reblank -- which in range mode would
@@ -5741,6 +5795,7 @@ def _mr_wrap_load_one_table_chunked(orig):
             # listing issues are surfaced by the loader itself; let it run normally
             pass
         _mr_nopk_fail_closed_guard(s3_client, label, has_single_pk)
+        _mr_target_generated_pk_guard(config)       # AMENDMENT 3 (R6): refuse a source-absent PK
         try:
             return orig(s3_client, entry, config)
         except Exception as e:
